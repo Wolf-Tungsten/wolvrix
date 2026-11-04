@@ -280,14 +280,14 @@ namespace wolvrix::lib::transform
             sig.kind = graph.opKind(opId);
             const std::span<const wolvrix::lib::grh::ValueId> operands = graph.opOperands(opId);
             sig.operands.assign(operands.begin(), operands.end());
-            const std::span<const wolvrix::lib::grh::AttrKV> attrs = graph.opAttrs(opId);
+            const auto attrs = graph.opAttrRange(opId);
             // Defensive (stage-07): refuse to copy/hash a large string
             // attribute into the signature; the op simply skips CSE.
             // kConstant, the known offender, is already excluded upstream.
             for (const auto &kv : attrs)
             {
-                if (const auto *text = std::get_if<std::string>(&kv.value);
-                    text != nullptr && text->size() > 1024)
+                if (const auto text = kv.value().get<std::string>();
+                    text.has_value() && text->size() > 1024)
                 {
                     return std::nullopt;
                 }
@@ -298,11 +298,11 @@ namespace wolvrix::lib::transform
             sig.attrs.reserve(attrs.size());
             for (const auto &kv : attrs)
             {
-                if (kv.key == kOriginModulesKey || kv.key == "grhsim.nodeClone" || ingest::node::isAttribute(kv.key))
+                if (kv.key() == kOriginModulesKey || kv.key() == "grhsim.nodeClone" || ingest::node::isAttribute(kv.key()))
                 {
                     continue;
                 }
-                sig.attrs.push_back(kv);
+                sig.attrs.push_back({std::string(kv.key()), kv.value().toOwned()});
             }
             std::stable_sort(sig.attrs.begin(), sig.attrs.end(),
                              [](const wolvrix::lib::grh::AttrKV &lhs, const wolvrix::lib::grh::AttrKV &rhs)
@@ -366,11 +366,11 @@ namespace wolvrix::lib::transform
                                           wolvrix::lib::grh::OperationId op,
                                           std::string_view key)
         {
-            for (const auto &kv : graph.opAttrs(op))
+            for (const auto &kv : graph.opAttrRange(op))
             {
-                if (kv.key == key)
+                if (kv.key() == key)
                 {
-                    if (const auto *value = std::get_if<int64_t>(&kv.value))
+                    if (const auto value = kv.value().get<int64_t>())
                     {
                         return *value;
                     }
@@ -611,9 +611,9 @@ namespace wolvrix::lib::transform
                         graph.opKind(index) == OperationKind::kConstant)
                     {
                         std::optional<uint64_t> selected;
-                        for (const auto &attr : graph.opAttrs(index))
-                            if (attr.key == "constValue")
-                                if (const auto *text = std::get_if<std::string>(&attr.value))
+                        for (const auto &attr : graph.opAttrRange(index))
+                            if (attr.key() == "constValue")
+                                if (const auto text = attr.value().get<std::string>())
                                 {
                                     try { selected = slang::SVInt::fromString(*text).as<uint64_t>(); }
                                     catch (const std::exception &) {}
@@ -662,11 +662,11 @@ namespace wolvrix::lib::transform
                                 // attribute span is not held across it.
                                 std::string literalText;
                                 bool literalFound = false;
-                                for (const auto &kv : graph.opAttrs(constOpId))
+                                for (const auto &kv : graph.opAttrRange(constOpId))
                                 {
-                                    if (kv.key == "constValue")
+                                    if (kv.key() == "constValue")
                                     {
-                                        if (const auto *text = std::get_if<std::string>(&kv.value))
+                                        if (const auto text = kv.value().get<std::string>())
                                         {
                                             literalText = *text;
                                             literalFound = true;

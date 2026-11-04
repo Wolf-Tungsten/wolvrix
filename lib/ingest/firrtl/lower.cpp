@@ -1,6 +1,7 @@
 #include "semantic.hpp"
 #include "core/state.hpp"
 #include "ingest/node_attributes.hpp"
+#include "slang/util/SmallVector.h"
 
 #include <algorithm>
 #include <array>
@@ -133,7 +134,7 @@ private:
     const Driver& findDriver(std::string_view name, std::span<const std::string> fields) const;
     Driver& findDriver(std::string_view name, std::span<const std::string_view> fields);
     const Driver& findDriver(std::string_view name, std::span<const std::string_view> fields) const;
-    grh::SrcLoc location(Range range) const;
+    grh::SrcLocView location(Range range) const;
     LogicalType logical(const Leaf& leaf) const;
     const Leaf& projected(ExprId expression, const std::vector<std::string>& fields) const;
     ValueId op(OperationKind kind, const LogicalType& type, std::span<const ValueId> args, Range range);
@@ -174,8 +175,8 @@ void Lowerer::ensureNodeSchema() {
     nodeSchemaReady_ = true;
 }
 
-grh::SrcLoc Lowerer::location(Range range) const {
-    grh::SrcLoc result;
+grh::SrcLocView Lowerer::location(Range range) const {
+    grh::SrcLocView result;
     result.file = sourceFile_;
     result.line = static_cast<uint32_t>(range.line);
     result.column = static_cast<uint32_t>(range.column);
@@ -249,12 +250,8 @@ ValueId Lowerer::op(OperationKind kind, const LogicalType& type, std::span<const
 
     graph_.addResult(operation, result);
 
-    // Source::position scans the FIRRTL source line and materializes strings.
-    // Both entities share the same range, so compute it once and move the
-    // second copy into the value record while preserving both source locations.
-    auto sourceLocation = location(range);
-    graph_.setOpSrcLoc(operation, sourceLocation);
-    graph_.setValueSrcLoc(result, std::move(sourceLocation));
+    // Both entities borrow the same source text and share one pooled record.
+    graph_.setOpAndValueSrcLocView(operation, result, location(range));
 
     if (!nodeKey_.empty()) {
         ensureNodeSchema();
@@ -416,8 +413,8 @@ ValueId Lowerer::primitive(ExprId id, const LogicalType& type) {
     const auto& expr = semantics_.body.arena.expressions[id];
 
     const auto word = expr.name; const auto range = expr.range;
-    std::vector<ValueId> args;
-    std::vector<int64_t> widths, parameters;
+    slang::SmallVector<ValueId, 4> args;
+    slang::SmallVector<int64_t, 4> widths, parameters;
     args.reserve(expr.operands.size());
     widths.reserve(expr.operands.size());
     parameters.reserve(expr.operands.size());
@@ -429,10 +426,11 @@ ValueId Lowerer::primitive(ExprId id, const LogicalType& type) {
         }
     }
     if (word == "cat") {
-        std::vector<ValueId> nonzero;
+        slang::SmallVector<ValueId, 4> nonzero;
         nonzero.reserve(args.size());
         for (const auto arg : args) if (arg) nonzero.push_back(arg);
-        return nonzero.size() == 1 ? view(nonzero[0], type, range) : op(OperationKind::kConcat, type, nonzero, range);
+        return nonzero.size() == 1 ? view(nonzero[0], type, range) :
+            op(OperationKind::kConcat, type, std::span<const ValueId>(nonzero.data(), nonzero.size()), range);
     }
     if (word == "asUInt" || word == "asSInt" || word == "asClock" || word == "asReset" || word == "asAsyncReset" || word == "cvt" || word == "pad")
         return adapt(args[0], type, range);
@@ -454,7 +452,7 @@ ValueId Lowerer::primitive(ExprId id, const LogicalType& type) {
     }
     if (word == "mul") {
         if (!args[0] || !args[1]) return constant(type, "0", range);
-        return op(OperationKind::kMul, type, args, range);
+        return op(OperationKind::kMul, type, std::span<const ValueId>(args.data(), args.size()), range);
     }
     static const std::map<std::string_view, OperationKind> kinds{
         {"add", OperationKind::kAdd}, {"sub", OperationKind::kSub}, {"div", OperationKind::kDiv}, {"rem", OperationKind::kMod},
@@ -511,7 +509,7 @@ void Lowerer::stateWrite(const Driver& driver, const Declaration::Register& stat
         graph_.addOperand(writer, expression(*state.reset)); edges.push_back("posedge");
     }
     graph_.setAttr(writer, "regSymbol", driver.regSymbol); graph_.setAttr(writer, "eventEdge", edges);
-    graph_.setOpSrcLoc(writer, location(range));
+    graph_.setOpSrcLocView(writer, location(range));
 }
 
 ValueId Lowerer::guard(int id, Range range) {
@@ -649,7 +647,7 @@ void Lowerer::connect(const Connection& connection) {
 void Lowerer::drive(ValueId target, ValueId source, Range range, bool root) {
     if (!target) return;
     const auto operation = graph_.createOperation(OperationKind::kAssign);
-    graph_.addOperand(operation, source); graph_.addResult(operation, target); graph_.setOpSrcLoc(operation, location(range));
+    graph_.addOperand(operation, source); graph_.addResult(operation, target); graph_.setOpSrcLocView(operation, location(range));
     if (root && !nodeKey_.empty()) {
         ensureNodeSchema();
         graph_.reserveOpAttrCapacity(operation, 4);
@@ -671,12 +669,12 @@ ValueId Lowerer::pipeline(ValueId data, ValueId clock, int64_t stages, Range ran
         const std::string symbol(graph_.getOperation(state).symbolText());
         grh::setStateLogicalType(graph_, state, type);
         grh::InitStep init; init.value = std::to_string(type.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
-        grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLoc(state, location(range));
+        grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLocView(state, location(range));
         graph_.setAttr(state, "firrtl.memoryPipeline", true);
         const auto write = graph_.createOperation(OperationKind::kRegisterWritePort);
         for (const auto value : {number(1, 1, range), data, clock}) graph_.addOperand(write, value);
         graph_.setAttr(write, "regSymbol", symbol); graph_.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
-        graph_.setOpSrcLoc(write, location(range));
+        graph_.setOpSrcLocView(write, location(range));
         data = op(OperationKind::kRegisterReadPort, type, {}, range); graph_.setAttr(graph_.valueDef(data), "regSymbol", symbol);
     }
     return data;
@@ -695,7 +693,7 @@ ValueId Lowerer::clockPulse(ValueId clock, Range range) {
     for (const auto value : {number(1, 1, range), clock, clock}) graph_.addOperand(writer, value);
     graph_.setAttr(writer, "regSymbol", symbol);
     graph_.setAttr(writer, "eventEdge", std::vector<std::string>{"both"});
-    graph_.setOpSrcLoc(writer, location(range));
+    graph_.setOpSrcLocView(writer, location(range));
     const auto pulse = op(OperationKind::kAnd, bit, {clock, op(OperationKind::kNot, bit, {previous}, range)}, range);
     clockPulses_.emplace(clock, pulse); return pulse;
 }
@@ -742,7 +740,7 @@ void Lowerer::memories() {
             const std::string symbol(graph_.getOperation(state).symbolText());
             grh::setStateLogicalType(graph_, state, storage);
             grh::InitStep init; init.value = std::to_string(storage.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
-            grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLoc(state, location(memory.range));
+            grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLocView(state, location(memory.range));
             graph_.setAttr(state, "firrtl.memory", name); graph_.setAttr(state, "firrtl.readUnderWrite", memory.readUnderWrite);
             std::vector<Port> ports;
             for (const auto& port : memory.ports) {
@@ -821,7 +819,7 @@ void Lowerer::memories() {
                 const auto writer = graph_.createOperation(OperationKind::kRegisterWriteArrayMaskPort);
                 for (const auto value : {port.writeEnable, port.writeAddress, data, port.writeMask, port.clock}) graph_.addOperand(writer, value);
                 graph_.setAttr(writer, "regSymbol", symbol); graph_.setAttr(writer, "eventEdge", std::vector<std::string>{"posedge"});
-                graph_.setOpSrcLoc(writer, location(port.source->range));
+                graph_.setOpSrcLocView(writer, location(port.source->range));
             }
             for (const auto& port : ports) {
                 ValueId data;
@@ -942,7 +940,7 @@ void Lowerer::effects() {
             if (statement.kind != StmtKind::Cover && placeholders != arguments.size()) throw Error(statement.range, "FIRRTL format argument count mismatch");
             const auto constant = graph_.createOperation(OperationKind::kConstant);
             const auto value = graph_.createValue({grh::ValueType::String, 0, false});
-            graph_.addResult(constant, value); graph_.setAttr(constant, "constValue", text); graph_.setOpSrcLoc(constant, location(statement.range));
+            graph_.addResult(constant, value); graph_.setAttr(constant, "constValue", text); graph_.setOpSrcLocView(constant, location(statement.range));
             arguments.insert(arguments.begin(), value);
             name = verification && statement.kind != StmtKind::Cover ? "fatal" : "write";
             if (name == "fatal") arguments.insert(arguments.begin(), number(1, 32, statement.range));
@@ -952,7 +950,7 @@ void Lowerer::effects() {
         graph_.setAttr(task, "name", name); graph_.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
         graph_.setAttr(task, "procKind", std::string("always")); graph_.setAttr(task, "hasTiming", true);
         graph_.setAttr(task, "firrtl.effectKind", std::string(statement.kind == StmtKind::Cover ? "cover-hit" : verification ? "assert" : statement.kind == StmtKind::Stop ? "stop" : "printf"));
-        graph_.setAttr(task, "firrtl.effectLabel", std::string(statement.name)); graph_.setOpSrcLoc(task, location(statement.range));
+        graph_.setAttr(task, "firrtl.effectLabel", std::string(statement.name)); graph_.setOpSrcLocView(task, location(statement.range));
     }
 }
 void Lowerer::checkCycles() const {
@@ -998,7 +996,7 @@ void Lowerer::instances() {
         const auto operation = graph_.createOperation(OperationKind::kInstance);
         graph_.setAttr(operation, "moduleName", instance.target);
         graph_.setAttr(operation, "instanceName", instance.name);
-        graph_.setOpSrcLoc(operation, location(instance.range));
+        graph_.setOpSrcLocView(operation, location(instance.range));
         std::vector<std::string> inputs, outputs;
         const auto& declaration = semantics_.declaration(instance.name);
         for (const auto& leaf : semantics_.leavesCached(declaration.type, declaration.flow)) {
@@ -1034,7 +1032,7 @@ ModuleSignature Lowerer::run() {
             const auto type = logical(leaf); ValueId value;
             if (type.width) {
                 value = declaration.state ? graph_.createValue(type) : graph_.createValue(graph_.internSymbol(symbol), type);
-                graph_.setValueSrcLoc(value, location(declaration.range));
+                graph_.setValueSrcLocView(value, location(declaration.range));
                 if (declaration.port) {
                     if (leaf.flow == 1) graph_.bindInputPort(symbol, value);
                     else graph_.bindOutputPort(symbol, value);
@@ -1046,9 +1044,9 @@ ModuleSignature Lowerer::run() {
                 const auto state = graph_.createOperation(OperationKind::kRegister, graph_.internSymbol(symbol));
                 grh::setStateLogicalType(graph_, state, type);
                 grh::InitStep init; init.value = std::to_string(type.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
-                grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLoc(state, location(declaration.range));
+                grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLocView(state, location(declaration.range));
                 const auto read = graph_.createOperation(OperationKind::kRegisterReadPort);
-                graph_.addResult(read, value); graph_.setAttr(read, "regSymbol", symbol); graph_.setOpSrcLoc(read, location(declaration.range));
+                graph_.addResult(read, value); graph_.setAttr(read, "regSymbol", symbol); graph_.setOpSrcLocView(read, location(declaration.range));
             }
             const auto entry = drivers_.emplace(LeafKey{name, leaf.fields}, std::move(driver)).first;
             if (leaf.fields.empty()) rootDrivers_.emplace(entry->first.first, &entry->second);
@@ -1108,6 +1106,7 @@ ModuleSignature Lowerer::run() {
     }
     checkCycles(); node::requireValid(graph_);
     if (options_.nodeAnnotations) { node::establishPolicy(graph_); node::recordRetention(graph_); }
+    if (!graph_.metadata("firrtl.pendingCombLoopCheck")) graph_.markLocalCyclesChecked();
     return signature;
 }
 } // namespace
@@ -1128,6 +1127,12 @@ ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
     if (body.interface.kind != ModuleKind::Module)
         throw Error(body.interface.range, "FIRRTL external/class lowering is not supported yet (F06/F07)");
     Semantics semantics(source, body, options, interfaces); semantics.analyze();
+    return Lowerer(semantics, graph, options).run();
+}
+
+ModuleSignature lowerModule(Semantics& semantics, grh::Graph& graph,
+                            const FirrtlOptions& options) {
+    if (!semantics.analyzed()) throw std::logic_error("FIRRTL lowering requires analyzed semantics");
     return Lowerer(semantics, graph, options).run();
 }
 } // namespace wolvrix::lib::ingest::firrtl::detail

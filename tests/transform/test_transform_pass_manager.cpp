@@ -1,6 +1,7 @@
 #include "core/grh.hpp"
 #include "core/transform.hpp"
 #include "transform/demo_stats.hpp"
+#include "ingest/node_attributes.hpp"
 
 #include <iostream>
 #include <string>
@@ -144,12 +145,157 @@ namespace
         }
     };
 
+    class LocalSequence : public Pass
+    {
+    public:
+        LocalSequence(std::string stage, std::string rejected = {})
+            : Pass(stage, stage), rejected_(std::move(rejected)) {}
+        std::unique_ptr<Pass> cloneGraphKernel() const override {
+            return std::make_unique<LocalSequence>(id(), rejected_);
+        }
+        bool preservesDialects() const noexcept override { return true; }
+        PassResult run() override {
+            PassResult result;
+            for (auto* graph : graphs()) {
+                if (id() == "noop" || (id() == "only-a" && graph->symbol() != "a")) continue;
+                const auto old = graph->metadata("sequence");
+                const auto previous = old ? std::get<std::string>(*old) : std::string{};
+                graph->setMetadata("sequence", previous + id());
+                diags().warning(id(), previous, std::string(graph->symbol()));
+                result.changed = true;
+                if (graph->symbol() == rejected_) {
+                    diags().error(id(), "rejected graph", rejected_);
+                    result.failed = true;
+                }
+            }
+            return result;
+        }
+    private:
+        std::string rejected_;
+    };
+
 } // namespace
 
 int main()
 {
     wolvrix::lib::grh::Design design;
     design.createGraph("top");
+
+    // A change in one graph refreshes the census of every graph. An entirely
+    // unchanged stage must leave missing/stale census metadata untouched.
+    for (const auto stage : {"only-a", "noop"}) {
+        wolvrix::lib::grh::Design serial;
+        for (const auto name : {"a", "untouched"}) {
+            auto& graph = serial.createGraph(name);
+            wolvrix::lib::ingest::node::establishPolicy(graph);
+            if (std::string_view(name) == "a") graph.setMetadata("firrtl.nodeRetention", std::string("stale"));
+        }
+        auto parallel = serial.clone();
+        PassManager old, fused;
+        old.addPass(std::make_unique<LocalSequence>(stage));
+        fused.addPass(std::make_unique<LocalSequence>(stage));
+        fused.options().graphThreads = 4;
+        PassDiagnostics expected, actual;
+        const auto original = old.run(serial, expected);
+        const auto updated = fused.runGraphPipeline(parallel, actual, true);
+        if (original.success != updated.success || original.changed != updated.changed)
+            return fail("Retention changed the pass result");
+        for (const auto& name : serial.graphOrder())
+            if (serial.findGraph(name)->metadata("firrtl.nodeRetention") != parallel.findGraph(name)->metadata("firrtl.nodeRetention"))
+                return fail("Global changed boundary did not preserve unchanged graph retention");
+        for (const auto& [name, graph] : parallel.graphs())
+            if (!graph->frozen()) return fail("Retention publication invalidated final compaction");
+    }
+
+    for (const bool unsupported : {false, true}) {
+        wolvrix::lib::grh::Design serial;
+        serial.createGraph("a"); serial.createGraph("b");
+        if (unsupported) serial.findGraph("b")->setMetadata("grhsim.stage", std::string("foreign"));
+        auto parallel = serial.clone();
+        PassManager old, fused;
+        old.options().stopOnError = false;
+        fused.options().stopOnError = false; fused.options().graphThreads = 4;
+        for (const auto stage : {"one", "two"}) {
+            old.addPass(std::make_unique<LocalSequence>(stage, "a"));
+            fused.addPass(std::make_unique<LocalSequence>(stage, "a"));
+        }
+        PassDiagnostics expected, actual;
+        const auto baseline = old.run(serial, expected);
+        const auto updated = fused.runGraphPipeline(parallel, actual);
+        if (baseline.success != updated.success || baseline.changed != updated.changed ||
+            expected.messages().size() != actual.messages().size()) return fail("Continue-on-error boundary changed");
+        for (std::size_t i = 0; i < expected.messages().size(); ++i)
+            if (expected.messages()[i].message != actual.messages()[i].message ||
+                expected.messages()[i].context != actual.messages()[i].context)
+                return fail("Continue-on-error diagnostic boundary changed");
+        for (const auto& name : serial.graphOrder())
+            if (serial.findGraph(name)->metadata("sequence") != parallel.findGraph(name)->metadata("sequence"))
+                return fail("Failed graph did not run in a later stage");
+    }
+    {
+        wolvrix::lib::grh::Design owner;
+        auto selected = owner.createUnpublishedGraph("unpublished");
+        wolvrix::lib::ingest::node::establishPolicy(*selected);
+        PassManager manager;
+        manager.addPass(std::make_unique<LocalSequence>("one"));
+        PassDiagnostics diagnostics;
+        if (!manager.runGraph(*selected, diagnostics).success ||
+            !selected->metadata("firrtl.nodeRetention")) return fail("Unpublished graph missed retention");
+        selected->setMetadata("grhsim.stage", std::string("foreign"));
+        diagnostics.clear();
+        if (manager.runGraph(*selected, diagnostics).success || diagnostics.messages().size() != 1 ||
+            diagnostics.messages().front().message != "Pass does not support dialect grhsim")
+            return fail("Unpublished graph missed dialect admission");
+    }
+    {
+        wolvrix::lib::grh::Design mixed;
+        mixed.createGraph("ordinary");
+        mixed.createGraph("foreign").setMetadata("grhsim.stage", std::string("foreign"));
+        PassManager manager;
+        manager.options().graphThreads = 4;
+        manager.addPass(std::make_unique<LocalSequence>("one"));
+        PassDiagnostics diagnostics;
+        if (manager.runGraphPipeline(mixed, diagnostics).success || diagnostics.messages().size() != 1)
+            return fail("Whole-design dialect rejection leaked graph kernel diagnostics");
+        for (const auto& [name, graph] : mixed.graphs())
+            if (graph->metadata("sequence")) return fail("Kernel ran before whole-design dialect admission");
+    }
+
+    // A graph may advance through its local chain before other graphs finish,
+    // but published diagnostics retain the serial stage and graph order.
+    for (const std::size_t threads : {1, 2, 4, 10}) {
+        wolvrix::lib::grh::Design serial;
+        for (const auto name : {"z", "a", "middle"}) serial.createGraph(name);
+        auto parallel = serial.clone();
+        PassManager baseline, fused;
+        fused.options().graphThreads = threads;
+        for (const auto stage : {"one", "two", "three"}) {
+            baseline.addPass(std::make_unique<LocalSequence>(stage));
+            fused.addPass(std::make_unique<LocalSequence>(stage));
+        }
+        PassDiagnostics expected, actual;
+        const auto old = baseline.run(serial, expected);
+        const auto merged = fused.runGraphPipeline(parallel, actual, true);
+        if (!old.success || !merged.success || !merged.changed || merged.stages.size() != 3 ||
+            expected.messages().size() != actual.messages().size()) return fail("Local chain result mismatch");
+        for (std::size_t i = 0; i < expected.messages().size(); ++i) {
+            const auto& a = expected.messages()[i]; const auto& b = actual.messages()[i];
+            if (a.kind != b.kind || a.message != b.message || a.context != b.context || a.passName != b.passName)
+                return fail("Local chain changed diagnostic publication order");
+        }
+        for (const auto& name : serial.graphOrder())
+            if (serial.findGraph(name)->metadata("sequence") != parallel.findGraph(name)->metadata("sequence"))
+                return fail("Local chain did not preserve per-graph dependency order");
+        PassManager failing;
+        failing.options().graphThreads = threads;
+        failing.addPass(std::make_unique<LocalSequence>("one", "a"));
+        failing.addPass(std::make_unique<LocalSequence>("two"));
+        PassDiagnostics failure;
+        const auto failed = failing.runGraphPipeline(parallel, failure);
+        if (failed.success || failed.stages.size() != 1) return fail("Local failure crossed the stage publication boundary");
+        for (const auto& entry : failure.messages())
+            if (entry.passName != "one") return fail("A later local stage published diagnostics after failure");
+    }
 
     {
         wolvrix::lib::grh::Design sources;

@@ -14,6 +14,10 @@ namespace wolvrix::lib::transform
     public:
         explicit RegisterWriteNormalizePass(bool twoState = false);
         PassResult run() override;
+        bool preservesDialects() const noexcept override { return true; }
+        std::unique_ptr<Pass> cloneGraphKernel() const override {
+            return std::make_unique<RegisterWriteNormalizePass>(twoState_);
+        }
 
     private:
         bool twoState_;

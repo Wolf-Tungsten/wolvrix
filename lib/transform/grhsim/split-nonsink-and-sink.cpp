@@ -31,10 +31,9 @@ PassResult SplitNonsinkAndSinkPass::run() {
         }
         if (stage(*graph) != "event-output-split") throw std::invalid_argument("General split requires event-output-split stage");
         const Owner generalOwner{"general"};
-        const auto topo = topological(*graph, [&](OperationId op) { return ownerView(*graph, op) == generalOwner; });
+        const auto topo = topological(*graph, [&](OperationId op) { return sameOwner(ownerView(*graph, op), generalOwner); });
         const auto hasHistory = [&](OperationId op) {
-            const auto attrs = graph->opAttrs(op);
-            return std::any_of(attrs.begin(), attrs.end(), [](const auto& attr) { return attr.key == "grhsim.history"; });
+            return graph->opAttrRange(op).find("grhsim.history").has_value();
         };
         std::unordered_map<OperationId, std::string, OperationIdHash> policy;
         for (const auto op : graph->operations()) {

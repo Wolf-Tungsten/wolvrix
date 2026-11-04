@@ -32,10 +32,12 @@
 #include "transform/xmr_resolve.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <charconv>
 #include <exception>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace wolvrix::lib::transform
@@ -307,6 +309,21 @@ namespace wolvrix::lib::transform
     {
     }
 
+    std::vector<wolvrix::lib::grh::Graph*> Pass::graphs(bool sourceOrder) const
+    {
+        if (context_->graph) return {context_->graph};
+        std::vector<wolvrix::lib::grh::Graph*> result;
+        result.reserve(context_->design.graphs().size());
+        if (sourceOrder) {
+            for (const auto& name : context_->design.graphOrder())
+                if (auto* graph = context_->design.findGraph(name)) result.push_back(graph);
+        } else {
+            for (const auto& entry : context_->design.graphs())
+                if (entry.second) result.push_back(entry.second.get());
+        }
+        return result;
+    }
+
     void PassManager::addPass(std::unique_ptr<Pass> pass, std::string instanceName)
     {
         PassEntry entry;
@@ -332,11 +349,25 @@ namespace wolvrix::lib::transform
 
     PassManagerResult PassManager::run(wolvrix::lib::grh::Design &design, PassDiagnostics &diags)
     {
+        return runImpl(design, diags, nullptr);
+    }
+
+    PassManagerResult PassManager::runGraph(wolvrix::lib::grh::Graph& graph, PassDiagnostics& diags)
+    {
+        for (const auto& entry : pipeline_)
+            if (!entry.instance || !entry.instance->cloneGraphKernel())
+                throw std::invalid_argument("runGraph requires graph-local passes");
+        return runImpl(graph.owner(), diags, &graph);
+    }
+
+    PassManagerResult PassManager::runImpl(wolvrix::lib::grh::Design &design, PassDiagnostics &diags,
+                                          wolvrix::lib::grh::Graph* selected, bool allowGraphThreads)
+    {
         PassManagerResult result;
         SessionStore localSession;
         SessionStore *session = options_.session ? options_.session : &localSession;
         PassContext context{design, diags, options_.verbosity, options_.logLevel, options_.logSink,
-                            options_.keepDeclaredSymbols, session};
+                            options_.keepDeclaredSymbols, session, selected};
         bool encounteredFailure = false;
         auto emitLog = [&](LogLevel level, std::string_view tag, std::string_view message) {
             if (!options_.logSink)
@@ -348,6 +379,30 @@ namespace wolvrix::lib::transform
                 return;
             }
             options_.logSink(level, tag, message);
+        };
+
+        // Dialect admission is a property of the current design revision,
+        // rather than of an individual pass. Cache the first-seen dialect
+        // sequence and rebuild it only after a graph mutation.
+        std::vector<std::string> dialects;
+        uint64_t dialectRevision = UINT64_MAX;
+        const auto refreshDialects = [&]() {
+            if (dialectRevision == design.revision()) return;
+            dialects.clear();
+            const auto addDialect = [&](std::string_view dialect) {
+                if (std::find(dialects.begin(), dialects.end(), dialect) == dialects.end())
+                    dialects.emplace_back(dialect);
+            };
+            const auto scan = [&](const auto& graph) {
+                if (graph.metadata("grhsim.stage")) addDialect("grhsim");
+                for (const auto operation : graph.operations()) {
+                    const auto* descriptor = wolvrix::lib::grh::findOpDescriptor(graph.opKind(operation));
+                    addDialect(descriptor ? descriptor->dialect : "unknown");
+                }
+            };
+            if (selected) scan(*selected);
+            else for (const auto& [graphName, graph] : design.graphs()) scan(*graph);
+            dialectRevision = design.revision();
         };
 
         for (auto &entry : pipeline_)
@@ -371,25 +426,10 @@ namespace wolvrix::lib::transform
                 continue;
             }
 
+            refreshDialects();
             std::string unsupported;
-            for (const auto& [graphName, graph] : design.graphs())
-            {
-                if (graph->metadata("grhsim.stage") && !pass->supportsDialect("grhsim"))
-                {
-                    unsupported = "grhsim";
-                    break;
-                }
-                for (const auto operation : graph->operations())
-                {
-                    const auto* descriptor = wolvrix::lib::grh::findOpDescriptor(graph->opKind(operation));
-                    if (!descriptor || !pass->supportsDialect(descriptor->dialect))
-                    {
-                        unsupported = descriptor ? std::string(descriptor->dialect) : "unknown";
-                        break;
-                    }
-                }
-                if (!unsupported.empty()) break;
-            }
+            for (const auto& dialect : dialects)
+                if (!pass->supportsDialect(dialect)) { unsupported = dialect; break; }
             if (!unsupported.empty())
             {
                 diags.error(pass->id(), "Pass does not support dialect " + unsupported, "pipeline");
@@ -399,19 +439,34 @@ namespace wolvrix::lib::transform
             }
 
             pass->setContext(&context);
+            const auto firstDiagnostic = diags.messages().size();
             auto startTime = std::chrono::steady_clock::now();
-            PassResult passResult = pass->run();
+            PassResult passResult;
+            if (allowGraphThreads && !selected && options_.graphThreads > 1 && pass->cloneGraphKernel()) {
+                PassManager workers(options_);
+                workers.addPass(pass->cloneGraphKernel(), pass->name());
+                const auto parallel = workers.runGraphPipeline(design, diags);
+                passResult.changed = parallel.changed;
+                passResult.failed = !parallel.success;
+            } else {
+                passResult = pass->run();
+            }
             // partition-sink records before capturing its revision-local schedule.
             if (!passResult.failed && passResult.changed && pass->id() != "grhsim-partition-sink") {
-                for (const auto& [name, graph] : design.graphs()) {
-                    try { ingest::node::recordRetention(*graph); }
+                const auto retain = [&](auto& graph) {
+                    try { ingest::node::recordRetention(graph); }
                     catch (const std::exception& error) {
                         diags.error(pass->id(), error.what(), "firrtl-node-retention");
                         passResult.failed = true;
                     }
-                }
+                };
+                if (selected) retain(*selected);
+                else for (const auto& [name, graph] : design.graphs()) retain(*graph);
             }
             auto endTime = std::chrono::steady_clock::now();
+            result.stages.push_back({pass->id(),
+                {diags.messages().begin() + static_cast<std::ptrdiff_t>(firstDiagnostic), diags.messages().end()},
+                std::chrono::duration<double>(endTime - startTime).count(), 0, false});
             pass->clearContext();
             result.changed = result.changed || passResult.changed;
 
@@ -449,6 +504,199 @@ namespace wolvrix::lib::transform
         }
 
         result.success = !encounteredFailure && !diags.hasError();
+        return result;
+    }
+
+    PassManagerResult PassManager::runGraphPipeline(wolvrix::lib::grh::Design& design,
+                                                   PassDiagnostics& diags, bool compactAtEnd)
+    {
+        if (pipeline_.empty()) return {};
+        struct Log { LogLevel level; std::string tag, message; };
+        struct Stage {
+            PassResult result;
+            PassDiagnostics diagnostics;
+            std::vector<Log> logs;
+            std::exception_ptr failure;
+            std::optional<grh::AttributeValue> retention;
+            std::string retentionError;
+            double seconds = 0;
+        };
+        struct Task {
+            wolvrix::lib::grh::Graph* graph;
+            std::vector<std::unique_ptr<Stage>> stages;
+        };
+        SessionStore coordinatorSession;
+        PassContext coordinator{design, diags, options_.verbosity, options_.logLevel, options_.logSink,
+                                options_.keepDeclaredSymbols, options_.session ? options_.session : &coordinatorSession};
+        for (const auto& entry : pipeline_)
+            if (!entry.instance || !entry.instance->cloneGraphKernel())
+                throw std::invalid_argument("runGraphPipeline requires graph-local passes");
+        pipeline_.front().instance->setContext(&coordinator);
+        const auto targets = pipeline_.front().instance->graphs(pipeline_.front().instance->usesSourceGraphOrder());
+        pipeline_.front().instance->clearContext();
+        const auto compact = [&] {
+            if (!compactAtEnd) return;
+            std::vector<std::exception_ptr> failures(targets.size());
+            std::atomic<std::size_t> next{0};
+            const auto finish = [&] {
+                for (;;) {
+                    const auto index = next.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= targets.size()) return;
+                    try {
+                        if (!options_.compactGraph || options_.compactGraph(*targets[index])) {
+                            if (options_.prepareFlattenSources) targets[index]->compactForFlatten();
+                            else targets[index]->compact();
+                        }
+                    }
+                    catch (...) { failures[index] = std::current_exception(); }
+                }
+            };
+            {
+                auto mutation = design.parallelGraphMutation();
+                const auto count = std::min(targets.size(), std::max(std::size_t{1}, options_.graphThreads));
+                std::vector<std::jthread> workers;
+                workers.reserve(count);
+                for (std::size_t i = 0; i < count; ++i) workers.emplace_back(finish);
+            }
+            for (const auto& failure : failures) if (failure) std::rethrow_exception(failure);
+        };
+        // Arbitrary kernels can change dialects, and continue-on-error callers
+        // require the failed graph to participate in later passes. Preserve
+        // those stage boundaries with the ordinary serial executor.
+        bool serial = !options_.stopOnError;
+        std::unordered_set<std::string_view> initialDialects;
+        for (const auto* graph : targets) {
+            if (graph->metadata("grhsim.stage")) initialDialects.insert("grhsim");
+            for (const auto op : graph->operations()) {
+                const auto* descriptor = grh::findOpDescriptor(graph->opKind(op));
+                initialDialects.insert(descriptor ? descriptor->dialect : "unknown");
+            }
+        }
+        for (const auto& entry : pipeline_) {
+            serial |= !entry.instance->preservesDialects();
+            for (const auto dialect : initialDialects)
+                if (!entry.instance->supportsDialect(dialect)) serial = true;
+        }
+        if (serial || (options_.stopOnError && diags.hasError())) {
+            auto result = runImpl(design, diags, nullptr, false);
+            if (result.success) compact();
+            return result;
+        }
+        std::vector<Task> tasks;
+        std::unordered_map<wolvrix::lib::grh::Graph*, std::size_t> positions;
+        for (auto* graph : targets) {
+            positions.emplace(graph, tasks.size());
+            Task task{graph, {}};
+            for (std::size_t i = 0; i < pipeline_.size(); ++i) task.stages.push_back(std::make_unique<Stage>());
+            tasks.push_back(std::move(task));
+        }
+        std::vector<std::size_t> schedule(tasks.size());
+        for (std::size_t i = 0; i < schedule.size(); ++i) schedule[i] = i;
+        std::stable_sort(schedule.begin(), schedule.end(), [&](auto a, auto b) {
+            return tasks[a].graph->operations().size() > tasks[b].graph->operations().size();
+        });
+        std::atomic<std::size_t> cursor{0};
+        const auto work = [&] {
+            for (;;) {
+                const auto next = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (next >= schedule.size()) return;
+                auto& task = tasks[schedule[next]];
+                SessionStore localSession;
+                bool failed = false;
+                for (std::size_t i = 0; i < pipeline_.size(); ++i) {
+                    auto& stage = *task.stages[i];
+                    const auto started = std::chrono::steady_clock::now();
+                    try {
+                        auto pass = pipeline_[i].instance->cloneGraphKernel();
+                        pass->setName(pipeline_[i].instance->name());
+                        PassContext context{design, stage.diagnostics, options_.verbosity, options_.logLevel,
+                            [&](LogLevel level, std::string_view tag, std::string_view message) {
+                                stage.logs.push_back({level, std::string(tag), std::string(message)});
+                            }, options_.keepDeclaredSymbols, &localSession, task.graph};
+                        pass->setContext(&context);
+                        std::string unsupported;
+                        for (const auto op : task.graph->operations()) {
+                            const auto* descriptor = wolvrix::lib::grh::findOpDescriptor(task.graph->opKind(op));
+                            const auto dialect = descriptor ? descriptor->dialect : "unknown";
+                            if (!pass->supportsDialect(dialect)) { unsupported = dialect; break; }
+                        }
+                        if (!unsupported.empty()) {
+                            stage.diagnostics.error(pass->id(), "Pass does not support dialect " + unsupported, "pipeline");
+                            stage.result.failed = true;
+                        } else {
+                            stage.result = pass->run();
+                            // Compute the local census while this exact stage's
+                            // graph state is available. The coordinator decides
+                            // whether the whole-design changed/failed boundary
+                            // actually publishes it, including unchanged graphs.
+                            if (!stage.result.failed) {
+                                try {
+                                    stage.retention = ingest::node::retentionCensus(*task.graph);
+                                }
+                                catch (const std::exception& error) {
+                                    stage.retentionError = error.what();
+                                }
+                            }
+                        }
+                        pass->clearContext();
+                        failed = stage.result.failed || stage.diagnostics.hasError();
+                    } catch (...) { stage.failure = std::current_exception(); failed = true; }
+                    stage.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+                    if (failed) break;
+                }
+            }
+        };
+        {
+            auto mutation = design.parallelGraphMutation();
+            const auto count = std::min(tasks.size(), std::max(std::size_t{1}, options_.graphThreads));
+            std::vector<std::jthread> workers;
+            workers.reserve(count);
+            for (std::size_t i = 0; i < count; ++i) workers.emplace_back(work);
+        }
+        PassManagerResult result;
+        for (std::size_t i = 0; i < pipeline_.size(); ++i) {
+            auto& pass = *pipeline_[i].instance;
+            pass.setContext(&coordinator);
+            const auto order = pass.graphs(pass.usesSourceGraphOrder());
+            std::vector<PassResult> rows;
+            const auto firstDiagnostic = diags.messages().size();
+            double seconds = 0;
+            bool stageChanged = false, stageFailed = false;
+            for (auto* graph : order) {
+                auto& stage = *tasks[positions.at(graph)].stages[i];
+                seconds += stage.seconds;
+                if (stage.failure) { pass.clearContext(); std::rethrow_exception(stage.failure); }
+                for (const auto& entry : stage.diagnostics.messages()) diags.append(entry);
+                if (options_.logSink)
+                    for (const auto& log : stage.logs) options_.logSink(log.level, log.tag, log.message);
+                result.changed |= stage.result.changed;
+                stageChanged |= stage.result.changed;
+                stageFailed |= stage.result.failed;
+                result.success &= !stage.result.failed && !stage.diagnostics.hasError();
+                rows.push_back(std::move(stage.result));
+            }
+            pass.finishGraphKernels(rows);
+            if (stageChanged && !stageFailed) {
+                for (const auto& [name, graph] : design.graphs()) {
+                    auto& stage = *tasks[positions.at(graph.get())].stages[i];
+                    if (!stage.retentionError.empty()) {
+                        diags.error(pass.id(), stage.retentionError, "firrtl-node-retention");
+                        result.success = false;
+                    } else if (stage.retention && graph->metadata("firrtl.nodeRetention") != stage.retention) {
+                        graph->setMetadata("firrtl.nodeRetention", *stage.retention);
+                    }
+                }
+            }
+            result.stages.push_back({pass.id(),
+                {diags.messages().begin() + static_cast<std::ptrdiff_t>(firstDiagnostic), diags.messages().end()},
+                0, seconds, true});
+            pass.clearContext();
+            if (!result.success && options_.stopOnError) break;
+        }
+        result.success &= !diags.hasError();
+        // Retention metadata is part of the published stage. Compact only
+        // after its coordinator writes, so every returned graph is ready.
+        if (result.success) compact();
         return result;
     }
 
@@ -686,6 +934,21 @@ namespace wolvrix::lib::transform
                 if (arg == "-preserve-modules")
                 {
                     options.preserveFlattenedModules = true;
+                }
+                else if (arg == "-threads" || arg.starts_with("-threads="))
+                {
+                    std::string_view value;
+                    if (arg == "-threads") {
+                        if (++i >= args.size()) { error = "-threads expects a value"; return nullptr; }
+                        value = args[i];
+                    } else value = arg.substr(std::string_view("-threads=").size());
+                    std::size_t threads = 0;
+                    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), threads);
+                    if (value.empty() || parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) {
+                        error = "-threads expects a non-negative integer";
+                        return nullptr;
+                    }
+                    options.numThreads = threads;
                 }
                 else if (arg == "-sym-protect" || arg.starts_with("-sym-protect="))
                 {

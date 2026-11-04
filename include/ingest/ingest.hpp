@@ -132,6 +132,8 @@ struct FirrtlOptions {
     std::vector<std::string> resourceRoots;
 };
 
+enum class IngestPipeline { Ingest, GrhPreFlatten };
+
 struct IngestRequest {
     std::vector<IngestSource> sources;
     // Empty uses the caller's working directory. Relative source paths use this root.
@@ -142,6 +144,10 @@ struct IngestRequest {
     std::vector<ExternalBinding> externalBindings;
     LogLevel logLevel = LogLevel::Info;
     Logger::Sink logSink;
+    // Explicit endpoint selection. The default returns the historical ingest
+    // graph; GrhPreFlatten additionally runs the production prefix, with
+    // cross-graph barriers followed by fused graph-local worker chains.
+    IngestPipeline pipeline = IngestPipeline::Ingest;
 };
 
 class SourceOwner {
@@ -158,6 +164,14 @@ struct InterfaceScanResult {
     bool success = false;
 };
 
+struct IngestPrefixStage {
+    std::string pass;
+    std::vector<IngestDiagnostic> diagnostics;
+    double wallSeconds = 0;
+    double workerSeconds = 0;
+    bool overlapped = false;
+};
+
 struct IngestResult {
     // Declared first so the design and diagnostics are destroyed before their sources.
     SourceOwners sourceOwners;
@@ -166,6 +180,9 @@ struct IngestResult {
     std::vector<IngestDiagnostic> diagnostics;
     // Canonical source identities, preprocessing inputs and specialization keys.
     std::vector<std::string> dependencies;
+    std::vector<IngestPrefixStage> prefixStages;
+    std::size_t ingestDiagnosticCount = 0;
+    double prefixWallSeconds = 0;
 
     bool success() const noexcept;
 };

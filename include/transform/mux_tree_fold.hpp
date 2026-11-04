@@ -35,6 +35,10 @@ namespace wolvrix::lib::transform
         explicit MuxTreeFoldPass(bool guardedWrites = false);
 
         PassResult run() override;
+        bool preservesDialects() const noexcept override { return true; }
+        std::unique_ptr<Pass> cloneGraphKernel() const override {
+            return std::make_unique<MuxTreeFoldPass>(guardedWrites_);
+        }
 
     private:
         bool guardedWrites_;

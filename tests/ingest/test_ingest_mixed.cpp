@@ -1,6 +1,7 @@
 #include "firrtl_emit_fixture.hpp"
 #include "../transform/grhsim_oracle.hpp"
 #include "ingest/sv.hpp"
+#include "../../lib/ingest/mixed.hpp"
 
 #include <tuple>
 
@@ -15,6 +16,105 @@ int main() {
     }
 }
 )CPP";
+void explicitPrefix(ingest::IngestRequest request) {
+    request.firrtl.lowerThreads = 1;
+    auto baseline = ingest::readSources(request);
+    require(baseline.success(), diagnostics(baseline));
+    require(baseline.prefixStages.empty(), "raw ingest unexpectedly ran the production prefix");
+    const auto portOrder = [](const auto& graph) {
+        std::vector<std::string> order;
+        for (const auto& port : graph.inputPorts()) order.push_back("input:" + port.name);
+        for (const auto& port : graph.outputPorts()) order.push_back("output:" + port.name);
+        for (const auto& port : graph.inoutPorts()) order.push_back("inout:" + port.name);
+        return order;
+    };
+    std::map<std::string, std::vector<std::string>> topPorts;
+    for (const auto& top : baseline.design->topGraphs()) topPorts.emplace(top, portOrder(*baseline.design->findGraph(top)));
+    tx::PassManagerOptions options; options.keepDeclaredSymbols = true;
+    tx::PassManager manager(options);
+    const auto add = [&](std::string_view name, std::initializer_list<std::string_view> arguments = {}) {
+        std::string error;
+        auto pass = tx::makePass(name, std::span(arguments.begin(), arguments.size()), error);
+        require(bool(pass), error); manager.addPass(std::move(pass));
+    };
+    add("xmr-resolve"); add("mux-tree-fold");
+    add("register-write-normalize", {"-semantics=2state"});
+    add("mux-tree-fold", {"-guarded-writes=2state"});
+    add("memory-read-retime"); add("multidriven-guard");
+    add("blackbox-guard"); add("latch-transparent-read"); add("hier-flatten");
+    tx::PassDiagnostics expected;
+    require(manager.run(*baseline.design, expected).success, "serial production prefix failed");
+    wolvrix::lib::store::StoreJson store;
+    const auto json = store.storeToString(*baseline.design);
+    require(json.has_value(), "serial prefix could not be serialized");
+    for (const std::size_t threads : {1, 2, 4, 10}) {
+        request.firrtl.lowerThreads = threads;
+        request.pipeline = ingest::IngestPipeline::GrhPreFlatten;
+        auto fused = ingest::readSources(request);
+        require(fused.success(), diagnostics(fused));
+        require(fused.prefixStages.size() == 8 && fused.ingestDiagnosticCount == baseline.diagnostics.size(),
+            "explicit prefix lost its raw endpoint boundary or production stages");
+        for (const auto& [top, order] : topPorts)
+            require(portOrder(*fused.design->findGraph(top)) == order, "explicit prefix sorted observable top-level port order");
+        tx::PassManager flatten(options);
+        std::string error; flatten.addPass(tx::makePass("hier-flatten", {}, error));
+        tx::PassDiagnostics flatDiagnostics;
+        require(flatten.run(*fused.design, flatDiagnostics).success, "flatten after explicit prefix failed");
+        const auto actual = store.storeToString(*fused.design);
+        require(actual.has_value(), "explicit worker prefix could not be serialized");
+        if (*actual != *json) {
+            const auto label = request.sources.front().path.stem().string() + "-t" + std::to_string(threads);
+            const auto expectedPath = artifact("ingest-mixed") / ("prefix-" + label + "-expected.json");
+            const auto actualPath = artifact("ingest-mixed") / ("prefix-" + label + "-actual.json");
+            std::ofstream(expectedPath, std::ios::binary) << *json;
+            std::ofstream(actualPath, std::ios::binary) << *actual;
+            const auto mismatch = std::mismatch(json->begin(), json->end(), actual->begin(), actual->end());
+            const auto offset = static_cast<std::size_t>(mismatch.first - json->begin());
+            const auto line = 1 + std::count(json->begin(), mismatch.first, '\n');
+            const auto begin = offset > 96 ? offset - 96 : 0;
+            throw std::runtime_error("explicit worker prefix changed complete flattened JSON: byte=" +
+                std::to_string(offset) + " expected_line=" + std::to_string(line) +
+                " expected=" + expectedPath.string() + " actual=" + actualPath.string() +
+                "\nexpected context: " + json->substr(begin, 240) +
+                "\nactual context: " + actual->substr(std::min(begin, actual->size()), 240));
+        }
+        std::vector<std::tuple<int, std::string, std::string, std::string, std::string>> oldMessages, newMessages;
+        for (const auto& entry : expected.messages()) oldMessages.emplace_back(static_cast<int>(entry.kind),
+            entry.message, entry.context, entry.passName, entry.originSymbol);
+        for (const auto& stage : fused.prefixStages)
+            for (const auto& entry : stage.diagnostics) newMessages.emplace_back(static_cast<int>(entry.kind),
+                entry.message, entry.context, entry.passName, entry.originSymbol);
+        for (const auto& entry : flatDiagnostics.messages()) newMessages.emplace_back(static_cast<int>(entry.kind),
+            entry.message, entry.context, entry.passName, entry.originSymbol);
+        require(oldMessages == newMessages, "explicit prefix changed serial diagnostic order or text");
+    }
+}
+void compactionEligibility() {
+    grh::Design design;
+    auto& top = design.createGraph("top"); design.markAsTop("top");
+    auto& child = design.createGraph("child"); design.createGraph("unreferenced");
+    for (const auto name : {"z", "a"}) {
+        const auto value = child.createValue(child.internSymbol(name), 1, false);
+        child.bindInputPort(name, value);
+    }
+    const auto instance = top.createOperation(OperationKind::kInstance);
+    top.setAttr(instance, "moduleName", std::string("child"));
+    top.setAttr(instance, "inputPortName", std::vector<std::string>{"z", "a"});
+    auto eligible = ingest::detail::compactablePrefixSources(design);
+    require(eligible.size() == 1 && eligible.contains(&child), "named source was not eligible for worker compaction");
+    require(!eligible.contains(&top), "top graph entered source compaction");
+    top.eraseAttr(instance, "inputPortName");
+    require(ingest::detail::compactablePrefixSources(design).empty(), "positional source would have reordered its port ABI");
+    top.setAttr(instance, "inputPortName", std::vector<std::string>{"a", "a"});
+    require(ingest::detail::compactablePrefixSources(design).empty(), "incomplete named map entered source compaction");
+    top.setAttr(instance, "inputPortName", std::vector<std::string>{"z", "a"});
+    const auto blackbox = top.createOperation(OperationKind::kBlackbox);
+    top.setAttr(blackbox, "moduleName", std::string("child"));
+    require(ingest::detail::compactablePrefixSources(design).empty(), "positional blackbox reference was ignored");
+    top.setAttr(blackbox, "inputPortName", std::vector<std::string>{"a", "z"});
+    require(ingest::detail::compactablePrefixSources(design).contains(&child), "all-named source failed compaction eligibility");
+    require(child.inputPorts().front().name == "z", "compaction eligibility mutated source port order");
+}
 void negativeTests(const std::filesystem::path& output, ingest::IngestRequest good) {
     const auto reject = [&](const ingest::IngestRequest& request, std::string_view message) {
         auto result = ingest::readSources(request);
@@ -139,6 +239,10 @@ circuit top :
     connect q, m.q
 )FIR";
     auto result = read(path); require(result.success(), diagnostics(result));
+    ingest::IngestRequest hierarchical;
+    hierarchical.sources = {{ingest::SourceLanguage::Firrtl, path, "fixture"}};
+    hierarchical.tops = {"top"};
+    explicitPrefix(hierarchical);
     tx::SessionStore session; pass(*result.design, session, "hier-flatten");
     const auto& graph = *result.design->findGraph("top");
     bool async = false;
@@ -306,6 +410,10 @@ circuit top :
     auto result = read(path); require(result.success(), diagnostics(result));
     require(!result.design->findGraph("top")->metadata("firrtl.pendingCombLoopCheck"),
         "local array dependencies were not resolved before publication");
+    ingest::IngestRequest request;
+    request.sources = {{ingest::SourceLanguage::Firrtl, path, "fixture"}};
+    request.tops = {"top"};
+    explicitPrefix(request);
     tx::SessionStore session;
     pass(*result.design, session, "hier-flatten");
     pass(*result.design, session, "comb-loop-elim", {"-fail-on-true-loop"});
@@ -520,6 +628,7 @@ void parallelSvPublication(const std::filesystem::path& output) {
     }
 }
 void test() {
+    compactionEligibility();
     hierarchicalReset();
     externalReset();
     hierarchicalWidths();
@@ -579,6 +688,19 @@ endmodule
 )SV";
     ingest::IngestRequest good; good.logLevel = wolvrix::lib::LogLevel::Off; good.tops = {"top"};
     good.sources = {{ingest::SourceLanguage::Firrtl, mixedPath, "fir"}, {ingest::SourceLanguage::SystemVerilog, svPath, "sv"}};
+    {
+        auto queued = good;
+        queued.firrtl.lowerThreads = 4;
+        queued.logLevel = wolvrix::lib::LogLevel::Info;
+        std::size_t batches = 0;
+        queued.logSink = [&](const auto& event) {
+            if (event.message.starts_with("parallel FIRRTL lowering threads=")) ++batches;
+        };
+        const auto result = ingest::readSources(queued);
+        require(result.success(), diagnostics(result));
+        require(batches >= 2, "SV-discovered FIRRTL module bypassed the lowering worker queue");
+    }
+    explicitPrefix(good);
     negativeTests(output, good);
     const auto actualPath = output / "actual.fir";
     std::ofstream(actualPath) << R"FIR(FIRRTL version 6.0.0

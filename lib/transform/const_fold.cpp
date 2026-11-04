@@ -183,11 +183,11 @@ namespace wolvrix::lib::transform
         // materialization) for hot screening loops.
         std::optional<int64_t> getIntAttr(const wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::OperationId op, std::string_view key)
         {
-            for (const auto &kv : graph.opAttrs(op))
+            for (const auto &kv : graph.opAttrRange(op))
             {
-                if (kv.key == key)
+                if (kv.key() == key)
                 {
-                    if (const auto *value = std::get_if<int64_t>(&kv.value))
+                    if (const auto value = kv.value().get<int64_t>())
                     {
                         return *value;
                     }
@@ -261,11 +261,11 @@ namespace wolvrix::lib::transform
         {
             std::string_view literal;
             bool found = false;
-            for (const auto &kv : graph.opAttrs(opId))
+            for (const auto &kv : graph.opAttrRange(opId))
             {
-                if (kv.key == "constValue")
+                if (kv.key() == "constValue")
                 {
-                    if (const auto *text = std::get_if<std::string>(&kv.value))
+                    if (const auto text = kv.value().get<std::string>())
                     {
                         literal = *text;
                         found = true;

@@ -243,6 +243,8 @@ void importInventory(const grh::Graph& source, grh::Graph& target,
                      std::span<const std::string> instancePath);
 // Diagnostic census. Optimizations may legitimately lose optional associations.
 void recordRetention(grh::Graph& graph);
+// Calculate against an immutable graph; publication remains a pass boundary.
+std::optional<grh::AttributeValue> retentionCensus(const grh::Graph& graph);
 
 } // namespace wolvrix::lib::ingest::node
 

@@ -36,7 +36,234 @@ namespace
                lhs->note == rhs->note;
     }
 
-    std::string compareViews(const GraphView &lhs, const GraphView &rhs)
+    int borrowedSourceLocations()
+    {
+        Design design;
+        Graph& graph = design.createGraph("borrowed_locations");
+        const auto op = graph.createOperation(OperationKind::kConstant, graph.internSymbol("op"));
+        const auto value = graph.createValue(graph.internSymbol("value"), 8, false);
+        graph.addResult(op, value);
+        const SrcLoc expected{std::string(2048, 'f'), 5, 6, 7, 8,
+            std::string(1024, 'o'), std::string(1024, 'p'), std::string(4096, 'n')};
+        {
+            SrcLoc temporary = expected;
+            graph.setOpAndValueSrcLocView(op, value, SrcLocView(temporary));
+            temporary.file.assign(temporary.file.size(), 'x');
+            temporary.note.clear();
+        }
+        if (!compareSrcLoc(graph.opSrcLoc(op), expected) ||
+            !compareSrcLoc(graph.valueSrcLoc(value), expected) || graph.payloadStats().srcLocs != 1)
+            return fail("borrowed source location was not owned and shared by both entities");
+
+        graph.setOpSrcLocView(op, SrcLocView(expected));
+        graph.setValueSrcLocView(value, SrcLocView(expected));
+        if (graph.payloadStats().srcLocs != 1)
+            return fail("borrowed single-entity setters did not deduplicate the source record");
+
+        const SrcLoc replacement{"replacement.sv", 11};
+        const auto rejects = [](auto&& write) {
+            try { write(); }
+            catch (const std::exception&) { return true; }
+            return false;
+        };
+        const auto erasedOp = graph.createOperation(OperationKind::kConstant);
+        const auto erasedValue = graph.createValue(8, false);
+        graph.eraseOp(erasedOp);
+        graph.eraseValue(erasedValue);
+        Graph& foreign = design.createGraph("foreign_locations");
+        const auto foreignOp = foreign.createOperation(OperationKind::kConstant);
+        const auto foreignValue = foreign.createValue(8, false);
+        for (const auto invalid : {OperationId::invalid(), erasedOp, foreignOp}) {
+            if (!rejects([&] { graph.setOpAndValueSrcLocView(invalid, value, SrcLocView(replacement)); }) ||
+                !compareSrcLoc(graph.valueSrcLoc(value), expected))
+                return fail("invalid paired source-location operation changed the value");
+        }
+        for (const auto invalid : {ValueId::invalid(), erasedValue, foreignValue}) {
+            if (!rejects([&] { graph.setOpAndValueSrcLocView(op, invalid, SrcLocView(replacement)); }) ||
+                !compareSrcLoc(graph.opSrcLoc(op), expected))
+                return fail("invalid paired source-location value changed the operation");
+        }
+        graph.compact();
+        const auto compactOp = graph.findOperation("op");
+        const auto compactValue = graph.findValue("value");
+        if (!compareSrcLoc(graph.opSrcLoc(compactOp), expected) ||
+            !compareSrcLoc(graph.valueSrcLoc(compactValue), expected))
+            return fail("compact changed borrowed source locations");
+        graph.setOpAndValueSrcLocView(compactOp, compactValue, SrcLocView{});
+        if (!compareSrcLoc(graph.opSrcLoc(compactOp), SrcLoc{}) ||
+            !compareSrcLoc(graph.valueSrcLoc(compactValue), SrcLoc{}))
+            return fail("empty borrowed source location changed the owning setter semantics");
+        return 0;
+    }
+
+    int copiedSourceLocations()
+    {
+        const SrcLoc expected{std::string(8192, 'f'), 123, 45, 678, 90,
+            std::string(4096, 'o'), std::string(2048, 'p'), std::string(16384, 'n')};
+        Design destination;
+        Graph& target = destination.createGraph("destination");
+        auto targetOp = target.createOperation(OperationKind::kConstant, target.internSymbol("imported_op"));
+        auto targetValue = target.createValue(target.internSymbol("imported_value"), 8, false);
+        auto copiedOp = target.createOperation(OperationKind::kConstant, target.internSymbol("copied_op"));
+        auto copiedValue = target.createValue(target.internSymbol("copied_value"), 8, false);
+        {
+            Design origin;
+            Graph& source = origin.createGraph("source");
+            const auto erasedOp = source.createOperation(OperationKind::kConstant, source.internSymbol("erased_op"));
+            const auto erasedValue = source.createValue(source.internSymbol("erased_value"), 8, false);
+            auto sourceOp = source.createOperation(OperationKind::kConstant, source.internSymbol("source_op"));
+            auto sourceValue = source.createValue(source.internSymbol("source_value"), 8, false);
+            const auto emptyOp = source.createOperation(OperationKind::kConstant);
+            const auto emptyValue = source.createValue(8, false);
+            source.setOpSrcLoc(sourceOp, expected);
+            source.setValueSrcLoc(sourceValue, expected);
+            if (!source.eraseOp(erasedOp) || !source.eraseValue(erasedValue))
+                return fail("source-location fixture did not create tombstones");
+
+            target.setOpSrcLoc(targetOp, SrcLoc{"replaced.sv", 1});
+            target.setValueSrcLoc(targetValue, SrcLoc{"replaced.sv", 1});
+            target.copyOpSrcLoc(targetOp, source, sourceOp);
+            target.copyValueSrcLoc(targetValue, source, sourceValue);
+            if (!compareSrcLoc(target.opSrcLoc(targetOp), expected) ||
+                !compareSrcLoc(target.valueSrcLoc(targetValue), expected))
+                return fail("cross-graph source-location import changed strings or coordinates");
+
+            const auto records = target.payloadStats().srcLocs;
+            target.copyOpSrcLoc(copiedOp, target, targetOp);
+            target.copyValueSrcLoc(copiedValue, target, targetValue);
+            target.copyOpSrcLoc(targetOp, target, targetOp);
+            target.copyValueSrcLoc(targetValue, target, targetValue);
+            if (target.payloadStats().srcLocs != records ||
+                !compareSrcLoc(target.opSrcLoc(copiedOp), expected) ||
+                !compareSrcLoc(target.valueSrcLoc(copiedValue), expected))
+                return fail("same-graph source-location copy did not reuse its pooled record");
+
+            target.copyOpSrcLoc(copiedOp, source, emptyOp);
+            target.copyValueSrcLoc(copiedValue, source, emptyValue);
+            if (target.opSrcLoc(copiedOp) || target.valueSrcLoc(copiedValue))
+                return fail("copying an absent source location did not clear the destination");
+            target.copyOpSrcLoc(copiedOp, target, targetOp);
+            target.copyValueSrcLoc(copiedValue, target, targetValue);
+            const auto localEmptyOp = target.createOperation(OperationKind::kConstant);
+            const auto localEmptyValue = target.createValue(8, false);
+            target.copyOpSrcLoc(copiedOp, target, localEmptyOp);
+            target.copyValueSrcLoc(copiedValue, target, localEmptyValue);
+            if (target.opSrcLoc(copiedOp) || target.valueSrcLoc(copiedValue))
+                return fail("same-graph absent source location did not clear the destination");
+
+            Graph& foreign = origin.createGraph("foreign");
+            const auto foreignOp = foreign.createOperation(OperationKind::kConstant);
+            const auto foreignValue = foreign.createValue(8, false);
+            const auto rejects = [](auto&& copy) {
+                try { copy(); }
+                catch (const std::exception&) { return true; }
+                return false;
+            };
+            for (const auto invalid : {OperationId::invalid(), erasedOp, foreignOp}) {
+                if (!rejects([&] { target.copyOpSrcLoc(targetOp, source, invalid); }) ||
+                    !compareSrcLoc(target.opSrcLoc(targetOp), expected))
+                    return fail("invalid or erased source operation changed destination provenance");
+            }
+            for (const auto invalid : {ValueId::invalid(), erasedValue, foreignValue}) {
+                if (!rejects([&] { target.copyValueSrcLoc(targetValue, source, invalid); }) ||
+                    !compareSrcLoc(target.valueSrcLoc(targetValue), expected))
+                    return fail("invalid or erased source value changed destination provenance");
+            }
+
+            source.compact();
+            target.compact();
+            sourceOp = source.findOperation("source_op");
+            sourceValue = source.findValue("source_value");
+            targetOp = target.findOperation("imported_op");
+            targetValue = target.findValue("imported_value");
+            copiedOp = target.findOperation("copied_op");
+            copiedValue = target.findValue("copied_value");
+            target.copyOpSrcLoc(copiedOp, source, sourceOp);
+            target.copyValueSrcLoc(copiedValue, source, sourceValue);
+            if (target.payloadStats().srcLocs != 1 ||
+                !compareSrcLoc(target.opSrcLoc(copiedOp), expected) ||
+                !compareSrcLoc(target.valueSrcLoc(copiedValue), expected))
+                return fail("source-location copying after compact changed provenance or deduplication");
+        }
+        target.compact();
+        for (const auto name : {"imported_op", "copied_op"})
+            if (!compareSrcLoc(target.opSrcLoc(target.findOperation(name)), expected))
+                return fail("imported operation provenance borrowed destroyed source strings");
+        for (const auto name : {"imported_value", "copied_value"})
+            if (!compareSrcLoc(target.valueSrcLoc(target.findValue(name)), expected))
+                return fail("imported value provenance borrowed destroyed source strings");
+        return 0;
+    }
+
+    int payloadFirstSymbols()
+    {
+        const std::string promoted(4096, 'a');
+        const std::string deferred(4096, 'b');
+        const std::string cloneOnly(4096, 'c');
+        Design cloned;
+        {
+            Design design;
+            Graph& graph = design.createGraph("payload_first");
+            auto holder = graph.createOperation(OperationKind::kConstant, graph.internSymbol("holder"));
+            for (int index = 0; index < 32; ++index)
+                graph.setAttr(holder, "dynamic-key-" + std::to_string(index),
+                    "discarded-payload-" + std::to_string(index));
+            graph.setAttr(holder, "promoted", promoted);
+            graph.setAttr(holder, "deferred", deferred);
+            graph.setAttr(holder, "clone_only", cloneOnly);
+            uint32_t payloadId = 0;
+            for (uint32_t id = 1; id <= graph.payloadStats().strings; ++id)
+                if (graph.payloadStore().string(id) == promoted) payloadId = id;
+            if (!payloadId || graph.lookupSymbol(promoted).valid())
+                return fail("payload-first text was prematurely registered as a symbol");
+            const auto promotedSymbol = graph.internSymbol(promoted);
+            if (!promotedSymbol.valid() || promotedSymbol.value == payloadId ||
+                graph.lookupSymbol(promoted) != promotedSymbol ||
+                graph.symbolText(promotedSymbol).data() !=
+                    graph.opAttrRange(holder).find("promoted")->value().asString().data())
+                return fail("payload promotion conflated StringId with SymbolId or duplicated text bytes");
+            graph.createValue(promotedSymbol, 8, false);
+            for (int index = 0; index < 32; ++index)
+                graph.eraseAttr(holder, "dynamic-key-" + std::to_string(index));
+            graph.compact();
+            holder = graph.findOperation("holder");
+            if (graph.lookupSymbol(promoted) != promotedSymbol || graph.lookupSymbol(deferred).valid())
+                return fail("compact changed symbol registration of payload-first text");
+            const auto deferredSymbol = graph.internSymbol(deferred);
+            if (!deferredSymbol.valid() || deferredSymbol.value != promotedSymbol.value + 1 ||
+                graph.symbolText(deferredSymbol).data() !=
+                    graph.opAttrRange(holder).find("deferred")->value().asString().data())
+                return fail("payload promotion after compact changed symbol numbering or shared text");
+            graph.createValue(deferredSymbol, 8, false);
+
+            cloned = design.clone();
+            Graph& clone = *cloned.findGraph("payload_first");
+            const auto cloneHolder = clone.findOperation("holder");
+            if (!clone.findValue(promoted).valid() || !clone.findValue(deferred).valid() ||
+                clone.lookupSymbol(cloneOnly).valid())
+                return fail("clone changed promoted or payload-only symbol registration");
+            const auto cloneSymbol = clone.internSymbol(cloneOnly);
+            clone.createValue(cloneSymbol, 8, false);
+            clone.setAttr(cloneHolder, "clone_write", std::string("clone-owned"));
+            graph.setAttr(holder, "clone_only", std::string("source-overwrite"));
+            if (graph.lookupSymbol(cloneOnly).valid() || graph.opAttrRange(holder).find("clone_write") ||
+                clone.opAttrRange(cloneHolder).find("clone_only")->value().asString() != cloneOnly)
+                return fail("cloned string/symbol entries shared mutable registration or payload state");
+        }
+        Graph& clone = *cloned.findGraph("payload_first");
+        clone.compact();
+        const auto holder = clone.findOperation("holder");
+        const auto independent = clone.internSymbol("post-source-destruction");
+        clone.createValue(independent, 8, false);
+        if (!clone.findValue(cloneOnly).valid() || !clone.findValue(promoted).valid() ||
+            !clone.findValue(deferred).valid() ||
+            clone.opAttrRange(holder).find("clone_only")->value().asString() != cloneOnly ||
+            clone.opAttrRange(holder).find("clone_write")->value().asString() != "clone-owned")
+            return fail("clone could not independently retain and extend payload-first symbols");
+        return 0;
+    }
+
+    std::string compareGraphs(const Graph &lhs, const Graph &rhs)
     {
         auto lhsValues = lhs.values();
         auto rhsValues = rhs.values();
@@ -118,7 +345,7 @@ namespace
             {
                 return "opKind mismatch";
             }
-            if (lhs.opSymbol(opId) != rhs.opSymbol(opId))
+            if (lhs.operationSymbol(opId) != rhs.operationSymbol(opId))
             {
                 return "opSymbol mismatch";
             }
@@ -155,15 +382,17 @@ namespace
                 }
             }
 
-            auto lhsAttrs = lhs.opAttrs(opId);
-            auto rhsAttrs = rhs.opAttrs(opId);
+            auto lhsAttrs = lhs.opAttrRange(opId);
+            auto rhsAttrs = rhs.opAttrRange(opId);
             if (lhsAttrs.size() != rhsAttrs.size())
             {
                 return "opAttrs size mismatch";
             }
-            for (std::size_t j = 0; j < lhsAttrs.size(); ++j)
+            auto rhsAttr = rhsAttrs.begin();
+            for (const auto lhsAttr : lhsAttrs)
             {
-                if (lhsAttrs[j].key != rhsAttrs[j].key || lhsAttrs[j].value != rhsAttrs[j].value)
+                const auto right = *rhsAttr++;
+                if (lhsAttr.key() != right.key() || lhsAttr.value().toOwned() != right.value().toOwned())
                 {
                     return "opAttrs mismatch";
                 }
@@ -238,37 +467,40 @@ int main()
 {
     try
     {
+        if (borrowedSourceLocations() != 0) return 1;
+        if (copiedSourceLocations() != 0) return 1;
+        if (payloadFirstSymbols() != 0) return 1;
         namespace grh_ir = wolvrix::lib::grh;
 
-        grh_ir::GraphSymbolTable graphSymbols;
-        grh_ir::GraphBuilder builder(graphSymbols);
+        grh_ir::Design design;
+        grh_ir::Graph& builder = design.createGraph("roundtrip");
 
-        auto symA = graphSymbols.intern("a");
-        auto symB = graphSymbols.intern("b");
-        auto symTmp = graphSymbols.intern("tmp");
-        auto symOutVal = graphSymbols.intern("out_val");
-        auto symArr = graphSymbols.intern("arr");
-        auto symArr2 = graphSymbols.intern("arr2");
-        auto symAdd = graphSymbols.intern("add0");
-        auto symAssign = graphSymbols.intern("assign0");
+        auto symA = builder.internSymbol("a");
+        auto symB = builder.internSymbol("b");
+        auto symTmp = builder.internSymbol("tmp");
+        auto symOutVal = builder.internSymbol("out_val");
+        auto symArr = builder.internSymbol("arr");
+        auto symArr2 = builder.internSymbol("arr2");
+        auto symAdd = builder.internSymbol("add0");
+        auto symAssign = builder.internSymbol("assign0");
 
-        auto vA = builder.addValue(symA, 8, false);
-        auto vB = builder.addValue(symB, 8, false);
-        auto vTmp = builder.addValue(symTmp, 8, true);
-        auto vOut = builder.addValue(symOutVal, 8, false);
+        auto vA = builder.createValue(symA, 8, false);
+        auto vB = builder.createValue(symB, 8, false);
+        auto vTmp = builder.createValue(symTmp, 8, true);
+        auto vOut = builder.createValue(symOutVal, 8, false);
         const std::vector<int64_t> arrShape{4};
         const std::vector<int64_t> arr2Shape{2, 4};
-        auto vArr = builder.addValue(symArr, 32, false, ValueType::Logic, arrShape);
-        auto vArr2 = builder.addValue(symArr2, 64, true, ValueType::Logic, arr2Shape);
+        auto vArr = builder.createValue(symArr, 32, false, ValueType::Logic, arrShape);
+        auto vArr2 = builder.createValue(symArr2, 64, true, ValueType::Logic, arr2Shape);
         (void)vArr;
         (void)vArr2;
 
-        auto opAdd = builder.addOp(OperationKind::kAdd, symAdd);
+        auto opAdd = builder.createOperation(OperationKind::kAdd, symAdd);
         builder.addOperand(opAdd, vA);
         builder.addOperand(opAdd, vB);
         builder.addResult(opAdd, vTmp);
 
-        auto opAssign = builder.addOp(OperationKind::kAssign, symAssign);
+        auto opAssign = builder.createOperation(OperationKind::kAssign, symAssign);
         builder.addOperand(opAssign, vTmp);
         builder.addResult(opAssign, vOut);
 
@@ -291,14 +523,15 @@ int main()
         valLoc.column = 1;
         builder.setValueSrcLoc(vA, valLoc);
 
-        grh_ir::GraphView view = builder.freeze();
-        grh_ir::GraphBuilder rebuilt = grh_ir::GraphBuilder::fromView(view, graphSymbols);
-        grh_ir::GraphView roundTrip = rebuilt.freeze();
+        builder.compact();
+        grh_ir::Design rebuilt = design.clone();
+        grh_ir::Graph& roundTrip = *rebuilt.findGraph("roundtrip");
+        roundTrip.compact();
 
-        const std::string mismatch = compareViews(view, roundTrip);
+        const std::string mismatch = compareGraphs(builder, roundTrip);
         if (!mismatch.empty())
         {
-            return fail(std::string("GraphBuilder fromView roundtrip ") + mismatch);
+            return fail(std::string("Graph compact/clone roundtrip ") + mismatch);
         }
     }
     catch (const std::exception &ex)

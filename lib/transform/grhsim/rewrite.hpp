@@ -69,13 +69,41 @@ inline Owner owner(const Graph& graph, OperationId op) {
 }
 
 // Valid only until graph mutation. Never persist this view in a session slot.
-inline const Owner& ownerView(const Graph& graph, OperationId op) {
-    static const Owner empty;
-    for (const auto& entry : graph.opAttrs(op)) if (entry.key == kPartition) {
-        if (const auto* path = std::get_if<Owner>(&entry.value)) return *path;
+inline StringListView ownerView(const Graph& graph, OperationId op) {
+    for (const auto entry : graph.opAttrRange(op)) if (entry.key() == kPartition) {
+        if (const auto path = entry.value().get<Owner>()) return *path;
         throw std::invalid_argument("Wrong attribute type: " + std::string(kPartition));
     }
-    return empty;
+    return {};
+}
+
+template <typename Left, typename Right>
+inline bool sameOwner(const Left& left, const Right& right) {
+    if (left.size() != right.size()) return false;
+    for (std::size_t i = 0; i < left.size(); ++i) if (left[i] != right[i]) return false;
+    return true;
+}
+
+template <typename Left, typename Right>
+inline bool ownerLess(const Left& left, const Right& right) {
+    const auto common = std::min(left.size(), right.size());
+    for (std::size_t i = 0; i < common; ++i) {
+        if (left[i] != right[i]) return left[i] < right[i];
+    }
+    return left.size() < right.size();
+}
+
+struct OwnerLess {
+    using is_transparent = void;
+    template <typename Left, typename Right>
+    bool operator()(const Left& left, const Right& right) const { return ownerLess(left, right); }
+};
+
+inline Owner copyOwner(StringListView path) {
+    Owner result;
+    result.reserve(path.size());
+    for (const auto component : path) result.emplace_back(component);
+    return result;
 }
 
 inline bool twoState(const LogicalType& type) {
@@ -115,9 +143,9 @@ inline void replaceOperands(Graph& graph, OperationId op, std::span<const ValueI
 
 inline void rewrite(Graph& graph, OperationId op, OperationKind kind, std::span<const ValueId> operands) {
     std::vector<std::string> erase;
-    for (const auto& attr : graph.opAttrs(op))
-        if (attr.key != kPartition && attr.key != kOriginModulesKey && attr.key != "grhsim.nodeClone" && !ingest::node::isAttribute(attr.key))
-            erase.emplace_back(attr.key);
+    for (const auto attr : graph.opAttrRange(op))
+        if (attr.key() != kPartition && attr.key() != kOriginModulesKey && attr.key() != "grhsim.nodeClone" && !ingest::node::isAttribute(attr.key()))
+            erase.emplace_back(attr.key());
     for (const auto& key : erase) graph.eraseAttr(op, key);
     replaceOperands(graph, op, operands);
     graph.setOpKind(op, kind);
@@ -173,6 +201,30 @@ inline void encode(std::ostream& out, const AttributeValue& attribute) {
     }, attribute);
 }
 
+inline void encode(std::ostream& out, AttrValueView attribute) {
+    out << static_cast<unsigned>(attribute.kind()) << ':';
+    const auto element = [&](const auto& value) {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, std::string_view>) out << value.size() << ':' << value;
+        else out << std::setprecision(17) << value << ';';
+    };
+    const auto list = [&](const auto& values) {
+        out << values.size() << '[';
+        for (const auto value : values) element(value);
+        out << ']';
+    };
+    switch (attribute.kind()) {
+    case AttrValueKind::Bool: element(attribute.asBool()); break;
+    case AttrValueKind::Int: element(attribute.asInt()); break;
+    case AttrValueKind::Double: element(attribute.asDouble()); break;
+    case AttrValueKind::String: element(attribute.asString()); break;
+    case AttrValueKind::BoolList: list(attribute.asBoolList()); break;
+    case AttrValueKind::IntList: list(attribute.asIntList()); break;
+    case AttrValueKind::DoubleList: list(attribute.asDoubleList()); break;
+    case AttrValueKind::StringList: list(attribute.asStringList()); break;
+    }
+}
+
 inline void encode(std::ostream& out, const LogicalType& type) {
     out << static_cast<unsigned>(type.kind) << ',' << type.width << ',' << type.isSigned << ','
         << static_cast<unsigned>(type.domain) << ',';
@@ -189,16 +241,19 @@ inline std::string expressionKey(const Graph& graph, OperationId op, bool histor
     }
     out << '/';
     for (const auto value : graph.opResults(op)) encode(out, graph.valueLogicalType(value));
-    std::vector<std::pair<std::string, AttributeValue>> attrs;
-    for (const auto& entry : graph.opAttrs(op)) {
-        if (entry.key == kPartition || entry.key == kOriginModulesKey || entry.key == "grhsim.nodeClone" || ingest::node::isAttribute(entry.key) ||
-            (history && entry.key == "prevInitFallback")) continue;
-        auto value = entry.value;
-        if (history && entry.key == "prevInit") value = slang::SVInt::fromString(std::get<std::string>(value)).toString();
-        attrs.emplace_back(entry.key, std::move(value));
+    std::vector<AttrRef> attrs;
+    for (const auto entry : graph.opAttrRange(op)) {
+        if (entry.key() == kPartition || entry.key() == kOriginModulesKey || entry.key() == "grhsim.nodeClone" || ingest::node::isAttribute(entry.key()) ||
+            (history && entry.key() == "prevInitFallback")) continue;
+        attrs.push_back(entry);
     }
-    std::sort(attrs.begin(), attrs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    for (const auto& [key, value] : attrs) { out << key.size() << ':' << key; encode(out, value); }
+    std::sort(attrs.begin(), attrs.end(), [](const auto a, const auto b) { return a.key() < b.key(); });
+    for (const auto entry : attrs) {
+        out << entry.key().size() << ':' << entry.key();
+        if (history && entry.key() == "prevInit")
+            encode(out, AttributeValue(slang::SVInt::fromString(entry.value().asString()).toString()));
+        else encode(out, entry.value());
+    }
     return out.str();
 }
 
@@ -247,8 +302,8 @@ struct Scope {
             (void)graph.opKind(op);
             return true;
         }
-        for (const auto& entry : graph.opAttrs(op)) if (entry.key == kPartition) {
-            if (const auto* path = std::get_if<Owner>(&entry.value)) return *path == partition;
+        for (const auto entry : graph.opAttrRange(op)) if (entry.key() == kPartition) {
+            if (const auto path = entry.value().get<Owner>()) return sameOwner(*path, partition);
             throw std::invalid_argument("Wrong attribute type: " + std::string(kPartition));
         }
         return partition.empty();

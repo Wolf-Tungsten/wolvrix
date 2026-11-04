@@ -321,13 +321,13 @@ namespace wolvrix::lib::transform
 
         std::optional<int64_t> getIntAttr(const Graph &graph, OperationId opId, std::string_view key)
         {
-            for (const auto &attr : graph.opAttrs(opId))
+            for (const auto &attr : graph.opAttrRange(opId))
             {
-                if (attr.key != key)
+                if (attr.key() != key)
                 {
                     continue;
                 }
-                if (const auto *value = std::get_if<int64_t>(&attr.value))
+                if (const auto value = attr.value().get<int64_t>())
                 {
                     return *value;
                 }
@@ -452,13 +452,13 @@ namespace wolvrix::lib::transform
             {
             case OperationKind::kConstant:
             {
-                for (const auto &attr : graph.opAttrs(defId))
+                for (const auto &attr : graph.opAttrRange(defId))
                 {
-                    if (attr.key != "constValue")
+                    if (attr.key() != "constValue")
                     {
                         continue;
                     }
-                    if (const auto *literal = std::get_if<std::string>(&attr.value))
+                    if (const auto literal = attr.value().get<std::string>())
                     {
                         auto parsed = parseConstIntLiteral(*literal);
                         if (!parsed || *parsed < 0)
@@ -4006,6 +4006,13 @@ namespace wolvrix::lib::transform
 
     } // namespace
 
+    namespace {
+        struct GraphLoopResult {
+            std::size_t loops = 0, trueLoops = 0, falseLoops = 0, fixed = 0, dynamic = 0, capped = 0;
+            std::vector<CombLoopReport> reports;
+        };
+    }
+
     CombLoopElimPass::CombLoopElimPass()
         : Pass("comb-loop-elim", "comb-loop-elim",
                "Detect combinational loops and record reports"),
@@ -4032,9 +4039,10 @@ namespace wolvrix::lib::transform
         std::size_t totalFragCapped = 0;
         std::vector<CombLoopReport> sessionReports;
 
-        for (const auto &entry : design().graphs())
+        for (Graph* selected : graphs())
         {
-            Graph &graph = *entry.second;
+            Graph &graph = *selected;
+            if (options_.graphSelection && !options_.graphSelection->contains(graph.symbol())) continue;
             const std::size_t initialValueCount = graph.values().size();
             if (options_.maxAnalysisNodes > 0 && initialValueCount > options_.maxAnalysisNodes)
             {
@@ -4478,6 +4486,28 @@ namespace wolvrix::lib::transform
             totalFragCapped += totalFragCappedLoops;
         }
 
+        result.graphData = GraphLoopResult{totalLoopsDetected, totalTrueLoops, totalFalseLoops,
+            totalFalseLoopsFixed, totalDynArrayLoops, totalFragCapped, std::move(sessionReports)};
+        if (!graphKernel()) finishGraphKernels(std::span<const PassResult>(&result, 1));
+        return result;
+    }
+
+    void CombLoopElimPass::finishGraphKernels(std::span<const PassResult> results)
+    {
+        std::size_t totalLoopsDetected = 0, totalTrueLoops = 0, totalFalseLoops = 0,
+            totalFalseLoopsFixed = 0, totalDynArrayLoops = 0, totalFragCapped = 0;
+        std::vector<CombLoopReport> sessionReports;
+        for (const auto& result : results) {
+            const auto* graph = std::any_cast<GraphLoopResult>(&result.graphData);
+            if (!graph) continue;
+            totalLoopsDetected += graph->loops;
+            totalTrueLoops += graph->trueLoops;
+            totalFalseLoops += graph->falseLoops;
+            totalFalseLoopsFixed += graph->fixed;
+            totalDynArrayLoops += graph->dynamic;
+            totalFragCapped += graph->capped;
+            sessionReports.insert(sessionReports.end(), graph->reports.begin(), graph->reports.end());
+        }
         std::string summary = "comb-loop-elim summary";
         summary.append(" loops=");
         summary.append(std::to_string(totalLoopsDetected));
@@ -4502,7 +4532,6 @@ namespace wolvrix::lib::transform
             setSessionValue(options_.outputKey, std::move(sessionReports), "comb-loop.reports");
         }
 
-        return result;
     }
 
 } // namespace wolvrix::lib::transform

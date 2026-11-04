@@ -5,6 +5,7 @@
 #include "core/state.hpp"
 
 #include <stdexcept>
+#include <type_traits>
 
 namespace wolvrix::lib::transform::grhsim {
 
@@ -30,10 +31,13 @@ inline constexpr std::string_view kPartition = "grhsim.partition";
 template <typename T>
 std::optional<T> attribute(const grh::Graph& graph, grh::OperationId operation, std::string_view key)
 {
-    for (const grh::AttrKV& entry : graph.opAttrs(operation))
+    for (const grh::AttrRef entry : graph.opAttrRange(operation))
     {
-        if (entry.key != key) continue;
-        if (const auto* typed = std::get_if<T>(&entry.value)) return *typed;
+        if (entry.key() != key) continue;
+        if (const auto typed = entry.value().get<T>()) {
+            if constexpr (std::is_arithmetic_v<T>) return *typed;
+            else return std::get<T>(entry.value().toOwned());
+        }
         throw std::invalid_argument("Wrong attribute type: " + std::string(key));
     }
     return std::nullopt;

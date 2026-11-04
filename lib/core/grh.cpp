@@ -1,4 +1,6 @@
 #include "core/grh.hpp"
+#include "core/detail/attribute_keys.hpp"
+#include "core/detail/block_executor.hpp"
 #include "core/op_descriptor.hpp"
 
 #include <algorithm>
@@ -8,12 +10,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -22,6 +26,89 @@
 
 namespace wolvrix::lib::grh
 {
+
+    namespace {
+        template <typename Function>
+        void fillBlockRows(std::size_t count, std::size_t threads, Function&& fill) {
+            // Preparation reserves all vectors and imports payload IDs. Workers
+            // only write disjoint scalar rows, with no allocation or graph API.
+            threads = std::min(threads, count / 16384);
+            if (threads < 2) {
+                fill(0, count);
+                return;
+            }
+            std::vector<std::jthread> workers;
+            workers.reserve(threads - 1);
+            for (std::size_t worker = 1; worker < threads; ++worker) {
+                const std::size_t begin = count * worker / threads;
+                const std::size_t end = count * (worker + 1) / threads;
+                workers.emplace_back([&, begin, end] { fill(begin, end); });
+            }
+            fill(0, count / threads);
+        }
+
+        struct ProfileCounters {
+            std::atomic<uint64_t> symbolInserts{0};
+            std::atomic<uint64_t> attributeWrites{0};
+            std::atomic<uint64_t> attributeBytes{0};
+            std::atomic<uint64_t> srcLocWrites{0};
+            std::atomic<uint64_t> srcLocBytes{0};
+            std::atomic<uint64_t> valueAllocations{0};
+            std::atomic<uint64_t> operationAllocations{0};
+            std::atomic<uint64_t> freezeCount{0};
+            std::atomic<uint64_t> thawCount{0};
+            std::atomic<bool> enabled{[] {
+                const char *env = std::getenv("WOLVRIX_GRH_PROFILE");
+                return env && std::string_view(env) == "1";
+            }()};
+        };
+
+        ProfileCounters profileCounters;
+
+        uint64_t srcLocBytes(const SrcLocView& loc) noexcept {
+            return static_cast<uint64_t>(loc.file.size() + loc.origin.size() +
+                                         loc.pass.size() + loc.note.size());
+        }
+
+        uint64_t attributePayloadBytes(const AttributeValue& value) noexcept {
+            return std::visit([](const auto& item) -> uint64_t {
+                using T = std::decay_t<decltype(item)>;
+                if constexpr (std::is_same_v<T, std::string>) return item.size();
+                else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
+                    uint64_t bytes = 0; for (const auto& text : item) bytes += text.size(); return bytes;
+                } else if constexpr (std::is_same_v<T, std::vector<bool>>) return (item.size() + 7) / 8;
+                else if constexpr (std::is_same_v<T, std::vector<int64_t>>) return item.size() * sizeof(int64_t);
+                else if constexpr (std::is_same_v<T, std::vector<double>>) return item.size() * sizeof(double);
+                else return sizeof(T);
+            }, value);
+        }
+    }
+
+    bool graphProfileEnabled() noexcept { return profileCounters.enabled.load(std::memory_order_relaxed); }
+    void setGraphProfileEnabled(bool enabled) noexcept { profileCounters.enabled.store(enabled, std::memory_order_relaxed); }
+    void resetGraphProfileStats() noexcept {
+        profileCounters.symbolInserts.store(0, std::memory_order_relaxed);
+        profileCounters.attributeWrites.store(0, std::memory_order_relaxed);
+        profileCounters.attributeBytes.store(0, std::memory_order_relaxed);
+        profileCounters.srcLocWrites.store(0, std::memory_order_relaxed);
+        profileCounters.srcLocBytes.store(0, std::memory_order_relaxed);
+        profileCounters.valueAllocations.store(0, std::memory_order_relaxed);
+        profileCounters.operationAllocations.store(0, std::memory_order_relaxed);
+        profileCounters.freezeCount.store(0, std::memory_order_relaxed);
+        profileCounters.thawCount.store(0, std::memory_order_relaxed);
+    }
+    GraphProfileStats graphProfileStats() noexcept {
+        return {
+            profileCounters.symbolInserts.load(std::memory_order_relaxed),
+            profileCounters.attributeWrites.load(std::memory_order_relaxed),
+            profileCounters.attributeBytes.load(std::memory_order_relaxed),
+            profileCounters.srcLocWrites.load(std::memory_order_relaxed),
+            profileCounters.srcLocBytes.load(std::memory_order_relaxed),
+            profileCounters.valueAllocations.load(std::memory_order_relaxed),
+            profileCounters.operationAllocations.load(std::memory_order_relaxed),
+            profileCounters.freezeCount.load(std::memory_order_relaxed),
+            profileCounters.thawCount.load(std::memory_order_relaxed)};
+    }
 
     bool attributeValueIsJsonSerializable(const AttributeValue &value)
     {
@@ -48,6 +135,385 @@ namespace wolvrix::lib::grh
         };
 
         return std::visit(Visitor{}, value);
+    }
+
+    AttrValueKind AttrValueView::kind() const
+    {
+        if (payload_) return payload_->attribute(record_).kind;
+        if (!value_) throw std::logic_error("invalid attribute value view");
+        return static_cast<AttrValueKind>(value_->index());
+    }
+
+    bool AttrValueView::asBool() const
+    {
+        if (kind() != AttrValueKind::Bool) throw std::logic_error("attribute value is not bool");
+        return payload_ ? payload_->attribute(record_).payload != 0 : std::get<bool>(*value_);
+    }
+
+    int64_t AttrValueView::asInt() const
+    {
+        if (kind() != AttrValueKind::Int) throw std::logic_error("attribute value is not int64");
+        if (!payload_) return std::get<int64_t>(*value_);
+        const uint64_t bits = payload_->attribute(record_).payload;
+        int64_t result;
+        std::memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+
+    double AttrValueView::asDouble() const
+    {
+        if (kind() != AttrValueKind::Double) throw std::logic_error("attribute value is not double");
+        if (!payload_) return std::get<double>(*value_);
+        const uint64_t bits = payload_->attribute(record_).payload;
+        double result;
+        std::memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+
+    std::string_view AttrValueView::asString() const
+    {
+        if (kind() != AttrValueKind::String) throw std::logic_error("attribute value is not string");
+        return payload_ ? payload_->string(static_cast<uint32_t>(payload_->attribute(record_).payload))
+                        : std::string_view(std::get<std::string>(*value_));
+    }
+
+    BoolListView AttrValueView::asBoolList() const
+    {
+        if (kind() != AttrValueKind::BoolList) throw std::logic_error("attribute value is not bool list");
+        if (!payload_) return BoolListView(std::get<std::vector<bool>>(*value_));
+        const auto record = payload_->attribute(record_);
+        return {payload_->bitPayload(record.slice), record.slice.count};
+    }
+
+    std::span<const int64_t> AttrValueView::asIntList() const
+    {
+        if (kind() != AttrValueKind::IntList) throw std::logic_error("attribute value is not int list");
+        return payload_ ? payload_->int64Payload(payload_->attribute(record_).slice)
+                        : std::span<const int64_t>(std::get<std::vector<int64_t>>(*value_));
+    }
+
+    std::span<const double> AttrValueView::asDoubleList() const
+    {
+        if (kind() != AttrValueKind::DoubleList) throw std::logic_error("attribute value is not double list");
+        return payload_ ? payload_->doublePayload(payload_->attribute(record_).slice)
+                        : std::span<const double>(std::get<std::vector<double>>(*value_));
+    }
+
+    StringListView AttrValueView::asStringList() const
+    {
+        if (kind() != AttrValueKind::StringList) throw std::logic_error("attribute value is not string list");
+        return payload_ ? StringListView(payload_, payload_->stringListPayload(payload_->attribute(record_).slice))
+                        : StringListView(std::get<std::vector<std::string>>(*value_));
+    }
+
+    AttributeValue AttrValueView::toOwned() const
+    {
+        if (!payload_) {
+            if (!value_) throw std::logic_error("invalid attribute value view");
+            return *value_;
+        }
+        switch (kind()) {
+        case AttrValueKind::Bool: return asBool();
+        case AttrValueKind::Int: return asInt();
+        case AttrValueKind::Double: return asDouble();
+        case AttrValueKind::String: return std::string(asString());
+        case AttrValueKind::BoolList: { const auto values = asBoolList(); return std::vector<bool>(values.begin(), values.end()); }
+        case AttrValueKind::IntList: { const auto values = asIntList(); return std::vector<int64_t>(values.begin(), values.end()); }
+        case AttrValueKind::DoubleList: { const auto values = asDoubleList(); return std::vector<double>(values.begin(), values.end()); }
+        case AttrValueKind::StringList: { const auto values = asStringList(); return std::vector<std::string>(values.begin(), values.end()); }
+        }
+        throw std::logic_error("unknown attribute value alternative");
+    }
+
+    std::string_view StringListView::operator[](std::size_t index) const
+    {
+        return payload_ ? payload_->string(ids_[index]) : std::string_view(legacy_[index]);
+    }
+
+    bool operator==(AttrValueView left, AttrValueView right)
+    {
+        if (!left.valid() || !right.valid()) return left.valid() == right.valid();
+        if (left.kind() != right.kind()) return false;
+        const auto equal = [](const auto& a, const auto& b) {
+            return std::equal(a.begin(), a.end(), b.begin(), b.end());
+        };
+        switch (left.kind()) {
+        case AttrValueKind::Bool: return left.asBool() == right.asBool();
+        case AttrValueKind::Int: return left.asInt() == right.asInt();
+        case AttrValueKind::Double: return left.asDouble() == right.asDouble();
+        case AttrValueKind::String: return left.asString() == right.asString();
+        case AttrValueKind::BoolList: return equal(left.asBoolList(), right.asBoolList());
+        case AttrValueKind::IntList: return equal(left.asIntList(), right.asIntList());
+        case AttrValueKind::DoubleList: return equal(left.asDoubleList(), right.asDoubleList());
+        case AttrValueKind::StringList: return equal(left.asStringList(), right.asStringList());
+        }
+        return false;
+    }
+
+    AttrRef AttrRange::const_iterator::operator*() const
+    {
+        if (!payload_) return AttrRef(attrs_[index_].key, &attrs_[index_].value);
+        const uint32_t id = records_[index_];
+        return AttrRef(payload_->string(payload_->attribute(id).key), AttrValueView(payload_, id));
+    }
+
+    std::optional<AttrRef> AttrRange::find(std::string_view key) const noexcept
+    {
+        for (const auto attr : *this) if (attr.key() == key) return attr;
+        return std::nullopt;
+    }
+
+    GraphPayload::GraphPayload(std::shared_ptr<detail::StringPool> strings)
+        : stringPool_(strings ? std::move(strings) : std::make_shared<detail::StringPool>())
+    {
+        // ID zero is the null payload reference.  Keeping it in every pool
+        // makes malformed/optional records cheap to inspect and preserves
+        // stable one-based record IDs across compact().
+        attrKeys_.push_back(0);
+        attrTags_.push_back(AttrValueKind::Bool);
+        attrPayloads_.push_back(0);
+        srcLocs_.push_back({});
+    }
+
+    GraphPayload::StringId GraphPayload::internString(std::string_view text)
+    {
+        return stringPool_->intern(text);
+    }
+
+    GraphPayload::StringId GraphPayload::internAttrKey(std::string_view text)
+    {
+        const auto& keys = detail::kBuiltinAttributeKeys;
+        const auto found = std::lower_bound(keys.begin(), keys.end(), text);
+        if (found != keys.end() && *found == text)
+            return uint32_t{0x80000000} | static_cast<uint32_t>(found - keys.begin());
+        return internString(text);
+    }
+
+    std::string_view GraphPayload::string(StringId id) const noexcept
+    {
+        if ((id & uint32_t{0x80000000}) != 0) {
+            const auto index = id & uint32_t{0x7fffffff};
+            return index < detail::kBuiltinAttributeKeys.size() ? detail::kBuiltinAttributeKeys[index] : std::string_view{};
+        }
+        return stringPool_->text(id);
+    }
+
+    GraphPayload::RecordId GraphPayload::internAttribute(std::string_view key, const AttributeValue& value)
+    {
+        return internAttribute(key, AttrValueView(&value));
+    }
+
+    GraphPayload::RecordId GraphPayload::internAttribute(std::string_view key, AttrValueView value)
+    {
+        if (value.payload_ == this) {
+            const auto record = attribute(value.record_);
+            attrKeys_.push_back(internAttrKey(key));
+            attrTags_.push_back(record.kind);
+            attrPayloads_.push_back(record.payload);
+            return static_cast<RecordId>(attrKeys_.size() - 1);
+        }
+        const auto kind = value.kind();
+        uint64_t payload = 0;
+        Slice slice;
+        const auto slicePayload = [&] {
+            return static_cast<uint64_t>(slice.offset) | (static_cast<uint64_t>(slice.count) << 32);
+        };
+        switch (kind) {
+        case AttrValueKind::Bool: payload = value.asBool() ? 1 : 0; break;
+        case AttrValueKind::Int: { const int64_t item = value.asInt(); std::memcpy(&payload, &item, sizeof(item)); break; }
+        case AttrValueKind::Double: { const double item = value.asDouble(); std::memcpy(&payload, &item, sizeof(item)); break; }
+        case AttrValueKind::String: payload = internString(value.asString()); break;
+        case AttrValueKind::BoolList: {
+            const auto items = value.asBoolList();
+            slice = {static_cast<uint32_t>(bitPayload_.size()), static_cast<uint32_t>(items.size())};
+            bitPayload_.appendGenerated((items.size() + 63) / 64, [&](std::size_t index) {
+                const std::size_t i = index * 64;
+                uint64_t word = 0;
+                for (std::size_t bit = i; bit < std::min(items.size(), i + 64); ++bit)
+                    if (items[bit]) word |= uint64_t{1} << (bit - i);
+                return word;
+            });
+            payload = slicePayload(); break;
+        }
+        case AttrValueKind::IntList: {
+            const auto items = value.asIntList();
+            slice = {static_cast<uint32_t>(int64Payload_.size()), static_cast<uint32_t>(items.size())};
+            int64Payload_.append(items);
+            payload = slicePayload(); break;
+        }
+        case AttrValueKind::DoubleList: {
+            const auto items = value.asDoubleList();
+            slice = {static_cast<uint32_t>(doublePayload_.size()), static_cast<uint32_t>(items.size())};
+            doublePayload_.append(items);
+            payload = slicePayload(); break;
+        }
+        case AttrValueKind::StringList: {
+            const auto items = value.asStringList();
+            slice = {static_cast<uint32_t>(stringListPayload_.size()), static_cast<uint32_t>(items.size())};
+            stringListPayload_.appendGenerated(items.size(), [&](std::size_t i) { return internString(items[i]); });
+            payload = slicePayload(); break;
+        }
+        }
+        attrKeys_.push_back(internAttrKey(key));
+        attrTags_.push_back(kind);
+        attrPayloads_.push_back(payload);
+        return static_cast<RecordId>(attrKeys_.size() - 1);
+    }
+
+    GraphPayload::RecordId GraphPayload::internStringListAttribute(std::string_view key, std::span<const StringId> values)
+    {
+        const uint64_t payload = static_cast<uint32_t>(stringListPayload_.size()) |
+                                 (static_cast<uint64_t>(values.size()) << 32);
+        stringListPayload_.append(values);
+        attrKeys_.push_back(internAttrKey(key));
+        attrTags_.push_back(AttrValueKind::StringList);
+        attrPayloads_.push_back(payload);
+        return static_cast<RecordId>(attrKeys_.size() - 1);
+    }
+
+    GraphPayload::RecordId GraphPayload::internIntListAttribute(std::string_view key, std::span<const int64_t> values)
+    {
+        const uint64_t payload = static_cast<uint32_t>(int64Payload_.size()) |
+                                 (static_cast<uint64_t>(values.size()) << 32);
+        int64Payload_.append(values);
+        attrKeys_.push_back(internAttrKey(key));
+        attrTags_.push_back(AttrValueKind::IntList);
+        attrPayloads_.push_back(payload);
+        return static_cast<RecordId>(attrKeys_.size() - 1);
+    }
+
+    GraphPayload::RecordId GraphPayload::internSrcLoc(const SrcLoc& loc)
+    {
+        return internSrcLocView(SrcLocView(loc));
+    }
+
+    GraphPayload::RecordId GraphPayload::internSrcLocView(SrcLocView loc)
+    {
+        const SrcLocRecord record{internString(loc.file), internString(loc.origin),
+                                  internString(loc.pass), internString(loc.note), loc.line,
+                                  loc.column, loc.endLine, loc.endColumn};
+        if (const auto it = srcLocIds_.find(record); it != srcLocIds_.end()) return it->second;
+        const RecordId id = static_cast<RecordId>(srcLocs_.size());
+        srcLocs_.push_back(record);
+        srcLocIds_.emplace(record, id);
+        return id;
+    }
+
+    std::size_t GraphPayload::SrcLocHash::operator()(const SrcLocRecord& loc) const noexcept
+    {
+        std::size_t hash = 0;
+        for (uint32_t item : {loc.file, loc.origin, loc.pass, loc.note, loc.line, loc.column,
+                              loc.endLine, loc.endColumn})
+            hash ^= std::hash<uint32_t>{}(item) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+
+    std::optional<SrcLoc> GraphPayload::srcLocValue(RecordId id) const
+    {
+        if (!id) return std::nullopt;
+        const SrcLocRecord& record = srcLoc(id);
+        SrcLoc result;
+        result.file = string(record.file);
+        result.origin = string(record.origin);
+        result.pass = string(record.pass);
+        result.note = string(record.note);
+        result.line = record.line;
+        result.column = record.column;
+        result.endLine = record.endLine;
+        result.endColumn = record.endColumn;
+        return result;
+    }
+
+    GraphPayload::RecordId GraphPayload::importSrcLoc(const GraphPayload& source, RecordId id)
+    {
+        if (!id) return 0;
+        const SrcLocRecord& sourceRecord = source.srcLoc(id);
+        SrcLocRecord record = sourceRecord;
+        record.file = internString(source.string(sourceRecord.file));
+        record.origin = internString(source.string(sourceRecord.origin));
+        record.pass = internString(source.string(sourceRecord.pass));
+        record.note = internString(source.string(sourceRecord.note));
+        if (const auto it = srcLocIds_.find(record); it != srcLocIds_.end()) return it->second;
+        const RecordId result = static_cast<RecordId>(srcLocs_.size());
+        srcLocs_.push_back(record);
+        srcLocIds_.emplace(record, result);
+        return result;
+    }
+
+    GraphPayload::AttributeRecord GraphPayload::attribute(RecordId id) const
+    {
+        if (id == 0 || id >= attrKeys_.size()) throw std::out_of_range("GraphStore attribute id");
+        const uint64_t payload = attrPayloads_[id];
+        return {attrKeys_[id], attrTags_[id], payload,
+                {static_cast<uint32_t>(payload), static_cast<uint32_t>(payload >> 32)}};
+    }
+
+    void GraphPayload::replaceAttribute(RecordId target, RecordId replacement)
+    {
+        attrKeys_[target] = attrKeys_[replacement];
+        attrTags_[target] = attrTags_[replacement];
+        attrPayloads_[target] = attrPayloads_[replacement];
+        // The replacement record was just appended; its variable payload is
+        // retained, and any superseded payload is reclaimed by compact().
+        attrKeys_.pop_back();
+        attrTags_.pop_back();
+        attrPayloads_.pop_back();
+    }
+
+    const GraphPayload::SrcLocRecord& GraphPayload::srcLoc(RecordId id) const
+    {
+        if (id == 0 || id >= srcLocs_.size()) throw std::out_of_range("GraphStore SrcLoc id");
+        return srcLocs_[id];
+    }
+
+    std::span<const int64_t> GraphPayload::int64Payload(Slice slice) const noexcept
+    {
+        if (slice.offset > int64Payload_.size() || slice.count > int64Payload_.size() - slice.offset)
+            return {};
+        return int64Payload_.slice(slice.offset, slice.count);
+    }
+
+    std::span<const double> GraphPayload::doublePayload(Slice slice) const noexcept
+    {
+        if (slice.offset > doublePayload_.size() || slice.count > doublePayload_.size() - slice.offset)
+            return {};
+        return doublePayload_.slice(slice.offset, slice.count);
+    }
+
+    std::span<const uint64_t> GraphPayload::bitPayload(Slice slice) const noexcept
+    {
+        const std::size_t words = (static_cast<std::size_t>(slice.count) + 63) / 64;
+        if (slice.offset > bitPayload_.size() || words > bitPayload_.size() - slice.offset)
+            return {};
+        return bitPayload_.slice(slice.offset, words);
+    }
+
+    std::span<const GraphPayload::StringId> GraphPayload::stringListPayload(Slice slice) const noexcept
+    {
+        if (slice.offset > stringListPayload_.size() || slice.count > stringListPayload_.size() - slice.offset)
+            return {};
+        return stringListPayload_.slice(slice.offset, slice.count);
+    }
+
+    GraphPayload::Stats GraphPayload::stats() const noexcept
+    {
+        return {0, 0, 0, 0, 0,
+                stringPool_->size(), attrKeys_.size() - 1, srcLocs_.size() - 1,
+                int64Payload_.size(), doublePayload_.size(), bitPayload_.size(),
+                stringListPayload_.size()};
+    }
+
+    void GraphPayload::compact()
+    {
+        stringPool_->compact();
+        int64Payload_.shrink_to_fit();
+        doublePayload_.shrink_to_fit();
+        bitPayload_.shrink_to_fit();
+        stringListPayload_.shrink_to_fit();
+        attrKeys_.shrink_to_fit();
+        attrTags_.shrink_to_fit();
+        attrPayloads_.shrink_to_fit();
+        srcLocs_.shrink_to_fit();
     }
 
     namespace
@@ -164,196 +630,157 @@ namespace wolvrix::lib::grh
             return ValueId::invalid();
         }
 
-        void cloneGraphContents(const Graph &source, Graph &clone)
+    } // namespace
+
+    void Graph::cloneContentsTo(Graph& clone) const
+    {
+        const Graph& source = *this;
+        const auto sourceValues = source.values();
+        const auto sourceOperations = source.operations();
+        clone.reserveSymbolCapacity(sourceValues.size() + sourceOperations.size());
+        if (!sourceValues.empty()) clone.reserveValueCapacity(sourceValues.size());
+        if (!sourceOperations.empty()) clone.reserveOperationCapacity(sourceOperations.size());
+        for (const AttrKV& entry : source.metadata()) clone.setMetadata(entry.key, entry.value);
+
+        std::vector<SymbolId> symbolMap(source.symbols_.textById_.size());
+        const auto mapSymbol = [&](SymbolId symbol) {
+            if (!symbol.valid()) return SymbolId::invalid();
+            SymbolId& result = symbolMap.at(symbol.value);
+            if (result.valid()) return result;
+            const std::string_view text = source.symbolText(symbol);
+            if (text.empty()) throw std::runtime_error("Source symbol text is empty during clone");
+            result = clone.lookupSymbol(text);
+            if (!result.valid()) result = clone.internSymbol(text);
+            if (!result.valid()) throw std::runtime_error("Failed to clone symbol: " + std::string(text));
+            return result;
+        };
+        std::vector<GraphPayload::RecordId> srcLocMap(source.store_->GraphPayload::stats().srcLocs + 1);
+        const auto copySrcLoc = [&](GraphPayload::RecordId id) {
+            if (!id) return GraphPayload::RecordId{0};
+            GraphPayload::RecordId& mapped = srcLocMap.at(id);
+            if (!mapped) mapped = clone.store_->importSrcLoc(*source.store_, id);
+            if (graphProfileEnabled()) {
+                const auto& record = source.store_->srcLoc(id);
+                const uint64_t bytes = source.store_->string(record.file).size() +
+                    source.store_->string(record.origin).size() + source.store_->string(record.pass).size() +
+                    source.store_->string(record.note).size();
+                profileCounters.srcLocWrites.fetch_add(1, std::memory_order_relaxed);
+                profileCounters.srcLocBytes.fetch_add(bytes, std::memory_order_relaxed);
+            }
+            return mapped;
+        };
+        std::vector<ValueId> valueMap(source.store_->values_.size() + 1);
+        const auto mapValue = [&](ValueId id, const char* error) {
+            if (id.graph != source.graphId_ || id.generation || id.index >= valueMap.size() ||
+                !valueMap[id.index].valid()) throw std::runtime_error(error);
+            return valueMap[id.index];
+        };
+        for (ValueId sourceId : sourceValues) {
+            const auto value = source.store_->values_[sourceId.index - 1];
+            const ValueId destination = clone.createValue(mapSymbol(value.symbol), value.width, value.isSigned,
+                                                          value.type, value.shape, value.domain);
+            clone.store_->values_[destination.index - 1].srcLoc = copySrcLoc(value.srcLoc);
+            valueMap[sourceId.index] = destination;
+        }
+        for (OperationId sourceId : sourceOperations) {
+            const auto operation = source.store_->operations_[sourceId.index - 1];
+            const OperationId destination = clone.createOperation(operation.kind, mapSymbol(operation.symbol));
+            clone.reserveOpOperandCapacity(destination, operation.operands.size());
+            clone.reserveOpResultCapacity(destination, operation.results.size());
+            clone.reserveOpAttrCapacity(destination, operation.attrs.size());
+            for (AttrRef attr : source.opAttrRange(sourceId))
+                clone.setAttrView(destination, attr.key(), attr.value());
+            for (ValueId operand : operation.operands)
+                clone.addOperand(destination, mapValue(operand, "Missing operand during graph clone"));
+            for (ValueId result : operation.results)
+                clone.addResult(destination, mapValue(result, "Missing result during graph clone"));
+            clone.store_->operations_[destination.index - 1].srcLoc = copySrcLoc(operation.srcLoc);
+        }
+        for (const Port& port : source.inputPorts())
+            clone.bindInputPort(port.name, mapValue(port.value, "Missing input port value during graph clone"));
+        for (const Port& port : source.outputPorts())
+            clone.bindOutputPort(port.name, mapValue(port.value, "Missing output port value during graph clone"));
+        for (const InoutPort& port : source.inoutPorts())
+            clone.bindInoutPort(port.name, mapValue(port.in, "Missing inout port value during graph clone"),
+                mapValue(port.out, "Missing inout port value during graph clone"),
+                mapValue(port.oe, "Missing inout port value during graph clone"));
+
+        for (const auto srcSym : source.declaredSymbols())
         {
-            for (const AttrKV& entry : source.metadata())
-                clone.setMetadata(entry.key, entry.value);
-            std::unordered_map<uint32_t, SymbolId> symbolMap;
-            symbolMap.reserve(source.values().size() + source.operations().size());
-
-            auto mapSymbol = [&](SymbolId sym) -> SymbolId {
-                if (!sym.valid())
-                {
-                    return SymbolId::invalid();
-                }
-                auto it = symbolMap.find(sym.value);
-                if (it != symbolMap.end())
-                {
-                    return it->second;
-                }
-                std::string_view text = source.symbolText(sym);
-                if (text.empty())
-                {
-                    throw std::runtime_error("Source symbol text is empty during clone");
-                }
-                SymbolId cloned = clone.lookupSymbol(text);
-                if (!cloned.valid())
-                {
-                    cloned = clone.internSymbol(text);
-                }
-                if (!cloned.valid())
-                {
-                    throw std::runtime_error("Failed to clone symbol: " + std::string(text));
-                }
-                symbolMap.emplace(sym.value, cloned);
-                return cloned;
-            };
-
-            std::unordered_map<ValueId, ValueId, ValueIdHash> valueMap;
-            valueMap.reserve(source.values().size());
-            for (const auto srcValueId : source.values())
+            if (!srcSym.valid())
             {
-                const Value srcValue = source.getValue(srcValueId);
-                SymbolId dstSym = mapSymbol(srcValue.symbol());
-                ValueId dstValue = clone.createValue(dstSym,
-                                                     srcValue.width(),
-                                                     srcValue.isSigned(),
-                                                     srcValue.type(),
-                                                     srcValue.shape(),
-                                                     srcValue.domain());
-                if (srcValue.srcLoc())
-                {
-                    clone.setValueSrcLoc(dstValue, *srcValue.srcLoc());
-                }
-                valueMap.emplace(srcValueId, dstValue);
+                continue;
             }
+            std::string_view text = source.symbolText(srcSym);
+            if (text.empty())
+            {
+                throw std::runtime_error("Declared symbol text is empty during clone");
+            }
+            SymbolId dstSym = clone.lookupSymbol(text);
+            if (!dstSym.valid())
+            {
+                dstSym = clone.internSymbol(text);
+            }
+            if (!dstSym.valid())
+            {
+                throw std::runtime_error("Failed to clone declared symbol: " + std::string(text));
+            }
+            clone.addDeclaredSymbol(dstSym);
+        }
 
-            for (const auto srcOpId : source.operations())
-            {
-                const Operation srcOp = source.getOperation(srcOpId);
-                SymbolId dstSym = mapSymbol(srcOp.symbol());
-                OperationId dstOp = clone.createOperation(srcOp.kind(), dstSym);
-                for (const auto &attr : srcOp.attrs())
-                {
-                    clone.setAttr(dstOp, attr.key, attr.value);
-                }
-                for (const auto srcOperand : srcOp.operands())
-                {
-                    auto it = valueMap.find(srcOperand);
-                    if (it == valueMap.end())
-                    {
-                        throw std::runtime_error("Missing operand during graph clone");
-                    }
-                    clone.addOperand(dstOp, it->second);
-                }
-                for (const auto srcResult : srcOp.results())
-                {
-                    auto it = valueMap.find(srcResult);
-                    if (it == valueMap.end())
-                    {
-                        throw std::runtime_error("Missing result during graph clone");
-                    }
-                    clone.addResult(dstOp, it->second);
-                }
-                if (srcOp.srcLoc())
-                {
-                    clone.setOpSrcLoc(dstOp, *srcOp.srcLoc());
-                }
-            }
-
-            for (const auto &port : source.inputPorts())
-            {
-                auto it = valueMap.find(port.value);
-                if (it == valueMap.end())
-                {
-                    throw std::runtime_error("Missing input port value during graph clone");
-                }
-                clone.bindInputPort(port.name, it->second);
-            }
-            for (const auto &port : source.outputPorts())
-            {
-                auto it = valueMap.find(port.value);
-                if (it == valueMap.end())
-                {
-                    throw std::runtime_error("Missing output port value during graph clone");
-                }
-                clone.bindOutputPort(port.name, it->second);
-            }
-            for (const auto &port : source.inoutPorts())
-            {
-                auto itIn = valueMap.find(port.in);
-                auto itOut = valueMap.find(port.out);
-                auto itOe = valueMap.find(port.oe);
-                if (itIn == valueMap.end() || itOut == valueMap.end() || itOe == valueMap.end())
-                {
-                    throw std::runtime_error("Missing inout port value during graph clone");
-                }
-                clone.bindInoutPort(port.name, itIn->second, itOut->second, itOe->second);
-            }
-
-            for (const auto srcSym : source.declaredSymbols())
+        for (const auto &srcGroup : source.generateGroups())
+        {
+            const SymbolId dstScope = mapSymbol(srcGroup.scope);
+            const SymbolId dstName = mapSymbol(srcGroup.name);
+            const std::size_t dstGroup = clone.addGenerateGroup(dstScope, dstName);
+            for (const auto srcSym : srcGroup.symbols)
             {
                 if (!srcSym.valid())
                 {
                     continue;
                 }
-                std::string_view text = source.symbolText(srcSym);
-                if (text.empty())
-                {
-                    throw std::runtime_error("Declared symbol text is empty during clone");
-                }
-                SymbolId dstSym = clone.lookupSymbol(text);
-                if (!dstSym.valid())
-                {
-                    dstSym = clone.internSymbol(text);
-                }
-                if (!dstSym.valid())
-                {
-                    throw std::runtime_error("Failed to clone declared symbol: " + std::string(text));
-                }
-                clone.addDeclaredSymbol(dstSym);
-            }
-
-            for (const auto &srcGroup : source.generateGroups())
-            {
-                const SymbolId dstScope = mapSymbol(srcGroup.scope);
-                const SymbolId dstName = mapSymbol(srcGroup.name);
-                const std::size_t dstGroup = clone.addGenerateGroup(dstScope, dstName);
-                for (const auto srcSym : srcGroup.symbols)
-                {
-                    if (!srcSym.valid())
-                    {
-                        continue;
-                    }
-                    clone.addGenerateGroupSymbol(dstGroup, mapSymbol(srcSym));
-                }
+                clone.addGenerateGroupSymbol(dstGroup, mapSymbol(srcSym));
             }
         }
-    } // namespace
-
-    std::size_t SymbolTable::StringHash::operator()(std::string_view value) const noexcept
-    {
-        return std::hash<std::string_view>{}(value);
     }
 
-    std::size_t SymbolTable::StringHash::operator()(const std::string &value) const noexcept
-    {
-        return std::hash<std::string_view>{}(value);
-    }
-
-    bool SymbolTable::StringEq::operator()(std::string_view lhs, std::string_view rhs) const noexcept
-    {
-        return lhs == rhs;
-    }
-
-    bool SymbolTable::StringEq::operator()(const std::string &lhs, const std::string &rhs) const noexcept
-    {
-        return lhs == rhs;
-    }
-
-    bool SymbolTable::StringEq::operator()(const std::string &lhs, std::string_view rhs) const noexcept
-    {
-        return lhs == rhs;
-    }
-
-    bool SymbolTable::StringEq::operator()(std::string_view lhs, const std::string &rhs) const noexcept
-    {
-        return lhs == rhs;
-    }
-
-    SymbolTable::SymbolTable()
+    SymbolTable::SymbolTable() : stringPool_(std::make_shared<detail::StringPool>())
     {
         textById_.emplace_back();
+    }
+
+    SymbolTable::SymbolTable(const SymbolTable& other)
+        : SymbolTable(other, std::make_shared<detail::StringPool>())
+    {
+    }
+
+    SymbolTable::SymbolTable(const SymbolTable& other, std::shared_ptr<detail::StringPool> strings)
+        : stringPool_(std::move(strings))
+    {
+        textById_.reserve(other.textById_.size());
+        symbolsByStringId_.reserve(stringPool_->size() + other.textById_.size());
+        textById_.emplace_back();
+        for (std::size_t index = 1; index < other.textById_.size(); ++index)
+        {
+            bindStringId(stringPool_->intern(other.textById_[index]));
+        }
+    }
+
+    SymbolTable& SymbolTable::operator=(const SymbolTable& other)
+    {
+        if (this != &other)
+        {
+            SymbolTable copy(other);
+            *this = std::move(copy);
+        }
+        return *this;
+    }
+
+    void SymbolTable::swapStringState(SymbolTable& other) noexcept
+    {
+        stringPool_.swap(other.stringPool_);
+        symbolsByStringId_.swap(other.symbolsByStringId_);
+        textById_.swap(other.textById_);
     }
 
     DesignSymbolTable::DesignSymbolTable()
@@ -438,61 +865,53 @@ namespace wolvrix::lib::grh
 
     SymbolId SymbolTable::intern(std::string_view text)
     {
-        auto it = symbolsByText_.find(text);
-        if (it != symbolsByText_.end())
+        const auto stringId = stringPool_->intern(text);
+        if (stringId < symbolsByStringId_.size() && symbolsByStringId_[stringId].valid())
         {
-            return it->second;
+            return symbolsByStringId_[stringId];
         }
-
-        SymbolId id;
-        id.value = static_cast<uint32_t>(textById_.size());
-        textById_.emplace_back(text);
-        symbolsByText_.emplace(textById_.back(), id);
-        return id;
-    }
-
-    SymbolId SymbolTable::internFresh(std::string_view text)
-    {
-        SymbolId id;
-        id.value = static_cast<uint32_t>(textById_.size());
-        textById_.emplace_back(text);
-        symbolsByText_.emplace(textById_.back(), id);
+        const SymbolId id = bindStringId(stringId);
+        if (graphProfileEnabled()) profileCounters.symbolInserts.fetch_add(1, std::memory_order_relaxed);
         return id;
     }
 
     SymbolId SymbolTable::tryInternFresh(std::string_view text)
     {
-        const SymbolId id{static_cast<uint32_t>(textById_.size())};
-        auto [entry, inserted] = symbolsByText_.try_emplace(std::string(text), id);
-        if (!inserted)
+        const auto stringId = stringPool_->intern(text);
+        if (stringId < symbolsByStringId_.size() && symbolsByStringId_[stringId].valid())
         {
             return SymbolId::invalid();
         }
-        try
+        const SymbolId id = bindStringId(stringId);
+        if (graphProfileEnabled()) profileCounters.symbolInserts.fetch_add(1, std::memory_order_relaxed);
+        return id;
+    }
+
+    SymbolId SymbolTable::bindStringId(uint32_t stringId)
+    {
+        if (symbolsByStringId_.size() <= stringId)
         {
-            textById_.push_back(entry->first);
+            symbolsByStringId_.resize(static_cast<std::size_t>(stringId) + 1);
         }
-        catch (...)
-        {
-            symbolsByText_.erase(entry);
-            throw;
-        }
+        const SymbolId id{static_cast<uint32_t>(textById_.size())};
+        textById_.push_back(stringPool_->text(stringId));
+        symbolsByStringId_[stringId] = id;
         return id;
     }
 
     SymbolId SymbolTable::lookup(std::string_view text) const
     {
-        auto it = symbolsByText_.find(text);
-        if (it == symbolsByText_.end())
+        const auto stringId = stringPool_->lookup(text);
+        if ((!stringId && !text.empty()) || stringId >= symbolsByStringId_.size())
         {
             return SymbolId::invalid();
         }
-        return it->second;
+        return symbolsByStringId_[stringId];
     }
 
     bool SymbolTable::contains(std::string_view text) const
     {
-        return symbolsByText_.find(text) != symbolsByText_.end();
+        return lookup(text).valid();
     }
 
     std::string_view SymbolTable::text(SymbolId id) const
@@ -511,7 +930,9 @@ namespace wolvrix::lib::grh
 
     void SymbolTable::reserve(std::size_t count)
     {
-        symbolsByText_.reserve(count);
+        symbolsByStringId_.reserve(std::max(count + 1, stringPool_->size() + 1));
+        textById_.reserve(count + 1);
+        stringPool_->reserve(count);
     }
 
     void ValueId::assertGraph(GraphId expected) const
@@ -568,598 +989,225 @@ namespace wolvrix::lib::grh
         }
     }
 
-    std::span<const OperationId> GraphView::operations() const noexcept
-    {
-        return std::span<const OperationId>(operations_.data(), operations_.size());
-    }
-
-    std::span<const ValueId> GraphView::values() const noexcept
-    {
-        return std::span<const ValueId>(values_.data(), values_.size());
-    }
-
-    std::span<const Port> GraphView::inputPorts() const noexcept
-    {
-        return std::span<const Port>(inputPorts_.data(), inputPorts_.size());
-    }
-
-    std::span<const Port> GraphView::outputPorts() const noexcept
-    {
-        return std::span<const Port>(outputPorts_.data(), outputPorts_.size());
-    }
-
-    std::span<const InoutPort> GraphView::inoutPorts() const noexcept
-    {
-        return std::span<const InoutPort>(inoutPorts_.data(), inoutPorts_.size());
-    }
-
-    OperationKind GraphView::opKind(OperationId op) const
-    {
-        return opKinds_[opIndex(op)];
-    }
-
-    std::span<const ValueId> GraphView::opOperands(OperationId op) const
-    {
-        return spanForRange(operands_, opOperandRanges_[opIndex(op)]);
-    }
-
-    std::span<const ValueId> GraphView::opResults(OperationId op) const
-    {
-        return spanForRange(results_, opResultRanges_[opIndex(op)]);
-    }
-
-    SymbolId GraphView::opSymbol(OperationId op) const
-    {
-        return opSymbols_[opIndex(op)];
-    }
-
-    std::span<const AttrKV> GraphView::opAttrs(OperationId op) const
-    {
-        return spanForRange(opAttrs_, opAttrRanges_[opIndex(op)]);
-    }
-
-    std::optional<AttributeValue> GraphView::opAttr(OperationId op, std::string_view key) const
-    {
-        const auto attrs = opAttrs(op);
-        for (const auto &attr : attrs)
+    namespace {
+        template <typename Id>
+        void markLiveErased(std::vector<Id>& ids, Id erased)
         {
-            if (attr.key == key)
-            {
-                return attr.value;
-            }
-        }
-        return std::nullopt;
-    }
-
-    std::optional<SrcLoc> GraphView::opSrcLoc(OperationId op) const
-    {
-        return opSrcLocs_[opIndex(op)];
-    }
-
-    SymbolId GraphView::valueSymbol(ValueId value) const
-    {
-        return valueSymbols_[valueIndex(value)];
-    }
-
-    int32_t GraphView::valueWidth(ValueId value) const
-    {
-        return valueWidths_[valueIndex(value)];
-    }
-
-    bool GraphView::valueSigned(ValueId value) const
-    {
-        return valueSigned_[valueIndex(value)] != 0;
-    }
-
-    ValueType GraphView::valueType(ValueId value) const
-    {
-        if (valueTypes_.empty())
-        {
-            return ValueType::Logic;
-        }
-        const std::size_t idx = valueIndex(value);
-        if (idx >= valueTypes_.size())
-        {
-            return ValueType::Logic;
-        }
-        return static_cast<ValueType>(valueTypes_[idx]);
-    }
-
-    std::span<const int64_t> GraphView::valueShape(ValueId value) const
-    {
-        if (valueShapeRanges_.empty())
-        {
-            return {};
-        }
-        return spanForRange(valueShapeDims_, valueShapeRanges_[valueIndex(value)]);
-    }
-
-    bool GraphView::valueIsInput(ValueId value) const
-    {
-        return valueIsInput_[valueIndex(value)] != 0;
-    }
-
-    bool GraphView::valueIsOutput(ValueId value) const
-    {
-        return valueIsOutput_[valueIndex(value)] != 0;
-    }
-
-    bool GraphView::valueIsInout(ValueId value) const
-    {
-        return valueIsInout_[valueIndex(value)] != 0;
-    }
-
-    OperationId GraphView::valueDef(ValueId value) const
-    {
-        return valueDefs_[valueIndex(value)];
-    }
-
-    std::span<const ValueUser> GraphView::valueUsers(ValueId value) const
-    {
-        return spanForRange(useList_, valueUserRanges_[valueIndex(value)]);
-    }
-
-    std::optional<SrcLoc> GraphView::valueSrcLoc(ValueId value) const
-    {
-        return valueSrcLocs_[valueIndex(value)];
-    }
-
-    ValueId GraphView::findValue(SymbolId symbol) const noexcept
-    {
-        if (!symbol.valid())
-        {
-            return ValueId::invalid();
-        }
-        auto it = symbolIndex_.find(symbol.value);
-        if (it == symbolIndex_.end() || it->second.kind != SymbolKind::kValue)
-        {
-            return ValueId::invalid();
-        }
-        ValueId id;
-        id.index = it->second.index;
-        id.generation = 0;
-        id.graph = graphId_;
-        return id;
-    }
-
-    OperationId GraphView::findOperation(SymbolId symbol) const noexcept
-    {
-        if (!symbol.valid())
-        {
-            return OperationId::invalid();
-        }
-        auto it = symbolIndex_.find(symbol.value);
-        if (it == symbolIndex_.end() || it->second.kind != SymbolKind::kOperation)
-        {
-            return OperationId::invalid();
-        }
-        OperationId id;
-        id.index = it->second.index;
-        id.generation = 0;
-        id.graph = graphId_;
-        return id;
-    }
-
-    std::size_t GraphView::opIndex(OperationId op) const
-    {
-        op.assertGraph(graphId_);
-        const std::size_t index = static_cast<std::size_t>(op.index);
-        if (index == 0 || index > opKinds_.size())
-        {
-            throw std::runtime_error("OperationId out of range");
-        }
-        return index - 1;
-    }
-
-    std::size_t GraphView::valueIndex(ValueId value) const
-    {
-        value.assertGraph(graphId_);
-        const std::size_t index = static_cast<std::size_t>(value.index);
-        if (index == 0 || index > valueWidths_.size())
-        {
-            throw std::runtime_error("ValueId out of range");
-        }
-        return index - 1;
-    }
-
-    GraphBuilder::GraphBuilder(GraphId graphId) : graphId_(graphId)
-    {
-        if (!graphId_.valid())
-        {
-            throw std::runtime_error("GraphBuilder requires a valid GraphId");
+            const auto it = std::lower_bound(ids.begin(), ids.end(), erased.index,
+                [](Id id, uint32_t index) { return id.index < index; });
+            if (it == ids.end() || it->index != erased.index)
+                throw std::logic_error("live graph ID list is inconsistent");
+            // Keep the index for ordered lookup while deferring linear movement
+            // until enumeration. This marker never escapes the store.
+            it->graph = GraphId::invalid();
         }
     }
 
-    GraphBuilder::GraphBuilder(GraphSymbolTable &symbols, GraphId graphId) : GraphBuilder(graphId)
+    std::span<const OperationId> GraphStore::operations() const noexcept
     {
+        if (operationsHaveTombstones_) {
+            std::erase_if(liveOperations_, [](OperationId id) { return !id.graph.valid(); });
+            operationsHaveTombstones_ = false;
+        }
+        return liveOperations_;
+    }
+
+    std::span<const ValueId> GraphStore::values() const noexcept
+    {
+        if (valuesHaveTombstones_) {
+            std::erase_if(liveValues_, [](ValueId id) { return !id.graph.valid(); });
+            valuesHaveTombstones_ = false;
+        }
+        return liveValues_;
+    }
+
+    GraphStore::GraphStore(GraphId graphId)
+        : graphId_(graphId), topology_(std::make_shared<TopologyPools>()),
+          values_(topology_), operations_(topology_)
+    {
+        if (!graphId_.valid()) throw std::runtime_error("GraphStore requires a valid GraphId");
+    }
+
+    GraphStore::GraphStore(GraphSymbolTable& symbols, GraphId graphId)
+        : GraphPayload(symbols.stringPool_), graphId_(graphId), topology_(std::make_shared<TopologyPools>()),
+          values_(topology_), operations_(topology_)
+    {
+        if (!graphId_.valid()) throw std::runtime_error("GraphStore requires a valid GraphId");
         symbols_ = &symbols;
     }
 
-    void GraphBuilder::reserveValues(std::size_t count)
+    GraphStore::Stats GraphStore::stats() const noexcept
+    {
+        Stats result = GraphPayload::stats();
+        result.shapes = topology_->shapes.ranges.size() - 1;
+        result.shapeDims = topology_->shapes.dims.size();
+        result.useSlots = topology_->users.size();
+        result.operandIndexSlots = topology_->operandUseIndices.size();
+        for (std::size_t i = 0; i < operations_.size(); ++i) {
+            const auto op = operations_[i];
+            if (!op.alive) continue;
+            ++result.operations;
+            result.operands += op.operands.size();
+            result.results += op.results.size();
+        }
+        for (std::size_t i = 0; i < values_.size(); ++i) {
+            if (!values_[i].alive) continue;
+            ++result.values;
+            result.uses += valueUsers_[i].size();
+        }
+        return result;
+    }
+
+    void GraphStore::compact()
+    {
+        std::vector<uint32_t> valueRemap(values_.size() + 1, 0);
+        std::vector<uint32_t> opRemap(operations_.size() + 1, 0);
+        std::size_t valueCount = 0, opCount = 0;
+        for (std::size_t i = 0; i < values_.size(); ++i)
+            if (values_[i].alive) valueRemap[i + 1] = static_cast<uint32_t>(++valueCount);
+        for (std::size_t i = 0; i < operations_.size(); ++i)
+            if (operations_[i].alive) opRemap[i + 1] = static_cast<uint32_t>(++opCount);
+
+        const auto remapValue = [&](ValueId value) {
+            value.assertGraph(graphId_);
+            if (!value.index || value.index >= valueRemap.size())
+                throw std::runtime_error("ValueId out of range during freeze");
+            if (!valueRemap[value.index])
+                throw std::runtime_error("ValueId refers to erased value during freeze");
+            return ValueId{valueRemap[value.index], 0, graphId_};
+        };
+        const auto remapOp = [&](OperationId op) {
+            if (!op.valid()) return OperationId::invalid();
+            op.assertGraph(graphId_);
+            if (op.index >= opRemap.size()) throw std::runtime_error("OperationId out of range during freeze");
+            return opRemap[op.index] ? OperationId{opRemap[op.index], 0, graphId_} : OperationId::invalid();
+        };
+
+        // Repack into the same column layout. No immutable representation or
+        // thaw is created: the prepared columns replace the old columns only
+        // after validation and allocation have succeeded.
+        GraphStore next(graphId_);
+        next.symbols_ = symbols_;
+        std::vector<RecordId> srcLocRemap(GraphPayload::stats().srcLocs + 1, 0);
+        const auto remapSrcLoc = [&](RecordId id) {
+            if (!id) return RecordId{0};
+            RecordId& mapped = srcLocRemap.at(id);
+            if (!mapped) mapped = next.importSrcLoc(*this, id);
+            return mapped;
+        };
+        next.reserveValues(valueCount);
+        next.reserveOperations(opCount);
+        next.reserveSymbols(valueCount + opCount);
+        for (std::size_t i = 0; i < values_.size(); ++i) {
+            const auto source = values_[i];
+            if (!source.alive) continue;
+            auto value = next.values_.emplace_back();
+            value.symbol = source.symbol;
+            value.width = source.width;
+            value.isSigned = source.isSigned;
+            value.type = source.type;
+            value.domain = source.domain;
+            value.shape.set(source.shape);
+            value.isInput = source.isInput;
+            value.isOutput = source.isOutput;
+            value.isInout = source.isInout;
+            value.definingOp = remapOp(source.definingOp);
+            value.srcLoc = remapSrcLoc(source.srcLoc);
+            next.valueUsers_.emplace_back(next.topology_->users);
+            next.valueUsers_.back().reserve(valueUsers_[i].size());
+            next.liveValues_.push_back(ValueId{valueRemap[i + 1], 0, graphId_});
+            next.bindSymbol(value.symbol, SymbolKind::kValue, valueRemap[i + 1], "Value");
+        }
+        for (std::size_t i = 0; i < operations_.size(); ++i) {
+            const auto source = operations_[i];
+            if (!source.alive) continue;
+            auto operation = next.operations_.emplace_back();
+            operation.kind = source.kind;
+            operation.symbol = source.symbol;
+            operation.srcLoc = remapSrcLoc(source.srcLoc);
+            operation.operands.reserve(source.operands.size());
+            operation.operandUseIndices.reserve(source.operands.size());
+            operation.results.reserve(source.results.size());
+            operation.attrs.reserve(source.attrs.size());
+            for (ValueId operand : source.operands) operation.operands.push_back(remapValue(operand));
+            for (ValueId result : source.results) operation.results.push_back(remapValue(result));
+            for (const RecordId attr : source.attrs)
+                operation.attrs.push_back(next.internAttribute(string(attribute(attr).key), AttrValueView(this, attr)));
+            const OperationId id{opRemap[i + 1], 0, graphId_};
+            next.liveOperations_.push_back(id);
+            next.bindSymbol(operation.symbol, SymbolKind::kOperation, id.index, "Operation");
+            next.addOpUses(id, operation.operands);
+        }
+        next.inputPorts_.reserve(inputPorts_.size());
+        next.outputPorts_.reserve(outputPorts_.size());
+        next.inoutPorts_.reserve(inoutPorts_.size());
+        for (const Port& port : inputPorts_) next.inputPorts_.push_back({port.name, remapValue(port.value)});
+        for (const Port& port : outputPorts_) next.outputPorts_.push_back({port.name, remapValue(port.value)});
+        for (const InoutPort& port : inoutPorts_)
+            next.inoutPorts_.push_back({port.name, remapValue(port.in), remapValue(port.out), remapValue(port.oe)});
+        const auto portLess = [](const auto& lhs, const auto& rhs) { return lhs.name < rhs.name; };
+        std::sort(next.inputPorts_.begin(), next.inputPorts_.end(), portLess);
+        std::sort(next.outputPorts_.begin(), next.outputPorts_.end(), portLess);
+        std::sort(next.inoutPorts_.begin(), next.inoutPorts_.end(), portLess);
+        next.topology_->operands.shrink_to_fit();
+        next.topology_->results.shrink_to_fit();
+        next.topology_->operandUseIndices.shrink_to_fit();
+        next.topology_->users.shrink_to_fit();
+        next.topology_->attrs.shrink_to_fit();
+        next.topology_->shapes.dims.shrink_to_fit();
+        next.topology_->shapes.ranges.shrink_to_fit();
+        next.topology_->shapes.hashNext.shrink_to_fit();
+        std::optional<SymbolTable> nextSymbols;
+        if (symbols_) nextSymbols = SymbolTable(*symbols_, next.stringPool_);
+        next.GraphPayload::compact();
+        static_assert(std::is_nothrow_move_assignable_v<GraphStore>);
+        if (nextSymbols) symbols_->swapStringState(*nextSymbols);
+        *this = std::move(next);
+        if (graphProfileEnabled()) profileCounters.freezeCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void GraphStore::reserveValues(std::size_t count)
     {
         values_.reserve(count);
         valueUsers_.reserve(count);
+        liveValues_.reserve(count);
     }
 
-    void GraphBuilder::reserveOperations(std::size_t count)
+    void GraphStore::reserveOperations(std::size_t count)
     {
         operations_.reserve(count);
+        liveOperations_.reserve(count);
     }
 
-    void GraphBuilder::reserveSymbols(std::size_t count)
+    void GraphStore::reserveSymbols(std::size_t count)
     {
         symbolIndex_.reserve(count);
     }
 
-    void GraphBuilder::reserveOpOperands(OperationId op, std::size_t count)
+    void GraphStore::reserveOpOperands(OperationId op, std::size_t count)
     {
         operations_[opIndex(op)].operands.reserve(count);
     }
 
-    void GraphBuilder::reserveOpResults(OperationId op, std::size_t count)
+    void GraphStore::reserveOpResults(OperationId op, std::size_t count)
     {
         operations_[opIndex(op)].results.reserve(count);
     }
 
-    void GraphBuilder::reserveOpAttrs(OperationId op, std::size_t count)
+    void GraphStore::reserveOpAttrs(OperationId op, std::size_t count)
     {
         operations_[opIndex(op)].attrs.reserve(count);
     }
 
-    GraphBuilder GraphBuilder::fromView(const GraphView &view, GraphSymbolTable &symbols)
-    {
-        if (!view.graphId_.valid())
-        {
-            throw std::runtime_error("GraphView has invalid GraphId");
-        }
-
-        GraphBuilder builder(symbols, view.graphId_);
-
-        auto require = [](bool condition, const char *message) {
-            if (!condition)
-            {
-                throw std::runtime_error(message);
-            }
-        };
-
-        const std::size_t valueCount = view.values_.size();
-        const std::size_t opCount = view.operations_.size();
-
-        require(view.valueSymbols_.size() == valueCount, "GraphView value metadata size mismatch");
-        require(view.valueWidths_.size() == valueCount, "GraphView value metadata size mismatch");
-        require(view.valueSigned_.size() == valueCount, "GraphView value metadata size mismatch");
-        if (!view.valueTypes_.empty())
-        {
-            require(view.valueTypes_.size() == valueCount, "GraphView value metadata size mismatch");
-        }
-        if (!view.valueShapeRanges_.empty())
-        {
-            require(view.valueShapeRanges_.size() == valueCount, "GraphView value shape range size mismatch");
-        }
-        require(view.valueIsInput_.size() == valueCount, "GraphView value metadata size mismatch");
-        require(view.valueIsOutput_.size() == valueCount, "GraphView value metadata size mismatch");
-        require(view.valueIsInout_.size() == valueCount, "GraphView value metadata size mismatch");
-        require(view.valueDefs_.size() == valueCount, "GraphView value metadata size mismatch");
-        require(view.valueUserRanges_.size() == valueCount, "GraphView value user range size mismatch");
-        require(view.valueSrcLocs_.size() == valueCount, "GraphView value metadata size mismatch");
-
-        require(view.opKinds_.size() == opCount, "GraphView operation metadata size mismatch");
-        require(view.opSymbols_.size() == opCount, "GraphView operation metadata size mismatch");
-        require(view.opOperandRanges_.size() == opCount, "GraphView operation metadata size mismatch");
-        require(view.opResultRanges_.size() == opCount, "GraphView operation metadata size mismatch");
-        require(view.opAttrRanges_.size() == opCount, "GraphView operation metadata size mismatch");
-        require(view.opSrcLocs_.size() == opCount, "GraphView operation metadata size mismatch");
-
-        auto checkRangeBounds = [&](const Range &range, std::size_t total, const char *label) {
-            if (range.offset > total || range.offset + range.count > total)
-            {
-                throw std::runtime_error(std::string("GraphView ") + label + " range out of bounds");
-            }
-        };
-
-        std::size_t operandOffset = 0;
-        for (std::size_t i = 0; i < opCount; ++i)
-        {
-            const Range &range = view.opOperandRanges_[i];
-            require(range.offset == operandOffset, "GraphView operand ranges are not contiguous");
-            checkRangeBounds(range, view.operands_.size(), "operand");
-            operandOffset = range.offset + range.count;
-        }
-        require(operandOffset == view.operands_.size(), "GraphView operand range size mismatch");
-
-        std::size_t resultOffset = 0;
-        for (std::size_t i = 0; i < opCount; ++i)
-        {
-            const Range &range = view.opResultRanges_[i];
-            require(range.offset == resultOffset, "GraphView result ranges are not contiguous");
-            checkRangeBounds(range, view.results_.size(), "result");
-            resultOffset = range.offset + range.count;
-        }
-        require(resultOffset == view.results_.size(), "GraphView result range size mismatch");
-
-        std::size_t attrOffset = 0;
-        for (std::size_t i = 0; i < opCount; ++i)
-        {
-            const Range &range = view.opAttrRanges_[i];
-            require(range.offset == attrOffset, "GraphView attribute ranges are not contiguous");
-            checkRangeBounds(range, view.opAttrs_.size(), "attribute");
-            attrOffset = range.offset + range.count;
-        }
-        require(attrOffset == view.opAttrs_.size(), "GraphView attribute range size mismatch");
-
-        std::size_t userOffset = 0;
-        for (std::size_t i = 0; i < valueCount; ++i)
-        {
-            const Range &range = view.valueUserRanges_[i];
-            require(range.offset == userOffset, "GraphView use-list ranges are not contiguous");
-            checkRangeBounds(range, view.useList_.size(), "use-list");
-            userOffset = range.offset + range.count;
-        }
-        require(userOffset == view.useList_.size(), "GraphView use-list size mismatch");
-
-        builder.values_.reserve(valueCount);
-        builder.valueUsers_.reserve(valueCount);
-        for (std::size_t i = 0; i < valueCount; ++i)
-        {
-            const ValueId valueId = view.values_[i];
-            valueId.assertGraph(view.graphId_);
-            require(valueId.generation == 0, "GraphView value generation must be zero");
-            require(valueId.index == i + 1, "GraphView values must be contiguous");
-
-            ValueData data;
-            data.symbol = view.valueSymbols_[i];
-            builder.validateSymbol(data.symbol, "Value");
-            const int32_t width = view.valueWidths_[i];
-            ValueType type = ValueType::Logic;
-            if (!view.valueTypes_.empty())
-            {
-                type = static_cast<ValueType>(view.valueTypes_[i]);
-            }
-            if (type == ValueType::Logic && width <= 0)
-            {
-                throw std::runtime_error("GraphView value width must be positive");
-            }
-            data.width = width > 0 ? width : 1;
-            data.isSigned = view.valueSigned_[i] != 0;
-            data.type = type;
-            data.domain = view.valueDomain(valueId);
-            if (!view.valueShapeRanges_.empty())
-            {
-                const std::span<const int64_t> shape =
-                    spanForRange(view.valueShapeDims_, view.valueShapeRanges_[i]);
-                validateValueShape(data.width, type, shape, "GraphView value");
-                data.shape.assign(shape.begin(), shape.end());
-            }
-            data.isInput = false;
-            data.isOutput = false;
-            data.isInout = false;
-            data.definingOp = OperationId::invalid();
-            data.srcLoc = view.valueSrcLocs_[i];
-            data.alive = true;
-            builder.values_.push_back(std::move(data));
-            builder.bindSymbol(builder.values_.back().symbol,
-                               GraphBuilder::SymbolKind::kValue,
-                               static_cast<uint32_t>(i + 1),
-                               "Value");
-        }
-
-        builder.operations_.reserve(opCount);
-        for (std::size_t i = 0; i < opCount; ++i)
-        {
-            const OperationId opId = view.operations_[i];
-            opId.assertGraph(view.graphId_);
-            require(opId.generation == 0, "GraphView operation generation must be zero");
-            require(opId.index == i + 1, "GraphView operations must be contiguous");
-
-            OperationData opData;
-            opData.kind = view.opKinds_[i];
-            opData.symbol = view.opSymbols_[i];
-            builder.validateSymbol(opData.symbol, "Operation");
-            opData.srcLoc = view.opSrcLocs_[i];
-            opData.alive = true;
-            builder.bindSymbol(opData.symbol,
-                               GraphBuilder::SymbolKind::kOperation,
-                               static_cast<uint32_t>(i + 1),
-                               "Operation");
-
-            const Range &operandRange = view.opOperandRanges_[i];
-            opData.operands.reserve(operandRange.count);
-            for (std::size_t j = 0; j < operandRange.count; ++j)
-            {
-                const ValueId operand = view.operands_[operandRange.offset + j];
-                operand.assertGraph(view.graphId_);
-                require(operand.generation == 0, "GraphView operand generation must be zero");
-                if (operand.index == 0 || operand.index > valueCount)
-                {
-                    throw std::runtime_error("GraphView operand refers to invalid value");
-                }
-                opData.operands.push_back(operand);
-            }
-
-            const Range &resultRange = view.opResultRanges_[i];
-            opData.results.reserve(resultRange.count);
-            for (std::size_t j = 0; j < resultRange.count; ++j)
-            {
-                const ValueId result = view.results_[resultRange.offset + j];
-                result.assertGraph(view.graphId_);
-                require(result.generation == 0, "GraphView result generation must be zero");
-                if (result.index == 0 || result.index > valueCount)
-                {
-                    throw std::runtime_error("GraphView result refers to invalid value");
-                }
-                const std::size_t valIdx = static_cast<std::size_t>(result.index - 1);
-                if (builder.values_[valIdx].definingOp.valid())
-                {
-                    throw std::runtime_error("GraphView value has multiple defining operations");
-                }
-                builder.values_[valIdx].definingOp = opId;
-                opData.results.push_back(result);
-            }
-
-            const Range &attrRange = view.opAttrRanges_[i];
-            opData.attrs.reserve(attrRange.count);
-            for (std::size_t j = 0; j < attrRange.count; ++j)
-            {
-                const AttrKV &attr = view.opAttrs_[attrRange.offset + j];
-                if (!attributeValueIsJsonSerializable(attr.value))
-                {
-                    throw std::runtime_error("GraphView attribute value must be JSON-serializable");
-                }
-                opData.attrs.push_back(attr);
-            }
-
-            builder.operations_.push_back(std::move(opData));
-        }
-
-        for (std::size_t i = 0; i < valueCount; ++i)
-        {
-            OperationId viewDef = view.valueDefs_[i];
-            if (viewDef.valid())
-            {
-                viewDef.assertGraph(view.graphId_);
-                require(viewDef.generation == 0, "GraphView value definition generation must be zero");
-                if (viewDef.index == 0 || viewDef.index > opCount)
-                {
-                    throw std::runtime_error("GraphView value definition refers to invalid operation");
-                }
-            }
-            if (builder.values_[i].definingOp != viewDef)
-            {
-                throw std::runtime_error("GraphView value definition mismatch");
-            }
-        }
-
-        builder.inputPorts_ = view.inputPorts_;
-        builder.outputPorts_ = view.outputPorts_;
-        builder.inoutPorts_ = view.inoutPorts_;
-
-        for (const auto &port : builder.inputPorts_)
-        {
-            if (port.name.empty())
-            {
-                throw std::runtime_error("Input port name is empty");
-            }
-            port.value.assertGraph(view.graphId_);
-            require(port.value.generation == 0, "GraphView input port value generation must be zero");
-            if (port.value.index == 0 || port.value.index > valueCount)
-            {
-                throw std::runtime_error("GraphView input port refers to invalid value");
-            }
-        }
-        for (const auto &port : builder.outputPorts_)
-        {
-            if (port.name.empty())
-            {
-                throw std::runtime_error("Output port name is empty");
-            }
-            port.value.assertGraph(view.graphId_);
-            require(port.value.generation == 0, "GraphView output port value generation must be zero");
-            if (port.value.index == 0 || port.value.index > valueCount)
-            {
-                throw std::runtime_error("GraphView output port refers to invalid value");
-            }
-        }
-        for (const auto &port : builder.inoutPorts_)
-        {
-            if (port.name.empty())
-            {
-                throw std::runtime_error("Inout port name is empty");
-            }
-            port.in.assertGraph(view.graphId_);
-            port.out.assertGraph(view.graphId_);
-            port.oe.assertGraph(view.graphId_);
-            require(port.in.generation == 0, "GraphView inout port input generation must be zero");
-            require(port.out.generation == 0, "GraphView inout port output generation must be zero");
-            require(port.oe.generation == 0, "GraphView inout port enable generation must be zero");
-            if (port.in.index == 0 || port.in.index > valueCount ||
-                port.out.index == 0 || port.out.index > valueCount ||
-                port.oe.index == 0 || port.oe.index > valueCount)
-            {
-                throw std::runtime_error("GraphView inout port refers to invalid value");
-            }
-        }
-
-        builder.recomputePortFlags();
-
-        for (std::size_t i = 0; i < valueCount; ++i)
-        {
-            const bool viewInput = view.valueIsInput_[i] != 0;
-            if (builder.values_[i].isInput != viewInput)
-            {
-                throw std::runtime_error("GraphView input port flag mismatch");
-            }
-            const bool viewOutput = view.valueIsOutput_[i] != 0;
-            if (builder.values_[i].isOutput != viewOutput)
-            {
-                throw std::runtime_error("GraphView output port flag mismatch");
-            }
-            const bool viewInout = view.valueIsInout_[i] != 0;
-            if (builder.values_[i].isInout != viewInout)
-            {
-                throw std::runtime_error("GraphView inout port flag mismatch");
-            }
-        }
-
-        std::vector<std::vector<ValueUser>> expectedUsers(valueCount);
-        for (std::size_t i = 0; i < opCount; ++i)
-        {
-            const OperationId opId = view.operations_[i];
-            const auto &operands = builder.operations_[i].operands;
-            for (std::size_t operandIndex = 0; operandIndex < operands.size(); ++operandIndex)
-            {
-                const ValueId valueId = operands[operandIndex];
-                expectedUsers[valueId.index - 1].push_back(
-                    ValueUser{opId, static_cast<uint32_t>(operandIndex)});
-            }
-        }
-
-        for (std::size_t i = 0; i < valueCount; ++i)
-        {
-            const ValueId valueId = view.values_[i];
-            auto actualUsers = view.valueUsers(valueId);
-            const auto &expected = expectedUsers[i];
-            if (actualUsers.size() != expected.size())
-            {
-                throw std::runtime_error("GraphView use-list mismatch");
-            }
-            for (std::size_t j = 0; j < expected.size(); ++j)
-            {
-                if (actualUsers[j].operation != expected[j].operation ||
-                    actualUsers[j].operandIndex != expected[j].operandIndex)
-                {
-                    throw std::runtime_error("GraphView use-list mismatch");
-                }
-            }
-        }
-
-        builder.valueUsers_ = std::move(expectedUsers);
-        for (auto& operation : builder.operations_)
-            operation.operandUseIndices.resize(operation.operands.size());
-        for (const auto& users : builder.valueUsers_)
-            for (std::size_t i = 0; i < users.size(); ++i)
-                builder.operations_[builder.opIndex(users[i].operation)]
-                    .operandUseIndices[users[i].operandIndex] = i;
-
-        return builder;
-    }
-
-    ValueId GraphBuilder::addValue(SymbolId sym, int32_t width, bool isSigned, ValueType type,
+    ValueId GraphStore::addValue(SymbolId sym, int32_t width, bool isSigned, ValueType type,
                                    std::span<const int64_t> shape, LogicDomain domain)
     {
-        const LogicalType logical = LogicalType{type, width, isSigned, domain,
-                                                {shape.begin(), shape.end()}}.normalized();
+        // Normalize scalar fields without copying the borrowed shape twice.
+        const LogicalType logical = LogicalType{type, width, isSigned, domain, {}}.normalized();
+        validateValueShape(width, type, shape, "LogicalType");
         width = logical.width;
         isSigned = logical.isSigned;
         domain = logical.domain;
-        if (type == ValueType::Logic && width <= 0)
-        {
-            throw std::runtime_error("Value width must be positive");
-        }
-        if (type != ValueType::Logic && width <= 0)
-        {
-            width = 1;
-        }
-        validateValueShape(width, type, shape, "Value");
         validateSymbol(sym, "Value");
 
         ValueId id;
@@ -1167,19 +1215,20 @@ namespace wolvrix::lib::grh
         id.generation = 0;
         id.graph = graphId_;
         bindSymbol(sym, SymbolKind::kValue, id.index, "Value");
-        ValueData data;
+        auto data = values_.emplace_back();
         data.symbol = sym;
         data.width = width;
         data.isSigned = isSigned;
         data.type = type;
         data.domain = domain;
-        data.shape.assign(shape.begin(), shape.end());
-        values_.push_back(std::move(data));
-        valueUsers_.emplace_back();
+        data.shape.set(shape);
+        valueUsers_.emplace_back(topology_->users);
+        liveValues_.push_back(id);
+        if (graphProfileEnabled()) profileCounters.valueAllocations.fetch_add(1, std::memory_order_relaxed);
         return id;
     }
 
-    OperationId GraphBuilder::addOp(OperationKind kind, SymbolId sym)
+    OperationId GraphStore::addOp(OperationKind kind, SymbolId sym)
     {
         validateSymbol(sym, "Operation");
 
@@ -1188,14 +1237,15 @@ namespace wolvrix::lib::grh
         id.generation = 0;
         id.graph = graphId_;
         bindSymbol(sym, SymbolKind::kOperation, id.index, "Operation");
-        OperationData data;
+        auto data = operations_.emplace_back();
         data.kind = kind;
         data.symbol = sym;
-        operations_.push_back(std::move(data));
+        liveOperations_.push_back(id);
+        if (graphProfileEnabled()) profileCounters.operationAllocations.fetch_add(1, std::memory_order_relaxed);
         return id;
     }
 
-    void GraphBuilder::addOperand(OperationId op, ValueId value)
+    void GraphStore::addOperand(OperationId op, ValueId value)
     {
         const std::size_t opIdx = opIndex(op);
         const std::size_t valIdx = valueIndex(value);
@@ -1212,7 +1262,7 @@ namespace wolvrix::lib::grh
         addValueUser(value, op, operands.size() - 1);
     }
 
-    void GraphBuilder::insertOperand(OperationId op, std::size_t index, ValueId value)
+    void GraphStore::insertOperand(OperationId op, std::size_t index, ValueId value)
     {
         const std::size_t opIdx = opIndex(op);
         const std::size_t valIdx = valueIndex(value);
@@ -1235,7 +1285,7 @@ namespace wolvrix::lib::grh
         addOpUses(op, operands);
     }
 
-    void GraphBuilder::addResult(OperationId op, ValueId value)
+    void GraphStore::addResult(OperationId op, ValueId value)
     {
         const std::size_t opIdx = opIndex(op);
         const std::size_t valIdx = valueIndex(value);
@@ -1247,7 +1297,7 @@ namespace wolvrix::lib::grh
         {
             throw std::runtime_error("ValueId refers to erased value");
         }
-        ValueData &data = values_[valIdx];
+        auto data = values_[valIdx];
         if (data.definingOp.valid())
         {
             auto describeValue = [&](ValueId id) -> std::string {
@@ -1267,7 +1317,7 @@ namespace wolvrix::lib::grh
                     out += " out_of_range";
                     return out;
                 }
-                const ValueData &valueData = values_[idx - 1];
+                const auto valueData = values_[idx - 1];
                 if (symbols_ && valueData.symbol.valid())
                 {
                     out += " (" + std::string(symbols_->text(valueData.symbol)) + ")";
@@ -1282,7 +1332,7 @@ namespace wolvrix::lib::grh
                 {
                     out += " output";
                 }
-                const std::string loc = formatSrcLocForDebug(valueData.srcLoc);
+                const std::string loc = formatSrcLocForDebug(srcLocValue(valueData.srcLoc));
                 if (!loc.empty())
                 {
                     out += " @";
@@ -1307,14 +1357,14 @@ namespace wolvrix::lib::grh
                     out += " out_of_range";
                     return out;
                 }
-                const OperationData &opData = operations_[idx - 1];
+                const auto opData = operations_[idx - 1];
                 out += " kind=";
                 out += std::string(toString(opData.kind));
                 if (symbols_ && opData.symbol.valid())
                 {
                     out += " (" + std::string(symbols_->text(opData.symbol)) + ")";
                 }
-                const std::string loc = formatSrcLocForDebug(opData.srcLoc);
+                const std::string loc = formatSrcLocForDebug(srcLocValue(opData.srcLoc));
                 if (!loc.empty())
                 {
                     out += " @";
@@ -1339,7 +1389,7 @@ namespace wolvrix::lib::grh
         operations_[opIdx].results.push_back(value);
     }
 
-    void GraphBuilder::insertResult(OperationId op, std::size_t index, ValueId value)
+    void GraphStore::insertResult(OperationId op, std::size_t index, ValueId value)
     {
         const std::size_t opIdx = opIndex(op);
         const std::size_t valIdx = valueIndex(value);
@@ -1356,7 +1406,7 @@ namespace wolvrix::lib::grh
         {
             throw std::runtime_error("Result index out of range");
         }
-        ValueData &data = values_[valIdx];
+        auto data = values_[valIdx];
         if (data.definingOp.valid())
         {
             auto describeValue = [&](ValueId id) -> std::string {
@@ -1376,7 +1426,7 @@ namespace wolvrix::lib::grh
                     out += " out_of_range";
                     return out;
                 }
-                const ValueData &valueData = values_[idx - 1];
+                const auto valueData = values_[idx - 1];
                 if (symbols_ && valueData.symbol.valid())
                 {
                     out += " (" + std::string(symbols_->text(valueData.symbol)) + ")";
@@ -1391,7 +1441,7 @@ namespace wolvrix::lib::grh
                 {
                     out += " output";
                 }
-                const std::string loc = formatSrcLocForDebug(valueData.srcLoc);
+                const std::string loc = formatSrcLocForDebug(srcLocValue(valueData.srcLoc));
                 if (!loc.empty())
                 {
                     out += " @";
@@ -1416,14 +1466,14 @@ namespace wolvrix::lib::grh
                     out += " out_of_range";
                     return out;
                 }
-                const OperationData &opData = operations_[idx - 1];
+                const auto opData = operations_[idx - 1];
                 out += " kind=";
                 out += std::string(toString(opData.kind));
                 if (symbols_ && opData.symbol.valid())
                 {
                     out += " (" + std::string(symbols_->text(opData.symbol)) + ")";
                 }
-                const std::string loc = formatSrcLocForDebug(opData.srcLoc);
+                const std::string loc = formatSrcLocForDebug(srcLocValue(opData.srcLoc));
                 if (!loc.empty())
                 {
                     out += " @";
@@ -1448,7 +1498,7 @@ namespace wolvrix::lib::grh
         results.insert(results.begin() + static_cast<std::ptrdiff_t>(index), value);
     }
 
-    void GraphBuilder::replaceOperand(OperationId op, std::size_t index, ValueId value)
+    void GraphStore::replaceOperand(OperationId op, std::size_t index, ValueId value)
     {
         const std::size_t opIdx = opIndex(op);
         const std::size_t valIdx = valueIndex(value);
@@ -1475,7 +1525,7 @@ namespace wolvrix::lib::grh
         addValueUser(value, op, index);
     }
 
-    void GraphBuilder::replaceResult(OperationId op, std::size_t index, ValueId value)
+    void GraphStore::replaceResult(OperationId op, std::size_t index, ValueId value)
     {
         const std::size_t opIdx = opIndex(op);
         if (!operations_[opIdx].alive)
@@ -1518,7 +1568,7 @@ namespace wolvrix::lib::grh
                     out += " out_of_range";
                     return out;
                 }
-                const ValueData &valueData = values_[idx - 1];
+                const auto valueData = values_[idx - 1];
                 if (symbols_ && valueData.symbol.valid())
                 {
                     out += " (" + std::string(symbols_->text(valueData.symbol)) + ")";
@@ -1533,7 +1583,7 @@ namespace wolvrix::lib::grh
                 {
                     out += " output";
                 }
-                const std::string loc = formatSrcLocForDebug(valueData.srcLoc);
+                const std::string loc = formatSrcLocForDebug(srcLocValue(valueData.srcLoc));
                 if (!loc.empty())
                 {
                     out += " @";
@@ -1558,14 +1608,14 @@ namespace wolvrix::lib::grh
                     out += " out_of_range";
                     return out;
                 }
-                const OperationData &opData = operations_[idx - 1];
+                const auto opData = operations_[idx - 1];
                 out += " kind=";
                 out += std::string(toString(opData.kind));
                 if (symbols_ && opData.symbol.valid())
                 {
                     out += " (" + std::string(symbols_->text(opData.symbol)) + ")";
                 }
-                const std::string loc = formatSrcLocForDebug(opData.srcLoc);
+                const std::string loc = formatSrcLocForDebug(srcLocValue(opData.srcLoc));
                 if (!loc.empty())
                 {
                     out += " @";
@@ -1594,12 +1644,12 @@ namespace wolvrix::lib::grh
         results[index] = value;
     }
 
-    void GraphBuilder::replaceAllUses(ValueId from, ValueId to)
+    void GraphStore::replaceAllUses(ValueId from, ValueId to)
     {
         replaceAllUsesInternal(from, to, std::nullopt);
     }
 
-    bool GraphBuilder::eraseOperand(OperationId op, std::size_t index)
+    bool GraphStore::eraseOperand(OperationId op, std::size_t index)
     {
         const std::size_t opIdx = opIndex(op);
         if (!operations_[opIdx].alive)
@@ -1618,7 +1668,7 @@ namespace wolvrix::lib::grh
         return true;
     }
 
-    bool GraphBuilder::eraseResult(OperationId op, std::size_t index)
+    bool GraphStore::eraseResult(OperationId op, std::size_t index)
     {
         const std::size_t opIdx = opIndex(op);
         if (!operations_[opIdx].alive)
@@ -1656,7 +1706,7 @@ namespace wolvrix::lib::grh
         return true;
     }
 
-    bool GraphBuilder::eraseOp(OperationId op)
+    bool GraphStore::eraseOp(OperationId op)
     {
         const std::size_t opIdx = opIndex(op);
         if (!operations_[opIdx].alive)
@@ -1686,10 +1736,12 @@ namespace wolvrix::lib::grh
             unbindSymbol(symbol, SymbolKind::kOperation, static_cast<uint32_t>(opIdx + 1));
         }
         operations_[opIdx].alive = false;
+        markLiveErased(liveOperations_, op);
+        operationsHaveTombstones_ = true;
         return true;
     }
 
-    bool GraphBuilder::eraseOpUnchecked(OperationId op)
+    bool GraphStore::eraseOpUnchecked(OperationId op)
     {
         const std::size_t opIdx = opIndex(op);
         if (!operations_[opIdx].alive)
@@ -1712,10 +1764,12 @@ namespace wolvrix::lib::grh
             unbindSymbol(symbol, SymbolKind::kOperation, static_cast<uint32_t>(opIdx + 1));
         }
         operations_[opIdx].alive = false;
+        markLiveErased(liveOperations_, op);
+        operationsHaveTombstones_ = true;
         return true;
     }
 
-    bool GraphBuilder::eraseOp(OperationId op, std::span<const ValueId> replacementResults)
+    bool GraphStore::eraseOp(OperationId op, std::span<const ValueId> replacementResults)
     {
         const std::size_t opIdx = opIndex(op);
         if (!operations_[opIdx].alive)
@@ -1760,10 +1814,12 @@ namespace wolvrix::lib::grh
             unbindSymbol(symbol, SymbolKind::kOperation, static_cast<uint32_t>(opIdx + 1));
         }
         operations_[opIdx].alive = false;
+        markLiveErased(liveOperations_, op);
+        operationsHaveTombstones_ = true;
         return true;
     }
 
-    bool GraphBuilder::eraseValue(ValueId value)
+    bool GraphStore::eraseValue(ValueId value)
     {
         const std::size_t valIdx = valueIndex(value);
         if (!values_[valIdx].alive)
@@ -1796,10 +1852,12 @@ namespace wolvrix::lib::grh
         }
         valueUsers_[valIdx].clear();
         values_[valIdx].alive = false;
+        markLiveErased(liveValues_, value);
+        valuesHaveTombstones_ = true;
         return true;
     }
 
-    bool GraphBuilder::eraseValueUnchecked(ValueId value)
+    bool GraphStore::eraseValueUnchecked(ValueId value)
     {
         const std::size_t valIdx = valueIndex(value);
         if (!values_[valIdx].alive)
@@ -1827,10 +1885,12 @@ namespace wolvrix::lib::grh
             unbindSymbol(symbol, SymbolKind::kValue, static_cast<uint32_t>(valIdx + 1));
         }
         values_[valIdx].alive = false;
+        markLiveErased(liveValues_, value);
+        valuesHaveTombstones_ = true;
         return true;
     }
 
-    void GraphBuilder::bindPort(std::vector<Port> &ports, std::string_view name, ValueId value, std::string_view context)
+    void GraphStore::bindPort(std::vector<Port> &ports, std::string_view name, ValueId value, std::string_view context)
     {
         if (name.empty())
         {
@@ -1858,7 +1918,7 @@ namespace wolvrix::lib::grh
         recomputePortFlags();
     }
 
-    void GraphBuilder::bindInputPorts(std::span<const Port> ports)
+    void GraphStore::bindInputPorts(std::span<const Port> ports)
     {
         for (const auto &port : ports)
         {
@@ -1889,7 +1949,7 @@ namespace wolvrix::lib::grh
         recomputePortFlags();
     }
 
-    void GraphBuilder::bindOutputPorts(std::span<const Port> ports)
+    void GraphStore::bindOutputPorts(std::span<const Port> ports)
     {
         for (const auto &port : ports)
         {
@@ -1920,7 +1980,7 @@ namespace wolvrix::lib::grh
         recomputePortFlags();
     }
 
-    void GraphBuilder::bindInoutPorts(std::span<const InoutPort> ports)
+    void GraphStore::bindInoutPorts(std::span<const InoutPort> ports)
     {
         for (const auto &port : ports)
         {
@@ -1955,7 +2015,7 @@ namespace wolvrix::lib::grh
         recomputePortFlags();
     }
 
-    void GraphBuilder::bindInoutPort(std::vector<InoutPort> &ports, std::string_view name, ValueId in,
+    void GraphStore::bindInoutPort(std::vector<InoutPort> &ports, std::string_view name, ValueId in,
                                      ValueId out, ValueId oe, std::string_view context)
     {
         if (name.empty())
@@ -1988,7 +2048,7 @@ namespace wolvrix::lib::grh
         recomputePortFlags();
     }
 
-    bool GraphBuilder::removePort(std::vector<Port> &ports, std::string_view name, std::string_view context)
+    bool GraphStore::removePort(std::vector<Port> &ports, std::string_view name, std::string_view context)
     {
         if (name.empty())
         {
@@ -2006,7 +2066,7 @@ namespace wolvrix::lib::grh
         return false;
     }
 
-    bool GraphBuilder::removeInoutPort(std::vector<InoutPort> &ports, std::string_view name, std::string_view context)
+    bool GraphStore::removeInoutPort(std::vector<InoutPort> &ports, std::string_view name, std::string_view context)
     {
         if (name.empty())
         {
@@ -2024,61 +2084,83 @@ namespace wolvrix::lib::grh
         return false;
     }
 
-    void GraphBuilder::bindInputPort(std::string_view name, ValueId value)
+    void GraphStore::bindInputPort(std::string_view name, ValueId value)
     {
         bindPort(inputPorts_, name, value, "Input port");
     }
 
-    void GraphBuilder::bindOutputPort(std::string_view name, ValueId value)
+    void GraphStore::bindOutputPort(std::string_view name, ValueId value)
     {
         bindPort(outputPorts_, name, value, "Output port");
     }
 
-    void GraphBuilder::bindInoutPort(std::string_view name, ValueId in, ValueId out, ValueId oe)
+    void GraphStore::bindInoutPort(std::string_view name, ValueId in, ValueId out, ValueId oe)
     {
         bindInoutPort(inoutPorts_, name, in, out, oe, "Inout port");
     }
 
-    bool GraphBuilder::removeInputPort(std::string_view name)
+    bool GraphStore::removeInputPort(std::string_view name)
     {
         return removePort(inputPorts_, name, "Input port");
     }
 
-    bool GraphBuilder::removeOutputPort(std::string_view name)
+    bool GraphStore::removeOutputPort(std::string_view name)
     {
         return removePort(outputPorts_, name, "Output port");
     }
 
-    bool GraphBuilder::removeInoutPort(std::string_view name)
+    bool GraphStore::removeInoutPort(std::string_view name)
     {
         return removeInoutPort(inoutPorts_, name, "Inout port");
     }
 
-    void GraphBuilder::setAttr(OperationId op, std::string_view key, AttributeValue value)
+    void GraphStore::setAttr(OperationId op, std::string_view key, AttributeValue value)
     {
-        if (!attributeValueIsJsonSerializable(value))
-        {
-            throw std::runtime_error("Attribute value must be JSON-serializable");
-        }
-        const std::size_t opIdx = opIndex(op);
-        if (!operations_[opIdx].alive)
-        {
-            throw std::runtime_error("OperationId refers to erased operation");
-        }
-        auto &attrs = operations_[opIdx].attrs;
-        auto it = std::lower_bound(attrs.begin(), attrs.end(), key,
-                                   [](const AttrKV &attr, std::string_view attrKey) {
-                                       return attr.key < attrKey;
-                                   });
-        if (it != attrs.end() && it->key == key)
-        {
-            it->value = std::move(value);
-            return;
-        }
-        attrs.insert(it, AttrKV{std::string(key), std::move(value)});
+        setAttrView(op, key, AttrValueView(&value));
     }
 
-    void GraphBuilder::setCanonicalNodeAttrs(OperationId op, std::string_view canonicalKey,
+    void GraphStore::setAttrView(OperationId op, std::string_view key, AttrValueView value)
+    {
+        if (!value.valid()) throw std::invalid_argument("invalid attribute value view");
+        if ((value.kind() == AttrValueKind::Double && !std::isfinite(value.asDouble())) ||
+            (value.kind() == AttrValueKind::DoubleList &&
+             std::any_of(value.asDoubleList().begin(), value.asDoubleList().end(),
+                         [](double item) { return !std::isfinite(item); })))
+            throw std::runtime_error("Attribute value must be JSON-serializable");
+        const std::size_t opIdx = opIndex(op);
+        if (!operations_[opIdx].alive) throw std::runtime_error("OperationId refers to erased operation");
+        if (graphProfileEnabled()) {
+            uint64_t bytes = 0;
+            switch (value.kind()) {
+            case AttrValueKind::Bool: bytes = sizeof(bool); break;
+            case AttrValueKind::Int: bytes = sizeof(int64_t); break;
+            case AttrValueKind::Double: bytes = sizeof(double); break;
+            case AttrValueKind::String: bytes = value.asString().size(); break;
+            case AttrValueKind::BoolList: bytes = value.asBoolList().size(); break;
+            case AttrValueKind::IntList: bytes = value.asIntList().size_bytes(); break;
+            case AttrValueKind::DoubleList: bytes = value.asDoubleList().size_bytes(); break;
+            case AttrValueKind::StringList: for (const auto item : value.asStringList()) bytes += item.size(); break;
+            }
+            profileCounters.attributeWrites.fetch_add(1, std::memory_order_relaxed);
+            profileCounters.attributeBytes.fetch_add(key.size() + bytes, std::memory_order_relaxed);
+        }
+        const RecordId record = internAttribute(key, value);
+        setAttrRecord(opIdx, key, record);
+    }
+
+    void GraphStore::setAttrRecord(std::size_t opIdx, std::string_view key, RecordId record)
+    {
+        auto& attrs = operations_[opIdx].attrs;
+        const auto it = std::lower_bound(attrs.begin(), attrs.end(), key,
+            [&](RecordId attr, std::string_view name) { return string(attribute(attr).key) < name; });
+        const auto index = attrs.empty() ? 0 : static_cast<std::size_t>(it - attrs.begin());
+        if (index < attrs.size() && string(attribute(attrs[index]).key) == key)
+            replaceAttribute(attrs[index], record);
+        else
+            attrs.insert(attrs.empty() ? attrs.begin() : attrs.begin() + index, record);
+    }
+
+    void GraphStore::setCanonicalNodeAttrs(OperationId op, std::string_view canonicalKey,
                                              bool root, int64_t rootResult)
     {
         constexpr std::string_view kMembers = "firrtl.node.members";
@@ -2090,7 +2172,7 @@ namespace wolvrix::lib::grh
             throw std::invalid_argument("FIRRTL node identity requires a canonical key");
         }
         const std::size_t opIdx = opIndex(op);
-        auto &operation = operations_[opIdx];
+        auto operation = operations_[opIdx];
         if (!operation.alive)
         {
             throw std::runtime_error("OperationId refers to erased operation");
@@ -2100,18 +2182,31 @@ namespace wolvrix::lib::grh
             throw std::invalid_argument("node root result index out of range");
         }
 
-        // Canonical node writes in FIRRTL lowering target fresh operations. If
-        // a caller supplies an existing attribute list, preserve the generic
-        // replacement semantics and its deterministic ordering.
+        const StringId canonical = internString(canonicalKey);
+        const std::span<const StringId> single(&canonical, 1);
+
+        // Existing attributes retain generic replacement semantics and profile
+        // counts, without materializing owned strings or temporary lists.
         if (!operation.attrs.empty())
         {
-            const std::string owned(canonicalKey);
-            setAttr(op, kMembers, std::vector<std::string>{owned});
-            setAttr(op, kOrigins, std::vector<std::string>{owned});
+            const auto profileWrite = [&](std::string_view key, std::size_t bytes) {
+                if (graphProfileEnabled()) {
+                    profileCounters.attributeWrites.fetch_add(1, std::memory_order_relaxed);
+                    profileCounters.attributeBytes.fetch_add(key.size() + bytes, std::memory_order_relaxed);
+                }
+            };
+            const auto writeStringList = [&](std::string_view key) {
+                profileWrite(key, canonicalKey.size());
+                setAttrRecord(opIdx, key, internStringListAttribute(key, single));
+            };
+            writeStringList(kMembers);
+            writeStringList(kOrigins);
             if (root)
             {
-                setAttr(op, kRoots, std::vector<std::string>{owned});
-                setAttr(op, kRootResults, std::vector<int64_t>{rootResult});
+                writeStringList(kRoots);
+                profileWrite(kRootResults, sizeof(rootResult));
+                setAttrRecord(opIdx, kRootResults,
+                              internIntListAttribute(kRootResults, std::span(&rootResult, 1)));
             }
             else
             {
@@ -2121,32 +2216,27 @@ namespace wolvrix::lib::grh
             return;
         }
 
-        const std::string owned(canonicalKey);
-        auto single = [&]() { return std::vector<std::string>{owned}; };
-        auto &attrs = operation.attrs;
+        auto& attrs = operation.attrs;
         attrs.reserve(root ? 4 : 2);
-        // AttrKV order is canonical and must remain lexicographically sorted;
-        // rootResults sorts before roots because uppercase 'R' precedes 's'.
-        attrs.push_back(AttrKV{std::string(kMembers), single()});
-        attrs.push_back(AttrKV{std::string(kOrigins), single()});
-        if (root)
-        {
-            attrs.push_back(AttrKV{std::string(kRootResults), std::vector<int64_t>{rootResult}});
-            attrs.push_back(AttrKV{std::string(kRoots), single()});
+        attrs.push_back(internStringListAttribute(kMembers, single));
+        attrs.push_back(internStringListAttribute(kOrigins, single));
+        if (root) {
+            attrs.push_back(internIntListAttribute(kRootResults, std::span(&rootResult, 1)));
+            attrs.push_back(internStringListAttribute(kRoots, single));
         }
     }
 
-    void GraphBuilder::setOpKind(OperationId op, OperationKind kind)
+    void GraphStore::setOpKind(OperationId op, OperationKind kind)
     {
         const std::size_t opIdx = opIndex(op);
         if (!operations_[opIdx].alive)
         {
             throw std::runtime_error("OperationId refers to erased operation");
         }
-        operations_[opIdx].kind = kind;
+        operations_.kind_.writableAt(opIdx) = kind;
     }
 
-    bool GraphBuilder::eraseAttr(OperationId op, std::string_view key)
+    bool GraphStore::eraseAttr(OperationId op, std::string_view key)
     {
         const std::size_t opIdx = opIndex(op);
         if (!operations_[opIdx].alive)
@@ -2156,7 +2246,7 @@ namespace wolvrix::lib::grh
         auto &attrs = operations_[opIdx].attrs;
         for (auto it = attrs.begin(); it != attrs.end(); ++it)
         {
-            if (it->key == key)
+            if (string(attribute(*it).key) == key)
             {
                 attrs.erase(it);
                 return true;
@@ -2165,20 +2255,29 @@ namespace wolvrix::lib::grh
         return false;
     }
 
-    void GraphBuilder::setValueSrcLoc(ValueId value, SrcLoc loc)
+    void GraphStore::setValueSrcLoc(ValueId value, SrcLoc loc)
+    {
+        setValueSrcLocView(value, SrcLocView(loc));
+    }
+
+    void GraphStore::setValueSrcLocView(ValueId value, SrcLocView loc)
     {
         const std::size_t valIdx = valueIndex(value);
         if (!values_[valIdx].alive)
         {
             throw std::runtime_error("ValueId refers to erased value");
         }
-        values_[valIdx].srcLoc = std::move(loc);
+        if (graphProfileEnabled()) {
+            profileCounters.srcLocWrites.fetch_add(1, std::memory_order_relaxed);
+            profileCounters.srcLocBytes.fetch_add(srcLocBytes(loc), std::memory_order_relaxed);
+        }
+        values_[valIdx].srcLoc = internSrcLocView(loc);
     }
 
-    void GraphBuilder::setValueShape(ValueId value, std::span<const int64_t> shape)
+    void GraphStore::setValueShape(ValueId value, std::span<const int64_t> shape)
     {
         const std::size_t valIdx = valueIndex(value);
-        ValueData &data = values_[valIdx];
+        auto data = values_[valIdx];
         if (!data.alive)
         {
             throw std::runtime_error("ValueId refers to erased value");
@@ -2188,20 +2287,50 @@ namespace wolvrix::lib::grh
             throw std::runtime_error("Value shape is already set");
         }
         validateValueShape(data.width, data.type, shape, "Value");
-        data.shape.assign(shape.begin(), shape.end());
+        data.shape.set(shape);
     }
 
-    void GraphBuilder::setOpSrcLoc(OperationId op, SrcLoc loc)
+    void GraphStore::setOpSrcLoc(OperationId op, SrcLoc loc)
+    {
+        setOpSrcLocView(op, SrcLocView(loc));
+    }
+
+    void GraphStore::setOpSrcLocView(OperationId op, SrcLocView loc)
     {
         const std::size_t opIdx = opIndex(op);
         if (!operations_[opIdx].alive)
         {
             throw std::runtime_error("OperationId refers to erased operation");
         }
-        operations_[opIdx].srcLoc = std::move(loc);
+        if (graphProfileEnabled()) {
+            profileCounters.srcLocWrites.fetch_add(1, std::memory_order_relaxed);
+            profileCounters.srcLocBytes.fetch_add(srcLocBytes(loc), std::memory_order_relaxed);
+        }
+        operations_[opIdx].srcLoc = internSrcLocView(loc);
     }
 
-    void GraphBuilder::setOpSymbol(OperationId op, SymbolId sym)
+    void GraphStore::setOpAndValueSrcLocView(OperationId op, ValueId value, SrcLocView loc)
+    {
+        const std::size_t opIdx = opIndex(op);
+        if (!operations_[opIdx].alive)
+        {
+            throw std::runtime_error("OperationId refers to erased operation");
+        }
+        const std::size_t valIdx = valueIndex(value);
+        if (!values_[valIdx].alive)
+        {
+            throw std::runtime_error("ValueId refers to erased value");
+        }
+        if (graphProfileEnabled()) {
+            profileCounters.srcLocWrites.fetch_add(2, std::memory_order_relaxed);
+            profileCounters.srcLocBytes.fetch_add(2 * srcLocBytes(loc), std::memory_order_relaxed);
+        }
+        const RecordId record = internSrcLocView(loc);
+        operations_[opIdx].srcLoc = record;
+        values_[valIdx].srcLoc = record;
+    }
+
+    void GraphStore::setOpSymbol(OperationId op, SymbolId sym)
     {
         validateSymbol(sym, "Operation");
         const std::size_t opIdx = opIndex(op);
@@ -2226,7 +2355,7 @@ namespace wolvrix::lib::grh
         operations_[opIdx].symbol = sym;
     }
 
-    void GraphBuilder::setValueSymbol(ValueId value, SymbolId sym)
+    void GraphStore::setValueSymbol(ValueId value, SymbolId sym)
     {
         validateSymbol(sym, "Value");
         const std::size_t valIdx = valueIndex(value);
@@ -2251,316 +2380,17 @@ namespace wolvrix::lib::grh
         values_[valIdx].symbol = sym;
     }
 
-    void GraphBuilder::clearOpSymbol(OperationId op)
+    void GraphStore::clearOpSymbol(OperationId op)
     {
         throw std::runtime_error("Clearing operation symbol is not allowed");
     }
 
-    void GraphBuilder::clearValueSymbol(ValueId value)
+    void GraphStore::clearValueSymbol(ValueId value)
     {
         throw std::runtime_error("Clearing value symbol is not allowed");
     }
 
-    GraphView GraphBuilder::freeze() const
-    {
-        return freezeImpl(nullptr);
-    }
-
-    GraphView GraphBuilder::freezeConsuming()
-    {
-        return freezeImpl(this);
-    }
-
-    GraphView GraphBuilder::freezeImpl(GraphBuilder* consume) const
-    {
-        GraphView view;
-        view.graphId_ = graphId_;
-
-        std::vector<uint32_t> valueRemap(values_.size() + 1, 0);
-        std::vector<uint32_t> opRemap(operations_.size() + 1, 0);
-        std::size_t valueCount = 0;
-        std::size_t opCount = 0;
-        for (std::size_t i = 0; i < values_.size(); ++i)
-        {
-            if (!values_[i].alive)
-            {
-                continue;
-            }
-            valueRemap[i + 1] = static_cast<uint32_t>(++valueCount);
-        }
-        for (std::size_t i = 0; i < operations_.size(); ++i)
-        {
-            if (!operations_[i].alive)
-            {
-                continue;
-            }
-            opRemap[i + 1] = static_cast<uint32_t>(++opCount);
-        }
-
-        auto remapValue = [&](ValueId value) -> ValueId {
-            value.assertGraph(graphId_);
-            if (value.index == 0 || value.index >= valueRemap.size())
-            {
-                throw std::runtime_error("ValueId out of range during freeze");
-            }
-            uint32_t newIndex = valueRemap[value.index];
-            if (newIndex == 0)
-            {
-                throw std::runtime_error("ValueId refers to erased value during freeze");
-            }
-            ValueId remapped;
-            remapped.index = newIndex;
-            remapped.generation = 0;
-            remapped.graph = graphId_;
-            return remapped;
-        };
-
-        auto remapOp = [&](OperationId op) -> OperationId {
-            op.assertGraph(graphId_);
-            if (op.index == 0 || op.index >= opRemap.size())
-            {
-                throw std::runtime_error("OperationId out of range during freeze");
-            }
-            uint32_t newIndex = opRemap[op.index];
-            if (newIndex == 0)
-            {
-                return OperationId::invalid();
-            }
-            OperationId remapped;
-            remapped.index = newIndex;
-            remapped.generation = 0;
-            remapped.graph = graphId_;
-            return remapped;
-        };
-
-        auto portLess = [&](const Port &lhs, const Port &rhs) {
-            return lhs.name < rhs.name;
-        };
-        auto inoutPortLess = [&](const InoutPort &lhs, const InoutPort &rhs) {
-            return lhs.name < rhs.name;
-        };
-
-        auto bindViewSymbol = [&](SymbolId sym, GraphView::SymbolKind kind, uint32_t index, std::string_view context) {
-            if (!sym.valid())
-            {
-                return;
-            }
-            auto [it, inserted] = view.symbolIndex_.emplace(sym.value, GraphView::SymbolBinding{kind, index});
-            if (!inserted)
-            {
-                const char *owner = it->second.kind == GraphView::SymbolKind::kValue ? "value" : "operation";
-                throw std::runtime_error(std::string(context) + " symbol already bound to " + owner);
-            }
-        };
-
-        view.operations_.reserve(opCount);
-        view.opKinds_.reserve(opCount);
-        view.opSymbols_.reserve(opCount);
-        view.opOperandRanges_.reserve(opCount);
-        view.opResultRanges_.reserve(opCount);
-        view.opAttrRanges_.reserve(opCount);
-        view.opSrcLocs_.reserve(opCount);
-
-        std::size_t operandOffset = 0;
-        std::size_t resultOffset = 0;
-        std::size_t attrOffset = 0;
-        for (std::size_t i = 0; i < operations_.size(); ++i)
-        {
-            const OperationData &opData = operations_[i];
-            if (!opData.alive)
-            {
-                continue;
-            }
-            OperationId opId;
-            opId.index = opRemap[i + 1];
-            opId.generation = 0;
-            opId.graph = graphId_;
-
-            view.operations_.push_back(opId);
-            view.opKinds_.push_back(opData.kind);
-            view.opSymbols_.push_back(opData.symbol);
-            if (consume) view.opSrcLocs_.emplace_back();
-            else view.opSrcLocs_.push_back(opData.srcLoc);
-            bindViewSymbol(opData.symbol, GraphView::SymbolKind::kOperation, opId.index, "Operation");
-
-            view.opOperandRanges_.push_back(Range{operandOffset, opData.operands.size()});
-            for (const auto &operand : opData.operands)
-            {
-                view.operands_.push_back(remapValue(operand));
-            }
-            operandOffset += opData.operands.size();
-
-            view.opResultRanges_.push_back(Range{resultOffset, opData.results.size()});
-            for (const auto &result : opData.results)
-            {
-                view.results_.push_back(remapValue(result));
-            }
-            resultOffset += opData.results.size();
-
-            view.opAttrRanges_.push_back(Range{attrOffset, opData.attrs.size()});
-            if (!consume) view.opAttrs_.insert(view.opAttrs_.end(), opData.attrs.begin(), opData.attrs.end());
-            attrOffset += opData.attrs.size();
-        }
-
-        view.values_.reserve(valueCount);
-        view.valueSymbols_.reserve(valueCount);
-        view.valueWidths_.reserve(valueCount);
-        view.valueSigned_.reserve(valueCount);
-        view.valueTypes_.reserve(valueCount);
-        view.valueDomains_.reserve(valueCount);
-        view.valueShapeRanges_.reserve(valueCount);
-        view.valueIsInput_.reserve(valueCount);
-        view.valueIsOutput_.reserve(valueCount);
-        view.valueIsInout_.reserve(valueCount);
-        view.valueDefs_.reserve(valueCount);
-        view.valueUserRanges_.reserve(valueCount);
-        view.valueSrcLocs_.reserve(valueCount);
-
-        for (std::size_t i = 0; i < values_.size(); ++i)
-        {
-            const ValueData &valueData = values_[i];
-            if (!valueData.alive)
-            {
-                continue;
-            }
-            ValueId valueId;
-            valueId.index = valueRemap[i + 1];
-            valueId.generation = 0;
-            valueId.graph = graphId_;
-            view.values_.push_back(valueId);
-            view.valueSymbols_.push_back(valueData.symbol);
-            view.valueWidths_.push_back(valueData.width);
-            view.valueSigned_.push_back(valueData.isSigned ? 1 : 0);
-            view.valueTypes_.push_back(static_cast<uint8_t>(valueData.type));
-            view.valueDomains_.push_back(static_cast<uint8_t>(valueData.domain));
-            view.valueShapeRanges_.push_back(Range{view.valueShapeDims_.size(), valueData.shape.size()});
-            view.valueShapeDims_.insert(view.valueShapeDims_.end(), valueData.shape.begin(),
-                                        valueData.shape.end());
-            view.valueIsInput_.push_back(valueData.isInput ? 1 : 0);
-            view.valueIsOutput_.push_back(valueData.isOutput ? 1 : 0);
-            view.valueIsInout_.push_back(valueData.isInout ? 1 : 0);
-            if (consume) view.valueSrcLocs_.emplace_back();
-            else view.valueSrcLocs_.push_back(valueData.srcLoc);
-            bindViewSymbol(valueData.symbol, GraphView::SymbolKind::kValue, valueId.index, "Value");
-
-            OperationId def = OperationId::invalid();
-            if (valueData.definingOp.valid())
-            {
-                def = remapOp(valueData.definingOp);
-            }
-            view.valueDefs_.push_back(def);
-        }
-
-        // Sort source indices while the builder is intact. The consuming path
-        // prepares mapped ports with empty names, then transfers names only
-        // after all remapping, validation and allocation have succeeded.
-        const auto portOrder = [](const auto& ports) {
-            std::vector<std::size_t> order(ports.size());
-            for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-            std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-                return ports[a].name < ports[b].name;
-            });
-            return order;
-        };
-        std::vector<std::size_t> inputOrder, outputOrder, inoutOrder;
-        if (consume) {
-            inputOrder = portOrder(inputPorts_);
-            outputOrder = portOrder(outputPorts_);
-            inoutOrder = portOrder(inoutPorts_);
-        }
-
-        view.inputPorts_.reserve(inputPorts_.size());
-        if (consume) for (const auto& port : inputPorts_) (void)remapValue(port.value);
-        for (std::size_t i = 0; i < inputPorts_.size(); ++i)
-        {
-            const auto& port = inputPorts_[consume ? inputOrder[i] : i];
-            view.inputPorts_.push_back({consume ? std::string{} : port.name, remapValue(port.value)});
-        }
-        if (!consume) std::sort(view.inputPorts_.begin(), view.inputPorts_.end(), portLess);
-
-        view.outputPorts_.reserve(outputPorts_.size());
-        if (consume) for (const auto& port : outputPorts_) (void)remapValue(port.value);
-        for (std::size_t i = 0; i < outputPorts_.size(); ++i)
-        {
-            const auto& port = outputPorts_[consume ? outputOrder[i] : i];
-            view.outputPorts_.push_back({consume ? std::string{} : port.name, remapValue(port.value)});
-        }
-        if (!consume) std::sort(view.outputPorts_.begin(), view.outputPorts_.end(), portLess);
-
-        view.inoutPorts_.reserve(inoutPorts_.size());
-        if (consume) for (const auto& port : inoutPorts_) {
-            (void)remapValue(port.in); (void)remapValue(port.out); (void)remapValue(port.oe);
-        }
-        for (std::size_t i = 0; i < inoutPorts_.size(); ++i)
-        {
-            const auto& port = inoutPorts_[consume ? inoutOrder[i] : i];
-            view.inoutPorts_.push_back({consume ? std::string{} : port.name,
-                remapValue(port.in), remapValue(port.out), remapValue(port.oe)});
-        }
-        if (!consume) std::sort(view.inoutPorts_.begin(), view.inoutPorts_.end(), inoutPortLess);
-
-        std::vector<std::vector<ValueUser>> users(valueCount);
-        for (std::size_t i = 0; i < operations_.size(); ++i)
-        {
-            const OperationData &opData = operations_[i];
-            if (!opData.alive)
-            {
-                continue;
-            }
-            OperationId opId;
-            opId.index = opRemap[i + 1];
-            opId.generation = 0;
-            opId.graph = graphId_;
-            for (std::size_t operandIndex = 0; operandIndex < opData.operands.size(); ++operandIndex)
-            {
-                const ValueId valueId = remapValue(opData.operands[operandIndex]);
-                const std::size_t valIdx = static_cast<std::size_t>(valueId.index - 1);
-                users[valIdx].push_back(ValueUser{opId, static_cast<uint32_t>(operandIndex)});
-            }
-        }
-
-        std::size_t userOffset = 0;
-        for (const auto &bucket : users)
-        {
-            view.valueUserRanges_.push_back(Range{userOffset, bucket.size()});
-            view.useList_.insert(view.useList_.end(), bucket.begin(), bucket.end());
-            userOffset += bucket.size();
-        }
-
-        if (consume)
-        {
-            // This resize is the final potentially throwing allocation. The
-            // commit below only assigns into preallocated storage using
-            // noexcept moves, so a failed preparation leaves the builder intact.
-            view.opAttrs_.resize(attrOffset);
-            static_assert(std::is_nothrow_move_assignable_v<AttrKV>);
-            static_assert(std::is_nothrow_move_assignable_v<std::optional<SrcLoc>>);
-            static_assert(std::is_nothrow_move_assignable_v<std::string>);
-            static_assert(std::is_nothrow_move_constructible_v<GraphView>);
-            static_assert(std::is_nothrow_move_assignable_v<GraphView>);
-            std::size_t opIndex = 0, attrIndex = 0, valueIndex = 0;
-            for (auto& opData : consume->operations_)
-            {
-                if (!opData.alive) continue;
-                view.opSrcLocs_[opIndex++] = std::move(opData.srcLoc);
-                for (auto& attr : opData.attrs) view.opAttrs_[attrIndex++] = std::move(attr);
-            }
-            for (auto& valueData : consume->values_)
-            {
-                if (valueData.alive) view.valueSrcLocs_[valueIndex++] = std::move(valueData.srcLoc);
-            }
-            for (std::size_t i = 0; i < inputOrder.size(); ++i)
-                view.inputPorts_[i].name = std::move(consume->inputPorts_[inputOrder[i]].name);
-            for (std::size_t i = 0; i < outputOrder.size(); ++i)
-                view.outputPorts_[i].name = std::move(consume->outputPorts_[outputOrder[i]].name);
-            for (std::size_t i = 0; i < inoutOrder.size(); ++i)
-                view.inoutPorts_[i].name = std::move(consume->inoutPorts_[inoutOrder[i]].name);
-        }
-
-        return view;
-    }
-
-    std::size_t GraphBuilder::valueIndex(ValueId value) const
+    std::size_t GraphStore::valueIndex(ValueId value) const
     {
         value.assertGraph(graphId_);
         const std::size_t index = static_cast<std::size_t>(value.index);
@@ -2571,7 +2401,7 @@ namespace wolvrix::lib::grh
         return index - 1;
     }
 
-    std::size_t GraphBuilder::opIndex(OperationId op) const
+    std::size_t GraphStore::opIndex(OperationId op) const
     {
         op.assertGraph(graphId_);
         const std::size_t index = static_cast<std::size_t>(op.index);
@@ -2582,17 +2412,17 @@ namespace wolvrix::lib::grh
         return index - 1;
     }
 
-    bool GraphBuilder::valueAlive(ValueId value) const
+    bool GraphStore::valueAlive(ValueId value) const
     {
         return values_[valueIndex(value)].alive;
     }
 
-    bool GraphBuilder::opAlive(OperationId op) const
+    bool GraphStore::opAlive(OperationId op) const
     {
         return operations_[opIndex(op)].alive;
     }
 
-    std::size_t GraphBuilder::countValueUses(ValueId value, std::optional<OperationId> skipOp) const
+    std::size_t GraphStore::countValueUses(ValueId value, std::optional<OperationId> skipOp) const
     {
         const std::size_t valIdx = valueIndex(value);
         if (!skipOp)
@@ -2611,7 +2441,7 @@ namespace wolvrix::lib::grh
         return count;
     }
 
-    void GraphBuilder::addValueUser(ValueId value, OperationId op, std::size_t operandIndex)
+    void GraphStore::addValueUser(ValueId value, OperationId op, std::size_t operandIndex)
     {
         const std::size_t valIdx = valueIndex(value);
         op.assertGraph(graphId_);
@@ -2625,7 +2455,7 @@ namespace wolvrix::lib::grh
         valueUsers_[valIdx].push_back(ValueUser{op, static_cast<uint32_t>(operandIndex)});
     }
 
-    void GraphBuilder::removeValueUser(ValueId value, OperationId op, std::size_t operandIndex)
+    void GraphStore::removeValueUser(ValueId value, OperationId op, std::size_t operandIndex)
     {
         const std::size_t valIdx = valueIndex(value);
         op.assertGraph(graphId_);
@@ -2646,7 +2476,7 @@ namespace wolvrix::lib::grh
         throw std::runtime_error("Value use-list out of sync while removing user");
     }
 
-    void GraphBuilder::removeOpUses(OperationId op, const std::vector<ValueId> &operands)
+    void GraphStore::removeOpUses(OperationId op, std::span<const ValueId> operands)
     {
         for (std::size_t operandIndex = 0; operandIndex < operands.size(); ++operandIndex)
         {
@@ -2655,7 +2485,7 @@ namespace wolvrix::lib::grh
         operations_[opIndex(op)].operandUseIndices.clear();
     }
 
-    void GraphBuilder::addOpUses(OperationId op, const std::vector<ValueId> &operands)
+    void GraphStore::addOpUses(OperationId op, std::span<const ValueId> operands)
     {
         for (std::size_t operandIndex = 0; operandIndex < operands.size(); ++operandIndex)
         {
@@ -2663,7 +2493,7 @@ namespace wolvrix::lib::grh
         }
     }
 
-    void GraphBuilder::replaceAllUsesInternal(ValueId from, ValueId to, std::optional<OperationId> skipOp)
+    void GraphStore::replaceAllUsesInternal(ValueId from, ValueId to, std::optional<OperationId> skipOp)
     {
         if (from == to)
         {
@@ -2718,10 +2548,11 @@ namespace wolvrix::lib::grh
         }
     }
 
-    void GraphBuilder::recomputePortFlags()
+    void GraphStore::recomputePortFlags()
     {
-        for (auto &value : values_)
+        for (std::size_t valueIndex = 0; valueIndex < values_.size(); ++valueIndex)
         {
+            auto value = values_[valueIndex];
             value.isInput = false;
             value.isOutput = false;
             value.isInout = false;
@@ -2765,7 +2596,7 @@ namespace wolvrix::lib::grh
         }
     }
 
-    void GraphBuilder::validateSymbol(SymbolId sym, std::string_view context) const
+    void GraphStore::validateSymbol(SymbolId sym, std::string_view context) const
     {
         if (!sym.valid())
         {
@@ -2777,7 +2608,7 @@ namespace wolvrix::lib::grh
         }
     }
 
-    void GraphBuilder::bindSymbol(SymbolId sym, SymbolKind kind, uint32_t index, std::string_view context)
+    void GraphStore::bindSymbol(SymbolId sym, SymbolKind kind, uint32_t index, std::string_view context)
     {
         if (!sym.valid())
         {
@@ -2805,7 +2636,7 @@ namespace wolvrix::lib::grh
         }
     }
 
-    void GraphBuilder::unbindSymbol(SymbolId sym, SymbolKind kind, uint32_t index)
+    void GraphStore::unbindSymbol(SymbolId sym, SymbolKind kind, uint32_t index)
     {
         if (!sym.valid())
         {
@@ -3156,6 +2987,14 @@ namespace wolvrix::lib::grh
 
     namespace
     {
+        std::optional<std::size_t> eventEdgeAttrCount(AttrRange attrs)
+        {
+            const auto attr = attrs.find("eventEdge");
+            if (!attr) return std::nullopt;
+            const auto edges = attr->value().get<std::vector<std::string>>();
+            return edges ? std::optional(edges->size()) : std::nullopt;
+        }
+
         std::optional<std::size_t> eventEdgeAttrCount(std::span<const AttrKV> attrs)
         {
             for (const auto &attr : attrs)
@@ -3250,16 +3089,11 @@ namespace wolvrix::lib::grh
                                           eventEdgeAttrCount(op.attrs()));
     }
 
-    std::optional<std::size_t> firstEventOperandIndex(const GraphView &view, OperationId op)
-    {
-        return firstEventOperandIndexImpl(view.opKind(op), view.opOperands(op).size(),
-                                          eventEdgeAttrCount(view.opAttrs(op)));
-    }
 
     std::optional<std::size_t> firstEventOperandIndex(const Graph &graph, OperationId op)
     {
         return firstEventOperandIndexImpl(graph.opKind(op), graph.opOperands(op).size(),
-                                          eventEdgeAttrCount(graph.opAttrs(op)));
+                                          eventEdgeAttrCount(graph.opAttrRange(op)));
     }
 
     std::optional<std::size_t> arrayPortIndexCount(const Operation &op)
@@ -3268,16 +3102,11 @@ namespace wolvrix::lib::grh
                                        eventEdgeAttrCount(op.attrs()));
     }
 
-    std::optional<std::size_t> arrayPortIndexCount(const GraphView &view, OperationId op)
-    {
-        return arrayPortIndexCountImpl(view.opKind(op), view.opOperands(op).size(),
-                                       eventEdgeAttrCount(view.opAttrs(op)));
-    }
 
     std::optional<std::size_t> arrayPortIndexCount(const Graph &graph, OperationId op)
     {
         return arrayPortIndexCountImpl(graph.opKind(op), graph.opOperands(op).size(),
-                                       eventEdgeAttrCount(graph.opAttrs(op)));
+                                       eventEdgeAttrCount(graph.opAttrRange(op)));
     }
 
     std::string_view toString(ValueType type) noexcept
@@ -3361,22 +3190,13 @@ namespace wolvrix::lib::grh
         return kind == ValueType::Logic ? static_cast<int32_t>(width / count) : 1;
     }
 
-    LogicDomain GraphView::valueDomain(ValueId value) const
+    LogicDomain Graph::valueDomain(ValueId id) const
     {
-        const std::size_t index = valueIndex(value);
-        return static_cast<LogicDomain>(valueDomains_.at(index));
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return data.domain;
     }
 
-    LogicDomain Graph::valueDomain(ValueId value) const
-    {
-        if (builder_)
-        {
-            const auto& data = builder_->values_.at(builder_->valueIndex(value));
-            if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
-            return data.domain;
-        }
-        return view().valueDomain(value);
-    }
 
     LogicalType Graph::valueLogicalType(ValueId value) const
     {
@@ -3388,14 +3208,14 @@ namespace wolvrix::lib::grh
     void Graph::setValueLogicalType(ValueId value, const LogicalType& type)
     {
         const LogicalType logical = type.normalized();
-        GraphBuilder& builder = ensureBuilder();
-        auto& data = builder.values_.at(builder.valueIndex(value));
-        if (!data.alive) throw std::runtime_error("Cannot type an erased value");
-        data.width = logical.width;
-        data.isSigned = logical.isSigned;
-        data.type = logical.kind;
-        data.domain = logical.domain;
-        data.shape = logical.shape;
+        GraphStore& builder = mutableStore();
+        const auto index = builder.valueIndex(value);
+        if (!builder.values_.alive_[index]) throw std::runtime_error("Cannot type an erased value");
+        builder.values_.width_.writableAt(index) = logical.width;
+        builder.values_.isSigned_.writableAt(index) = logical.isSigned;
+        builder.values_.type_.writableAt(index) = logical.kind;
+        builder.values_.domain_.writableAt(index) = logical.domain;
+        builder.values_[index].shape = logical.shape;
     }
 
     Value::Value(ValueId id, SymbolId symbol, std::string symbolText, int32_t width, bool isSigned,
@@ -3463,22 +3283,14 @@ namespace wolvrix::lib::grh
         return std::nullopt;
     }
 
-    Graph::Graph(Design &owner, std::string symbol, GraphId graphId)
-        : owner_(&owner),
-          symbol_(std::move(symbol)),
-          graphId_(graphId)
+    Graph::Graph(Design& owner, std::string symbol, GraphId graphId)
+        : owner_(&owner), symbol_(std::move(symbol)), graphId_(graphId),
+          store_(std::make_shared<GraphStore>(symbols_, graphId))
     {
-        if (symbol_.empty())
-        {
-            throw std::invalid_argument("Graph symbol must not be empty");
-        }
-        if (!graphId_.valid())
-        {
-            throw std::invalid_argument("GraphId must be valid");
-        }
-        GraphBuilder builder(symbols_, graphId_);
-        view_ = builder.freeze();
+        if (symbol_.empty()) throw std::invalid_argument("Graph symbol must not be empty");
+        if (!graphId_.valid()) throw std::invalid_argument("GraphId must be valid");
     }
+
 
     std::optional<AttributeValue> Graph::metadata(std::string_view key) const
     {
@@ -3492,6 +3304,7 @@ namespace wolvrix::lib::grh
         if (key.empty() || !attributeValueIsJsonSerializable(value))
             throw std::invalid_argument("Invalid graph metadata");
         owner_->touch();
+        compacted_ = false;
         for (AttrKV& entry : metadata_)
         {
             if (entry.key != key) continue;
@@ -3507,32 +3320,23 @@ namespace wolvrix::lib::grh
                                      [&](const AttrKV& entry) { return entry.key == key; });
         if (it == metadata_.end()) return false;
         owner_->touch();
+        compacted_ = false;
         metadata_.erase(it);
         return true;
     }
 
     SymbolId Graph::internSymbol(std::string_view text)
     {
-        SymbolId existing = symbols_.lookup(text);
-        if (existing.valid())
+        const std::size_t count = symbols_.textById_.size();
+        const SymbolId symbol = symbols_.intern(text);
+        if (symbols_.textById_.size() != count)
         {
-            if (builder_)
-            {
-                if (builder_->symbolIndex_.contains(existing.value))
-                {
-                    return SymbolId::invalid();
-                }
-                return existing;
-            }
-            if (findValue(existing).valid() || findOperation(existing).valid())
-            {
-                return SymbolId::invalid();
-            }
-            return existing;
+            owner_->touch();
+            compacted_ = false;
         }
-        owner_->touch();
-        return symbols_.internFresh(text);
+        return store_->symbolIndex_.contains(symbol.value) ? SymbolId::invalid() : symbol;
     }
+
 
     SymbolId Graph::lookupSymbol(std::string_view text) const
     {
@@ -3559,6 +3363,7 @@ namespace wolvrix::lib::grh
             if (const SymbolId symbol = symbols_.tryInternFresh(candidate); symbol.valid())
             {
                 owner_->touch();
+        compacted_ = false;
                 return symbol;
             }
         }
@@ -3575,6 +3380,7 @@ namespace wolvrix::lib::grh
             if (const SymbolId symbol = symbols_.tryInternFresh(candidate); symbol.valid())
             {
                 owner_->touch();
+        compacted_ = false;
                 return symbol;
             }
         }
@@ -3583,6 +3389,7 @@ namespace wolvrix::lib::grh
     void Graph::addDeclaredSymbol(SymbolId sym)
     {
         owner_->touch();
+        compacted_ = false;
         if (!sym.valid())
         {
             throw std::runtime_error("Declared symbol is invalid");
@@ -3600,6 +3407,7 @@ namespace wolvrix::lib::grh
     bool Graph::removeDeclaredSymbol(SymbolId sym)
     {
         owner_->touch();
+        compacted_ = false;
         if (!sym.valid())
         {
             throw std::runtime_error("Declared symbol is invalid");
@@ -3624,6 +3432,7 @@ namespace wolvrix::lib::grh
     void Graph::clearDeclaredSymbols()
     {
         owner_->touch();
+        compacted_ = false;
         declaredSymbols_.clear();
         declaredSymbolSet_.clear();
     }
@@ -3645,6 +3454,7 @@ namespace wolvrix::lib::grh
     std::size_t Graph::addGenerateGroup(SymbolId scope, SymbolId name)
     {
         owner_->touch();
+        compacted_ = false;
         if (!scope.valid() || !name.valid())
         {
             throw std::runtime_error("Generate group scope/name symbol is invalid");
@@ -3661,6 +3471,7 @@ namespace wolvrix::lib::grh
     void Graph::addGenerateGroupSymbol(std::size_t group, SymbolId symbol)
     {
         owner_->touch();
+        compacted_ = false;
         if (group >= generateGroups_.size())
         {
             throw std::runtime_error("Generate group index out of range");
@@ -3741,102 +3552,56 @@ namespace wolvrix::lib::grh
         generateGroupsBySymbol_.erase(found);
     }
 
+    void Graph::compact()
+    {
+        preparedFlattenFreeze_.reset();
+        if (compacted_) return;
+        owner_->touch();
+        compacted_ = false;
+        store_->compact();
+        ++srcLocEpoch_;
+        compacted_ = true;
+
+    }
+
+    void Graph::compactForFlatten()
+    {
+        if (compacted_) return;
+        compact();
+        preparedFlattenFreeze_ = mutationEpoch_;
+    }
+
+    bool Graph::consumePreparedFlattenFreeze() noexcept
+    {
+        const bool prepared = compacted_ && preparedFlattenFreeze_ == mutationEpoch_;
+        preparedFlattenFreeze_.reset();
+        return prepared;
+    }
+
+
     void Graph::freeze()
     {
-        if (builder_)
-        {
-            owner_->touch();
-            view_ = builder_->freezeConsuming();
-            builder_.reset();
-            invalidateCaches();
-        }
-        if (!view_)
-        {
-            GraphBuilder builder(symbols_, graphId_);
-            view_ = builder.freeze();
-        }
+        compact();
     }
 
-    std::span<const OperationId> Graph::operations() const
-    {
-        if (!builder_)
-        {
-            if (view_)
-            {
-                return view_->operations();
-            }
-            return std::span<const OperationId>();
-        }
-        ensureOperationsCache();
-        return std::span<const OperationId>(operationsCache_.data(), operationsCache_.size());
-    }
+    GraphStore::Stats Graph::payloadStats() const noexcept { return store_->stats(); }
 
-    std::span<const ValueId> Graph::values() const
-    {
-        if (!builder_)
-        {
-            if (view_)
-            {
-                return view_->values();
-            }
-            return std::span<const ValueId>();
-        }
-        ensureValuesCache();
-        return std::span<const ValueId>(valuesCache_.data(), valuesCache_.size());
-    }
 
-    std::span<const Port> Graph::inputPorts() const
-    {
-        if (!builder_)
-        {
-            if (view_)
-            {
-                return view_->inputPorts();
-            }
-            return std::span<const Port>();
-        }
-        ensurePortsCache();
-        return std::span<const Port>(inputPortsCache_.data(), inputPortsCache_.size());
-    }
+    std::span<const OperationId> Graph::operations() const { return store_->operations(); }
 
-    std::span<const Port> Graph::outputPorts() const
-    {
-        if (!builder_)
-        {
-            if (view_)
-            {
-                return view_->outputPorts();
-            }
-            return std::span<const Port>();
-        }
-        ensurePortsCache();
-        return std::span<const Port>(outputPortsCache_.data(), outputPortsCache_.size());
-    }
+    std::span<const ValueId> Graph::values() const { return store_->values(); }
 
-    std::span<const InoutPort> Graph::inoutPorts() const
-    {
-        if (!builder_)
-        {
-            if (view_)
-            {
-                return view_->inoutPorts();
-            }
-            return std::span<const InoutPort>();
-        }
-        ensurePortsCache();
-        return std::span<const InoutPort>(inoutPortsCache_.data(), inoutPortsCache_.size());
-    }
+    std::span<const Port> Graph::inputPorts() const { return store_->inputPorts_; }
+
+    std::span<const Port> Graph::outputPorts() const { return store_->outputPorts_; }
+
+    std::span<const InoutPort> Graph::inoutPorts() const { return store_->inoutPorts_; }
 
     ValueId Graph::createValue(SymbolId symbol, int32_t width, bool isSigned, ValueType type,
                                std::span<const int64_t> shape, LogicDomain domain)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         ValueId id = builder.addValue(symbol, width, isSigned, type, shape, domain);
-        // Incremental update: directly append to cache without full rebuild
-        if (!valuesCacheDirty_)
-        {
-            valuesCache_.push_back(id);
-        }
         return id;
     }
 
@@ -3858,19 +3623,701 @@ namespace wolvrix::lib::grh
 
     OperationId Graph::createOperation(OperationKind kind, SymbolId symbol)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         OperationId id = builder.addOp(kind, symbol);
-        // Incremental update: directly append to cache without full rebuild
-        if (!operationsCacheDirty_)
-        {
-            operationsCache_.push_back(id);
-        }
         return id;
     }
 
     OperationId Graph::createOperation(OperationKind kind)
     {
         return createOperation(kind, makeInternalOpSym());
+    }
+
+    void Graph::appendValueBlock(const Graph& source, std::span<const ValueId> sourceValues,
+                                  std::span<const SymbolId> symbols, std::span<ValueId> output,
+                                  SrcLocImportContext& context, std::size_t threads,
+                                  bool retainSourceColumns)
+    {
+        if (this == &source) throw std::invalid_argument("cannot append a graph block to itself");
+        const std::size_t count = sourceValues.size();
+        if (symbols.size() != count || output.size() != count)
+            throw std::invalid_argument("value block column lengths differ");
+        auto& target = *store_;
+        const auto& input = *source.store_;
+        const std::size_t base = target.values_.size();
+        if (count > std::numeric_limits<uint32_t>::max() - base)
+            throw std::length_error("value block ID capacity");
+        slang::flat_hash_set<uint32_t, std::hash<uint32_t>> bindings;
+        bindings.reserve(count);
+        std::vector<std::size_t> rows(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            rows[i] = input.valueIndex(sourceValues[i]);
+            if (!input.values_[rows[i]].alive) throw std::runtime_error("ValueId refers to erased value");
+            target.validateSymbol(symbols[i], "Value");
+            if (target.symbolIndex_.contains(symbols[i].value) || !bindings.insert(symbols[i].value).second)
+                throw std::invalid_argument("value block symbol already bound");
+        }
+        if (!count) return;
+        mutableStore();
+        std::vector<GraphPayload::RecordId> locations(count), shapes(count);
+        std::vector<GraphPayload::RecordId> shapeMap(input.topology_->shapes.ranges.size(), 0);
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::size_t row = rows[i];
+            locations[i] = importSrcLoc(source, input.values_.srcLoc_[row], context);
+            const auto shape = input.values_.shape_[row];
+            if (shape && !shapeMap[shape])
+                shapeMap[shape] = target.topology_->shapes.intern(input.topology_->shapes.shape(shape));
+            shapes[i] = shapeMap[shape];
+        }
+        target.reserveValues(base + count);
+        target.symbolIndex_.reserve(target.symbolIndex_.size() + count);
+        auto& values = target.values_;
+        const std::size_t size = base + count;
+        values.symbol_.resize(size);
+        if (retainSourceColumns) {
+            auto& sourceColumns = source.store_->values_;
+            values.width_.appendSharedRowsFrom(sourceColumns.width_, rows);
+            values.isSigned_.appendSharedRowsFrom(sourceColumns.isSigned_, rows);
+            values.type_.appendSharedRowsFrom(sourceColumns.type_, rows);
+            values.domain_.appendSharedRowsFrom(sourceColumns.domain_, rows);
+        } else {
+            values.width_.resize(size);
+            values.isSigned_.resize(size);
+            values.type_.resize(size);
+            values.domain_.resize(size);
+        }
+        values.shape_.resize(size);
+        values.isInput_.resize(size, 0);
+        values.isOutput_.resize(size, 0);
+        values.isInout_.resize(size, 0);
+        values.definingOp_.resize(size);
+        values.srcLoc_.resize(size);
+        values.alive_.resize(size, 1);
+        target.valueUsers_.resize(size);
+        target.liveValues_.resize(target.liveValues_.size() + count);
+        const std::size_t liveBase = target.liveValues_.size() - count;
+        for (std::size_t i = 0; i < count; ++i)
+            target.bindSymbol(symbols[i], GraphStore::SymbolKind::kValue,
+                              static_cast<uint32_t>(base + i + 1), "Value");
+        fillBlockRows(count, threads, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t i = begin; i < end; ++i) {
+                const std::size_t from = rows[i], to = base + i;
+                values.symbol_[to] = symbols[i];
+                if (!retainSourceColumns) {
+                    values.width_[to] = input.values_.width_[from];
+                    values.isSigned_[to] = input.values_.isSigned_[from];
+                    values.type_[to] = input.values_.type_[from];
+                    values.domain_[to] = input.values_.domain_[from];
+                }
+                values.shape_[to] = shapes[i];
+                values.srcLoc_[to] = locations[i];
+                target.valueUsers_[to].bind(target.topology_->users);
+                const ValueId id{static_cast<uint32_t>(to + 1), 0, graphId_};
+                output[i] = target.liveValues_[liveBase + i] = id;
+            }
+        });
+        if (graphProfileEnabled()) {
+            profileCounters.valueAllocations.fetch_add(count, std::memory_order_relaxed);
+            for (std::size_t row : rows) {
+                const auto recordId = input.values_.srcLoc_[row];
+                if (!recordId) continue;
+                const auto& loc = input.srcLoc(recordId);
+                profileCounters.srcLocWrites.fetch_add(1, std::memory_order_relaxed);
+                profileCounters.srcLocBytes.fetch_add(input.string(loc.file).size() + input.string(loc.origin).size() +
+                    input.string(loc.pass).size() + input.string(loc.note).size(), std::memory_order_relaxed);
+            }
+        }
+    }
+
+    void Graph::appendOperationBlock(const Graph& source, std::span<const OperationId> sourceOps,
+                                      std::span<const SymbolId> symbols, std::span<OperationId> output,
+                                      SrcLocImportContext& context, std::size_t threads,
+                                      bool retainSourceColumns)
+    {
+        if (this == &source) throw std::invalid_argument("cannot append a graph block to itself");
+        const std::size_t count = sourceOps.size();
+        if (symbols.size() != count || output.size() != count)
+            throw std::invalid_argument("operation block column lengths differ");
+        auto& target = *store_;
+        const auto& input = *source.store_;
+        const std::size_t base = target.operations_.size();
+        if (count > std::numeric_limits<uint32_t>::max() - base)
+            throw std::length_error("operation block ID capacity");
+        slang::flat_hash_set<uint32_t, std::hash<uint32_t>> bindings;
+        bindings.reserve(count);
+        std::vector<std::size_t> rows(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            rows[i] = input.opIndex(sourceOps[i]);
+            if (!input.operations_[rows[i]].alive) throw std::runtime_error("OperationId refers to erased operation");
+            target.validateSymbol(symbols[i], "Operation");
+            if (target.symbolIndex_.contains(symbols[i].value) || !bindings.insert(symbols[i].value).second)
+                throw std::invalid_argument("operation block symbol already bound");
+        }
+        if (!count) return;
+        mutableStore();
+        std::vector<GraphPayload::RecordId> locations(count);
+        for (std::size_t i = 0; i < count; ++i)
+            locations[i] = importSrcLoc(source, input.operations_.srcLoc_[rows[i]], context);
+        target.reserveOperations(base + count);
+        target.symbolIndex_.reserve(target.symbolIndex_.size() + count);
+        auto& operations = target.operations_;
+        const std::size_t size = base + count;
+        if (retainSourceColumns)
+            operations.kind_.appendSharedRowsFrom(source.store_->operations_.kind_, rows);
+        else operations.kind_.resize(size);
+        operations.symbol_.resize(size);
+        operations.operands_.resize(size);
+        operations.operandUseIndices_.resize(size);
+        operations.results_.resize(size);
+        operations.attrs_.resize(size);
+        operations.srcLoc_.resize(size);
+        operations.alive_.resize(size, 1);
+        target.liveOperations_.resize(target.liveOperations_.size() + count);
+        const std::size_t liveBase = target.liveOperations_.size() - count;
+        for (std::size_t i = 0; i < count; ++i)
+            target.bindSymbol(symbols[i], GraphStore::SymbolKind::kOperation,
+                              static_cast<uint32_t>(base + i + 1), "Operation");
+        fillBlockRows(count, threads, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t i = begin; i < end; ++i) {
+                const std::size_t to = base + i;
+                if (!retainSourceColumns) operations.kind_[to] = input.operations_.kind_[rows[i]];
+                operations.symbol_[to] = symbols[i];
+                operations.srcLoc_[to] = locations[i];
+                operations.operands_[to].bind(target.topology_->operands);
+                operations.operandUseIndices_[to].bind(target.topology_->operandUseIndices);
+                operations.results_[to].bind(target.topology_->results);
+                operations.attrs_[to].bind(target.topology_->attrs);
+                const OperationId id{static_cast<uint32_t>(to + 1), 0, graphId_};
+                output[i] = target.liveOperations_[liveBase + i] = id;
+            }
+        });
+        if (graphProfileEnabled()) {
+            profileCounters.operationAllocations.fetch_add(count, std::memory_order_relaxed);
+            for (std::size_t row : rows) {
+                const auto recordId = input.operations_.srcLoc_[row];
+                if (!recordId) continue;
+                const auto& loc = input.srcLoc(recordId);
+                profileCounters.srcLocWrites.fetch_add(1, std::memory_order_relaxed);
+                profileCounters.srcLocBytes.fetch_add(input.string(loc.file).size() + input.string(loc.origin).size() +
+                    input.string(loc.pass).size() + input.string(loc.note).size(), std::memory_order_relaxed);
+            }
+        }
+    }
+
+    void Graph::setOperationBlockEdges(std::span<const OperationId> ops,
+                                        std::span<const uint32_t> operandOffsets,
+                                        std::span<const ValueId> operands,
+                                        std::span<const uint32_t> resultOffsets,
+                                        std::span<const ValueId> results)
+    {
+        const auto validateOffsets = [&](auto offsets, std::size_t count) {
+            if (offsets.size() != ops.size() + 1 || offsets.front() != 0 ||
+                offsets.back() != count || !std::is_sorted(offsets.begin(), offsets.end()))
+                throw std::invalid_argument("invalid operation block edge offsets");
+        };
+        validateOffsets(operandOffsets, operands.size());
+        validateOffsets(resultOffsets, results.size());
+        auto& target = *store_;
+        slang::flat_hash_set<uint32_t, std::hash<uint32_t>> definitions;
+        slang::flat_hash_set<uint32_t, std::hash<uint32_t>> operations;
+        for (OperationId op : ops) {
+            const auto row = target.operations_[target.opIndex(op)];
+            if (!row.alive) throw std::runtime_error("OperationId refers to erased operation");
+            if (!operations.insert(op.index).second)
+                throw std::invalid_argument("duplicate operation in block edges");
+            if (!row.operands.empty() || !row.results.empty())
+                throw std::invalid_argument("operation block edges already set");
+        }
+        for (ValueId value : operands)
+            if (!target.values_[target.valueIndex(value)].alive)
+                throw std::runtime_error("ValueId refers to erased value");
+        for (ValueId value : results) {
+            const auto row = target.values_[target.valueIndex(value)];
+            if (!row.alive) throw std::runtime_error("ValueId refers to erased value");
+            if (row.definingOp.valid() || !definitions.insert(value.index).second)
+                throw std::invalid_argument("operation block result already has defining op");
+        }
+        if (ops.empty()) return;
+        mutableStore();
+        auto& pools = *target.topology_;
+        std::vector<ValueId> savedOperands, savedResults;
+        const auto borrows = [](std::span<const ValueId> input, const std::vector<ValueId>& pool) {
+            const std::less<const ValueId*> before;
+            return !input.empty() && !pool.empty() && !before(input.data(), pool.data()) &&
+                before(input.data(), pool.data() + pool.size());
+        };
+        // Public callers may copy existing edges in this target. Snapshot only
+        // that alias case before range-insert reallocates the underlying pool.
+        if (borrows(operands, pools.operands) || borrows(operands, pools.results)) {
+            savedOperands.assign(operands.begin(), operands.end());
+            operands = savedOperands;
+        }
+        if (borrows(results, pools.operands) || borrows(results, pools.results)) {
+            savedResults.assign(results.begin(), results.end());
+            results = savedResults;
+        }
+        const std::size_t operandBase = pools.operands.size(), resultBase = pools.results.size();
+        pools.operands.insert(pools.operands.end(), operands.begin(), operands.end());
+        pools.results.insert(pools.results.end(), results.begin(), results.end());
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            auto row = target.operations_[ops[i].index - 1];
+            row.operands.bindSlice(pools.operands, operandBase + operandOffsets[i],
+                                   operandOffsets[i + 1] - operandOffsets[i]);
+            row.results.bindSlice(pools.results, resultBase + resultOffsets[i],
+                                  resultOffsets[i + 1] - resultOffsets[i]);
+            for (ValueId result : row.results) {
+                const auto index = result.index - 1;
+                target.values_.definingOp_[index] = ops[i];
+                // addResult inherits an operation's provenance when the value
+                // has none. Bulk definition publication preserves that rule.
+                if (!target.values_.srcLoc_[index] && row.srcLoc)
+                    target.values_.srcLoc_[index] = row.srcLoc;
+            }
+        }
+    }
+
+    void Graph::setOperationBlockResults(std::span<const OperationId> ops,
+                                          std::span<const uint32_t> resultOffsets,
+                                          std::span<const ValueId> results)
+    {
+        const std::vector<uint32_t> noOperands(ops.size() + 1, 0);
+        setOperationBlockEdges(ops, noOperands, {}, resultOffsets, results);
+    }
+
+    void Graph::setOperationBlockOperands(std::span<const OperationId> ops,
+                                           std::span<const uint32_t> operandOffsets,
+                                           std::span<const ValueId> operands)
+    {
+        if (operandOffsets.size() != ops.size() + 1 || operandOffsets.front() != 0 ||
+            operandOffsets.back() != operands.size() ||
+            !std::is_sorted(operandOffsets.begin(), operandOffsets.end()))
+            throw std::invalid_argument("invalid operation block edge offsets");
+        auto& target = *store_;
+        slang::flat_hash_set<uint32_t, std::hash<uint32_t>> seen;
+        for (OperationId op : ops) {
+            const auto row = target.operations_[target.opIndex(op)];
+            if (!row.alive) throw std::runtime_error("OperationId refers to erased operation");
+            if (!seen.insert(op.index).second) throw std::invalid_argument("duplicate operation in block edges");
+            if (!row.operands.empty()) throw std::invalid_argument("operation block operands already set");
+        }
+        for (ValueId value : operands)
+            if (!target.values_[target.valueIndex(value)].alive)
+                throw std::runtime_error("ValueId refers to erased value");
+        if (ops.empty()) return;
+        auto& pool = target.topology_->operands;
+        std::vector<ValueId> saved;
+        const std::less<const ValueId*> before;
+        if (!operands.empty() && !pool.empty() && !before(operands.data(), pool.data()) &&
+            before(operands.data(), pool.data() + pool.size())) {
+            saved.assign(operands.begin(), operands.end());
+            operands = saved;
+        }
+        mutableStore();
+        const std::size_t base = pool.size();
+        pool.insert(pool.end(), operands.begin(), operands.end());
+        for (std::size_t i = 0; i < ops.size(); ++i)
+            target.operations_[ops[i].index - 1].operands.bindSlice(pool, base + operandOffsets[i],
+                operandOffsets[i + 1] - operandOffsets[i]);
+    }
+
+    void Graph::consumeBlockTopology(Graph& source, std::span<const TopologyBlock> blocks,
+                                      std::span<const ValueId> mappedValues)
+    {
+        if (&source == this || source.owner_->findGraph(source.symbol_) != &source)
+            throw std::invalid_argument("topology source must be a distinct published graph");
+        auto& input = *source.store_;
+        auto& target = *store_;
+        auto& fromPools = *input.topology_;
+        auto& toPools = *target.topology_;
+        const auto ownedPool = [&](const std::vector<ValueId>* pool) {
+            if (pool == &fromPools.operands || pool == &fromPools.results) return true;
+            return std::any_of(fromPools.retainedEdges.begin(), fromPools.retainedEdges.end(),
+                [&](const auto& owned) { return owned.get() == pool; });
+        };
+        slang::flat_hash_set<uint32_t, std::hash<uint32_t>> sources, destinations;
+        for (const auto& block : blocks) {
+            if (block.sourceOps.size() != block.targetOps.size())
+                throw std::invalid_argument("topology block column lengths differ");
+            for (std::size_t i = 0; i < block.sourceOps.size(); ++i) {
+                const auto from = input.operations_[input.opIndex(block.sourceOps[i])];
+                const auto to = target.operations_[target.opIndex(block.targetOps[i])];
+                if (!from.alive || !to.alive)
+                    throw std::runtime_error("OperationId refers to erased operation");
+                if (!sources.insert(block.sourceOps[i].index).second ||
+                    !destinations.insert(block.targetOps[i].index).second)
+                    throw std::invalid_argument("duplicate operation in topology blocks");
+                if (!to.operands.empty() || to.results.size() != from.results.size())
+                    throw std::invalid_argument("topology target requires empty operands and published results");
+                if (!ownedPool(from.operands.backingPool()) || !ownedPool(from.results.backingPool()))
+                    throw std::invalid_argument("topology slice has no source owner");
+                for (ValueId value : from.operands) {
+                    if (!input.values_[input.valueIndex(value)].alive || value.index >= mappedValues.size())
+                        throw std::invalid_argument("invalid topology source value");
+                    const auto mapped = mappedValues[value.index];
+                    if (!target.values_[target.valueIndex(mapped)].alive)
+                        throw std::runtime_error("ValueId refers to erased value");
+                }
+            }
+        }
+        // Allocate everything that can fail before consuming the source. The
+        // vector objects stay at stable addresses for their PoolVector slices.
+        const std::string sourceName = source.symbol_;
+        Design* sourceOwner = source.owner_;
+        auto operands = std::make_unique<std::vector<ValueId>>();
+        auto results = std::make_unique<std::vector<ValueId>>();
+        toPools.retainedEdges.reserve(toPools.retainedEdges.size() + fromPools.retainedEdges.size() + 2);
+        mutableStore();
+        *operands = std::move(fromPools.operands);
+        *results = std::move(fromPools.results);
+        const auto relocatePool = [&](const std::vector<ValueId>* pool) -> std::vector<ValueId>& {
+            if (pool == &fromPools.operands) return *operands;
+            if (pool == &fromPools.results) return *results;
+            return *const_cast<std::vector<ValueId>*>(pool);
+        };
+        for (const auto& block : blocks) {
+            for (std::size_t i = 0; i < block.sourceOps.size(); ++i) {
+                const auto fromIndex = block.sourceOps[i].index - 1;
+                const auto toIndex = block.targetOps[i].index - 1;
+                const auto& fromOperands = input.operations_.operands_[fromIndex];
+                const auto& fromResults = input.operations_.results_[fromIndex];
+                auto& toOperands = target.operations_.operands_[toIndex];
+                auto& toResults = target.operations_.results_[toIndex];
+                auto& operandPool = relocatePool(fromOperands.backingPool());
+                auto& resultPool = relocatePool(fromResults.backingPool());
+                for (std::size_t j = 0; j < fromOperands.size(); ++j) {
+                    auto& value = operandPool[fromOperands.offset() + j];
+                    value = mappedValues[value.index];
+                }
+                // Definitions were published before union-find resolved port
+                // aliases. Preserve those result IDs; only uses follow roots.
+                std::copy(toResults.begin(), toResults.end(), resultPool.begin() + fromResults.offset());
+                toOperands.bindSlice(operandPool, fromOperands.offset(), fromOperands.size());
+                toResults.bindSlice(resultPool, fromResults.offset(), fromResults.size());
+            }
+        }
+        toPools.retainedEdges.push_back(std::move(operands));
+        toPools.retainedEdges.push_back(std::move(results));
+        for (auto& pool : fromPools.retainedEdges) toPools.retainedEdges.push_back(std::move(pool));
+        sourceOwner->deleteGraph(sourceName);
+    }
+
+    void Graph::rebuildUseLists()
+    {
+        auto& target = *store_;
+        std::vector<std::size_t> counts(target.values_.size(), 0);
+        std::size_t edges = 0;
+        for (OperationId op : target.operations()) {
+            for (ValueId value : target.operations_[op.index - 1].operands) {
+                const auto row = target.valueIndex(value);
+                if (!target.values_.alive_[row]) throw std::runtime_error("ValueId refers to erased value");
+                ++counts[row];
+                ++edges;
+            }
+        }
+        auto& pools = *target.topology_;
+        pools.users.resize(edges);
+        pools.operandUseIndices.resize(edges);
+        mutableStore();
+        std::size_t offset = 0;
+        for (std::size_t i = 0; i < counts.size(); ++i) {
+            target.valueUsers_[i].bindSlice(pools.users, offset, counts[i]);
+            offset += counts[i];
+            counts[i] = 0;
+        }
+        offset = 0;
+        for (OperationId op : target.operations()) {
+            auto row = target.operations_[op.index - 1];
+            row.operandUseIndices.bindSlice(pools.operandUseIndices, offset, row.operands.size());
+            offset += row.operands.size();
+            for (std::size_t i = 0; i < row.operands.size(); ++i) {
+                const std::size_t value = row.operands[i].index - 1;
+                const std::size_t local = counts[value]++;
+                row.operandUseIndices[i] = local;
+                target.valueUsers_[value][local] = ValueUser{op, static_cast<uint32_t>(i)};
+            }
+        }
+    }
+
+    void Graph::prepareBlockImport(const Graph& source, BlockImportContext& context,
+                                    SrcLocImportContext& locations)
+    {
+        if (this == &source) throw std::invalid_argument("cannot import a graph block from itself");
+        const bool changed = !context.prepared_ ||
+            context.source_.owner_before(source.store_) || source.store_.owner_before(context.source_) ||
+            context.target_.owner_before(store_) || store_.owner_before(context.target_) ||
+            context.sourceEpoch_ != source.srcLocEpoch_ || context.targetEpoch_ != srcLocEpoch_ ||
+            context.sourceMutation_ != source.mutationEpoch_;
+        if (!changed) return;
+        context.prepared_ = false;
+        auto& target = mutableStore();
+        const auto& input = *source.store_;
+        context.strings_ = std::make_shared<const std::vector<GraphPayload::StringId>>(
+            target.stringPool_->retain(*input.stringPool_));
+        const auto remapString = [&](GraphPayload::StringId id) {
+            return id & uint32_t{0x80000000} ? id : context.strings_->at(id);
+        };
+        const auto capacity = [](std::size_t base, std::size_t count) {
+            if (base > std::numeric_limits<uint32_t>::max() ||
+                count > std::numeric_limits<uint32_t>::max() - base)
+                throw std::length_error("block payload pool capacity");
+        };
+        capacity(target.int64Payload_.size(), input.int64Payload_.size());
+        capacity(target.doublePayload_.size(), input.doublePayload_.size());
+        capacity(target.bitPayload_.size(), input.bitPayload_.size());
+        capacity(target.stringListPayload_.size(), input.stringListPayload_.size());
+        const auto ints = target.int64Payload_.share(input.int64Payload_);
+        const auto doubles = target.doublePayload_.share(input.doublePayload_);
+        const auto bits = target.bitPayload_.share(input.bitPayload_);
+        const auto strings = target.stringListPayload_.size();
+        input.stringListPayload_.forEachSegment([&](std::size_t, std::span<const uint32_t> ids) {
+            target.stringListPayload_.appendGenerated(ids.size(), [&](std::size_t i) { return remapString(ids[i]); });
+        });
+        context.attributes_.resize(input.attrKeys_.size());
+        for (std::size_t i = 1; i < context.attributes_.size(); ++i) {
+            auto record = input.attribute(static_cast<GraphPayload::RecordId>(i));
+            record.key = remapString(record.key);
+            std::size_t base = 0;
+            switch (record.kind) {
+            case AttrValueKind::String: record.payload = remapString(static_cast<uint32_t>(record.payload)); break;
+            case AttrValueKind::BoolList: base = bits; break;
+            case AttrValueKind::IntList: base = ints; break;
+            case AttrValueKind::DoubleList: base = doubles; break;
+            case AttrValueKind::StringList: base = strings; break;
+            default: break;
+            }
+            if (record.kind == AttrValueKind::BoolList || record.kind == AttrValueKind::IntList ||
+                record.kind == AttrValueKind::DoubleList || record.kind == AttrValueKind::StringList) {
+                record.slice.offset += static_cast<uint32_t>(base);
+                record.payload = record.slice.offset | (static_cast<uint64_t>(record.slice.count) << 32);
+            }
+            context.attributes_[i] = record;
+        }
+        context.source_ = source.store_;
+        context.target_ = store_;
+        context.sourceEpoch_ = source.srcLocEpoch_;
+        context.targetEpoch_ = srcLocEpoch_;
+        context.sourceMutation_ = source.mutationEpoch_;
+        context.prepared_ = true;
+
+        // Prime provenance's integer text relocation. The first location then
+        // only deduplicates its integer record, never its four long strings.
+        locations.source_ = source.store_;
+        locations.target_ = store_;
+        locations.sourceEpoch_ = source.srcLocEpoch_;
+        locations.targetEpoch_ = srcLocEpoch_;
+        locations.records_.clear();
+        locations.strings_.clear();
+        locations.blockStrings_ = context.strings_;
+    }
+
+    void Graph::appendOperationBlockAttributes(const Graph& source,
+                                               std::span<const OperationId> sourceOps,
+                                               std::span<const OperationId> targetOps,
+                                               BlockImportContext& context)
+    {
+        if (sourceOps.size() != targetOps.size())
+            throw std::invalid_argument("attribute block column lengths differ");
+        if (!context.prepared_ || context.source_.owner_before(source.store_) ||
+            source.store_.owner_before(context.source_) || context.target_.owner_before(store_) ||
+            store_.owner_before(context.target_) || context.sourceEpoch_ != source.srcLocEpoch_ ||
+            context.targetEpoch_ != srcLocEpoch_ || context.sourceMutation_ != source.mutationEpoch_)
+            throw std::invalid_argument("attribute block import context is stale");
+        auto& target = *store_;
+        const auto& input = *source.store_;
+        std::size_t count = 0;
+        slang::flat_hash_set<uint32_t, std::hash<uint32_t>> destinations;
+        for (std::size_t i = 0; i < sourceOps.size(); ++i) {
+            const auto from = input.operations_[input.opIndex(sourceOps[i])];
+            const auto to = target.operations_[target.opIndex(targetOps[i])];
+            if (!from.alive || !to.alive) throw std::runtime_error("OperationId refers to erased operation");
+            if (!destinations.insert(targetOps[i].index).second)
+                throw std::invalid_argument("duplicate operation in attribute block");
+            if (!to.attrs.empty()) throw std::invalid_argument("operation block attributes already set");
+            count += from.attrs.size();
+        }
+        if (count > std::numeric_limits<uint32_t>::max() - target.attrKeys_.size())
+            throw std::length_error("attribute block record capacity");
+        if (!count) return;
+        mutableStore();
+        const auto base = target.attrKeys_.size();
+        target.attrKeys_.resize(base + count);
+        target.attrTags_.resize(base + count);
+        target.attrPayloads_.resize(base + count);
+        auto& ids = target.topology_->attrs;
+        const auto sliceBase = ids.size();
+        ids.resize(sliceBase + count);
+        std::size_t position = 0;
+        for (std::size_t i = 0; i < sourceOps.size(); ++i) {
+            const auto from = input.operations_[sourceOps[i].index - 1];
+            auto to = target.operations_[targetOps[i].index - 1];
+            to.attrs.bindSlice(ids, sliceBase + position, from.attrs.size());
+            for (auto id : from.attrs) {
+                const auto& record = context.attributes_.at(id);
+                target.attrKeys_[base + position] = record.key;
+                target.attrTags_[base + position] = record.kind;
+                target.attrPayloads_[base + position] = record.payload;
+                ids[sliceBase + position] = static_cast<uint32_t>(base + position);
+                ++position;
+            }
+        }
+        if (graphProfileEnabled()) {
+            profileCounters.attributeWrites.fetch_add(count, std::memory_order_relaxed);
+            uint64_t bytes = 0;
+            for (OperationId op : sourceOps) for (auto attr : source.opAttrRange(op)) {
+                bytes += attr.key().size();
+                const auto value = attr.value();
+                switch (value.kind()) {
+                case AttrValueKind::Bool: bytes += sizeof(bool); break;
+                case AttrValueKind::Int: bytes += sizeof(int64_t); break;
+                case AttrValueKind::Double: bytes += sizeof(double); break;
+                case AttrValueKind::String: bytes += value.asString().size(); break;
+                case AttrValueKind::BoolList: bytes += value.asBoolList().size(); break;
+                case AttrValueKind::IntList: bytes += value.asIntList().size_bytes(); break;
+                case AttrValueKind::DoubleList: bytes += value.asDoubleList().size_bytes(); break;
+                case AttrValueKind::StringList: for (auto text : value.asStringList()) bytes += text.size(); break;
+                }
+            }
+            profileCounters.attributeBytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    }
+
+    void Graph::appendOperationBlocksAttributes(std::span<const OperationBlockImport> blocks,
+                                                detail::BlockExecutor& executor)
+    {
+        struct Range {
+            const OperationBlockImport* block;
+            std::size_t recordBase;
+            std::size_t sliceBase;
+            std::size_t count;
+        };
+        std::vector<Range> ranges;
+        ranges.reserve(blocks.size());
+        auto& target = *store_;
+        std::size_t records = 0;
+        slang::flat_hash_set<uint32_t, std::hash<uint32_t>> destinations;
+        for (const auto& block : blocks) {
+            if (!block.source || !block.context || block.source == this ||
+                block.sourceOps.size() != block.targetOps.size())
+                throw std::invalid_argument("invalid operation attribute block");
+            const auto& source = *block.source;
+            const auto& context = *block.context;
+            if (!context.prepared_ || context.source_.owner_before(source.store_) ||
+                source.store_.owner_before(context.source_) || context.target_.owner_before(store_) ||
+                store_.owner_before(context.target_) || context.sourceEpoch_ != source.srcLocEpoch_ ||
+                context.targetEpoch_ != srcLocEpoch_ || context.sourceMutation_ != source.mutationEpoch_)
+                throw std::invalid_argument("attribute block import context is stale");
+            std::size_t count = 0;
+            for (std::size_t i = 0; i < block.sourceOps.size(); ++i) {
+                const auto from = source.store_->operations_[source.store_->opIndex(block.sourceOps[i])];
+                const auto to = target.operations_[target.opIndex(block.targetOps[i])];
+                if (!from.alive || !to.alive) throw std::runtime_error("OperationId refers to erased operation");
+                if (!to.attrs.empty()) throw std::invalid_argument("operation block attributes already set");
+                if (!destinations.insert(block.targetOps[i].index).second)
+                    throw std::invalid_argument("duplicate operation in attribute blocks");
+                count += from.attrs.size();
+            }
+            ranges.push_back({&block, target.attrKeys_.size() + records,
+                               target.topology_->attrs.size() + records, count});
+            records += count;
+        }
+        if (records > std::numeric_limits<uint32_t>::max() - target.attrKeys_.size())
+            throw std::length_error("attribute block record capacity");
+        if (!records) return;
+        mutableStore();
+        target.attrKeys_.resize(target.attrKeys_.size() + records);
+        target.attrTags_.resize(target.attrTags_.size() + records);
+        target.attrPayloads_.resize(target.attrPayloads_.size() + records);
+        target.topology_->attrs.resize(target.topology_->attrs.size() + records);
+        for (const auto& range : ranges) {
+            executor.submit([&, range] {
+                const auto& block = *range.block;
+                const auto& input = *block.source->store_;
+                const auto& prototypes = block.context->attributes_;
+                std::size_t position = 0;
+                auto& ids = target.topology_->attrs;
+                for (std::size_t i = 0; i < block.sourceOps.size(); ++i) {
+                    const auto from = input.operations_[block.sourceOps[i].index - 1];
+                    auto to = target.operations_[block.targetOps[i].index - 1];
+                    to.attrs.bindSlice(ids, range.sliceBase + position, from.attrs.size());
+                    for (auto id : from.attrs) {
+                        const auto& record = prototypes.at(id);
+                        const auto destination = range.recordBase + position;
+                        target.attrKeys_[destination] = record.key;
+                        target.attrTags_[destination] = record.kind;
+                        target.attrPayloads_[destination] = record.payload;
+                        ids[range.sliceBase + position] = static_cast<uint32_t>(destination);
+                        ++position;
+                    }
+                }
+                if (graphProfileEnabled()) {
+                    profileCounters.attributeWrites.fetch_add(range.count, std::memory_order_relaxed);
+                    uint64_t bytes = 0;
+                    for (OperationId op : block.sourceOps) for (auto attr : block.source->opAttrRange(op)) {
+                        bytes += attr.key().size();
+                        const auto value = attr.value();
+                        switch (value.kind()) {
+                        case AttrValueKind::Bool: bytes += sizeof(bool); break;
+                        case AttrValueKind::Int: bytes += sizeof(int64_t); break;
+                        case AttrValueKind::Double: bytes += sizeof(double); break;
+                        case AttrValueKind::String: bytes += value.asString().size(); break;
+                        case AttrValueKind::BoolList: bytes += value.asBoolList().size(); break;
+                        case AttrValueKind::IntList: bytes += value.asIntList().size_bytes(); break;
+                        case AttrValueKind::DoubleList: bytes += value.asDoubleList().size_bytes(); break;
+                        case AttrValueKind::StringList: for (auto text : value.asStringList()) bytes += text.size(); break;
+                        }
+                    }
+                    profileCounters.attributeBytes.fetch_add(bytes, std::memory_order_relaxed);
+                }
+            });
+        }
+        executor.wait();
+    }
+
+    void Graph::setOperationBlockAttr(std::span<const OperationId> ops, std::string_view key,
+                                       AttrValueView value)
+    {
+        if (!value.valid()) throw std::invalid_argument("invalid attribute value view");
+        if ((value.kind() == AttrValueKind::Double && !std::isfinite(value.asDouble())) ||
+            (value.kind() == AttrValueKind::DoubleList &&
+             std::any_of(value.asDoubleList().begin(), value.asDoubleList().end(),
+                         [](double item) { return !std::isfinite(item); })))
+            throw std::runtime_error("Attribute value must be JSON-serializable");
+        for (OperationId op : ops)
+            if (!store_->operations_[store_->opIndex(op)].alive)
+                throw std::runtime_error("OperationId refers to erased operation");
+        if (ops.empty()) return;
+        auto& target = mutableStore();
+        // Use one prototype payload, then duplicate only its fixed record.
+        // Records must be private because replacing an attr edits it in place.
+        const auto prototypeId = target.internAttribute(key, value);
+        const auto prototype = target.attribute(prototypeId);
+        uint64_t bytes = key.size();
+        if (graphProfileEnabled()) {
+            switch (value.kind()) {
+            case AttrValueKind::Bool: bytes += sizeof(bool); break;
+            case AttrValueKind::Int: bytes += sizeof(int64_t); break;
+            case AttrValueKind::Double: bytes += sizeof(double); break;
+            case AttrValueKind::String: bytes += value.asString().size(); break;
+            case AttrValueKind::BoolList: bytes += value.asBoolList().size(); break;
+            case AttrValueKind::IntList: bytes += value.asIntList().size_bytes(); break;
+            case AttrValueKind::DoubleList: bytes += value.asDoubleList().size_bytes(); break;
+            case AttrValueKind::StringList: for (auto text : value.asStringList()) bytes += text.size(); break;
+            }
+        }
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            GraphPayload::RecordId id = prototypeId;
+            if (i) {
+                id = static_cast<GraphPayload::RecordId>(target.attrKeys_.size());
+                target.attrKeys_.push_back(prototype.key);
+                target.attrTags_.push_back(prototype.kind);
+                target.attrPayloads_.push_back(prototype.payload);
+            }
+            target.setAttrRecord(ops[i].index - 1, key, id);
+        }
+        if (graphProfileEnabled()) {
+            profileCounters.attributeWrites.fetch_add(ops.size(), std::memory_order_relaxed);
+            profileCounters.attributeBytes.fetch_add(bytes * ops.size(), std::memory_order_relaxed);
+        }
     }
 
     ValueId Graph::createArray(std::span<const ValueId> elements)
@@ -3909,55 +4356,23 @@ namespace wolvrix::lib::grh
 
     ValueId Graph::findValue(SymbolId symbol) const noexcept
     {
-        if (!symbol.valid())
-        {
+        if (!symbol.valid()) return ValueId::invalid();
+        const auto it = store_->symbolIndex_.find(symbol.value);
+        if (it == store_->symbolIndex_.end() || it->second.kind != GraphStore::SymbolKind::kValue)
             return ValueId::invalid();
-        }
-        if (builder_)
-        {
-            auto it = builder_->symbolIndex_.find(symbol.value);
-            if (it == builder_->symbolIndex_.end() || it->second.kind != GraphBuilder::SymbolKind::kValue)
-            {
-                return ValueId::invalid();
-            }
-            ValueId id;
-            id.index = it->second.index;
-            id.generation = 0;
-            id.graph = graphId_;
-            return id;
-        }
-        if (!view_)
-        {
-            return ValueId::invalid();
-        }
-        return view_->findValue(symbol);
+        return ValueId{it->second.index, 0, graphId_};
     }
+
 
     OperationId Graph::findOperation(SymbolId symbol) const noexcept
     {
-        if (!symbol.valid())
-        {
+        if (!symbol.valid()) return OperationId::invalid();
+        const auto it = store_->symbolIndex_.find(symbol.value);
+        if (it == store_->symbolIndex_.end() || it->second.kind != GraphStore::SymbolKind::kOperation)
             return OperationId::invalid();
-        }
-        if (builder_)
-        {
-            auto it = builder_->symbolIndex_.find(symbol.value);
-            if (it == builder_->symbolIndex_.end() || it->second.kind != GraphBuilder::SymbolKind::kOperation)
-            {
-                return OperationId::invalid();
-            }
-            OperationId id;
-            id.index = it->second.index;
-            id.generation = 0;
-            id.graph = graphId_;
-            return id;
-        }
-        if (!view_)
-        {
-            return OperationId::invalid();
-        }
-        return view_->findOperation(symbol);
+        return OperationId{it->second.index, 0, graphId_};
     }
+
 
     ValueId Graph::findValue(std::string_view symbol) const
     {
@@ -3971,143 +4386,51 @@ namespace wolvrix::lib::grh
 
     SymbolId Graph::valueSymbol(ValueId id) const noexcept
     {
-        if (builder_)
-        {
-            if (id.graph != graphId_ || id.index == 0 || id.index > builder_->values_.size())
-            {
-                return SymbolId::invalid();
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            if (!builder_->values_[idx].alive)
-            {
-                return SymbolId::invalid();
-            }
-            return builder_->values_[idx].symbol;
-        }
-        if (view_)
-        {
-            return view_->valueSymbol(id);
-        }
-        return SymbolId::invalid();
+        if (id.graph != graphId_ || !id.index || id.index > store_->values_.size()) return SymbolId::invalid();
+        const auto data = store_->values_[id.index - 1];
+        return data.alive ? data.symbol : SymbolId::invalid();
     }
+
 
     SymbolId Graph::operationSymbol(OperationId id) const noexcept
     {
-        if (builder_)
-        {
-            if (id.graph != graphId_ || id.index == 0 || id.index > builder_->operations_.size())
-            {
-                return SymbolId::invalid();
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            if (!builder_->operations_[idx].alive)
-            {
-                return SymbolId::invalid();
-            }
-            return builder_->operations_[idx].symbol;
-        }
-        if (view_)
-        {
-            return view_->opSymbol(id);
-        }
-        return SymbolId::invalid();
+        if (id.graph != graphId_ || !id.index || id.index > store_->operations_.size()) return SymbolId::invalid();
+        const auto data = store_->operations_[id.index - 1];
+        return data.alive ? data.symbol : SymbolId::invalid();
     }
+
 
     int32_t Graph::valueWidth(ValueId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->values_.size())
-            {
-                throw std::runtime_error("ValueId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->values_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("ValueId refers to erased value");
-            }
-            return data.width;
-        }
-        if (view_)
-        {
-            return view_->valueWidth(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return data.width;
     }
+
 
     bool Graph::valueSigned(ValueId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->values_.size())
-            {
-                throw std::runtime_error("ValueId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->values_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("ValueId refers to erased value");
-            }
-            return data.isSigned;
-        }
-        if (view_)
-        {
-            return view_->valueSigned(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return data.isSigned;
     }
+
 
     ValueType Graph::valueType(ValueId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->values_.size())
-            {
-                throw std::runtime_error("ValueId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->values_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("ValueId refers to erased value");
-            }
-            return data.type;
-        }
-        if (view_)
-        {
-            return view_->valueType(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return data.type;
     }
+
 
     std::span<const int64_t> Graph::valueShape(ValueId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->values_.size())
-            {
-                throw std::runtime_error("ValueId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->values_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("ValueId refers to erased value");
-            }
-            return data.shape;
-        }
-        if (view_)
-        {
-            return view_->valueShape(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return data.shape;
     }
+
 
     bool Graph::sameValueType(ValueId lhs, ValueId rhs) const
     {
@@ -4120,438 +4443,195 @@ namespace wolvrix::lib::grh
 
     bool Graph::valueIsInput(ValueId id) const
     {
-
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->values_.size())
-            {
-                throw std::runtime_error("ValueId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->values_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("ValueId refers to erased value");
-            }
-            return data.isInput;
-        }
-        if (view_)
-        {
-            return view_->valueIsInput(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return data.isInput;
     }
+
 
     bool Graph::valueIsOutput(ValueId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->values_.size())
-            {
-                throw std::runtime_error("ValueId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->values_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("ValueId refers to erased value");
-            }
-            return data.isOutput;
-        }
-        if (view_)
-        {
-            return view_->valueIsOutput(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return data.isOutput;
     }
+
 
     bool Graph::valueIsInout(ValueId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->values_.size())
-            {
-                throw std::runtime_error("ValueId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->values_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("ValueId refers to erased value");
-            }
-            return data.isInout;
-        }
-        if (view_)
-        {
-            return view_->valueIsInout(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return data.isInout;
     }
+
 
     OperationId Graph::valueDef(ValueId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->values_.size())
-            {
-                throw std::runtime_error("ValueId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->values_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("ValueId refers to erased value");
-            }
-            return data.definingOp;
-        }
-        if (view_)
-        {
-            return view_->valueDef(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return data.definingOp;
     }
+
 
     std::optional<SrcLoc> Graph::valueSrcLoc(ValueId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->values_.size())
-            {
-                throw std::runtime_error("ValueId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->values_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("ValueId refers to erased value");
-            }
-            return data.srcLoc;
-        }
-        if (view_)
-        {
-            return view_->valueSrcLoc(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->values_.at(store_->valueIndex(id));
+        if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+        return store_->srcLocValue(data.srcLoc);
     }
+
 
     OperationKind Graph::opKind(OperationId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->operations_.size())
-            {
-                throw std::runtime_error("OperationId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->operations_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("OperationId refers to erased operation");
-            }
-            return data.kind;
-        }
-        if (view_)
-        {
-            return view_->opKind(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->operations_.at(store_->opIndex(id));
+        if (!data.alive) throw std::runtime_error("OperationId refers to erased operation");
+        return data.kind;
     }
+
 
     std::span<const ValueId> Graph::opOperands(OperationId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->operations_.size())
-            {
-                throw std::runtime_error("OperationId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->operations_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("OperationId refers to erased operation");
-            }
-            return std::span<const ValueId>(data.operands.data(), data.operands.size());
-        }
-        if (view_)
-        {
-            return view_->opOperands(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->operations_.at(store_->opIndex(id));
+        if (!data.alive) throw std::runtime_error("OperationId refers to erased operation");
+        return data.operands;
     }
+
 
     std::span<const ValueId> Graph::opResults(OperationId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->operations_.size())
-            {
-                throw std::runtime_error("OperationId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->operations_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("OperationId refers to erased operation");
-            }
-            return std::span<const ValueId>(data.results.data(), data.results.size());
-        }
-        if (view_)
-        {
-            return view_->opResults(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->operations_.at(store_->opIndex(id));
+        if (!data.alive) throw std::runtime_error("OperationId refers to erased operation");
+        return data.results;
     }
 
-    std::span<const AttrKV> Graph::opAttrs(OperationId id) const
+
+    AttrRange Graph::opAttrs(OperationId id) const { return opAttrRange(id); }
+
+    AttrRange Graph::opAttrRange(OperationId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->operations_.size())
-            {
-                throw std::runtime_error("OperationId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->operations_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("OperationId refers to erased operation");
-            }
-            return std::span<const AttrKV>(data.attrs.data(), data.attrs.size());
-        }
-        if (view_)
-        {
-            return view_->opAttrs(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->operations_.at(store_->opIndex(id));
+        if (!data.alive) throw std::runtime_error("OperationId refers to erased operation");
+        return AttrRange(store_.get(), data.attrs);
     }
 
     std::optional<SrcLoc> Graph::opSrcLoc(OperationId id) const
     {
-        if (builder_)
-        {
-            id.assertGraph(graphId_);
-            if (id.index == 0 || id.index > builder_->operations_.size())
-            {
-                throw std::runtime_error("OperationId out of range");
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            const auto &data = builder_->operations_[idx];
-            if (!data.alive)
-            {
-                throw std::runtime_error("OperationId refers to erased operation");
-            }
-            return data.srcLoc;
-        }
-        if (view_)
-        {
-            return view_->opSrcLoc(id);
-        }
-        throw std::runtime_error("GraphView is not available; freeze the graph first");
+        const auto data = store_->operations_.at(store_->opIndex(id));
+        if (!data.alive) throw std::runtime_error("OperationId refers to erased operation");
+        return store_->srcLocValue(data.srcLoc);
     }
 
-    Value Graph::getValue(ValueId id) const
-    {
-        if (builder_)
-        {
-            return valueFromBuilder(id);
-        }
-        return valueFromView(id);
-    }
+
+    Value Graph::getValue(ValueId id) const { return valueFromStore(id); }
+
 
     std::span<const ValueUser> Graph::valueUsers(ValueId value) const
     {
-        // Match the checked scalar accessors before borrowing storage.
         (void)valueDef(value);
         return valueUsersSpan(value);
     }
 
-    Operation Graph::getOperation(OperationId id) const
-    {
-        if (builder_)
-        {
-            return operationFromBuilder(id);
-        }
-        return operationFromView(id);
-    }
+
+    Operation Graph::getOperation(OperationId id) const { return operationFromStore(id); }
+
 
     void Graph::bindInputPort(std::string_view name, ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.bindInputPort(name, value);
-        // Incremental update: sync cache directly
-        if (!portsCacheDirty_)
-        {
-            inputPortsCache_.clear();
-            inputPortsCache_ = builder.inputPorts_;
-        }
     }
 
     void Graph::bindOutputPort(std::string_view name, ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.bindOutputPort(name, value);
-        // Incremental update: sync cache directly
-        if (!portsCacheDirty_)
-        {
-            outputPortsCache_.clear();
-            outputPortsCache_ = builder.outputPorts_;
-        }
     }
 
     void Graph::bindInoutPort(std::string_view name, ValueId in, ValueId out, ValueId oe)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.bindInoutPort(name, in, out, oe);
-        // Incremental update: sync cache directly
-        if (!portsCacheDirty_)
-        {
-            inoutPortsCache_.clear();
-            inoutPortsCache_ = builder.inoutPorts_;
-        }
     }
 
     void Graph::bindInputPorts(std::span<const Port> ports)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.bindInputPorts(ports);
-        if (!portsCacheDirty_)
-        {
-            inputPortsCache_.clear();
-            inputPortsCache_ = builder.inputPorts_;
-        }
     }
 
     void Graph::bindOutputPorts(std::span<const Port> ports)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.bindOutputPorts(ports);
-        if (!portsCacheDirty_)
-        {
-            outputPortsCache_.clear();
-            outputPortsCache_ = builder.outputPorts_;
-        }
     }
 
     void Graph::bindInoutPorts(std::span<const InoutPort> ports)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.bindInoutPorts(ports);
-        if (!portsCacheDirty_)
-        {
-            inoutPortsCache_.clear();
-            inoutPortsCache_ = builder.inoutPorts_;
-        }
     }
 
     bool Graph::removeInputPort(std::string_view name)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         bool removed = builder.removeInputPort(name);
-        if (removed && !portsCacheDirty_)
-        {
-            inputPortsCache_.clear();
-            inputPortsCache_ = builder.inputPorts_;
-        }
         return removed;
     }
 
     bool Graph::removeOutputPort(std::string_view name)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         bool removed = builder.removeOutputPort(name);
-        if (removed && !portsCacheDirty_)
-        {
-            outputPortsCache_.clear();
-            outputPortsCache_ = builder.outputPorts_;
-        }
         return removed;
     }
 
     bool Graph::removeInoutPort(std::string_view name)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         bool removed = builder.removeInoutPort(name);
-        if (removed && !portsCacheDirty_)
-        {
-            inoutPortsCache_.clear();
-            inoutPortsCache_ = builder.inoutPorts_;
-        }
         return removed;
     }
 
     ValueId Graph::inputPortValue(std::string_view name) const noexcept
     {
-        if (builder_)
-        {
-            return findPortValue(std::span<const Port>(builder_->inputPorts_.data(),
-                                                       builder_->inputPorts_.size()),
-                                 name);
-        }
-        if (!view_)
-        {
-            return ValueId::invalid();
-        }
-        return findPortValue(view_->inputPorts(), name);
+        return findPortValue(std::span<const Port>(store_->inputPorts_), name);
     }
+
 
     ValueId Graph::outputPortValue(std::string_view name) const noexcept
     {
-        if (builder_)
-        {
-            return findPortValue(std::span<const Port>(builder_->outputPorts_.data(),
-                                                       builder_->outputPorts_.size()),
-                                 name);
-        }
-        if (!view_)
-        {
-            return ValueId::invalid();
-        }
-        return findPortValue(view_->outputPorts(), name);
+        return findPortValue(std::span<const Port>(store_->outputPorts_), name);
     }
+
 
     void Graph::addOperand(OperationId op, ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.addOperand(op, value);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::addResult(OperationId op, ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.addResult(op, value);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::insertOperand(OperationId op, std::size_t index, ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.insertOperand(op, index, value);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::insertResult(OperationId op, std::size_t index, ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.insertResult(op, index, value);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::replaceOperand(OperationId op, std::size_t index, ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.replaceOperand(op, index, value);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::guardShapeAlias(ValueId from, ValueId to, std::string_view api)
@@ -4572,17 +4652,15 @@ namespace wolvrix::lib::grh
         // 不在这里做 shape 校验：replaceResult 只改变 op 产出哪个 value，不改变
         // 任何 value 自身的类型（shape 创建即定型，不可变）。op 自身的结果类型
         // 契约由 grh.verify 事后强制。真正的别名通道是 replaceAllUses/eraseOp。
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.replaceResult(op, index, value);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::replaceAllUses(ValueId from, ValueId to)
     {
         guardShapeAlias(from, to, "replaceAllUses");
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.replaceAllUses(from, to);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     ValueId Graph::replaceAllUsesWithView(ValueId from, ValueId to)
@@ -4617,21 +4695,19 @@ namespace wolvrix::lib::grh
 
     bool Graph::eraseOperand(OperationId op, std::size_t index)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         return builder.eraseOperand(op, index);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     bool Graph::eraseResult(OperationId op, std::size_t index)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         return builder.eraseResult(op, index);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     bool Graph::eraseOp(OperationId op)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         SymbolId declaredSymbol;
         if (builder.opAlive(op))
         {
@@ -4646,7 +4722,7 @@ namespace wolvrix::lib::grh
                 removeDeclaredSymbol(declaredSymbol);
             }
             removeSymbolFromGenerateGroups(declaredSymbol);
-            invalidateOperationsCache();
+
         }
         return result;
     }
@@ -4661,7 +4737,7 @@ namespace wolvrix::lib::grh
         {
             guardShapeAlias(results[i], replacementResults[i], "eraseOp");
         }
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         SymbolId declaredSymbol;
         if (builder.opAlive(op))
         {
@@ -4676,14 +4752,14 @@ namespace wolvrix::lib::grh
                 removeDeclaredSymbol(declaredSymbol);
             }
             removeSymbolFromGenerateGroups(declaredSymbol);
-            invalidateOperationsCache();
+
         }
         return result;
     }
 
     bool Graph::eraseOpUnchecked(OperationId op)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         SymbolId declaredSymbol;
         if (builder.opAlive(op))
         {
@@ -4698,14 +4774,14 @@ namespace wolvrix::lib::grh
                 removeDeclaredSymbol(declaredSymbol);
             }
             removeSymbolFromGenerateGroups(declaredSymbol);
-            invalidateOperationsCache();
+
         }
         return result;
     }
 
     bool Graph::eraseValue(ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         SymbolId declaredSymbol;
         if (builder.valueAlive(value))
         {
@@ -4720,14 +4796,14 @@ namespace wolvrix::lib::grh
                 removeDeclaredSymbol(declaredSymbol);
             }
             removeSymbolFromGenerateGroups(declaredSymbol);
-            invalidateValuesCache();
+
         }
         return result;
     }
 
     bool Graph::eraseValueUnchecked(ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         SymbolId declaredSymbol;
         if (builder.valueAlive(value))
         {
@@ -4742,59 +4818,186 @@ namespace wolvrix::lib::grh
                 removeDeclaredSymbol(declaredSymbol);
             }
             removeSymbolFromGenerateGroups(declaredSymbol);
-            invalidateValuesCache();
+
         }
         return result;
     }
 
     void Graph::setAttr(OperationId op, std::string_view key, AttributeValue value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.setAttr(op, key, std::move(value));
-        // No cache invalidation needed - doesn't affect value/op/port lists
+    }
+
+    void Graph::setAttrView(OperationId op, std::string_view key, AttrValueView value)
+    {
+        mutableStore().setAttrView(op, key, value);
     }
 
     void Graph::setCanonicalNodeAttrs(OperationId op, std::string_view canonicalKey,
                                       bool root, int64_t rootResult)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.setCanonicalNodeAttrs(op, canonicalKey, root, rootResult);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::setOpKind(OperationId op, OperationKind kind)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.setOpKind(op, kind);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     bool Graph::eraseAttr(OperationId op, std::string_view key)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         return builder.eraseAttr(op, key);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::setValueSrcLoc(ValueId value, SrcLoc loc)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore(false);
         builder.setValueSrcLoc(value, std::move(loc));
-        // No cache invalidation needed - doesn't affect value/op/port lists
+    }
+
+    void Graph::setValueSrcLocView(ValueId value, SrcLocView loc)
+    {
+        mutableStore(false).setValueSrcLocView(value, loc);
+    }
+
+    GraphPayload::RecordId Graph::importSrcLoc(const Graph& source, GraphPayload::RecordId id,
+                                              SrcLocImportContext& context)
+    {
+        if (!id) return 0;
+        const bool sourceChanged = context.source_.owner_before(source.store_) ||
+            source.store_.owner_before(context.source_) || context.sourceEpoch_ != source.srcLocEpoch_;
+        const bool targetChanged = context.target_.owner_before(store_) ||
+            store_.owner_before(context.target_) || context.targetEpoch_ != srcLocEpoch_;
+        if (sourceChanged || targetChanged) {
+            context.records_.clear();
+            context.strings_.clear();
+            context.blockStrings_.reset();
+            context.source_ = source.store_;
+            context.target_ = store_;
+            context.sourceEpoch_ = source.srcLocEpoch_;
+            context.targetEpoch_ = srcLocEpoch_;
+        }
+        if (id >= context.records_.size()) context.records_.resize(static_cast<std::size_t>(id) + 1);
+        auto& mapped = context.records_[id];
+        if (mapped) return mapped;
+        const auto importString = [&](GraphPayload::StringId sourceId) {
+            if (!sourceId) return GraphPayload::StringId{0};
+            if (context.blockStrings_ && sourceId < context.blockStrings_->size())
+                return (*context.blockStrings_)[sourceId];
+            if (const auto found = context.strings_.find(sourceId); found != context.strings_.end())
+                return found->second;
+            const auto targetId = store_->internString(source.store_->string(sourceId));
+            context.strings_.emplace(sourceId, targetId);
+            return targetId;
+        };
+        auto record = source.store_->srcLoc(id);
+        record.file = importString(record.file);
+        record.origin = importString(record.origin);
+        record.pass = importString(record.pass);
+        record.note = importString(record.note);
+        if (const auto found = store_->srcLocIds_.find(record); found != store_->srcLocIds_.end()) {
+            mapped = found->second;
+        } else {
+            const auto result = static_cast<GraphPayload::RecordId>(store_->srcLocs_.size());
+            store_->srcLocs_.push_back(record);
+            store_->srcLocIds_.emplace(record, result);
+            mapped = result;
+        }
+        return mapped;
+    }
+
+    void Graph::copyValueSrcLoc(ValueId value, const Graph& source, ValueId sourceValue)
+    {
+        copyValueSrcLoc(value, source, sourceValue, nullptr);
+    }
+
+    void Graph::copyValueSrcLoc(ValueId value, const Graph& source, ValueId sourceValue,
+                               SrcLocImportContext& context)
+    {
+        copyValueSrcLoc(value, source, sourceValue, &context);
+    }
+
+    void Graph::copyValueSrcLoc(ValueId value, const Graph& source, ValueId sourceValue,
+                               SrcLocImportContext* context)
+    {
+        const auto sourceData = source.store_->values_.at(source.store_->valueIndex(sourceValue));
+        if (!sourceData.alive) throw std::runtime_error("ValueId refers to erased value");
+        GraphStore& target = mutableStore(false);
+        const std::size_t index = target.valueIndex(value);
+        if (!target.values_[index].alive) throw std::runtime_error("ValueId refers to erased value");
+        const GraphPayload::RecordId sourceId = sourceData.srcLoc;
+        const GraphPayload::RecordId targetId = this == &source
+            ? sourceId : context ? importSrcLoc(source, sourceId, *context)
+                                 : target.importSrcLoc(*source.store_, sourceId);
+        target.values_[index].srcLoc = targetId;
+        if (sourceId && graphProfileEnabled()) {
+            const auto& record = source.store_->srcLoc(sourceId);
+            const uint64_t bytes = source.store_->string(record.file).size() +
+                source.store_->string(record.origin).size() + source.store_->string(record.pass).size() +
+                source.store_->string(record.note).size();
+            profileCounters.srcLocWrites.fetch_add(1, std::memory_order_relaxed);
+            profileCounters.srcLocBytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
     }
 
     void Graph::setValueShape(ValueId value, std::span<const int64_t> shape)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.setValueShape(value, shape);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::setOpSrcLoc(OperationId op, SrcLoc loc)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore(false);
         builder.setOpSrcLoc(op, std::move(loc));
-        // No cache invalidation needed - doesn't affect value/op/port lists
+    }
+
+    void Graph::setOpSrcLocView(OperationId op, SrcLocView loc)
+    {
+        mutableStore(false).setOpSrcLocView(op, loc);
+    }
+
+    void Graph::setOpAndValueSrcLocView(OperationId op, ValueId value, SrcLocView loc)
+    {
+        mutableStore(false).setOpAndValueSrcLocView(op, value, loc);
+    }
+
+    void Graph::copyOpSrcLoc(OperationId op, const Graph& source, OperationId sourceOp)
+    {
+        copyOpSrcLoc(op, source, sourceOp, nullptr);
+    }
+
+    void Graph::copyOpSrcLoc(OperationId op, const Graph& source, OperationId sourceOp,
+                            SrcLocImportContext& context)
+    {
+        copyOpSrcLoc(op, source, sourceOp, &context);
+    }
+
+    void Graph::copyOpSrcLoc(OperationId op, const Graph& source, OperationId sourceOp,
+                            SrcLocImportContext* context)
+    {
+        const auto sourceData = source.store_->operations_.at(source.store_->opIndex(sourceOp));
+        if (!sourceData.alive) throw std::runtime_error("OperationId refers to erased operation");
+        GraphStore& target = mutableStore(false);
+        const std::size_t index = target.opIndex(op);
+        if (!target.operations_[index].alive) throw std::runtime_error("OperationId refers to erased operation");
+        const GraphPayload::RecordId sourceId = sourceData.srcLoc;
+        const GraphPayload::RecordId targetId = this == &source
+            ? sourceId : context ? importSrcLoc(source, sourceId, *context)
+                                 : target.importSrcLoc(*source.store_, sourceId);
+        target.operations_[index].srcLoc = targetId;
+        if (sourceId && graphProfileEnabled()) {
+            const auto& record = source.store_->srcLoc(sourceId);
+            const uint64_t bytes = source.store_->string(record.file).size() +
+                source.store_->string(record.origin).size() + source.store_->string(record.pass).size() +
+                source.store_->string(record.note).size();
+            profileCounters.srcLocWrites.fetch_add(1, std::memory_order_relaxed);
+            profileCounters.srcLocBytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
     }
 
     void Graph::setOpSymbol(OperationId op, SymbolId sym)
@@ -4804,32 +5007,28 @@ namespace wolvrix::lib::grh
         // symbol transplantation (handing the old SymbolId to an equivalent
         // new entity) preserves membership naturally, while a plain rename
         // leaves the old SymbolId's membership untouched.
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.setOpSymbol(op, sym);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::setValueSymbol(ValueId value, SymbolId sym)
     {
         // Only rebinds the value's symbol; same declaredSymbols_/generateGroups_
         // membership contract as setOpSymbol.
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.setValueSymbol(value, sym);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::clearOpSymbol(OperationId op)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.clearOpSymbol(op);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::clearValueSymbol(ValueId value)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.clearValueSymbol(value);
-        // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     void Graph::writeJson(slang::JsonWriter &writer) const
@@ -5078,134 +5277,21 @@ namespace wolvrix::lib::grh
         writer.endObject();
     }
 
-    void Graph::invalidateCaches() const
+    GraphStore& Graph::mutableStore(bool affectsLocalCycles)
     {
-        valuesCacheDirty_ = true;
-        operationsCacheDirty_ = true;
-        portsCacheDirty_ = true;
-    }
-
-    void Graph::invalidateValuesCache() const
-    {
-        valuesCacheDirty_ = true;
-    }
-
-    void Graph::invalidateOperationsCache() const
-    {
-        operationsCacheDirty_ = true;
-    }
-
-    void Graph::invalidatePortsCache() const
-    {
-        portsCacheDirty_ = true;
-    }
-
-    void Graph::ensureCaches() const
-    {
-        ensureValuesCache();
-        ensureOperationsCache();
-        ensurePortsCache();
-    }
-
-    void Graph::ensureValuesCache() const
-    {
-        if (!valuesCacheDirty_)
-        {
-            return;
-        }
-        valuesCache_.clear();
-        if (builder_)
-        {
-            const auto &values = builder_->values_;
-            valuesCache_.reserve(values.size());
-            for (std::size_t i = 0; i < values.size(); ++i)
-            {
-                if (!values[i].alive)
-                {
-                    continue;
-                }
-                ValueId id;
-                id.index = static_cast<uint32_t>(i + 1);
-                id.generation = 0;
-                id.graph = graphId_;
-                valuesCache_.push_back(id);
-            }
-        }
-        valuesCacheDirty_ = false;
-    }
-
-    void Graph::ensureOperationsCache() const
-    {
-        if (!operationsCacheDirty_)
-        {
-            return;
-        }
-        operationsCache_.clear();
-        if (builder_)
-        {
-            const auto &ops = builder_->operations_;
-            operationsCache_.reserve(ops.size());
-            for (std::size_t i = 0; i < ops.size(); ++i)
-            {
-                if (!ops[i].alive)
-                {
-                    continue;
-                }
-                OperationId id;
-                id.index = static_cast<uint32_t>(i + 1);
-                id.generation = 0;
-                id.graph = graphId_;
-                operationsCache_.push_back(id);
-            }
-        }
-        operationsCacheDirty_ = false;
-    }
-
-    void Graph::ensurePortsCache() const
-    {
-        if (!portsCacheDirty_)
-        {
-            return;
-        }
-        inputPortsCache_.clear();
-        outputPortsCache_.clear();
-        inoutPortsCache_.clear();
-        if (builder_)
-        {
-            inputPortsCache_ = builder_->inputPorts_;
-            outputPortsCache_ = builder_->outputPorts_;
-            inoutPortsCache_ = builder_->inoutPorts_;
-        }
-        portsCacheDirty_ = false;
-    }
-
-    GraphBuilder &Graph::ensureBuilder()
-    {
+        const bool preserveProof = !affectsLocalCycles && localCyclesChecked();
         owner_->touch();
-        if (builder_)
-        {
-            return *builder_;
-        }
-        if (view_)
-        {
-            builder_ = GraphBuilder::fromView(*view_, symbols_);
-            view_.reset();
-        }
-        else
-        {
-            builder_.emplace(symbols_, graphId_);
-        }
-        invalidateCaches();
-        return *builder_;
+        compacted_ = false;
+        ++mutationEpoch_;
+        if (preserveProof) localCycleProof_ = mutationEpoch_;
+        return *store_;
     }
+
 
     void Graph::reserveSymbolCapacity(std::size_t count)
     {
         symbols_.reserve(count);
-        if (builder_)
-        {
-            builder_->reserveSymbols(count);
-        }
+        store_->reserveSymbols(count);
     }
 
     void Graph::reserveDeclaredSymbolCapacity(std::size_t count)
@@ -5216,85 +5302,40 @@ namespace wolvrix::lib::grh
 
     void Graph::reserveValueCapacity(std::size_t count)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.reserveValues(count);
-        if (!valuesCacheDirty_)
-        {
-            valuesCache_.reserve(count);
-        }
     }
 
     void Graph::reserveOperationCapacity(std::size_t count)
     {
-        GraphBuilder &builder = ensureBuilder();
+        GraphStore &builder = mutableStore();
         builder.reserveOperations(count);
-        if (!operationsCacheDirty_)
-        {
-            operationsCache_.reserve(count);
-        }
     }
 
     void Graph::reserveOpOperandCapacity(OperationId op, std::size_t count)
     {
-        ensureBuilder().reserveOpOperands(op, count);
+        mutableStore().reserveOpOperands(op, count);
     }
 
     void Graph::reserveOpResultCapacity(OperationId op, std::size_t count)
     {
-        ensureBuilder().reserveOpResults(op, count);
+        mutableStore().reserveOpResults(op, count);
     }
 
     void Graph::reserveOpAttrCapacity(OperationId op, std::size_t count)
     {
-        ensureBuilder().reserveOpAttrs(op, count);
+        mutableStore().reserveOpAttrs(op, count);
     }
 
-    const GraphView &Graph::view() const
+    Value Graph::valueFromStore(ValueId id) const
     {
-        if (!view_)
-        {
-            throw std::runtime_error("GraphView is not available; freeze the graph first");
-        }
-        return *view_;
-    }
-
-    Value Graph::valueFromView(ValueId id) const
-    {
-        const GraphView &graphView = view();
         id.assertGraph(graphId_);
-        SymbolId symbol = graphView.valueSymbol(id);
-        std::string symbolText = symbolTextOrEmpty(symbols_, symbol);
-        return Value(id,
-                     symbol,
-                     std::move(symbolText),
-                     graphView.valueWidth(id),
-                     graphView.valueSigned(id),
-                     graphView.valueType(id),
-                     graphView.valueDomain(id),
-                     std::vector<int64_t>(graphView.valueShape(id).begin(), graphView.valueShape(id).end()),
-                     graphView.valueIsInput(id),
-                     graphView.valueIsOutput(id),
-                     graphView.valueIsInout(id),
-                     graphView.valueDef(id),
-                     std::span<const ValueUser>(),
-                     graphView.valueSrcLoc(id),
-                     this,
-                     false);
-    }
-
-    Value Graph::valueFromBuilder(ValueId id) const
-    {
-        if (!builder_)
-        {
-            throw std::runtime_error("GraphBuilder is not available");
-        }
-        id.assertGraph(graphId_);
-        if (id.index == 0 || id.index > builder_->values_.size())
+        if (id.index == 0 || id.index > store_->values_.size())
         {
             throw std::runtime_error("ValueId out of range");
         }
         const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-        const auto &data = builder_->values_[idx];
+        const auto data = store_->values_[idx];
         if (!data.alive)
         {
             throw std::runtime_error("ValueId refers to erased value");
@@ -5314,40 +5355,20 @@ namespace wolvrix::lib::grh
                      data.isInout,
                      data.definingOp,
                      std::span<const ValueUser>(),
-                     data.srcLoc,
+                     store_->srcLocValue(data.srcLoc),
                      this,
                      false);
     }
 
-    Operation Graph::operationFromView(OperationId id) const
+    Operation Graph::operationFromStore(OperationId id) const
     {
-        const GraphView &graphView = view();
         id.assertGraph(graphId_);
-        SymbolId symbol = graphView.opSymbol(id);
-        std::string symbolText = symbolTextOrEmpty(symbols_, symbol);
-        return Operation(id,
-                         graphView.opKind(id),
-                         symbol,
-                         std::move(symbolText),
-                         std::vector<ValueId>(graphView.opOperands(id).begin(), graphView.opOperands(id).end()),
-                         std::vector<ValueId>(graphView.opResults(id).begin(), graphView.opResults(id).end()),
-                         std::vector<AttrKV>(graphView.opAttrs(id).begin(), graphView.opAttrs(id).end()),
-                         graphView.opSrcLoc(id));
-    }
-
-    Operation Graph::operationFromBuilder(OperationId id) const
-    {
-        if (!builder_)
-        {
-            throw std::runtime_error("GraphBuilder is not available");
-        }
-        id.assertGraph(graphId_);
-        if (id.index == 0 || id.index > builder_->operations_.size())
+        if (id.index == 0 || id.index > store_->operations_.size())
         {
             throw std::runtime_error("OperationId out of range");
         }
         const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-        const auto &data = builder_->operations_[idx];
+        const auto data = store_->operations_[idx];
         if (!data.alive)
         {
             throw std::runtime_error("OperationId refers to erased operation");
@@ -5360,32 +5381,23 @@ namespace wolvrix::lib::grh
                          std::move(symbolText),
                          data.operands,
                          data.results,
-                         data.attrs,
-                         data.srcLoc);
+                         [&] {
+                             std::vector<AttrKV> attrs;
+                             attrs.reserve(data.attrs.size());
+                             for (const auto attr : opAttrRange(id))
+                                 attrs.push_back({std::string(attr.key()), attr.value().toOwned()});
+                             return attrs;
+                         }(),
+                         store_->srcLocValue(data.srcLoc));
     }
 
     std::span<const ValueUser> Graph::valueUsersSpan(ValueId id) const noexcept
     {
-        if (builder_)
-        {
-            if (id.graph != graphId_ || id.index == 0 || id.index > builder_->valueUsers_.size())
-            {
-                return {};
-            }
-            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
-            if (idx >= builder_->values_.size() || !builder_->values_[idx].alive)
-            {
-                return {};
-            }
-            const auto &users = builder_->valueUsers_[idx];
-            return std::span<const ValueUser>(users.data(), users.size());
-        }
-        if (view_)
-        {
-            return view_->valueUsers(id);
-        }
-        return {};
+        if (id.graph != graphId_ || !id.index || id.index > store_->valueUsers_.size()) return {};
+        if (!store_->values_[id.index - 1].alive) return {};
+        return store_->valueUsers_[id.index - 1];
     }
+
 
     Graph &Design::addGraphInternal(std::unique_ptr<Graph> graph)
     {
@@ -5507,7 +5519,7 @@ namespace wolvrix::lib::grh
         GraphId graphId = designSymbols_.allocateGraphId(graphSymbol);
         auto instance = std::make_unique<Graph>(*this, std::move(newName), graphId);
         Graph &clone = addGraphInternal(std::move(instance));
-        cloneGraphContents(*source, clone);
+        source->cloneContentsTo(clone);
 
         return clone;
     }
@@ -5515,7 +5527,7 @@ namespace wolvrix::lib::grh
     Graph &Design::importGraph(const Graph &source, std::string newName)
     {
         Graph &destination = createGraph(std::move(newName));
-        cloneGraphContents(source, destination);
+        source.cloneContentsTo(destination);
         return destination;
     }
 
@@ -5530,7 +5542,7 @@ namespace wolvrix::lib::grh
                 throw std::runtime_error("Graph not found during design clone: " + name);
             }
             Graph &dest = cloned.createGraph(name);
-            cloneGraphContents(*source, dest);
+            source->cloneContentsTo(dest);
         }
 
         for (const auto &name : graphOrder_)

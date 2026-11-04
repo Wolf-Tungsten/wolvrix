@@ -167,9 +167,9 @@ void applyAnnotations(const Source&, const Module& module, const AnnotationIndex
             if (graph.opKind(op) != grh::OperationKind::kRegister) continue;
             const auto symbol = graph.operationSymbol(op);
             anchors[graph.symbolText(symbol)].push_back(symbol);
-            for (const auto& attribute : graph.opAttrs(op)) {
-                if (attribute.key != "firrtl.memory") continue;
-                if (const auto name = std::get_if<std::string>(&attribute.value)) anchors[*name].push_back(symbol);
+            for (const auto& attribute : graph.opAttrRange(op)) {
+                if (attribute.key() != "firrtl.memory") continue;
+                if (const auto name = attribute.value().get<std::string>()) anchors[*name].push_back(symbol);
             }
         }
     }

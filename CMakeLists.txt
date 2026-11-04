@@ -48,6 +48,7 @@ file(MAKE_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 option(SLANG_USE_MIMALLOC "Use mimalloc for global C++ allocations" ON)
 set(WOLVRIX_MIMALLOC_GENERIC_COLLECT "1000000" CACHE STRING
     "Generic allocation slow paths between bundled mimalloc whole-heap scans")
+option(WOLVRIX_MIMALLOC_STATS "Count bundled mimalloc allocations for diagnostic runs" OFF)
 add_subdirectory(external/slang)
 
 option(WOLVRIX_MTKAHYPAR_BUILD_SHARED "Build vendored mt-kahypar as a shared library" OFF)
@@ -186,6 +187,7 @@ target_link_libraries(wolvrix-lib
 
 # Only change defaults on our private, bundled allocator. A shared or imported
 # mimalloc can already be in use by other threads in an embedding application.
+set(WOLVRIX_HAVE_MIMALLOC_STATS OFF)
 if (SLANG_USE_MIMALLOC AND TARGET mimalloc-static)
     get_target_property(WOLVRIX_SLANG_LINK_LIBRARIES slang::slang LINK_LIBRARIES)
     get_target_property(WOLVRIX_MIMALLOC_IMPORTED mimalloc-static IMPORTED)
@@ -197,7 +199,15 @@ if (SLANG_USE_MIMALLOC AND TARGET mimalloc-static)
         target_compile_definitions(wolvrix-lib PRIVATE
             WOLVRIX_BUNDLED_MIMALLOC_DEFAULTS
             WOLVRIX_MIMALLOC_GENERIC_COLLECT=${WOLVRIX_MIMALLOC_GENERIC_COLLECT})
+        if (WOLVRIX_MIMALLOC_STATS)
+            target_compile_definitions(mimalloc-static PRIVATE MI_STAT=1)
+            target_compile_definitions(wolvrix-lib PRIVATE WOLVRIX_MIMALLOC_STATS)
+            set(WOLVRIX_HAVE_MIMALLOC_STATS ON)
+        endif()
     endif()
+endif()
+if (WOLVRIX_MIMALLOC_STATS AND NOT WOLVRIX_HAVE_MIMALLOC_STATS)
+    message(FATAL_ERROR "WOLVRIX_MIMALLOC_STATS requires the bundled static mimalloc allocator")
 endif()
 
 if (WOLVRIX_HAVE_MT_KAHYPAR)
@@ -329,6 +339,41 @@ file(MAKE_DIRECTORY "${EMIT_ARTIFACT_DIR}")
 function(register_test_exe target_name)
     add_test(NAME "${target_name}" COMMAND $<TARGET_FILE:${target_name}>)
 endfunction()
+
+# Explicit diagnostic target; allocation budgets are observations, not CTests.
+add_executable(grh-allocation-bench EXCLUDE_FROM_ALL tests/grh/bench_grh_allocations.cpp)
+target_link_libraries(grh-allocation-bench PRIVATE wolvrix-lib)
+
+# The same public-API mutation oracle runs in two independent processes. The
+# archived target must never inherit current GRH headers or link current GRH.
+add_executable(grh-storage-oracle EXCLUDE_FROM_ALL tests/grh/grh_storage_oracle.cpp)
+target_link_libraries(grh-storage-oracle PRIVATE wolvrix-lib ${CMAKE_DL_LIBS})
+set(WOLVRIX_GRH_ORACLE_LEGACY_SOURCE "" CACHE PATH "Archived GRH source for the F17 oracle")
+set(WOLVRIX_GRH_ORACLE_LEGACY_NATIVE "" CACHE PATH "Archived native libraries for the F17 oracle")
+if (WOLVRIX_GRH_ORACLE_LEGACY_SOURCE AND WOLVRIX_GRH_ORACLE_LEGACY_NATIVE)
+    if (NOT EXISTS "${WOLVRIX_GRH_ORACLE_LEGACY_SOURCE}/include/core/grh.hpp" OR
+        NOT EXISTS "${WOLVRIX_GRH_ORACLE_LEGACY_NATIVE}/libwolvrix-lib.so")
+        message(FATAL_ERROR "The GRH oracle requires archived headers and libwolvrix-lib.so")
+    endif()
+    add_library(grh-oracle-legacy-library SHARED IMPORTED)
+    set_target_properties(grh-oracle-legacy-library PROPERTIES
+        IMPORTED_LOCATION "${WOLVRIX_GRH_ORACLE_LEGACY_NATIVE}/libwolvrix-lib.so")
+    add_executable(grh-storage-oracle-legacy EXCLUDE_FROM_ALL tests/grh/grh_storage_oracle.cpp)
+    target_include_directories(grh-storage-oracle-legacy PRIVATE
+        "${WOLVRIX_GRH_ORACLE_LEGACY_SOURCE}/include")
+    # StoreDiagnostics exposes slang types. Copy only header usage requirements,
+    # including vendored Boost's single-header macro, without linking a second
+    # slang/allocator implementation into the archived executable.
+    foreach(header_target slang::slang fmt::fmt Boost::headers)
+        target_include_directories(grh-storage-oracle-legacy SYSTEM PRIVATE
+            "$<TARGET_PROPERTY:${header_target},INTERFACE_INCLUDE_DIRECTORIES>")
+        target_compile_definitions(grh-storage-oracle-legacy PRIVATE
+            "$<TARGET_PROPERTY:${header_target},INTERFACE_COMPILE_DEFINITIONS>")
+    endforeach()
+    target_link_libraries(grh-storage-oracle-legacy PRIVATE grh-oracle-legacy-library ${CMAKE_DL_LIBS})
+    set_target_properties(grh-storage-oracle-legacy PROPERTIES
+        BUILD_RPATH "${WOLVRIX_GRH_ORACLE_LEGACY_NATIVE}")
+endif()
 
 # grh tests
 add_executable(grh-tests

@@ -18,14 +18,30 @@ namespace {
     template <typename T> constexpr std::size_t index = AttributeValue(T{}).index();
     using Owner = std::vector<std::string>;
 
-    const Owner* ownerAttribute(const Graph& graph, OperationId op)
+    std::optional<StringListView> ownerAttribute(const Graph& graph, OperationId op)
     {
-        for (const auto& entry : graph.opAttrs(op))
-            if (entry.key == kPartition) {
-                if (const auto* owner = std::get_if<Owner>(&entry.value)) return owner;
+        for (const auto entry : graph.opAttrRange(op))
+            if (entry.key() == kPartition) {
+                if (const auto owner = entry.value().get<Owner>()) return owner;
                 throw std::invalid_argument("Wrong attribute type: " + std::string(kPartition));
             }
-        return nullptr;
+        return std::nullopt;
+    }
+
+    template <typename Left, typename Right>
+    bool sameOwner(const Left& left, const Right& right)
+    {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) if (left[i] != right[i]) return false;
+        return true;
+    }
+
+    Owner copyOwner(StringListView path)
+    {
+        Owner result;
+        result.reserve(path.size());
+        for (const auto component : path) result.emplace_back(component);
+        return result;
     }
 
     std::string partitionTopology(const Graph& graph)
@@ -34,29 +50,28 @@ namespace {
         uint32_t last = 0;
         for (const auto op : operations) last = std::max(last, op.index);
         std::vector<std::size_t> positions(static_cast<std::size_t>(last) + 1);
-        const Owner empty;
-        std::vector<const Owner*> owners;
+        std::vector<StringListView> owners;
         owners.reserve(operations.size());
         std::map<int64_t, std::size_t> effects;
         bool hasSupernodes = false;
         for (const auto op : graph.operations()) {
             positions[op.index] = owners.size();
-            const auto* owner = ownerAttribute(graph, op);
-            owners.push_back(owner ? owner : &empty);
+            const auto owner = ownerAttribute(graph, op);
+            owners.push_back(owner.value_or(StringListView{}));
             hasSupernodes |= owner && owner->size() == 4 && (*owner)[1] == "nonsink";
             if (const auto order = attribute<int64_t>(graph, op, "grhsim.effectOrder")) effects.emplace(*order, positions[op.index]);
         }
         std::vector<std::pair<std::size_t, std::size_t>> edges;
         for (const auto op : graph.operations()) {
             const auto target = positions[op.index];
-            if (owners[target]->empty()) continue;
+            if (owners[target].empty()) continue;
             for (const auto input : graph.opOperands(op)) {
                 const auto producer = graph.valueDef(input);
                 if (!producer) continue;
                 const auto source = positions[producer.index];
                 // Cross-phase pulses and held samples are protocol boundaries,
                 // not same-round combinational dependencies.
-                if (!owners[source]->empty() && (*owners[source])[0] == (*owners[target])[0]) edges.emplace_back(source, target);
+                if (!owners[source].empty() && owners[source][0] == owners[target][0]) edges.emplace_back(source, target);
             }
         }
         std::optional<std::size_t> previous;
@@ -87,7 +102,7 @@ namespace {
             std::map<Owner, std::size_t> indices;
             std::vector<std::size_t> quotient(owners.size());
             for (std::size_t i = 0; i < owners.size(); ++i) {
-                auto key = *owners[i];
+                auto key = copyOwner(owners[i]);
                 if (supernodes && key.size() == 4 && key[1] == "nonsink") key.resize(3);
                 quotient[i] = indices.emplace(std::move(key), indices.size()).first->second;
             }
@@ -474,14 +489,11 @@ std::string verifyGraph(const grh::Graph& graph)
     std::map<OperationId, uint32_t, std::function<bool(OperationId, OperationId)>> historyWriters(
         [](OperationId a, OperationId b) { return a.index < b.index; });
     std::set<int64_t> effectOrders;
-    const Owner emptyOwner;
-    const auto pathOf = [&](OperationId op) -> const Owner& {
-        const auto* owner = ownerAttribute(graph, op);
-        return owner ? *owner : emptyOwner;
+    const auto pathOf = [&](OperationId op) {
+        return ownerAttribute(graph, op).value_or(StringListView{});
     };
     const auto has = [&](OperationId op, std::string_view key) {
-        return std::any_of(graph.opAttrs(op).begin(), graph.opAttrs(op).end(),
-                           [&](const auto& entry) { return entry.key == key; });
+        return graph.opAttrRange(op).find(key).has_value();
     };
     for (const OperationId op : graph.operations())
     {
@@ -498,7 +510,7 @@ std::string verifyGraph(const grh::Graph& graph)
             kind == OperationKind::kSystemTask || kind == OperationKind::kSystemFunction || kind == OperationKind::kDpicCall ||
             kind == OperationKind::kInstance || kind == OperationKind::kXMRRead || kind == OperationKind::kXMRWrite || kind == OperationKind::kBlackbox)
             return "Incomplete conversion or non-flat GrhSIM graph";
-        const auto* owner = ownerAttribute(graph, op);
+        const auto owner = ownerAttribute(graph, op);
         if (*stage == "converted" && owner) return "Converted graph must not contain virtual partitions";
         if (*stage == "converted" && (kind == kHistoryWrite || has(op, "grhsim.history") ||
             has(op, "grhsim.timeslot") || has(op, "grhsim.sampleBoundary")))
@@ -521,22 +533,22 @@ std::string verifyGraph(const grh::Graph& graph)
                 (owner->size() < 2 || ((*owner)[1] != "nonsink" && (*owner)[1] != "small-sink" && (*owner)[1] != "large-sink")))
                 return "Invalid General partition path";
             for (const auto& component : *owner) if (component.empty()) return "Empty virtual partition key";
-            leaves.insert(*owner);
+            leaves.insert(copyOwner(*owner));
             if (*stage == "nonsink-partitioned" || *stage == "sink-partitioned")
                 if ((*owner)[0] == "general" && (*owner)[1] == "nonsink" && owner->size() != 4)
                     return "Nonsink requires supernode and node ownership";
             if (*stage == "sink-partitioned" && (*owner)[0] == "general" && (*owner)[1] != "nonsink" && owner->size() != 3)
                 return "Sink requires complete group ownership";
-            if (kind == kEdgeDetect && *owner != Owner{"event"}) return "edge-detect must belong to Event";
+            if (kind == kEdgeDetect && !sameOwner(*owner, Owner{"event"})) return "edge-detect must belong to Event";
             if (kind == kHistoryWrite) {
-                if (*owner != Owner{"output"}) return "History writes must belong to Output";
+                if (!sameOwner(*owner, Owner{"output"})) return "History writes must belong to Output";
                 ++historyWriters[writerTarget(graph, op)];
             }
             if (kind == kSystemTask) {
                 const auto name = attribute<std::string>(graph, op, "name").value();
                 const auto timeslot = attribute<std::string>(graph, op, "grhsim.timeslot");
                 if (name == "monitor" || name == "strobe") {
-                    if (*owner != Owner{"output"} || !timeslot ||
+                    if (!sameOwner(*owner, Owner{"output"}) || !timeslot ||
                         *timeslot != (attribute<bool>(graph, op, "eventDriven").value() ? "event" : "change"))
                         return "Timeslot task requires Output and explicit event/change semantics";
                 } else if ((*owner)[0] != "general") return "Ordinary task must belong to General";
@@ -576,7 +588,7 @@ std::string verifyGraph(const grh::Graph& graph)
                         operationEffect(graph, producer) == OpEffect::External;
                     if (!pulse && !sample) return "Ordinary computation/read crosses Event/General/Output extraction boundary";
                 } else if (source[0] == "general" && source.size() > 1 && owner->size() > 1 &&
-                           source[1] != "nonsink" && source != *owner)
+                           source[1] != "nonsink" && !sameOwner(source, *owner))
                     return "Sink computation escapes its private partition";
             }
         }
@@ -601,9 +613,9 @@ std::string verifyGraph(const grh::Graph& graph)
         }
         const auto validOutput = [&](ValueId value) {
             const auto op = graph.valueDef(value);
-            return !op || pathOf(op) == Owner{"output"} ||
+            return !op || sameOwner(pathOf(op), Owner{"output"}) ||
                 attribute<bool>(graph, op, "grhsim.sampleBoundary").value_or(false) ||
-                (pathOf(op) == Owner{"event"} && isFire(graph, value));
+                (sameOwner(pathOf(op), Owner{"event"}) && isFire(graph, value));
         };
         for (const auto& port : graph.outputPorts()) if (!validOutput(port.value)) return "Top output was not extracted to Output";
         for (const auto& port : graph.inoutPorts())

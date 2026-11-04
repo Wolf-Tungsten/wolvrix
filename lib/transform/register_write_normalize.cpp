@@ -49,8 +49,8 @@ namespace wolvrix::lib::transform
             if (!def.valid() || graph.valueWidth(data) != width) return false;
             if (graph.opKind(def) != OperationKind::kRegisterReadArrayPort) return false;
             const auto operands = graph.opOperands(def);
-            const auto *attr = findAttr(graph, def, "regSymbol");
-            const auto *reg = attr ? std::get_if<std::string>(&*attr) : nullptr;
+            const auto attr = findAttr(graph, def, "regSymbol");
+            const auto reg = attr ? attr->get<std::string>() : std::nullopt;
             return operands.size() == 1 && reg && *reg == symbol &&
                    constant(graph, operands[0]) == row;
         }
@@ -62,8 +62,8 @@ namespace wolvrix::lib::transform
             const auto def = graph.valueDef(data);
             if (!def.valid() || graph.valueWidth(data) != width) return false;
             const auto kind = graph.opKind(def);
-            const auto *attr = findAttr(graph, def, attrName);
-            const auto *storage = attr ? std::get_if<std::string>(&*attr) : nullptr;
+            const auto attr = findAttr(graph, def, attrName);
+            const auto storage = attr ? attr->get<std::string>() : std::nullopt;
             const bool readKind = attrName == "latchSymbol"
                 ? kind == OperationKind::kLatchReadPort
                 : kind == OperationKind::kRegisterReadPort;
@@ -177,8 +177,8 @@ namespace wolvrix::lib::transform
             bool reads = false;
             if (def.valid())
             {
-                const auto *attr = findAttr(graph, def, attrName);
-                if (const auto *reg = attr ? std::get_if<std::string>(&*attr) : nullptr)
+                const auto attr = findAttr(graph, def, attrName);
+                if (const auto reg = attr ? attr->get<std::string>() : std::nullopt)
                     reads = *reg == symbol;
                 for (auto input : graph.opOperands(def))
                     if (readsStorage(graph, input, attrName, symbol, memo, budget, depth + 1))
@@ -200,9 +200,9 @@ namespace wolvrix::lib::transform
     {
         PassResult result;
         if (!twoState_) return result;
-        for (const auto &entry : design().graphs())
+        for (Graph* selected : graphs())
         {
-            auto &graph = *entry.second;
+            auto &graph = *selected;
             std::map<std::pair<std::string, std::string>, std::vector<OperationId>> groups;
             for (const auto id : graph.operations())
             {
@@ -210,9 +210,9 @@ namespace wolvrix::lib::transform
                 if (!(grh::isRegisterWritePortKind(kind) || kind == OperationKind::kLatchWritePort)) continue;
                 const auto attrName = storageAttr(kind);
                 if (!attrName) continue;
-                const auto *attr = findAttr(graph, id, *attrName);
-                if (const auto *symbol = attr ? std::get_if<std::string>(&*attr) : nullptr)
-                    groups[{*attrName, *symbol}].push_back(id);
+                const auto attr = findAttr(graph, id, *attrName);
+                if (const auto symbol = attr ? attr->get<std::string>() : std::nullopt)
+                    groups[{*attrName, std::string(*symbol)}].push_back(id);
             }
             BooleanBuilder booleans(graph);
             std::size_t normalized = 0, removedHolds = 0;

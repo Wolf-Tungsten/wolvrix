@@ -1,9 +1,28 @@
 #include <Python.h>
 
 #include "core/allocator.hpp"
+#include "core/grh.hpp"
 #include "native/module/methods.hpp"
 
 namespace wolvrix::app::pybind {
+
+PyObject *py_graph_profile_stats(PyObject *, PyObject *) {
+    using namespace wolvrix::lib::grh;
+    if (!graphProfileEnabled()) {
+        Py_RETURN_NONE;
+    }
+    const auto stats = graphProfileStats();
+    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
+                         "symbol_inserts", static_cast<unsigned long long>(stats.symbolInserts),
+                         "attribute_writes", static_cast<unsigned long long>(stats.attributeWrites),
+                         "attribute_bytes", static_cast<unsigned long long>(stats.attributeBytes),
+                         "src_loc_writes", static_cast<unsigned long long>(stats.srcLocWrites),
+                         "src_loc_bytes", static_cast<unsigned long long>(stats.srcLocBytes),
+                         "value_creations", static_cast<unsigned long long>(stats.valueAllocations),
+                         "operation_creations", static_cast<unsigned long long>(stats.operationAllocations),
+                         "freeze_count", static_cast<unsigned long long>(stats.freezeCount),
+                         "thaw_count", static_cast<unsigned long long>(stats.thawCount));
+}
 
 PyObject *py_allocator_configuration(PyObject *, PyObject *) {
     const auto config = wolvrix::lib::allocator::configuration();
@@ -22,9 +41,27 @@ PyObject *py_allocator_configuration(PyObject *, PyObject *) {
                          "generic_collect", genericCollect);
 }
 
+PyObject *py_allocator_statistics(PyObject *, PyObject *) {
+    const auto stats = wolvrix::lib::allocator::statistics();
+    if (!stats.enabled) {
+        Py_RETURN_NONE;
+    }
+    return Py_BuildValue("{s:s,s:K,s:K,s:K,s:L,s:O}",
+                         "source", "bundled-mimalloc-MI_STAT=1",
+                         "allocations", static_cast<unsigned long long>(stats.allocations),
+                         "normal_allocations", static_cast<unsigned long long>(stats.normalAllocations),
+                         "huge_allocations", static_cast<unsigned long long>(stats.hugeAllocations),
+                         "live_allocator_threads", static_cast<long long>(stats.liveThreads),
+                         "all_threads_merged", stats.liveThreads == 0 ? Py_True : Py_False);
+}
+
 } // namespace wolvrix::app::pybind
 
 static PyMethodDef WolvrixMethods[] = {
+    {"allocator_statistics", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_allocator_statistics), METH_NOARGS,
+     "Private diagnostic allocation counters for the bundled MI_STAT=1 build, or None."},
+    {"graph_profile_stats", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_graph_profile_stats), METH_NOARGS,
+     "Private graph storage counters, or None when WOLVRIX_GRH_PROFILE is disabled."},
     {"allocator_configuration", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_allocator_configuration), METH_NOARGS,
      "Private benchmark diagnostics for the effective native allocator configuration."},
     {"create_session", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_create_session), METH_NOARGS,

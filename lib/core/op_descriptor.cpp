@@ -125,16 +125,15 @@ std::string verifyOpDescriptor(const Graph& graph, OperationId operation)
     if (operands.size() < descriptor->minOperands || operands.size() > descriptor->maxOperands ||
         results.size() < descriptor->minResults || results.size() > descriptor->maxResults)
         return std::string(descriptor->name) + ": invalid operand/result count";
-    const auto attrs = graph.opAttrs(operation);
+    const auto attrs = graph.opAttrRange(operation);
     for (const AttrSchema& schema : descriptor->attributes)
     {
-        const auto it = std::find_if(attrs.begin(), attrs.end(),
-                                      [&](const AttrKV& entry) { return entry.key == schema.name; });
-        if (it == attrs.end())
+        const auto entry = attrs.find(schema.name);
+        if (!entry)
         {
             if (schema.required) return "Missing attribute " + std::string(schema.name);
         }
-        else if (it->value.index() != schema.variantIndex)
+        else if (static_cast<std::size_t>(entry->value().kind()) != schema.variantIndex)
             return "Wrong attribute type for " + std::string(schema.name);
     }
     try

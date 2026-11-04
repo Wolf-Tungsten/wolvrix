@@ -88,6 +88,25 @@ void linkedPorts(std::size_t count, BadPort bad = BadPort::None) {
     }
 }
 
+void unprovedLocalCycleIsChecked() {
+    grh::Design design;
+    auto& graph = design.createGraph("cycle");
+    design.markAsTop("cycle");
+    const auto value = graph.createValue(graph.internSymbol("feedback"), 1, false);
+    const auto op = graph.createOperation(grh::OperationKind::kNot);
+    graph.addOperand(op, value);
+    graph.addResult(op, value);
+    require(!graph.localCyclesChecked(), "cycle fixture unexpectedly carried a proof");
+
+    std::vector<ingest::IngestDiagnostic> diagnostics;
+    require(!ingest::verifyLinkedDesign(design, diagnostics),
+        "unproved local combinational cycle was skipped by linked verification");
+    require(std::any_of(diagnostics.begin(), diagnostics.end(), [](const auto& diagnostic) {
+        return diagnostic.passName == "comb-loop-elim" &&
+            diagnostic.message.find("comb loop detected") != std::string::npos;
+    }), "unproved local cycle did not publish comb-loop diagnostic");
+}
+
 void moduleAnnotations(std::size_t modules, std::size_t perModule) {
     std::string json = "[";
     for (std::size_t record = 0; record < perModule; ++record) for (std::size_t module = 0; module < modules; ++module) {
@@ -130,6 +149,7 @@ int main(int argc, char** argv) {
         } else {
             semanticPorts(256); linkedPorts(256);
             linkedPorts(4, BadPort::Unknown); linkedPorts(4, BadPort::Duplicate); linkedPorts(4, BadPort::Type);
+            unprovedLocalCycleIsChecked();
             moduleAnnotations(16, 8);
         }
         return 0;

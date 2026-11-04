@@ -110,14 +110,6 @@ namespace wolvrix::lib::store
             std::size_t portsInoutCount = 0;
         };
 
-        template <class... Ts>
-        struct Overloaded : Ts...
-        {
-            using Ts::operator()...;
-        };
-        template <class... Ts>
-        Overloaded(Ts...) -> Overloaded<Ts...>;
-
         constexpr int kIndentSize = 2;
 
         // The same writer targets an owned string or a bounded file buffer.
@@ -1056,146 +1048,91 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
-        const wolvrix::lib::grh::AttrKV &attributeRef(const wolvrix::lib::grh::AttrKV &attr)
+        wolvrix::lib::grh::AttrRef attributeRef(const wolvrix::lib::grh::AttrKV &attr)
+        {
+            return wolvrix::lib::grh::AttrRef(attr.key, &attr.value);
+        }
+
+        wolvrix::lib::grh::AttrRef attributeRef(const wolvrix::lib::grh::AttrKV *attr)
+        {
+            return attributeRef(*attr);
+        }
+
+        wolvrix::lib::grh::AttrRef attributeRef(wolvrix::lib::grh::AttrRef attr)
         {
             return attr;
         }
 
-        const wolvrix::lib::grh::AttrKV &attributeRef(const wolvrix::lib::grh::AttrKV *attr)
+        void writeAttributeInline(JsonOutput &out, wolvrix::lib::grh::AttrValueView value, JsonPrintMode mode)
         {
-            return *attr;
+            using wolvrix::lib::grh::AttrValueKind;
+            const char *comma = commaToken(mode);
+            writeInlineObject(out, mode, [&](auto &&prop)
+            {
+                const auto scalar = [&](std::string_view type, auto &&write)
+                {
+                    prop("t", [&] { appendQuotedString(out, type); });
+                    prop("v", write);
+                };
+                const auto list = [&](std::string_view type, const auto &values, auto &&write)
+                {
+                    prop("t", [&] { appendQuotedString(out, type); });
+                    prop("vs", [&]
+                    {
+                        out.push_back('[');
+                        bool first = true;
+                        for (const auto entry : values)
+                        {
+                            if (!first) out.append(comma);
+                            write(entry);
+                            first = false;
+                        }
+                        out.push_back(']');
+                    });
+                };
+                switch (value.kind())
+                {
+                case AttrValueKind::Bool:
+                    scalar("bool", [&] { out.append(value.asBool() ? "true" : "false"); });
+                    break;
+                case AttrValueKind::Int:
+                    scalar("int", [&] { out.append(std::to_string(value.asInt())); });
+                    break;
+                case AttrValueKind::Double:
+                    scalar("double", [&] { appendDouble(out, value.asDouble()); });
+                    break;
+                case AttrValueKind::String:
+                    scalar("string", [&] { appendQuotedString(out, value.asString()); });
+                    break;
+                case AttrValueKind::BoolList:
+                    list("bool[]", value.asBoolList(), [&](bool entry) { out.append(entry ? "true" : "false"); });
+                    break;
+                case AttrValueKind::IntList:
+                    list("int[]", value.asIntList(), [&](int64_t entry) { out.append(std::to_string(entry)); });
+                    break;
+                case AttrValueKind::DoubleList:
+                    list("double[]", value.asDoubleList(), [&](double entry) { appendDouble(out, entry); });
+                    break;
+                case AttrValueKind::StringList:
+                    list("string[]", value.asStringList(), [&](std::string_view entry) { appendQuotedString(out, entry); });
+                    break;
+                }
+            });
         }
 
         template <typename Range>
         void writeAttrsInline(JsonOutput &out, const Range &attrs, JsonPrintMode mode)
         {
             out.push_back('{');
-            bool firstAttr = true;
-            const char *comma = commaToken(mode);
+            bool first = true;
             for (const auto &entry : attrs)
             {
-                const auto &attr = attributeRef(entry);
-                if (!firstAttr)
-                {
-                    out.append(comma);
-                }
-                appendQuotedString(out, attr.key);
+                const auto attr = attributeRef(entry);
+                if (!first) out.append(commaToken(mode));
+                appendQuotedString(out, attr.key());
                 out.append(colonToken(mode));
-                writeInlineObject(out, mode, [&](auto &&prop)
-                                  {
-                                      std::visit(
-                                          Overloaded{
-                                              [&](bool v)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "bool"); });
-                                                  prop("v", [&]
-                                                       { out.append(v ? "true" : "false"); });
-                                              },
-                                              [&](int64_t v)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "int"); });
-                                                  prop("v", [&]
-                                                       { out.append(std::to_string(v)); });
-                                              },
-                                              [&](double v)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "double"); });
-                                                  prop("v", [&]
-                                                       { appendDouble(out, v); });
-                                              },
-                                              [&](const std::string &v)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "string"); });
-                                                  prop("v", [&]
-                                                       { appendQuotedString(out, v); });
-                                              },
-                                              [&](const std::vector<bool> &arr)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "bool[]"); });
-                                                  prop("vs", [&]
-                                                       {
-                                                           out.push_back('[');
-                                                           bool first = true;
-                                                           for (bool entry : arr)
-                                                           {
-                                                               if (!first)
-                                                               {
-                                                                   out.append(comma);
-                                                               }
-                                                               out.append(entry ? "true" : "false");
-                                                               first = false;
-                                                           }
-                                                           out.push_back(']');
-                                                       });
-                                              },
-                                              [&](const std::vector<int64_t> &arr)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "int[]"); });
-                                                  prop("vs", [&]
-                                                       {
-                                                           out.push_back('[');
-                                                           bool first = true;
-                                                           for (int64_t entry : arr)
-                                                           {
-                                                               if (!first)
-                                                               {
-                                                                   out.append(comma);
-                                                               }
-                                                               out.append(std::to_string(entry));
-                                                               first = false;
-                                                           }
-                                                           out.push_back(']');
-                                                       });
-                                              },
-                                              [&](const std::vector<double> &arr)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "double[]"); });
-                                                  prop("vs", [&]
-                                                       {
-                                                           out.push_back('[');
-                                                           bool first = true;
-                                                          for (double entry : arr)
-                                                          {
-                                                              if (!first)
-                                                              {
-                                                                  out.append(comma);
-                                                              }
-                                                              appendDouble(out, entry);
-                                                              first = false;
-                                                          }
-                                                          out.push_back(']');
-                                                       });
-                                              },
-                                              [&](const std::vector<std::string> &arr)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "string[]"); });
-                                                  prop("vs", [&]
-                                                       {
-                                                           out.push_back('[');
-                                                           bool first = true;
-                                                           for (const auto &entry : arr)
-                                                           {
-                                                               if (!first)
-                                                               {
-                                                                   out.append(comma);
-                                                               }
-                                                               appendQuotedString(out, entry);
-                                                               first = false;
-                                                           }
-                                                           out.push_back(']');
-                                                       });
-                                              }},
-                                          attr.value);
-                                  });
-                firstAttr = false;
+                writeAttributeInline(out, attr.value(), mode);
+                first = false;
             }
             out.push_back('}');
         }
@@ -1309,10 +1246,10 @@ namespace wolvrix::lib::store
                                            }
                                            out.push_back(']');
                                        });
-                                  if (!graph.opAttrs(op).empty())
+                                  if (!graph.opAttrRange(op).empty())
                                   {
                                       prop("attrs", [&]
-                                           { writeAttrsInline(out, graph.opAttrs(op), mode); });
+                                           { writeAttrsInline(out, graph.opAttrRange(op), mode); });
                                   }
                                   if (graph.opSrcLoc(op))
                                   {
@@ -1726,140 +1663,6 @@ namespace wolvrix::lib::store
                 first = false;
             }
             out.push_back(']');
-        }
-
-        void writeAttrsInlineIr(JsonOutput &out,
-                                std::span<const wolvrix::lib::grh::AttrKV> attrs,
-                                JsonPrintMode mode)
-        {
-            out.push_back('{');
-            bool firstAttr = true;
-            const char *comma = commaToken(mode);
-            for (const auto &attr : attrs)
-            {
-                if (!firstAttr)
-                {
-                    out.append(comma);
-                }
-                appendQuotedString(out, attr.key);
-                out.append(colonToken(mode));
-                writeInlineObject(out, mode, [&](auto &&prop)
-                                  {
-                                      std::visit(
-                                          Overloaded{
-                                              [&](bool v)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "bool"); });
-                                                  prop("v", [&]
-                                                       { out.append(v ? "true" : "false"); });
-                                              },
-                                              [&](int64_t v)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "int"); });
-                                                  prop("v", [&]
-                                                       { out.append(std::to_string(v)); });
-                                              },
-                                              [&](double v)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "double"); });
-                                                  prop("v", [&]
-                                                       { appendDouble(out, v); });
-                                              },
-                                              [&](const std::string &v)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "string"); });
-                                                  prop("v", [&]
-                                                       { appendQuotedString(out, v); });
-                                              },
-                                              [&](const std::vector<bool> &arr)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "bool[]"); });
-                                                  prop("vs", [&]
-                                                       {
-                                                           out.push_back('[');
-                                                           bool first = true;
-                                                           for (bool entry : arr)
-                                                           {
-                                                               if (!first)
-                                                               {
-                                                                   out.append(comma);
-                                                               }
-                                                               out.append(entry ? "true" : "false");
-                                                               first = false;
-                                                           }
-                                                           out.push_back(']');
-                                                       });
-                                              },
-                                              [&](const std::vector<int64_t> &arr)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "int[]"); });
-                                                  prop("vs", [&]
-                                                       {
-                                                           out.push_back('[');
-                                                           bool first = true;
-                                                           for (int64_t entry : arr)
-                                                           {
-                                                               if (!first)
-                                                               {
-                                                                   out.append(comma);
-                                                               }
-                                                               out.append(std::to_string(entry));
-                                                               first = false;
-                                                           }
-                                                           out.push_back(']');
-                                                       });
-                                              },
-                                              [&](const std::vector<double> &arr)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "double[]"); });
-                                                  prop("vs", [&]
-                                                       {
-                                                           out.push_back('[');
-                                                           bool first = true;
-                                                           for (double entry : arr)
-                                                           {
-                                                               if (!first)
-                                                               {
-                                                                   out.append(comma);
-                                                               }
-                                                               appendDouble(out, entry);
-                                                               first = false;
-                                                           }
-                                                           out.push_back(']');
-                                                       });
-                                              },
-                                              [&](const std::vector<std::string> &arr)
-                                              {
-                                                  prop("t", [&]
-                                                       { appendQuotedString(out, "string[]"); });
-                                                  prop("vs", [&]
-                                                       {
-                                                           out.push_back('[');
-                                                           bool first = true;
-                                                           for (const auto &entry : arr)
-                                                           {
-                                                               if (!first)
-                                                               {
-                                                                   out.append(comma);
-                                                               }
-                                                               appendQuotedString(out, entry);
-                                                               first = false;
-                                                           }
-                                                           out.push_back(']');
-                                                       });
-                                              }},
-                                          attr.value);
-                                  });
-                firstAttr = false;
-            }
-            out.push_back('}');
         }
 
         void serializePrettyCompact(JsonOutput &out, const wolvrix::lib::grh::Design &design, std::span<const wolvrix::lib::grh::Graph *const> topGraphs)

@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <tuple>
+#include <utility>
 
 namespace wolvrix::lib::ingest::firrtl::detail {
 
@@ -46,6 +47,61 @@ struct WidthConstraint {
     std::function<int64_t(const std::vector<int64_t>&)> calculate;
     Range range;
 };
+
+struct InterfaceLeaf {
+    PortLeafSignature port;
+    std::string declaration;
+    std::string target; // Empty for this module's own ports.
+    std::vector<std::string> fields; // Instance port path, without the instance name.
+    uint32_t width = 0;
+    uint32_t resetGroup = 0;
+    TypeKind kind = TypeKind::Unknown;
+    Range range;
+};
+struct InterfaceEvaluation {
+    std::vector<int64_t> widths;
+    std::vector<unsigned> resets;
+};
+struct InterfaceCheck {
+    enum class Kind { ExactlyOne, AtMostOne, Equal, ResetConstant } kind = Kind::ExactlyOne;
+    uint32_t left = 0;
+    uint32_t right = 0;
+    Range range;
+    std::string_view message;
+    TypeKind resetKind = TypeKind::Unknown;
+    ExprId expression = 0;
+    bool provenConstant = true;
+};
+struct InterfaceWidthLimit {
+    uint32_t width = 0;
+    int64_t maximum = 0;
+    Range range;
+};
+
+// Immutable inference network. Unlike Semantics, this retains no declaration
+// trees, expression types, guards, connections, effects, or deferred checks.
+// Width transfer functions are the very same functions used by strict analysis.
+class InterfaceSummary {
+public:
+    std::vector<InterfaceLeaf> leaves;
+    std::vector<std::string> dependencies; // Enabled instance targets, in source order.
+    InterfaceEvaluation evaluate(const std::map<std::string, ModuleSignature>& interfaces) const;
+private:
+    std::string module_;
+    std::vector<Width> widths_;
+    std::vector<WidthConstraint> constraints_;
+    std::vector<unsigned> resets_;
+    std::vector<InterfaceCheck> checks_;
+    std::vector<InterfaceWidthLimit> limits_;
+    std::exception_ptr failure_;
+    friend class Semantics;
+    friend InterfaceSummary summarizeInterface(const Source&, const ModuleBody&, const FirrtlOptions&);
+};
+InterfaceSummary summarizeInterface(const Source& source, const ModuleBody& body,
+                                     const FirrtlOptions& options);
+std::shared_ptr<const InterfaceSummary> sharedInterfaceSummary(std::shared_ptr<const Source> source,
+                                                              std::size_t module,
+                                                              const FirrtlOptions& options);
 
 // Reduced Boolean DAG used for path coverage, independently of emitted RTL ops.
 class Guards {
@@ -140,6 +196,8 @@ public:
     Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options,
               const std::map<std::string, ModuleSignature>* interfaces = nullptr);
     void analyze(bool allowUnknownWidths = false);
+    InterfaceSummary interfaceSummary();
+    bool analyzed() const noexcept { return analyzed_; }
     TypePtr expression(ExprId id);
     std::vector<Leaf> leaves(TypePtr type, int flow = 1) const;
     const std::vector<Leaf>& leavesCached(TypePtr type, int flow = 1) const;
@@ -193,6 +251,10 @@ private:
     std::unordered_set<std::string> knownLayers_;
     std::vector<std::string> enabledLayers_;
     std::string activeLayer_;
+    bool analyzed_ = false;
+    bool summarizing_ = false;
+    bool captureSummaryConnections_ = false;
+    std::vector<InterfaceCheck> summaryChecks_;
     const std::map<std::string, ModuleSignature>* interfaces_;
     std::vector<Leaf> computeLeaves(TypePtr type, int flow) const;
     // The interface map is owned by Transaction and may be replaced between
@@ -222,6 +284,10 @@ private:
     bool passive(TypePtr type) const;
     int flow(ExprId id) const;
     void solve(bool allowUnknownWidths);
+    void prepare();
+    template <typename Check> void defer(Check&& check) {
+        if (!summarizing_) checks_.emplace_back(std::forward<Check>(check));
+    }
     void normalizeGuards();
     void collectMemory(const Statement& statement);
     void collectMemoryPort(const Statement& statement);
@@ -234,6 +300,8 @@ ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
 ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
                             grh::Graph& graph, const FirrtlOptions& options,
                             const std::map<std::string, ModuleSignature>* interfaces = nullptr);
+ModuleSignature lowerModule(Semantics& semantics, grh::Graph& graph,
+                            const FirrtlOptions& options);
 
 } // namespace wolvrix::lib::ingest::firrtl::detail
 #endif

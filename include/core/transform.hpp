@@ -6,6 +6,7 @@
 #include "core/grh.hpp"
 
 #include <algorithm>
+#include <any>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -40,6 +41,10 @@ namespace wolvrix::lib::transform
     {
     public:
         using wolvrix::lib::diag::Diagnostics::Diagnostics;
+        void append(const PassDiagnostic& entry) {
+            add(entry.kind, entry.message, entry.context, entry.passName, entry.originSymbol,
+                entry.location, entry.sourcePosition);
+        }
 
         void error(std::string passName, std::string message, std::string context = {},
                    std::optional<diag::SourcePosition> position = {});
@@ -125,6 +130,9 @@ namespace wolvrix::lib::transform
         // ingest; passes must preserve them. Pipelines must not turn this off.
         bool keepDeclaredSymbols = true;
         SessionStore *session = nullptr;
+        // Non-owning selection for an explicitly graph-local kernel. The
+        // design catalog remains available for read-only ABI checks.
+        wolvrix::lib::grh::Graph *graph = nullptr;
     };
 
     struct PassResult
@@ -132,6 +140,7 @@ namespace wolvrix::lib::transform
         bool changed = false;
         bool failed = false;
         std::vector<std::string> artifacts;
+        std::any graphData;
     };
 
     // A deterministic graph-level worklist shared by the passes that form a
@@ -194,15 +203,15 @@ namespace wolvrix::lib::transform
     {
         // Graph has no lean single-attr accessor; the span scan is cheap
         // (attribute lists are short) and keeps callers off fat Operation.
-        for (const wolvrix::lib::grh::AttrKV &kv : graph.opAttrs(op))
+        for (const auto kv : graph.opAttrRange(op))
         {
-            if (kv.key != kOriginModulesKey)
+            if (kv.key() != kOriginModulesKey)
             {
                 continue;
             }
-            if (const auto *values = std::get_if<std::vector<std::string>>(&kv.value))
+            if (const auto values = kv.value().get<std::vector<std::string>>())
             {
-                return *values;
+                return std::vector<std::string>(values->begin(), values->end());
             }
             return std::nullopt;
         }
@@ -251,10 +260,10 @@ namespace wolvrix::lib::transform
                                    const std::vector<std::string> &extra)
     {
         if (extra.empty()) return false;
-        const std::vector<std::string>* current = nullptr;
-        for (const auto& attribute : graph.opAttrs(op))
-            if (attribute.key == kOriginModulesKey) {
-                current = std::get_if<std::vector<std::string>>(&attribute.value);
+        std::optional<wolvrix::lib::grh::StringListView> current;
+        for (const auto attribute : graph.opAttrRange(op))
+            if (attribute.key() == kOriginModulesKey) {
+                current = attribute.value().get<std::vector<std::string>>();
                 break;
             }
         // Shared constants/expressions can have thousands of origin paths.
@@ -263,7 +272,8 @@ namespace wolvrix::lib::transform
             return !module.empty() && (!current || std::find(current->begin(), current->end(), module) == current->end());
         };
         if (std::none_of(extra.begin(), extra.end(), missing)) return false;
-        std::vector<std::string> merged = current ? *current : std::vector<std::string>{};
+        std::vector<std::string> merged;
+        if (current) merged.assign(current->begin(), current->end());
         const std::size_t before = merged.size();
         appendOriginModules(merged, extra);
         if (merged.empty())
@@ -313,6 +323,13 @@ namespace wolvrix::lib::transform
         virtual ~Pass() = default;
 
         virtual PassResult run() = 0;
+        // A fresh instance owns its context and diagnostics on one worker.
+        // Cross-graph/catalog-mutating passes deliberately return nullptr.
+        virtual std::unique_ptr<Pass> cloneGraphKernel() const { return {}; }
+        virtual void finishGraphKernels(std::span<const PassResult>) {}
+        virtual bool usesSourceGraphOrder() const noexcept { return false; }
+        // Fusing across pass boundaries requires a stable dialect set.
+        virtual bool preservesDialects() const noexcept { return false; }
         virtual bool supportsDialect(std::string_view dialect) const noexcept { return dialect == "grh"; }
 
         const std::string &id() const noexcept { return id_; }
@@ -321,6 +338,8 @@ namespace wolvrix::lib::transform
         void setName(std::string name) { name_ = std::move(name); }
 
     protected:
+        std::vector<wolvrix::lib::grh::Graph*> graphs(bool sourceOrder = false) const;
+        bool graphKernel() const noexcept { return context_ && context_->graph; }
         void log(LogLevel level, std::string message);
         void log(LogLevel level, std::string_view tag, std::string message);
         void logInfo(std::string message) { log(LogLevel::Info, std::move(message)); }
@@ -449,12 +468,26 @@ namespace wolvrix::lib::transform
         // and must stay enabled in all pipelines (see PassContext).
         bool keepDeclaredSymbols = true;
         SessionStore *session = nullptr;
+        std::size_t graphThreads = 1;
+        // Optional eligibility gate for final compaction (e.g. positional ABI).
+        std::function<bool(const wolvrix::lib::grh::Graph&)> compactGraph;
+        bool prepareFlattenSources = false;
+    };
+
+    struct PassStageResult
+    {
+        std::string pass;
+        std::vector<PassDiagnostic> diagnostics;
+        double wallSeconds = 0;
+        double workerSeconds = 0;
+        bool overlapped = false;
     };
 
     struct PassManagerResult
     {
         bool success = true;
         bool changed = false;
+        std::vector<PassStageResult> stages;
     };
 
     class PassManager
@@ -466,11 +499,22 @@ namespace wolvrix::lib::transform
         void clear();
 
         PassManagerResult run(wolvrix::lib::grh::Design &design, PassDiagnostics &diags);
+        PassManagerResult runGraph(wolvrix::lib::grh::Graph& graph, PassDiagnostics& diags);
+        // All entries must offer graph kernels. One worker completes the
+        // ordered local chain before taking another graph. Results/diagnostics
+        // are published by stage, then the original graph traversal order.
+        // Continue-on-error and kernels without a dialect-preservation contract
+        // retain serial stage barriers. A failed fused chain may have performed
+        // later speculative mutations; transactional callers discard its design.
+        PassManagerResult runGraphPipeline(wolvrix::lib::grh::Design& design,
+                                           PassDiagnostics& diags, bool compactAtEnd = false);
 
         PassManagerOptions &options() noexcept { return options_; }
         const PassManagerOptions &options() const noexcept { return options_; }
 
     private:
+        PassManagerResult runImpl(wolvrix::lib::grh::Design& design, PassDiagnostics& diags,
+                                  wolvrix::lib::grh::Graph* graph, bool allowGraphThreads = true);
         struct PassEntry
         {
             std::unique_ptr<Pass> instance;

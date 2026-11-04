@@ -249,9 +249,48 @@ void resourceAndLineBoundaries() {
     nested.append(300, ')');
     bad(design("    node n = " + nested + "\n"), "nesting limit exceeded");
 }
+
+void byteIndexedModuleBoundaries() {
+    const std::string text =
+        "FIRRTL version 6.0.0\ncircuit T :\n  module T :\n"
+        "    input a : UInt<8>\n    output y : UInt<9>\n"
+        "    node n = add(\nUInt<8>(1),\nUInt<8>(2))\n"
+        "    connect y, n\n"
+        "    printf(a, a, \"brackets () <> [] ; module Phantom :\") @[escaped\\]source 1:2]\n"
+        "  ; blank and comment lines do not terminate the preceding module\n"
+        "  module Spare :\n    skip";
+    std::string crlf;
+    for (const auto c : text) { if (c == '\n') crlf += '\r'; crlf += c; }
+    const auto indexed = fi::indexText(std::move(crlf), "byte-boundaries.fir", "bytes");
+    if (!indexed.success()) print(indexed.diagnostics);
+    require(indexed.success() && indexed.source->modules().size() == 2,
+            "byte index mistook grouped continuation, string, or comment for a module boundary");
+    require(indexed.source->modules()[1].range.line == 12,
+            "byte index lost physical CRLF line numbers across a module boundary");
+    const auto validated = fi::validate(indexed.source);
+    if (!validated.success()) print(validated.diagnostics);
+    require(validated.success() && validated.modules == 2,
+            "byte-indexed modules did not preserve grouped body parsing or the final line");
+
+    const auto invalid = fi::indexText(design("    @\n"), "body-token.fir", "body-token");
+    require(invalid.success(), "interface index lexed an invalid body token");
+    const auto parsed = fi::parseModule(invalid.source, 0);
+    require(!parsed.success() && !parsed.diagnostics.empty() &&
+            parsed.diagnostics.front().message.find("unexpected character") != std::string::npos &&
+            parsed.diagnostics.front().location->line == 6,
+            "the one body parse lost its lexical error or source line");
+
+    const auto doubleError = fi::indexText(
+        "FIRRTL version 6.0.0\ncircuit T :\n  module T :\n    output y : UInt<1>\n"
+        "    @\n  module Later\n    skip\n", "ordered-errors.fir", "ordered-errors");
+    require(!doubleError.success() && !doubleError.diagnostics.empty() &&
+            doubleError.diagnostics.front().message.find("unexpected character") != std::string::npos &&
+            doubleError.diagnostics.front().location->line == 5,
+            "header-error fallback lost the earlier legacy body lexical diagnostic");
+}
 }
 int main() {
-    try { sourceInfoScanning(); validFixture(); errors(); propertiesAndInterning(); memoryPortScope(); signaturesAndRequests(); resourceAndLineBoundaries(); }
+    try { sourceInfoScanning(); validFixture(); errors(); propertiesAndInterning(); memoryPortScope(); signaturesAndRequests(); resourceAndLineBoundaries(); byteIndexedModuleBoundaries(); }
     catch (const std::exception& error) { std::cerr << "[firrtl-parser] " << error.what() << '\n'; return 1; }
     return 0;
 }

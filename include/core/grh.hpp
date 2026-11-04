@@ -1,14 +1,24 @@
 #ifndef WOLVRIX_GRH_HPP
 #define WOLVRIX_GRH_HPP
 
+#include "core/detail/string_pool.hpp"
+
+#include "core/detail/pool_vector.hpp"
+#include "core/detail/payload_pool.hpp"
+#include "core/detail/shared_column.hpp"
+#include "slang/util/FlatMap.h"
+
 #include <array>
 #include <cctype>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -140,9 +150,48 @@ struct SrcLoc
     std::string note;
 };
 
+// Borrowed provenance strings are consumed by the setter before it returns.
+struct SrcLocView
+{
+    std::string_view file;
+    uint32_t line = 0;
+    uint32_t column = 0;
+    uint32_t endLine = 0;
+    uint32_t endColumn = 0;
+    std::string_view origin;
+    std::string_view pass;
+    std::string_view note;
+
+    SrcLocView() = default;
+    explicit SrcLocView(const SrcLoc& loc) noexcept
+        : file(loc.file), line(loc.line), column(loc.column), endLine(loc.endLine),
+          endColumn(loc.endColumn), origin(loc.origin), pass(loc.pass), note(loc.note) {}
+};
+
 using DebugInfo = SrcLoc;
 
 [[nodiscard]] bool attributeValueIsJsonSerializable(const AttributeValue &value);
+
+// Optional low-overhead counters for the F17 storage baseline. Counters are
+// disabled by default and become active when WOLVRIX_GRH_PROFILE=1 (or when
+// explicitly enabled by a profiling harness). They are process-wide because
+// graph construction may be distributed across worker threads.
+struct GraphProfileStats {
+    uint64_t symbolInserts = 0;
+    uint64_t attributeWrites = 0;
+    uint64_t attributeBytes = 0;
+    uint64_t srcLocWrites = 0;
+    uint64_t srcLocBytes = 0;
+    uint64_t valueAllocations = 0;
+    uint64_t operationAllocations = 0;
+    uint64_t freezeCount = 0;
+    uint64_t thawCount = 0;
+};
+
+[[nodiscard]] bool graphProfileEnabled() noexcept;
+void setGraphProfileEnabled(bool enabled) noexcept;
+void resetGraphProfileStats() noexcept;
+[[nodiscard]] GraphProfileStats graphProfileStats() noexcept;
 
 class Graph;
 
@@ -158,6 +207,10 @@ struct SymbolId {
 class SymbolTable {
 public:
     SymbolTable();
+    SymbolTable(const SymbolTable& other);
+    SymbolTable& operator=(const SymbolTable& other);
+    SymbolTable(SymbolTable&&) noexcept = default;
+    SymbolTable& operator=(SymbolTable&&) noexcept = default;
 
     SymbolId intern(std::string_view text);
     SymbolId lookup(std::string_view text) const;
@@ -167,28 +220,18 @@ public:
     void reserve(std::size_t count);
 
 private:
-    struct StringHash {
-        using is_transparent = void;
-        std::size_t operator()(std::string_view value) const noexcept;
-        std::size_t operator()(const std::string &value) const noexcept;
-    };
-
     friend class Graph;
-    // Graph has already checked that this text is absent.
-    SymbolId internFresh(std::string_view text);
+    friend class GraphStore;
+    SymbolTable(const SymbolTable& other, std::shared_ptr<detail::StringPool> strings);
+    void swapStringState(SymbolTable& other) noexcept;
     // Insert once; an existing reservation is a miss, not a reusable symbol.
     SymbolId tryInternFresh(std::string_view text);
+    SymbolId bindStringId(uint32_t stringId);
 
-    struct StringEq {
-        using is_transparent = void;
-        bool operator()(const std::string &lhs, const std::string &rhs) const noexcept;
-        bool operator()(std::string_view lhs, std::string_view rhs) const noexcept;
-        bool operator()(const std::string &lhs, std::string_view rhs) const noexcept;
-        bool operator()(std::string_view lhs, const std::string &rhs) const noexcept;
-    };
-
-    std::unordered_map<std::string, SymbolId, StringHash, StringEq> symbolsByText_;
-    std::deque<std::string> textById_;
+    std::shared_ptr<detail::StringPool> stringPool_;
+    // Payload text may have a StringId without a symbol reservation.
+    std::vector<SymbolId> symbolsByStringId_{SymbolId::invalid()};
+    std::vector<std::string_view> textById_;
 };
 
 struct GraphId;
@@ -304,6 +347,294 @@ struct AttrKV {
     AttributeValue value;
 };
 
+// Borrowed attribute views over pooled records or owning AttrKV snapshots.
+// Constructing a view does not allocate; setAttr/getOperation retain their
+// owning API.
+enum class AttrValueKind : uint8_t {
+    Bool,
+    Int,
+    Double,
+    String,
+    BoolList,
+    IntList,
+    DoubleList,
+    StringList
+};
+
+class GraphPayload;
+
+class BoolListView {
+public:
+    BoolListView() = default;
+    explicit BoolListView(const std::vector<bool>& values) : legacy_(&values), count_(values.size()) {}
+    BoolListView(std::span<const uint64_t> words, std::size_t count) : words_(words), count_(count) {}
+    std::size_t size() const noexcept { return count_; }
+    bool empty() const noexcept { return count_ == 0; }
+    bool operator[](std::size_t index) const {
+        return legacy_ ? (*legacy_)[index] : ((words_[index / 64] >> (index % 64)) & 1) != 0;
+    }
+    class const_iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = bool;
+        using difference_type = std::ptrdiff_t;
+        using pointer = void;
+        using reference = value_type;
+        const_iterator() = default;
+        const_iterator(const BoolListView* view, std::size_t index) : view_(view), index_(index) {}
+        bool operator*() const { return (*view_)[index_]; }
+        const_iterator& operator++() { ++index_; return *this; }
+        const_iterator operator++(int) { auto copy = *this; ++*this; return copy; }
+        friend bool operator==(const_iterator lhs, const_iterator rhs) = default;
+    private:
+        const BoolListView* view_ = nullptr;
+        std::size_t index_ = 0;
+    };
+    const_iterator begin() const { return {this, 0}; }
+    const_iterator end() const { return {this, count_}; }
+private:
+    const std::vector<bool>* legacy_ = nullptr;
+    std::span<const uint64_t> words_;
+    std::size_t count_ = 0;
+};
+
+class StringListView {
+public:
+    StringListView() = default;
+    explicit StringListView(std::span<const std::string> values) : legacy_(values) {}
+    StringListView(const GraphPayload* payload, std::span<const uint32_t> ids) : payload_(payload), ids_(ids) {}
+    std::size_t size() const noexcept { return payload_ ? ids_.size() : legacy_.size(); }
+    bool empty() const noexcept { return size() == 0; }
+    std::string_view operator[](std::size_t index) const;
+    class const_iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = std::string_view;
+        using difference_type = std::ptrdiff_t;
+        using pointer = void;
+        using reference = value_type;
+        const_iterator() = default;
+        const_iterator(const StringListView* view, std::size_t index) : view_(view), index_(index) {}
+        std::string_view operator*() const { return (*view_)[index_]; }
+        const_iterator& operator++() { ++index_; return *this; }
+        const_iterator operator++(int) { auto copy = *this; ++*this; return copy; }
+        friend bool operator==(const_iterator lhs, const_iterator rhs) = default;
+    private:
+        const StringListView* view_ = nullptr;
+        std::size_t index_ = 0;
+    };
+    const_iterator begin() const { return {this, 0}; }
+    const_iterator end() const { return {this, size()}; }
+private:
+    const GraphPayload* payload_ = nullptr;
+    std::span<const uint32_t> ids_;
+    std::span<const std::string> legacy_;
+};
+
+class AttrValueView {
+public:
+    AttrValueView() = default;
+    explicit AttrValueView(const AttributeValue* value) : value_(value) {}
+    AttrValueView(const GraphPayload* payload, uint32_t record) : payload_(payload), record_(record) {}
+
+    bool valid() const noexcept { return value_ != nullptr || (payload_ != nullptr && record_ != 0); }
+    AttrValueKind kind() const;
+    bool asBool() const;
+    int64_t asInt() const;
+    double asDouble() const;
+    std::string_view asString() const;
+    BoolListView asBoolList() const;
+    std::span<const int64_t> asIntList() const;
+    std::span<const double> asDoubleList() const;
+    StringListView asStringList() const;
+    AttributeValue toOwned() const;
+    friend bool operator==(AttrValueView left, AttrValueView right);
+
+    template <typename T>
+    using Borrowed = std::conditional_t<std::is_same_v<T, std::string>, std::string_view,
+        std::conditional_t<std::is_same_v<T, std::vector<bool>>, BoolListView,
+        std::conditional_t<std::is_same_v<T, std::vector<int64_t>>, std::span<const int64_t>,
+        std::conditional_t<std::is_same_v<T, std::vector<double>>, std::span<const double>,
+        std::conditional_t<std::is_same_v<T, std::vector<std::string>>, StringListView, T>>>>>;
+
+    template <typename T>
+    std::optional<Borrowed<T>> get() const {
+        if (!valid()) return std::nullopt;
+        if constexpr (std::is_same_v<T, bool>) { if (kind() == AttrValueKind::Bool) return asBool(); }
+        else if constexpr (std::is_same_v<T, int64_t>) { if (kind() == AttrValueKind::Int) return asInt(); }
+        else if constexpr (std::is_same_v<T, double>) { if (kind() == AttrValueKind::Double) return asDouble(); }
+        else if constexpr (std::is_same_v<T, std::string>) { if (kind() == AttrValueKind::String) return asString(); }
+        else if constexpr (std::is_same_v<T, std::vector<bool>>) { if (kind() == AttrValueKind::BoolList) return asBoolList(); }
+        else if constexpr (std::is_same_v<T, std::vector<int64_t>>) { if (kind() == AttrValueKind::IntList) return asIntList(); }
+        else if constexpr (std::is_same_v<T, std::vector<double>>) { if (kind() == AttrValueKind::DoubleList) return asDoubleList(); }
+        else if constexpr (std::is_same_v<T, std::vector<std::string>>) { if (kind() == AttrValueKind::StringList) return asStringList(); }
+        return std::nullopt;
+    }
+
+private:
+    friend class GraphPayload;
+    const AttributeValue* value_ = nullptr;
+    const GraphPayload* payload_ = nullptr;
+    uint32_t record_ = 0;
+};
+
+class AttrRef {
+public:
+    AttrRef() = default;
+    AttrRef(std::string_view key, const AttributeValue* value) : key_(key), value_(value) {}
+    AttrRef(std::string_view key, AttrValueView value) : key_(key), value_(value) {}
+
+    std::string_view key() const noexcept { return key_; }
+    AttrValueView value() const noexcept { return value_; }
+
+private:
+    std::string_view key_;
+    AttrValueView value_;
+};
+
+class AttrRange {
+public:
+    class const_iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = AttrRef;
+        using difference_type = std::ptrdiff_t;
+        using pointer = void;
+        using reference = value_type;
+
+        const_iterator() = default;
+        const_iterator(const GraphPayload* payload, const uint32_t* records, const AttrKV* attrs, std::size_t index)
+            : payload_(payload), records_(records), attrs_(attrs), index_(index) {}
+        AttrRef operator*() const;
+        const_iterator& operator++() { ++index_; return *this; }
+        const_iterator operator++(int) { auto copy = *this; ++*this; return copy; }
+        friend bool operator==(const_iterator lhs, const_iterator rhs) = default;
+        friend bool operator!=(const_iterator lhs, const_iterator rhs) { return !(lhs == rhs); }
+
+    private:
+        const GraphPayload* payload_ = nullptr;
+        const uint32_t* records_ = nullptr;
+        const AttrKV* attrs_ = nullptr;
+        std::size_t index_ = 0;
+    };
+
+    AttrRange() = default;
+    explicit AttrRange(std::span<const AttrKV> attrs) : attrs_(attrs) {}
+    AttrRange(const GraphPayload* payload, std::span<const uint32_t> records) : payload_(payload), records_(records) {}
+
+    const_iterator begin() const noexcept { return {payload_, records_.data(), attrs_.data(), 0}; }
+    const_iterator end() const noexcept { return {payload_, records_.data(), attrs_.data(), size()}; }
+    std::size_t size() const noexcept { return payload_ ? records_.size() : attrs_.size(); }
+    bool empty() const noexcept { return size() == 0; }
+    AttrRef operator[](std::size_t index) const { return *const_iterator(payload_, records_.data(), attrs_.data(), index); }
+    std::optional<AttrRef> find(std::string_view key) const noexcept;
+
+private:
+    std::span<const AttrKV> attrs_;
+    const GraphPayload* payload_ = nullptr;
+    std::span<const uint32_t> records_;
+};
+
+
+// Graph-owned payload pools shared by the entity columns in GraphStore.
+// Records contain integer references to strings and variable-width values.
+class GraphPayload {
+public:
+    using StringId = uint32_t;
+    using RecordId = uint32_t;
+
+    struct Slice {
+        uint32_t offset = 0;
+        uint32_t count = 0;
+    };
+
+    struct AttributeRecord {
+        StringId key = 0;
+        AttrValueKind kind = AttrValueKind::Bool;
+        uint64_t payload = 0;
+        Slice slice{};
+    };
+
+    struct SrcLocRecord {
+        StringId file = 0;
+        StringId origin = 0;
+        StringId pass = 0;
+        StringId note = 0;
+        uint32_t line = 0;
+        uint32_t column = 0;
+        uint32_t endLine = 0;
+        uint32_t endColumn = 0;
+        friend bool operator==(const SrcLocRecord&, const SrcLocRecord&) = default;
+    };
+
+    struct Stats {
+        std::size_t operations = 0;
+        std::size_t values = 0;
+        std::size_t operands = 0;
+        std::size_t results = 0;
+        std::size_t uses = 0;
+        std::size_t strings = 0;
+        std::size_t attributes = 0;
+        std::size_t srcLocs = 0;
+        std::size_t int64Payload = 0;
+        std::size_t doublePayload = 0;
+        std::size_t bitWords = 0;
+        std::size_t stringListPayload = 0;
+        std::size_t shapes = 0;
+        std::size_t shapeDims = 0;
+        std::size_t useSlots = 0;
+        std::size_t operandIndexSlots = 0;
+    };
+
+    explicit GraphPayload(std::shared_ptr<detail::StringPool> strings = {});
+    GraphPayload(const GraphPayload&) = delete;
+    GraphPayload& operator=(const GraphPayload&) = delete;
+    GraphPayload(GraphPayload&&) noexcept = default;
+    GraphPayload& operator=(GraphPayload&&) noexcept = default;
+
+    StringId internString(std::string_view text);
+    StringId internAttrKey(std::string_view text);
+    std::string_view string(StringId id) const noexcept;
+    RecordId internAttribute(std::string_view key, const AttributeValue& value);
+    RecordId internAttribute(std::string_view key, AttrValueView value);
+    RecordId internStringListAttribute(std::string_view key, std::span<const StringId> values);
+    RecordId internSrcLoc(const SrcLoc& loc);
+    RecordId internSrcLocView(SrcLocView loc);
+    RecordId importSrcLoc(const GraphPayload& source, RecordId id);
+    AttributeRecord attribute(RecordId id) const;
+    const SrcLocRecord& srcLoc(RecordId id) const;
+    std::optional<SrcLoc> srcLocValue(RecordId id) const;
+    std::span<const int64_t> int64Payload(Slice slice) const noexcept;
+    std::span<const double> doublePayload(Slice slice) const noexcept;
+    std::span<const uint64_t> bitPayload(Slice slice) const noexcept;
+    std::span<const StringId> stringListPayload(Slice slice) const noexcept;
+    Stats stats() const noexcept;
+
+    // Releases excess capacity while preserving all record IDs. GraphStore
+    // reimports live records into fresh pools to reclaim unreachable payloads.
+    void compact();
+
+private:
+    friend class GraphStore;
+    friend class Graph;
+    RecordId internIntListAttribute(std::string_view key, std::span<const int64_t> values);
+    void replaceAttribute(RecordId target, RecordId replacement);
+    struct SrcLocHash {
+        std::size_t operator()(const SrcLocRecord& loc) const noexcept;
+    };
+    slang::flat_hash_map<SrcLocRecord, RecordId, SrcLocHash> srcLocIds_;
+    std::shared_ptr<detail::StringPool> stringPool_;
+    std::vector<StringId> attrKeys_;
+    std::vector<AttrValueKind> attrTags_;
+    std::vector<uint64_t> attrPayloads_;
+    std::vector<SrcLocRecord> srcLocs_;
+    detail::PayloadPool<int64_t> int64Payload_;
+    detail::PayloadPool<double> doublePayload_;
+    detail::PayloadPool<uint64_t> bitPayload_;
+    detail::PayloadPool<StringId> stringListPayload_;
+
+};
+
 namespace detail
 {
     class InlineValueUsers
@@ -403,93 +734,14 @@ namespace detail
     };
 } // namespace detail
 
-class GraphView {
+class GraphStore : public GraphPayload {
 public:
-    GraphView() = default;
-
+    explicit GraphStore(GraphId graphId);
+    GraphStore(GraphSymbolTable& symbols, GraphId graphId = GraphId{1, 0});
+    void compact();
+    Stats stats() const noexcept;
     std::span<const OperationId> operations() const noexcept;
     std::span<const ValueId> values() const noexcept;
-    std::span<const Port> inputPorts() const noexcept;
-    std::span<const Port> outputPorts() const noexcept;
-    std::span<const InoutPort> inoutPorts() const noexcept;
-    OperationKind opKind(OperationId op) const;
-    std::span<const ValueId> opOperands(OperationId op) const;
-    std::span<const ValueId> opResults(OperationId op) const;
-    SymbolId opSymbol(OperationId op) const;
-    std::span<const AttrKV> opAttrs(OperationId op) const;
-    std::optional<AttributeValue> opAttr(OperationId op, std::string_view key) const;
-    std::optional<SrcLoc> opSrcLoc(OperationId op) const;
-    SymbolId valueSymbol(ValueId value) const;
-    int32_t valueWidth(ValueId value) const;
-    bool valueSigned(ValueId value) const;
-    ValueType valueType(ValueId value) const;
-    LogicDomain valueDomain(ValueId value) const;
-    // Packed-first structural view of an array value; empty span = scalar.
-    // `valueWidth` always reports the total bit width; element width is
-    // valueWidth / product(valueShape).
-    std::span<const int64_t> valueShape(ValueId value) const;
-    bool valueIsInput(ValueId value) const;
-    bool valueIsOutput(ValueId value) const;
-    bool valueIsInout(ValueId value) const;
-    OperationId valueDef(ValueId value) const;
-    std::span<const ValueUser> valueUsers(ValueId value) const;
-    std::optional<SrcLoc> valueSrcLoc(ValueId value) const;
-    ValueId findValue(SymbolId symbol) const noexcept;
-    OperationId findOperation(SymbolId symbol) const noexcept;
-
-private:
-    friend class GraphBuilder;
-
-    enum class SymbolKind {
-        kValue,
-        kOperation
-    };
-
-    struct SymbolBinding {
-        SymbolKind kind;
-        uint32_t index = 0;
-    };
-
-    GraphId graphId_{};
-    std::vector<OperationId> operations_;
-    std::vector<ValueId> values_;
-    std::vector<Port> inputPorts_;
-    std::vector<Port> outputPorts_;
-    std::vector<InoutPort> inoutPorts_;
-    std::vector<OperationKind> opKinds_;
-    std::vector<SymbolId> opSymbols_;
-    std::vector<Range> opOperandRanges_;
-    std::vector<Range> opResultRanges_;
-    std::vector<Range> opAttrRanges_;
-    std::vector<ValueId> operands_;
-    std::vector<ValueId> results_;
-    std::vector<AttrKV> opAttrs_;
-    std::vector<std::optional<SrcLoc>> opSrcLocs_;
-    std::unordered_map<uint32_t, SymbolBinding> symbolIndex_;
-    std::vector<SymbolId> valueSymbols_;
-    std::vector<int32_t> valueWidths_;
-    std::vector<uint8_t> valueSigned_;
-    std::vector<uint8_t> valueTypes_;
-    std::vector<uint8_t> valueDomains_;
-    std::vector<Range> valueShapeRanges_;
-    std::vector<int64_t> valueShapeDims_;
-    std::vector<uint8_t> valueIsInput_;
-    std::vector<uint8_t> valueIsOutput_;
-    std::vector<uint8_t> valueIsInout_;
-    std::vector<OperationId> valueDefs_;
-    std::vector<Range> valueUserRanges_;
-    std::vector<ValueUser> useList_;
-    std::vector<std::optional<SrcLoc>> valueSrcLocs_;
-
-    std::size_t opIndex(OperationId op) const;
-    std::size_t valueIndex(ValueId value) const;
-};
-
-class GraphBuilder {
-public:
-    explicit GraphBuilder(GraphId graphId);
-    GraphBuilder(GraphSymbolTable& symbols, GraphId graphId = GraphId{1, 0});
-    static GraphBuilder fromView(const GraphView& view, GraphSymbolTable& symbols);
 
     void reserveValues(std::size_t count);
     void reserveOperations(std::size_t count);
@@ -527,64 +779,205 @@ public:
     bool removeOutputPort(std::string_view name);
     bool removeInoutPort(std::string_view name);
     void setAttr(OperationId op, std::string_view key, AttributeValue value);
-    // Write the canonical FIRRTL node attributes on a freshly-created
-    // operation. The implementation may append the already-sorted known
-    // attributes directly; non-empty attribute lists fall back to setAttr.
+    void setAttrView(OperationId op, std::string_view key, AttrValueView value);
+    // Write canonical FIRRTL node attributes, replacing existing keys while
+    // preserving their deterministic ordering.
     void setCanonicalNodeAttrs(OperationId op, std::string_view canonicalKey,
                                bool root = false, int64_t rootResult = 0);
     void setOpKind(OperationId op, OperationKind kind);
     bool eraseAttr(OperationId op, std::string_view key);
     void setValueSrcLoc(ValueId value, SrcLoc loc);
+    void setValueSrcLocView(ValueId value, SrcLocView loc);
     // Backfill the array shape of a value created scalar. Only allowed while
     // the current shape is empty; the new shape must satisfy the usual
     // invariants (positive dims, product divides width, Logic only). Shape is
     // a pure structural view and never changes op semantics.
     void setValueShape(ValueId value, std::span<const int64_t> shape);
     void setOpSrcLoc(OperationId op, SrcLoc loc);
+    void setOpSrcLocView(OperationId op, SrcLocView loc);
+    // Validate both destinations before assigning one shared provenance record.
+    void setOpAndValueSrcLocView(OperationId op, ValueId value, SrcLocView loc);
     void setOpSymbol(OperationId op, SymbolId sym);
     void setValueSymbol(ValueId value, SymbolId sym);
     void clearOpSymbol(OperationId op);
     void clearValueSymbol(ValueId value);
-    GraphView freeze() const;
 
 private:
     friend class Graph;
+    struct ShapePool {
+        std::vector<int64_t> dims;
+        std::vector<Range> ranges{{0, 0}};
+        slang::flat_hash_map<std::size_t, RecordId, std::hash<std::size_t>> ids;
+        std::vector<RecordId> hashNext{0};
 
-    // Only Graph consumes its builder. Validation and allocating work finish
-    // before any owned payload is moved; the public const freeze stays a copy.
-    GraphView freezeConsuming();
-    GraphView freezeImpl(GraphBuilder* consume) const;
-
-    struct ValueData {
-        SymbolId symbol;
-        int32_t width = 0; // total bit width, including every array dimension
-        bool isSigned = false;
-        ValueType type = ValueType::Logic;
-        LogicDomain domain = LogicDomain::FourState;
-        // Packed-first structural view of an array value; empty = scalar.
-        // Row-major element layout with canonical index 0 at the lowest
-        // element address; element width = width / product(shape). Logic
-        // values only; never changes op semantics (see docs/grh/grh-ir.md).
-        std::vector<int64_t> shape;
-        bool isInput = false;
-        bool isOutput = false;
-        bool isInout = false;
-        OperationId definingOp = OperationId::invalid();
-        std::optional<SrcLoc> srcLoc;
-        bool alive = true;
+        std::span<const int64_t> shape(RecordId id) const {
+            const Range range = ranges.at(id);
+            return range.count ? std::span<const int64_t>(dims.data() + range.offset, range.count)
+                               : std::span<const int64_t>{};
+        }
+        RecordId intern(std::span<const int64_t> value) {
+            if (value.empty()) return 0;
+            std::size_t hash = value.size();
+            for (int64_t dim : value)
+                hash ^= std::hash<int64_t>{}(dim) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+            const auto found = ids.find(hash);
+            const RecordId first = found == ids.end() ? 0 : found->second;
+            for (RecordId current = first; current; current = hashNext[current]) {
+                const auto candidate = shape(current);
+                if (candidate.size() == value.size() && std::equal(candidate.begin(), candidate.end(), value.begin()))
+                    return current;
+            }
+            // A new shape may be a subspan of an existing shape in this
+            // same pool. Snapshot that range before insert can reallocate it.
+            std::vector<int64_t> aliased;
+            const std::less<const int64_t*> before;
+            if (!dims.empty() && !before(value.data(), dims.data()) &&
+                before(value.data(), dims.data() + dims.size())) {
+                aliased.assign(value.begin(), value.end());
+                value = aliased;
+            }
+            const RecordId id = static_cast<RecordId>(ranges.size());
+            const std::size_t offset = dims.size();
+            dims.insert(dims.end(), value.begin(), value.end());
+            ranges.push_back({offset, value.size()});
+            hashNext.push_back(first);
+            ids.insert_or_assign(hash, id);
+            return id;
+        }
     };
-
-    struct OperationData {
-        OperationKind kind = OperationKind::kConstant;
-        SymbolId symbol;
+    struct ShapeRef {
+        ShapePool& pool;
+        RecordId& id;
+        void set(std::span<const int64_t> shape) { id = pool.intern(shape); }
+        ShapeRef& operator=(const std::vector<int64_t>& shape) { set(shape); return *this; }
+        std::span<const int64_t> span() const { return pool.shape(id); }
+        operator std::span<const int64_t>() const { return span(); }
+        operator std::vector<int64_t>() const { const auto view = span(); return {view.begin(), view.end()}; }
+        auto begin() const { return span().begin(); }
+        auto end() const { return span().end(); }
+        std::size_t size() const { return span().size(); }
+        bool empty() const { return span().empty(); }
+    };
+    struct TopologyPools {
         std::vector<ValueId> operands;
-        // Backlinks into each operand's mutable use-list. Enumeration order
-        // is unspecified; freeze reconstructs canonical operation order.
-        std::vector<std::size_t> operandUseIndices;
         std::vector<ValueId> results;
-        std::vector<AttrKV> attrs;
-        std::optional<SrcLoc> srcLoc;
-        bool alive = true;
+        std::vector<std::unique_ptr<std::vector<ValueId>>> retainedEdges;
+        std::vector<std::size_t> operandUseIndices;
+        std::vector<ValueUser> users;
+        ShapePool shapes;
+        std::vector<RecordId> attrs;
+    };
+    struct ValueRow {
+        SymbolId& symbol;
+        int32_t& width;
+        uint8_t& isSigned;
+        ValueType& type;
+        LogicDomain& domain;
+        ShapeRef shape;
+        uint8_t& isInput;
+        uint8_t& isOutput;
+        uint8_t& isInout;
+        OperationId& definingOp;
+        RecordId& srcLoc;
+        uint8_t& alive;
+    };
+    struct ValueColumns {
+        std::shared_ptr<TopologyPools> pools_;
+        explicit ValueColumns(std::shared_ptr<TopologyPools> pools) : pools_(std::move(pools)) {}
+        std::vector<SymbolId> symbol_;
+        detail::PagedColumn<int32_t> width_;
+        detail::PagedColumn<uint8_t> isSigned_;
+        detail::PagedColumn<ValueType> type_;
+        detail::PagedColumn<LogicDomain> domain_;
+        std::vector<RecordId> shape_;
+        std::vector<uint8_t> isInput_;
+        std::vector<uint8_t> isOutput_;
+        std::vector<uint8_t> isInout_;
+        std::vector<OperationId> definingOp_;
+        std::vector<RecordId> srcLoc_;
+        std::vector<uint8_t> alive_;
+        std::size_t size() const noexcept { return symbol_.size(); }
+        void reserve(std::size_t count) {
+            symbol_.reserve(count);
+            width_.reserve(count);
+            isSigned_.reserve(count);
+            type_.reserve(count);
+            domain_.reserve(count);
+            shape_.reserve(count);
+            isInput_.reserve(count);
+            isOutput_.reserve(count);
+            isInout_.reserve(count);
+            definingOp_.reserve(count);
+            srcLoc_.reserve(count);
+            alive_.reserve(count);
+        }
+        ValueRow operator[](std::size_t index) const {
+            return {const_cast<SymbolId&>(symbol_[index]), const_cast<int32_t&>(width_[index]), const_cast<uint8_t&>(isSigned_[index]), const_cast<ValueType&>(type_[index]), const_cast<LogicDomain&>(domain_[index]), ShapeRef{pools_->shapes, const_cast<RecordId&>(shape_[index])}, const_cast<uint8_t&>(isInput_[index]), const_cast<uint8_t&>(isOutput_[index]), const_cast<uint8_t&>(isInout_[index]), const_cast<OperationId&>(definingOp_[index]), const_cast<RecordId&>(srcLoc_[index]), const_cast<uint8_t&>(alive_[index])};
+        }
+        ValueRow at(std::size_t index) const { if (index >= size()) throw std::out_of_range("graph column index"); return (*this)[index]; }
+        ValueRow emplace_back() {
+            symbol_.emplace_back();
+            width_.emplace_back(0);
+            isSigned_.emplace_back(0);
+            type_.emplace_back(ValueType::Logic);
+            domain_.emplace_back(LogicDomain::FourState);
+            shape_.emplace_back(0);
+            isInput_.emplace_back(0);
+            isOutput_.emplace_back(0);
+            isInout_.emplace_back(0);
+            definingOp_.emplace_back(OperationId::invalid());
+            srcLoc_.emplace_back();
+            alive_.emplace_back(1);
+            return (*this)[size() - 1];
+        }
+    };
+    struct OperationRow {
+        OperationKind& kind;
+        SymbolId& symbol;
+        detail::PoolVector<ValueId>& operands;
+        detail::PoolVector<std::size_t>& operandUseIndices;
+        detail::PoolVector<ValueId>& results;
+        detail::PoolVector<RecordId>& attrs;
+        RecordId& srcLoc;
+        uint8_t& alive;
+    };
+    struct OperationColumns {
+        std::shared_ptr<TopologyPools> pools_;
+        explicit OperationColumns(std::shared_ptr<TopologyPools> pools) : pools_(std::move(pools)) {}
+        detail::PagedColumn<OperationKind> kind_;
+        std::vector<SymbolId> symbol_;
+        std::vector<detail::PoolVector<ValueId>> operands_;
+        std::vector<detail::PoolVector<std::size_t>> operandUseIndices_;
+        std::vector<detail::PoolVector<ValueId>> results_;
+        std::vector<detail::PoolVector<RecordId>> attrs_;
+        std::vector<RecordId> srcLoc_;
+        std::vector<uint8_t> alive_;
+        std::size_t size() const noexcept { return kind_.size(); }
+        void reserve(std::size_t count) {
+            kind_.reserve(count);
+            symbol_.reserve(count);
+            operands_.reserve(count);
+            operandUseIndices_.reserve(count);
+            results_.reserve(count);
+            attrs_.reserve(count);
+            srcLoc_.reserve(count);
+            alive_.reserve(count);
+        }
+        OperationRow operator[](std::size_t index) const {
+            return {const_cast<OperationKind&>(kind_[index]), const_cast<SymbolId&>(symbol_[index]), const_cast<detail::PoolVector<ValueId>&>(operands_[index]), const_cast<detail::PoolVector<std::size_t>&>(operandUseIndices_[index]), const_cast<detail::PoolVector<ValueId>&>(results_[index]), const_cast<detail::PoolVector<RecordId>&>(attrs_[index]), const_cast<RecordId&>(srcLoc_[index]), const_cast<uint8_t&>(alive_[index])};
+        }
+        OperationRow at(std::size_t index) const { if (index >= size()) throw std::out_of_range("graph column index"); return (*this)[index]; }
+        OperationRow emplace_back() {
+            kind_.emplace_back(OperationKind::kConstant);
+            symbol_.emplace_back();
+            operands_.emplace_back(pools_->operands);
+            operandUseIndices_.emplace_back(pools_->operandUseIndices);
+            results_.emplace_back(pools_->results);
+            attrs_.emplace_back(pools_->attrs);
+            srcLoc_.emplace_back();
+            alive_.emplace_back(1);
+            return (*this)[size() - 1];
+        }
     };
 
     enum class SymbolKind {
@@ -599,13 +992,14 @@ private:
 
     std::size_t valueIndex(ValueId value) const;
     std::size_t opIndex(OperationId op) const;
+    void setAttrRecord(std::size_t opIndex, std::string_view key, RecordId record);
     bool valueAlive(ValueId value) const;
     bool opAlive(OperationId op) const;
     std::size_t countValueUses(ValueId value, std::optional<OperationId> skipOp) const;
     void addValueUser(ValueId value, OperationId op, std::size_t operandIndex);
     void removeValueUser(ValueId value, OperationId op, std::size_t operandIndex);
-    void removeOpUses(OperationId op, const std::vector<ValueId>& operands);
-    void addOpUses(OperationId op, const std::vector<ValueId>& operands);
+    void removeOpUses(OperationId op, std::span<const ValueId> operands);
+    void addOpUses(OperationId op, std::span<const ValueId> operands);
     void replaceAllUsesInternal(ValueId from, ValueId to, std::optional<OperationId> skipOp);
     void recomputePortFlags();
     void validateSymbol(SymbolId sym, std::string_view context) const;
@@ -617,15 +1011,20 @@ private:
     bool removePort(std::vector<Port>& ports, std::string_view name, std::string_view context);
     bool removeInoutPort(std::vector<InoutPort>& ports, std::string_view name, std::string_view context);
 
+    mutable std::vector<OperationId> liveOperations_;
+    mutable std::vector<ValueId> liveValues_;
+    mutable bool operationsHaveTombstones_ = false;
+    mutable bool valuesHaveTombstones_ = false;
     GraphId graphId_;
     GraphSymbolTable* symbols_ = nullptr;
-    std::vector<ValueData> values_;
-    std::vector<std::vector<ValueUser>> valueUsers_;
-    std::vector<OperationData> operations_;
+    std::shared_ptr<TopologyPools> topology_;
+    ValueColumns values_;
+    std::vector<detail::PoolVector<ValueUser>> valueUsers_;
+    OperationColumns operations_;
     std::vector<Port> inputPorts_;
     std::vector<Port> outputPorts_;
     std::vector<InoutPort> inoutPorts_;
-    std::unordered_map<uint32_t, SymbolBinding> symbolIndex_;
+    slang::flat_hash_map<uint32_t, SymbolBinding, std::hash<uint32_t>> symbolIndex_;
 };
 
 class Value {
@@ -719,18 +1118,55 @@ private:
 // header size. Returns nullopt for non-write-port kinds and for malformed
 // array write ports (missing eventEdge attr or too few operands).
 [[nodiscard]] std::optional<std::size_t> firstEventOperandIndex(const Operation &op);
-[[nodiscard]] std::optional<std::size_t> firstEventOperandIndex(const GraphView &view, OperationId op);
 [[nodiscard]] std::optional<std::size_t> firstEventOperandIndex(const Graph &graph, OperationId op);
 // Number of index operands of an array port op (kRegisterReadArrayPort /
 // kRegisterWriteArrayPort / kRegisterWriteArrayMaskPort); nullopt otherwise.
 [[nodiscard]] std::optional<std::size_t> arrayPortIndexCount(const Operation &op);
-[[nodiscard]] std::optional<std::size_t> arrayPortIndexCount(const GraphView &view, OperationId op);
 [[nodiscard]] std::optional<std::size_t> arrayPortIndexCount(const Graph &graph, OperationId op);
 
 class Design;
+namespace detail { class BlockExecutor; }
 
 class Graph {
 public:
+    // Reuse pooled provenance imports for one source/destination graph pair.
+    // Ordinary mutations may append records. Compacting either graph or
+    // reusing this context with another pair automatically clears its maps.
+    // Weak ownership does not keep either graph's storage alive.
+    class SrcLocImportContext {
+    public:
+        SrcLocImportContext() = default;
+    private:
+        friend class Graph;
+        std::weak_ptr<GraphStore> source_, target_;
+        uint64_t sourceEpoch_ = 0, targetEpoch_ = 0;
+        std::vector<GraphPayload::RecordId> records_;
+        std::shared_ptr<const std::vector<GraphPayload::StringId>> blockStrings_;
+        slang::flat_hash_map<GraphPayload::StringId, GraphPayload::StringId,
+                             std::hash<GraphPayload::StringId>> strings_;
+    };
+
+    // Per-definition payload relocation, shared by all instances in one
+    // flatten. Attribute records remain private to each destination op, while
+    // immutable list buffers and string arena pages retain source ownership.
+    class BlockImportContext {
+    public:
+        BlockImportContext() = default;
+    private:
+        friend class Graph;
+        std::weak_ptr<GraphStore> source_, target_;
+        uint64_t sourceEpoch_ = 0, targetEpoch_ = 0, sourceMutation_ = 0;
+        bool prepared_ = false;
+        std::vector<GraphPayload::AttributeRecord> attributes_;
+        std::shared_ptr<const std::vector<GraphPayload::StringId>> strings_;
+    };
+    struct OperationBlockImport {
+        const Graph* source = nullptr;
+        std::span<const OperationId> sourceOps;
+        std::span<const OperationId> targetOps;
+        BlockImportContext* context = nullptr;
+    };
+
     // Provenance annotation for declarations inside generate scopes: one group
     // per generate-scope declaration, holding the SymbolIds of its per-round
     // elaboration copies (ingest emits them in round order). Pure metadata;
@@ -809,8 +1245,24 @@ public:
     // Returns an empty vector when the annotations are consistent.
     std::vector<std::string> validateDeclaredSymbols() const;
 
-    bool frozen() const noexcept { return !builder_.has_value(); }
+    bool frozen() const noexcept { return compacted_; }
+    // Compact live columns and pools into canonical dense entity order.
+    // This is the public compaction boundary used by ingest/flatten; it keeps
+    // the historical freeze name and ID/JSON ordering contract.
+    void compact();
+    // Prepare a safe source in a prefix worker. A one-shot, nonserialized
+    // receipt lets flatten report the same source-freeze work at its boundary.
+    void compactForFlatten();
+    bool consumePreparedFlattenFreeze() noexcept;
     void freeze();
+    [[nodiscard]] GraphStore::Stats payloadStats() const noexcept;
+    // Non-serialized proof used by ingest's linked cycle-check gate. Only a
+    // successful checker may mark it; subsequent graph mutations invalidate it.
+    bool localCyclesChecked() const noexcept {
+        return localCycleProof_ && *localCycleProof_ == mutationEpoch_;
+    }
+    void markLocalCyclesChecked() noexcept { localCycleProof_ = mutationEpoch_; }
+    [[nodiscard]] const GraphStore& payloadStore() const noexcept { return *store_; }
 
     std::span<const OperationId> operations() const;
     std::span<const ValueId> values() const;
@@ -847,7 +1299,7 @@ public:
     // Explicit semantic type changes; callers must update producers and users.
     void setValueLogicalType(ValueId value, const LogicalType& type);
     // Array structural view of a value; empty span = scalar. See
-    // GraphView::valueShape for the layout contract.
+    // valueShape for the layout contract.
     std::span<const int64_t> valueShape(ValueId value) const;
     bool valueIsInput(ValueId value) const;
     bool valueIsOutput(ValueId value) const;
@@ -857,7 +1309,8 @@ public:
     OperationKind opKind(OperationId op) const;
     std::span<const ValueId> opOperands(OperationId op) const;
     std::span<const ValueId> opResults(OperationId op) const;
-    std::span<const AttrKV> opAttrs(OperationId op) const;
+    AttrRange opAttrs(OperationId op) const;
+    AttrRange opAttrRange(OperationId op) const;
     std::optional<SrcLoc> opSrcLoc(OperationId op) const;
     Value getValue(ValueId id) const;
     // Borrowed current use-list; invalidated by graph mutation or freeze.
@@ -904,15 +1357,73 @@ public:
     bool eraseValue(ValueId value);
     bool eraseValueUnchecked(ValueId value);
     void setAttr(OperationId op, std::string_view key, AttributeValue value);
-    // See GraphBuilder::setCanonicalNodeAttrs.
+    void setAttrView(OperationId op, std::string_view key, AttrValueView value);
+    // See GraphStore::setCanonicalNodeAttrs.
     void setCanonicalNodeAttrs(OperationId op, std::string_view canonicalKey,
                                bool root = false, int64_t rootResult = 0);
     void setOpKind(OperationId op, OperationKind kind);
     bool eraseAttr(OperationId op, std::string_view key);
     void setValueSrcLoc(ValueId value, SrcLoc loc);
-    // See GraphBuilder::setValueShape.
+    void setValueSrcLocView(ValueId value, SrcLocView loc);
+    // Copy pooled provenance without materializing its owned strings.
+    // An absent source location clears the destination location.
+    void copyValueSrcLoc(ValueId value, const Graph& source, ValueId sourceValue);
+    void copyValueSrcLoc(ValueId value, const Graph& source, ValueId sourceValue,
+                         SrcLocImportContext& context);
+    // See GraphStore::setValueShape.
     void setValueShape(ValueId value, std::span<const int64_t> shape);
     void setOpSrcLoc(OperationId op, SrcLoc loc);
+    void setOpSrcLocView(OperationId op, SrcLocView loc);
+    void setOpAndValueSrcLocView(OperationId op, ValueId value, SrcLocView loc);
+    void copyOpSrcLoc(OperationId op, const Graph& source, OperationId sourceOp);
+    void copyOpSrcLoc(OperationId op, const Graph& source, OperationId sourceOp,
+                      SrcLocImportContext& context);
+    // Internal block import used by hierarchy flattening. Symbols are reserved
+    // in legacy traversal order before column writes; ports are omitted from
+    // sourceValues and supplied through the caller's relocation table.
+    void appendValueBlock(const Graph& source, std::span<const ValueId> sourceValues,
+                          std::span<const SymbolId> symbols, std::span<ValueId> output,
+                          SrcLocImportContext& context, std::size_t threads = 1,
+                          bool retainSourceColumns = false);
+    void appendOperationBlock(const Graph& source, std::span<const OperationId> sourceOps,
+                              std::span<const SymbolId> symbols, std::span<OperationId> output,
+                              SrcLocImportContext& context, std::size_t threads = 1,
+                              bool retainSourceColumns = false);
+    // Offsets have ops.size()+1 entries, begin at zero, and terminate at the
+    // corresponding flat edge count. Results acquire their definitions now;
+    // reverse uses must be rebuilt before querying or mutating imported edges.
+    void setOperationBlockEdges(std::span<const OperationId> ops,
+                                std::span<const uint32_t> operandOffsets,
+                                std::span<const ValueId> operands,
+                                std::span<const uint32_t> resultOffsets,
+                                std::span<const ValueId> results);
+    void rebuildUseLists();
+    void setOperationBlockResults(std::span<const OperationId> ops,
+                                  std::span<const uint32_t> resultOffsets,
+                                  std::span<const ValueId> results);
+    void setOperationBlockOperands(std::span<const OperationId> ops,
+                                   std::span<const uint32_t> operandOffsets,
+                                   std::span<const ValueId> operands);
+    struct TopologyBlock {
+        std::span<const OperationId> sourceOps;
+        std::span<const OperationId> targetOps;
+    };
+    // Consume a published, exclusively used source after all metadata imports.
+    // mappedValues is indexed by one-based source ValueId.index, with slot 0
+    // unused. Retain its edge buffers, relocate live slices in place, and delete
+    // the source graph. Rebuild uses before querying or mutating imported edges.
+    void consumeBlockTopology(Graph& source, std::span<const TopologyBlock> blocks,
+                              std::span<const ValueId> mappedValues);
+    void prepareBlockImport(const Graph& source, BlockImportContext& context,
+                            SrcLocImportContext& locations);
+    void appendOperationBlockAttributes(const Graph& source,
+                                         std::span<const OperationId> sourceOps,
+                                         std::span<const OperationId> targetOps,
+                                         BlockImportContext& context);
+    void appendOperationBlocksAttributes(std::span<const OperationBlockImport> blocks,
+                                          detail::BlockExecutor& executor);
+    void setOperationBlockAttr(std::span<const OperationId> ops, std::string_view key,
+                               AttrValueView value);
     void setOpSymbol(OperationId op, SymbolId sym);
     void setValueSymbol(ValueId value, SymbolId sym);
     void clearOpSymbol(OperationId op);
@@ -924,23 +1435,19 @@ private:
     friend class Design;
     friend class Value;
 
-    void invalidateCaches() const;
-    void invalidateValuesCache() const;
-    void invalidateOperationsCache() const;
-    void invalidatePortsCache() const;
-    void ensureCaches() const;
-    void ensureValuesCache() const;
-    void ensureOperationsCache() const;
-    void ensurePortsCache() const;
-    GraphBuilder& ensureBuilder();
+    GraphStore& mutableStore(bool affectsLocalCycles = true);
+    GraphPayload::RecordId importSrcLoc(const Graph& source, GraphPayload::RecordId id,
+                                       SrcLocImportContext& context);
+    void copyValueSrcLoc(ValueId value, const Graph& source, ValueId sourceValue,
+                         SrcLocImportContext* context);
+    void copyOpSrcLoc(OperationId op, const Graph& source, OperationId sourceOp,
+                      SrcLocImportContext* context);
+    void cloneContentsTo(Graph& destination) const;
     void removeSymbolFromGenerateGroups(SymbolId sym) noexcept;
     // Alias replacement requires the complete value type to be identical.
     void guardShapeAlias(ValueId from, ValueId to, std::string_view api);
-    const GraphView& view() const;
-    Value valueFromView(ValueId id) const;
-    Value valueFromBuilder(ValueId id) const;
-    Operation operationFromView(OperationId id) const;
-    Operation operationFromBuilder(OperationId id) const;
+    Value valueFromStore(ValueId id) const;
+    Operation operationFromStore(OperationId id) const;
     std::span<const ValueUser> valueUsersSpan(ValueId id) const noexcept;
 
     Design* owner_;
@@ -948,20 +1455,16 @@ private:
     GraphId graphId_{};
     std::vector<AttrKV> metadata_;
     GraphSymbolTable symbols_;
-    std::optional<GraphView> view_;
-    std::optional<GraphBuilder> builder_;
+    std::shared_ptr<GraphStore> store_;
+    bool compacted_ = true;
+    uint64_t srcLocEpoch_ = 0;
+    uint64_t mutationEpoch_ = 0;
+    std::optional<uint64_t> localCycleProof_;
+    std::optional<uint64_t> preparedFlattenFreeze_;
     std::vector<SymbolId> declaredSymbols_;
     std::unordered_set<uint32_t> declaredSymbolSet_;
     std::vector<GenerateGroup> generateGroups_;
     std::unordered_map<uint32_t, std::vector<std::size_t>> generateGroupsBySymbol_;
-    mutable std::vector<ValueId> valuesCache_;
-    mutable std::vector<OperationId> operationsCache_;
-    mutable std::vector<Port> inputPortsCache_;
-    mutable std::vector<Port> outputPortsCache_;
-    mutable std::vector<InoutPort> inoutPortsCache_;
-    mutable bool valuesCacheDirty_ = true;
-    mutable bool operationsCacheDirty_ = true;
-    mutable bool portsCacheDirty_ = true;
     uint32_t nextInternalOpSym_ = 0;
     uint32_t nextInternalValSym_ = 0;
 };

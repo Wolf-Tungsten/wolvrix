@@ -3,6 +3,7 @@
 #include "core/transform.hpp"
 #include "ingest/node_attributes.hpp"
 #include "transform/hier_flatten.hpp"
+#include "transform/xmr_resolve.hpp"
 
 #include <algorithm>
 #include <array>
@@ -851,7 +852,7 @@ int testSourceFreezeEquivalence()
         if (!manager.run(design, diags).success || diags.hasError())
             return fail("source freeze equivalence flatten failed");
         if (design.findGraph("top") != top || design.findGraph("child") != source ||
-            source->frozen() != (namedInstances == 2) ||
+            source->frozen() || !source->metadata("firrtl.nodeRetention") ||
             source->metadata("fixture.source") != wolvrix::lib::grh::AttributeValue(std::string("preserved")) ||
             source->metadata(wolvrix::lib::ingest::node::kInventory) != inventory ||
             !findGenerateGroup(*source, "gen", "difference") ||
@@ -924,6 +925,7 @@ int testSourceFreezeBlackboxRetention()
         grh::Design design;
         buildSourceFreezeDesign(design, 2);
         auto *const source = design.findGraph("child");
+        const auto oldIndex = source->findOperation("difference").index;
         auto &top = *design.findGraph("top");
         const auto blackbox = top.createOperation(grh::OperationKind::kBlackbox);
         top.setAttr(blackbox, "moduleName", std::string("child"));
@@ -940,7 +942,9 @@ int testSourceFreezeBlackboxRetention()
         manager.addPass(std::make_unique<HierFlattenPass>());
         PassDiagnostics diags;
         if (!manager.run(design, diags).success || design.graphs().size() != 2 ||
-            design.findGraph("child") != source || source->frozen() != namedBlackbox ||
+            design.findGraph("child") != source || source->frozen() ||
+            !source->metadata("firrtl.nodeRetention") ||
+            (namedBlackbox && source->findOperation("difference").index >= oldIndex) ||
             top.opKind(blackbox) != grh::OperationKind::kBlackbox ||
             (!namedBlackbox && source->inputPorts().front().name != "z"))
             return fail("source freeze changed blackbox definition retention or positional ports");
@@ -1392,7 +1396,7 @@ int testCloneMetadataPreservation()
             !sameLocation(child.valueSrcLoc(child.opResults(sourceProducer)[0])))
             return fail("cloning moved metadata out of its preserved source definition");
         std::vector<std::string> expectedKeys;
-        for (const auto &attr : child.opAttrs(sourceProducer)) expectedKeys.push_back(attr.key);
+        for (const auto &attr : child.opAttrRange(sourceProducer)) expectedKeys.emplace_back(attr.key());
         if (provenance == 0) expectedKeys.emplace_back(kOriginModulesKey);
         for (int i = 0; i < 2; ++i)
         {
@@ -1408,7 +1412,7 @@ int testCloneMetadataPreservation()
             if (getOriginModules(top, clone) != expectedOrigins)
                 return fail("clone changed provenance order, duplicates, or empty-attr handling");
             std::vector<std::string> actualKeys;
-            for (const auto &attr : top.opAttrs(clone)) actualKeys.push_back(attr.key);
+            for (const auto &attr : top.opAttrRange(clone)) actualKeys.emplace_back(attr.key());
             if (actualKeys != expectedKeys ||
                 getAttrString(top.getOperation(clone), "before") != "preserve-before" ||
                 getAttrString(top.getOperation(clone), "after") != "preserve-after")
@@ -1481,7 +1485,38 @@ int testFrozenNestedDefinitionsAndPassReuse()
         top.addDeclaredSymbol(top.valueSymbol(output));
         instantiate(top, "m0", "u" + std::to_string(ordinal), topInput, output);
     };
-    addTopInstance(0); addTopInstance(1);
+    addTopInstance(0);
+    // One complete 24-level expansion exercises consuming every definition.
+    // Keep this separate from the sibling/preserved-source pass-reuse checks.
+    std::string consumedReference;
+    std::vector<std::string> consumedDiagnostics;
+    for (const auto [global, threads] : {std::pair{false, std::size_t{1}},
+                                        std::pair{true, std::size_t{1}},
+                                        std::pair{true, std::size_t{4}}}) {
+        auto candidate = design.clone();
+        HierFlattenOptions consumeOptions;
+        consumeOptions.useGlobalPlan = global;
+        consumeOptions.numThreads = threads;
+        PassManager consumeManager;
+        consumeManager.addPass(std::make_unique<HierFlattenPass>(consumeOptions));
+        PassDiagnostics diagnostics;
+        if (!consumeManager.run(candidate, diagnostics).success || diagnostics.hasError() ||
+            candidate.graphs().size() != 1 || candidate.findGraph("m0") || candidate.findGraph("m23"))
+            return fail("24-level single-use flatten did not consume all source definitions");
+        wolvrix::lib::store::StoreDiagnostics storeDiagnostics;
+        wolvrix::lib::store::StoreJson store(&storeDiagnostics);
+        const auto json = store.storeToString(candidate);
+        if (!json || storeDiagnostics.hasError()) return fail("24-level consumed JSON serialization failed");
+        std::vector<std::string> messages;
+        for (const auto &message : diagnostics.messages()) messages.push_back(message.message);
+        if (!global) {
+            consumedReference = *json;
+            consumedDiagnostics = std::move(messages);
+        } else if (*json != consumedReference || messages != consumedDiagnostics) {
+            return fail("24-level consuming global plan differs from eager JSON or diagnostics");
+        }
+    }
+    addTopInstance(1);
     HierFlattenOptions options;
     options.preserveFlattenedModules = true;
     PassManager manager;
@@ -1523,8 +1558,515 @@ int testFrozenNestedDefinitionsAndPassReuse()
     return 0;
 }
 
+int testBlockRunsSerialParallelIdentity()
+{
+    namespace grh = wolvrix::lib::grh;
+    // Exercise the retained eager reference, the global event plan and its
+    // persistent executor on runs interrupted by nested instances.
+    constexpr std::size_t runLength = 32768;
+    constexpr std::size_t tailLength = 3;
+    const auto build = [&](grh::Design& design, std::size_t instances) {
+        auto& leaf = design.createGraph("leaf");
+        auto& middle = design.createGraph("middle");
+        auto& top = design.createGraph("top");
+        design.markAsTop("top");
+        const auto ports = [](grh::Graph& graph) {
+            const auto input = graph.createValue(graph.internSymbol("x"), 8, false);
+            const auto output = graph.createValue(graph.internSymbol("y"), 8, false);
+            graph.bindInputPort("x", input);
+            graph.bindOutputPort("y", output);
+            return std::pair(input, output);
+        };
+        const auto [leafInput, leafOutput] = ports(leaf);
+        const auto leafOp = leaf.createOperation(grh::OperationKind::kAssign, leaf.internSymbol("leaf"));
+        leaf.addDeclaredSymbol(leaf.operationSymbol(leafOp));
+        leaf.addOperand(leafOp, leafInput);
+        leaf.addResult(leafOp, leafOutput);
+        const auto [middleInput, middleOutput] = ports(middle);
+        grh::SrcLoc location;
+        location.file = "a/shared/long/source/path/for/ordinary/operation/block/runs.fir";
+        location.pass = "ingest-firrtl";
+        location.note = "provenance shared across values and operation runs";
+        const auto chain = [&](grh::ValueId first, grh::ValueId final, bool before) {
+            auto previous = first;
+            const auto count = before ? runLength : tailLength;
+            for (std::size_t index = 0; index < count; ++index) {
+                const bool named = before ? index == 0 : index + 1 == count;
+                const auto symbol = named ? middle.internSymbol(before ? "before" : "after") : middle.makeInternalOpSym();
+                const auto operation = middle.createOperation(grh::OperationKind::kAssign, symbol);
+                if (named) middle.addDeclaredSymbol(symbol);
+                const auto result = index + 1 == count ? final : middle.createValue(8, false);
+                middle.addOperand(operation, previous);
+                middle.addResult(operation, result);
+                location.line = static_cast<uint32_t>(index + (before ? 1 : runLength + 1));
+                middle.setOpAndValueSrcLocView(operation, result, grh::SrcLocView(location));
+                middle.setAttr(operation, "fixture.payload", std::vector<int64_t>{1, 2, 3});
+                previous = result;
+            }
+        };
+        const auto beforeOutput = middle.createValue(8, false);
+        const auto childOutput = middle.createValue(8, false);
+        chain(middleInput, beforeOutput, true);
+        const auto instantiate = [](grh::Graph& graph, std::string module, std::string name,
+                                    grh::ValueId input, grh::ValueId output) {
+            const auto instance = graph.createOperation(grh::OperationKind::kInstance);
+            graph.addOperand(instance, input);
+            graph.addResult(instance, output);
+            graph.setAttr(instance, "moduleName", std::move(module));
+            graph.setAttr(instance, "instanceName", std::move(name));
+            graph.setAttr(instance, "inputPortName", std::vector<std::string>{"x"});
+            graph.setAttr(instance, "outputPortName", std::vector<std::string>{"y"});
+        };
+        instantiate(middle, "leaf", "nested", beforeOutput, childOutput);
+        chain(childOutput, middleOutput, false);
+        const auto input = top.createValue(top.internSymbol("x"), 8, false);
+        top.bindInputPort("x", input);
+        // Force the protected operation name to use the old collision suffix.
+        top.createValue(top.internSymbol("u$before"), 8, false);
+        for (std::size_t index = 0; index < instances; ++index) {
+            const auto name = index ? "v" : "u";
+            const auto output = top.createValue(top.internSymbol(std::string(name) + "_out"), 8, false);
+            top.bindOutputPort(std::string(name) + "_out", output);
+            instantiate(top, "middle", name, input, output);
+        }
+    };
+    for (const std::size_t instances : {std::size_t{1}, std::size_t{2}}) {
+        for (const bool preserve : {false, true}) {
+            std::string serialJson;
+            std::vector<std::string> serialDiagnostics;
+            for (const auto [global, threads] : {std::pair{false, std::size_t{1}},
+                                                std::pair{true, std::size_t{1}},
+                                                std::pair{true, std::size_t{4}}}) {
+                grh::Design design;
+                build(design, instances);
+                HierFlattenOptions options;
+                options.preserveFlattenedModules = preserve;
+                options.numThreads = threads;
+                options.useGlobalPlan = global;
+                PassManager manager;
+                manager.addPass(std::make_unique<HierFlattenPass>(options));
+                PassDiagnostics diagnostics;
+                if (!manager.run(design, diagnostics).success || diagnostics.hasError())
+                    return fail("ordinary block runs failed across an instance boundary");
+                const auto& top = *design.findGraph("top");
+                const auto before = top.findOperation("u$before_1");
+                const auto nested = top.findOperation("u$nested$leaf");
+                const auto after = top.findOperation("u$after");
+                if (before.index != instances + 1 || nested.index != instances + runLength + 1 ||
+                    after.index != instances + runLength + tailLength + 1)
+                    return fail("block planning changed legacy parent/child operation creation order");
+                for (const auto operation : top.operations()) {
+                    const auto operands = top.opOperands(operation);
+                    for (std::size_t index = 0; index < operands.size(); ++index) {
+                        const auto users = top.valueUsers(operands[index]);
+                        if (std::count_if(users.begin(), users.end(), [&](const auto& user) {
+                            return user.operation == operation && user.operandIndex == index;
+                        }) != 1)
+                            return fail("block use-list rebuild lost an operand backlink");
+                    }
+                }
+                if (bool(design.findGraph("middle")) != preserve || bool(design.findGraph("leaf")) != preserve)
+                    return fail("block flatten changed source preservation policy");
+                wolvrix::lib::store::StoreDiagnostics storeDiagnostics;
+                wolvrix::lib::store::StoreJson store(&storeDiagnostics);
+                const auto json = store.storeToString(design);
+                if (!json || storeDiagnostics.hasError()) return fail("block flatten JSON serialization failed");
+                std::vector<std::string> messages;
+                for (const auto& diagnostic : diagnostics.messages()) messages.push_back(diagnostic.message);
+                if (!global) {
+                    serialJson = *json;
+                    serialDiagnostics = std::move(messages);
+                } else if (*json != serialJson || messages != serialDiagnostics) {
+                    return fail("global event plan, eager reference or parallel executor changed JSON bytes or diagnostic order");
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int testGlobalBoundaryPlanReference()
+{
+    namespace grh = wolvrix::lib::grh;
+    const auto build = [](grh::Design &design) {
+        auto &leaf = design.createGraph("leaf_view");
+        auto &middle = design.createGraph("middle_view");
+        auto &top = design.createGraph("top_view");
+        design.markAsTop("top_view");
+        const std::array<int64_t, 1> shape{1};
+        const auto x = leaf.createValue(leaf.internSymbol("x"), 8, false, grh::ValueType::Logic, shape);
+        const auto y = leaf.createValue(leaf.internSymbol("y"), 8, false, grh::ValueType::Logic, shape);
+        leaf.bindInputPort("x", x);
+        leaf.bindOutputPort("copy", x); // Input/output alias requires an assign at each boundary.
+        leaf.bindOutputPort("y", y);
+        const auto assign = leaf.createOperation(grh::OperationKind::kAssign);
+        leaf.addOperand(assign, x);
+        leaf.addResult(assign, y);
+        leaf.setAttr(assign, "fixture.payload", std::vector<int64_t>{7, 11});
+        const auto instantiate = [](grh::Graph &graph, std::string module, std::string name,
+                                    grh::ValueId input, grh::ValueId copy, grh::ValueId output) {
+            const auto op = graph.createOperation(grh::OperationKind::kInstance);
+            graph.addOperand(op, input);
+            graph.addResult(op, copy);
+            graph.addResult(op, output);
+            graph.setAttr(op, "moduleName", std::move(module));
+            graph.setAttr(op, "instanceName", std::move(name));
+            graph.setAttr(op, "inputPortName", std::vector<std::string>{"x"});
+            graph.setAttr(op, "outputPortName", std::vector<std::string>{"copy", "y"});
+        };
+        const auto midX = middle.createValue(8, false);
+        const auto midCopy = middle.createValue(8, false);
+        const auto midY = middle.createValue(8, false);
+        middle.bindInputPort("x", midX);
+        middle.bindOutputPort("copy", midCopy);
+        middle.bindOutputPort("y", midY);
+        instantiate(middle, "leaf_view", "inner", midX, midCopy, midY);
+        const auto input = top.createValue(top.internSymbol("x"), 8, false);
+        top.bindInputPort("x", input);
+        for (const std::string name : {"u", "v"}) {
+            const auto copy = top.createValue(8, false);
+            const auto output = top.createValue(8, false);
+            top.bindOutputPort(name + "_copy", copy);
+            top.bindOutputPort(name + "_y", output);
+            instantiate(top, "middle_view", name, input, copy, output);
+        }
+    };
+    std::string reference;
+    for (const auto [global, threads] : {std::pair{false, std::size_t{1}},
+                                        std::pair{true, std::size_t{1}},
+                                        std::pair{true, std::size_t{4}}}) {
+        grh::Design design;
+        build(design);
+        HierFlattenOptions options;
+        options.useGlobalPlan = global;
+        options.numThreads = threads;
+        options.symProtect = HierFlattenOptions::SymProtectMode::None;
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>(options));
+        PassDiagnostics diagnostics;
+        if (!manager.run(design, diagnostics).success || diagnostics.hasError())
+            return fail("global boundary plan failed on nested aliases and shared type views");
+        wolvrix::lib::store::StoreDiagnostics storeDiagnostics;
+        wolvrix::lib::store::StoreJson store(&storeDiagnostics);
+        const auto json = store.storeToString(design);
+        if (!json || storeDiagnostics.hasError()) return fail("boundary plan JSON serialization failed");
+        if (!global) reference = *json;
+        else if (*json != reference)
+            return fail("global port union changed view/alias boundary IDs, ownership or operands");
+    }
+    return 0;
+}
+
+int testResolvedXmrGlobalBlocksReference()
+{
+    namespace grh = wolvrix::lib::grh;
+    namespace node = wolvrix::lib::ingest::node;
+    const auto build = [](grh::Design &design) {
+        // The real register/latch read/write fixture from
+        // test_xmr_resolve_storage, nested inside interrupted parent runs.
+        auto &leaf = design.createGraph("leaf");
+        auto &middle = design.createGraph("middle");
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+        const auto reg = leaf.createOperation(grh::OperationKind::kRegister, leaf.internSymbol("reg_a"));
+        leaf.setAttr(reg, "width", int64_t{8});
+        leaf.setAttr(reg, "isSigned", false);
+        const auto latch = leaf.createOperation(grh::OperationKind::kLatch, leaf.internSymbol("lat_b"));
+        leaf.setAttr(latch, "width", int64_t{4});
+        leaf.setAttr(latch, "isSigned", false);
+        const auto constant = [](grh::Graph &graph) {
+            const auto value = graph.createValue(1, false);
+            const auto op = graph.createOperation(grh::OperationKind::kConstant);
+            graph.addResult(op, value);
+            graph.setAttr(op, "constValue", std::string("1'b0"));
+        };
+        const auto instantiate = [](grh::Graph &graph, std::string module, std::string name) {
+            const auto op = graph.createOperation(grh::OperationKind::kInstance);
+            graph.setAttr(op, "moduleName", std::move(module));
+            graph.setAttr(op, "instanceName", std::move(name));
+            graph.setAttr(op, "inputPortName", std::vector<std::string>{});
+            graph.setAttr(op, "outputPortName", std::vector<std::string>{});
+            graph.setAttr(op, "inoutPortName", std::vector<std::string>{});
+        };
+        constant(middle);
+        instantiate(middle, "leaf", "u_leaf");
+        constant(middle);
+        instantiate(top, "middle", "u_middle");
+        const auto makeInput = [&](std::string_view name, int32_t width) {
+            const auto value = top.createValue(top.internSymbol(name), width, false);
+            top.bindInputPort(std::string(name), value);
+            return value;
+        };
+        const auto cond = makeInput("cond", 1), data = makeInput("data", 8);
+        const auto mask = makeInput("mask", 8), clock = makeInput("clock", 1);
+        const auto latchCond = makeInput("latch_cond", 1), latchData = makeInput("latch_data", 4);
+        const auto latchMask = makeInput("latch_mask", 4);
+        const auto observed = top.createValue(top.internSymbol("observed"), 8, false);
+        const auto read = top.createOperation(grh::OperationKind::kXMRRead);
+        top.addResult(read, observed);
+        top.setAttr(read, "xmrPath", std::string("u_middle.u_leaf.reg_a"));
+        top.bindOutputPort("observed", observed);
+        const auto key = node::key({"fixture", "Circuit", "top", {}, "xmr", {}});
+        node::write(top, read, {{key}, {{key, 0}}, {key}});
+        node::establishPolicy(top);
+        const auto regWrite = top.createOperation(grh::OperationKind::kXMRWrite);
+        for (const auto value : {cond, data, mask, clock}) top.addOperand(regWrite, value);
+        top.setAttr(regWrite, "xmrPath", std::string("u_middle.u_leaf.reg_a"));
+        top.setAttr(regWrite, "eventEdge", std::vector<std::string>{"posedge"});
+        const auto latchWrite = top.createOperation(grh::OperationKind::kXMRWrite);
+        for (const auto value : {latchCond, latchData, latchMask}) top.addOperand(latchWrite, value);
+        top.setAttr(latchWrite, "xmrPath", std::string("u_middle.u_leaf.lat_b"));
+    };
+    std::string reference;
+    std::vector<std::string> referenceDiagnostics;
+    for (const auto [global, threads] : {std::pair{false, std::size_t{1}},
+                                        std::pair{true, std::size_t{1}},
+                                        std::pair{true, std::size_t{4}}}) {
+        grh::Design design;
+        build(design);
+        HierFlattenOptions options;
+        options.useGlobalPlan = global;
+        options.numThreads = threads;
+        PassDiagnostics diagnostics;
+        PassManager resolver;
+        resolver.addPass(std::make_unique<XmrResolvePass>());
+        if (!resolver.run(design, diagnostics).success || diagnostics.hasError())
+            return fail("nested storage XMR fixture could not resolve its read/write paths");
+        const auto &resolvedTop = *design.findGraph("top");
+        const auto resolvedNodes = node::inspect(resolvedTop);
+        if (!resolvedNodes.errors.empty() || resolvedNodes.nodes.size() != 1 ||
+            resolvedNodes.nodes[0].roots.size() != 1 ||
+            resolvedNodes.nodes[0].roots[0].value != resolvedTop.outputPortValue("observed"))
+            return fail("nested XMR resolution changed the observed node root");
+        PassManager flatten;
+        flatten.addPass(std::make_unique<HierFlattenPass>(options));
+        if (!flatten.run(design, diagnostics).success || diagnostics.hasError() || design.graphs().size() != 1)
+            return fail("resolved storage XMR did not flatten across nested block boundaries");
+        const auto &top = *design.findGraph("top");
+        for (const auto op : top.operations())
+            if (top.opKind(op) == grh::OperationKind::kXMRRead || top.opKind(op) == grh::OperationKind::kXMRWrite)
+                return fail("resolved cross-block flatten retained an XMR operation");
+        const auto inspection = node::inspect(top);
+        if (!inspection.errors.empty()) return fail("resolved cross-block flatten produced invalid node metadata");
+        // The old flatten drops optional associations on the erased instance.
+        // Check XMR's actual storage read after that boundary; full JSON below
+        // also compares the exact surviving associations against the old path.
+        const auto observedDef = top.valueDef(top.outputPortValue("observed"));
+        if (!observedDef.valid() || top.opKind(observedDef) != grh::OperationKind::kRegisterReadPort)
+            return fail("resolved cross-block observed output is no longer a register read");
+        const auto regSymbol = getAttrString(top.getOperation(observedDef), "regSymbol");
+        const auto reg = regSymbol ? top.findOperation(*regSymbol) : grh::OperationId{};
+        if (!reg.valid() || top.opKind(reg) != grh::OperationKind::kRegister)
+            return fail("resolved cross-block register read lost its cloned storage reference");
+        wolvrix::lib::store::StoreDiagnostics storeDiagnostics;
+        wolvrix::lib::store::StoreJson store(&storeDiagnostics);
+        const auto json = store.storeToString(design);
+        if (!json || storeDiagnostics.hasError()) return fail("resolved XMR JSON serialization failed");
+        std::vector<std::string> messages;
+        for (const auto &message : diagnostics.messages()) messages.push_back(message.message);
+        if (!global) {
+            reference = *json;
+            referenceDiagnostics = std::move(messages);
+        } else if (*json != reference || messages != referenceDiagnostics) {
+            return fail("resolved storage XMR eager/global/parallel flatten differs in JSON or diagnostics");
+        }
+    }
+    return 0;
+}
+
+int testGlobalPlanBoundaryDiagnosticsReference()
+{
+    namespace grh = wolvrix::lib::grh;
+    for (int scenario = 0; scenario < 5; ++scenario) {
+        std::vector<std::string> reference;
+        std::string referenceJson;
+        for (const bool global : {false, true}) {
+            grh::Design design;
+            auto &child = design.createGraph("child");
+            auto &top = design.createGraph("top");
+            design.markAsTop("top");
+            grh::LogicalType childType{grh::ValueType::Logic, 8, false, grh::LogicDomain::FourState, {}};
+            auto parentInputType = childType;
+            auto parentOutputType = childType;
+            if (scenario == 0) parentInputType.width = 16;
+            if (scenario == 1) {
+                childType.kind = grh::ValueType::Real;
+                childType.width = 1;
+                parentInputType.width = 1;
+                parentOutputType = childType;
+            }
+            if (scenario == 2) parentInputType.domain = grh::LogicDomain::TwoState;
+            if (scenario == 3) parentOutputType.width = 16;
+            const auto input = child.createValue(child.internSymbol("x"), childType);
+            const auto output = child.createValue(child.internSymbol("y"), childType);
+            child.bindInputPort("x", input);
+            child.bindOutputPort("y", output);
+            const auto instance = [](grh::Graph &graph, grh::ValueId in, grh::ValueId out) {
+                const auto op = graph.createOperation(grh::OperationKind::kInstance);
+                graph.addOperand(op, in);
+                graph.addResult(op, out);
+                graph.setAttr(op, "moduleName", std::string("child"));
+                graph.setAttr(op, "instanceName", std::string("u"));
+                graph.setAttr(op, "inputPortName", std::vector<std::string>{"x"});
+                graph.setAttr(op, "outputPortName", std::vector<std::string>{"y"});
+            };
+            if (scenario == 4) instance(child, input, output);
+            else {
+                const auto assign = child.createOperation(grh::OperationKind::kAssign);
+                child.addOperand(assign, input);
+                child.addResult(assign, output);
+            }
+            const auto parentInput = top.createValue(top.internSymbol("x"), parentInputType);
+            const auto parentOutput = top.createValue(top.internSymbol("y"), parentOutputType);
+            top.bindInputPort("x", parentInput);
+            top.bindOutputPort("y", parentOutput);
+            instance(top, parentInput, parentOutput);
+            HierFlattenOptions options;
+            options.useGlobalPlan = global;
+            options.numThreads = 4;
+            PassManager manager;
+            manager.addPass(std::make_unique<HierFlattenPass>(options));
+            PassDiagnostics diagnostics;
+            if (manager.run(design, diagnostics).success || !diagnostics.hasError())
+                return fail("invalid port type or recursive instance escaped flatten diagnostics");
+            std::vector<std::string> messages;
+            for (const auto &message : diagnostics.messages()) messages.push_back(message.message);
+            const auto expected = scenario == 4 ? "Recursive instance detected during hier-flatten" :
+                scenario == 3 ? "Flatten output port requires equal width and compatible kind/domain" :
+                "Flatten input port requires equal width and compatible kind/domain";
+            if (std::find(messages.begin(), messages.end(), expected) == messages.end())
+                return fail("invalid boundary produced the wrong flatten diagnostic");
+            wolvrix::lib::store::StoreDiagnostics storeDiagnostics;
+            wolvrix::lib::store::StoreJson store(&storeDiagnostics);
+            const auto json = store.storeToString(design);
+            if (!json || storeDiagnostics.hasError()) return fail("failed-boundary JSON serialization failed");
+            if (!global) {
+                reference = std::move(messages);
+                referenceJson = *json;
+            } else if (messages != reference || *json != referenceJson) {
+                return fail("global plan changed boundary failure order, message or partial graph JSON");
+            }
+        }
+    }
+    return 0;
+}
+
+int testResultLocationInheritanceReference()
+{
+    namespace grh = wolvrix::lib::grh;
+    const grh::SrcLoc opLocation{"SimTop.fir", 8794404, 11, 8794404, 19,
+        "FIRRTL", "ingest-firrtl", "RocketDebugWrapper.scala 132:13"};
+    const grh::SrcLoc ownLocation{"value.fir", 7, 2, 7, 8, "value", "lower", "keep explicit location"};
+    const std::array<std::string, 5> names{"missing_string", "explicit_logic", "empty_location", "no_locations", "missing_logic"};
+    const auto build = [&](grh::Design &design, std::size_t instances) {
+        auto &child = design.createGraph("child");
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            const auto type = index == 0 ? grh::ValueType::String : grh::ValueType::Logic;
+            const auto value = child.createValue(child.internSymbol(names[index]), 1, false, type);
+            child.addDeclaredSymbol(child.valueSymbol(value));
+            if (index == 1) child.setValueSrcLoc(value, ownLocation);
+            if (index == 2) child.setValueSrcLoc(value, grh::SrcLoc{});
+            const auto op = child.createOperation(grh::OperationKind::kConstant,
+                child.internSymbol("make_" + names[index]));
+            child.addDeclaredSymbol(child.operationSymbol(op));
+            child.addResult(op, value);
+            child.setAttr(op, "constValue", index == 0 ? std::string("debug.scala") : std::string("1'b0"));
+            // Ingest can attach provenance after adding the result. Such a
+            // result intentionally has no source record until flatten clones
+            // the located op and calls the old scalar addResult route.
+            if (index != 3) child.setOpSrcLoc(op, opLocation);
+        }
+        if (child.valueSrcLoc(child.findValue(names[0])))
+            throw std::runtime_error("inheritance fixture unexpectedly set the source String value location");
+        for (std::size_t index = 0; index < instances; ++index) {
+            const auto op = top.createOperation(grh::OperationKind::kInstance);
+            top.setAttr(op, "moduleName", std::string("child"));
+            top.setAttr(op, "instanceName", index == 0 ? std::string("u") : std::string("v"));
+            top.setAttr(op, "inputPortName", std::vector<std::string>{});
+            top.setAttr(op, "outputPortName", std::vector<std::string>{});
+        }
+    };
+    const auto scalarFlatten = [&](grh::Design &design) {
+        auto &source = *design.findGraph("child");
+        auto &target = *design.findGraph("top");
+        const std::vector<grh::OperationId> instances(target.operations().begin(), target.operations().end());
+        for (std::size_t index = 0; index < instances.size(); ++index) {
+            const std::string prefix = index == 0 ? "u" : "v";
+            target.eraseOpUnchecked(instances[index]);
+            std::vector<grh::ValueId> values(source.values().size() + 1);
+            for (const auto sourceValue : source.values()) {
+                const auto name = prefix + "$" + std::string(source.symbolText(source.valueSymbol(sourceValue)));
+                const auto symbol = target.internSymbol(name);
+                target.addDeclaredSymbol(symbol);
+                const auto value = target.createValue(symbol, source.valueLogicalType(sourceValue));
+                target.copyValueSrcLoc(value, source, sourceValue);
+                values[sourceValue.index] = value;
+            }
+            for (const auto sourceOp : source.operations()) {
+                const auto name = prefix + "$" + std::string(source.symbolText(source.operationSymbol(sourceOp)));
+                const auto symbol = target.internSymbol(name);
+                target.addDeclaredSymbol(symbol);
+                const auto op = target.createOperation(source.opKind(sourceOp), symbol);
+                target.copyOpSrcLoc(op, source, sourceOp);
+                for (const auto attr : source.opAttrRange(sourceOp)) target.setAttrView(op, attr.key(), attr.value());
+                target.setAttr(op, "originModules", std::vector<std::string>{prefix});
+                for (const auto value : source.opResults(sourceOp)) target.addResult(op, values[value.index]);
+            }
+        }
+        design.deleteGraph("child");
+    };
+    for (const std::size_t instances : {std::size_t{1}, std::size_t{2}}) {
+        grh::Design scalar;
+        build(scalar, instances);
+        scalarFlatten(scalar);
+        wolvrix::lib::store::StoreDiagnostics storeDiagnostics;
+        wolvrix::lib::store::StoreJson store(&storeDiagnostics);
+        const auto expected = store.storeToString(scalar);
+        if (!expected || storeDiagnostics.hasError()) return fail("scalar provenance reference did not serialize");
+        for (const auto [global, threads] : {std::pair{false, std::size_t{1}},
+                                            std::pair{true, std::size_t{1}},
+                                            std::pair{true, std::size_t{4}}}) {
+            grh::Design design;
+            build(design, instances);
+            HierFlattenOptions options;
+            options.useGlobalPlan = global;
+            options.numThreads = threads;
+            PassManager manager;
+            manager.addPass(std::make_unique<HierFlattenPass>(options));
+            PassDiagnostics diagnostics;
+            if (!manager.run(design, diagnostics).success || diagnostics.hasError())
+                return fail("bulk result provenance inheritance flatten failed");
+            const auto &top = *design.findGraph("top");
+            for (std::size_t index = 0; index < instances; ++index) {
+                const std::string prefix = index == 0 ? "u$" : "v$";
+                const auto inherited = top.valueSrcLoc(top.findValue(prefix + names[0]));
+                const auto explicitValue = top.valueSrcLoc(top.findValue(prefix + names[1]));
+                const auto empty = top.valueSrcLoc(top.findValue(prefix + names[2]));
+                const auto inheritedLogic = top.valueSrcLoc(top.findValue(prefix + names[4]));
+                if (!inherited || inherited->file != opLocation.file || inherited->line != opLocation.line ||
+                    inherited->note != opLocation.note || !explicitValue || explicitValue->file != ownLocation.file ||
+                    !empty || !empty->file.empty() || empty->line != 0 ||
+                    !inheritedLogic || inheritedLogic->file != opLocation.file ||
+                    top.valueSrcLoc(top.findValue(prefix + names[3])))
+                    return fail("bulk result location inheritance differs from scalar missing/explicit/empty semantics");
+            }
+            const auto actual = store.storeToString(design);
+            if (!actual || storeDiagnostics.hasError() || *actual != *expected)
+                return fail("eager/global/parallel provenance JSON differs from scalar copyOpSrcLoc then addResult");
+        }
+    }
+    return 0;
+}
+
 int main()
 {
+    if (const int result = testBlockRunsSerialParallelIdentity()) return result;
+    if (const int result = testGlobalBoundaryPlanReference()) return result;
+    if (const int result = testResolvedXmrGlobalBlocksReference()) return result;
+    if (const int result = testGlobalPlanBoundaryDiagnosticsReference()) return result;
+    if (const int result = testResultLocationInheritanceReference()) return result;
     if (const int result = testFrozenNestedDefinitionsAndPassReuse()) return result;
     if (const int result = testCloneMetadataPreservation()) return result;
     if (const int result = testSharedPortInputFirstMapping()) return result;

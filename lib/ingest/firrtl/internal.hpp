@@ -4,9 +4,36 @@
 #include "ingest/firrtl_syntax.hpp"
 
 #include <deque>
+#include <exception>
+#include <mutex>
 #include <stdexcept>
 
 namespace wolvrix::lib::ingest::firrtl {
+
+namespace detail {
+class InterfaceSummary;
+struct ParsedModuleCache {
+    std::mutex mutex;
+    bool parsed = false;
+    std::shared_ptr<const ModuleBody> body;
+    std::vector<IngestDiagnostic> diagnostics;
+    bool summarized = false;
+    std::vector<std::string> summaryLayers;
+    std::shared_ptr<const InterfaceSummary> summary;
+    std::exception_ptr summaryFailure;
+};
+struct SharedModuleResult {
+    std::shared_ptr<const Source> source;
+    std::shared_ptr<const ModuleBody> sharedBody;
+    std::vector<IngestDiagnostic> diagnostics;
+    bool success() const noexcept;
+};
+// Production callers borrow the cached AST; the public parseModule API keeps
+// returning an owning compatibility copy.
+SharedModuleResult parseSharedModule(std::shared_ptr<const Source> source, std::size_t module);
+// Called after a module has been lowered; outstanding shared readers stay valid.
+void releaseParsedModule(const Source& source, std::size_t module);
+}
 
 struct Source::Impl {
     std::filesystem::path path;
@@ -24,6 +51,10 @@ struct Source::Impl {
     std::vector<TypeAlias> aliases;
     std::vector<Formal> formals;
     std::unordered_map<std::string_view, std::size_t> moduleNames;
+    // Workers parse independent modules once, then reuse their inference
+    // summaries and ASTs. Each slot has its own lock for lazy callers.
+    mutable std::mutex parsedModulesMutex;
+    mutable std::vector<std::shared_ptr<detail::ParsedModuleCache>> parsedModules;
     ~Impl();
 };
 
@@ -57,6 +88,13 @@ public:
                    uint64_t line = 1, uint64_t baseIndent = 0);
     const Token& peek();
     Token take();
+    // Resume the circuit lexer after a byte-indexed module, preserving its
+    // enclosing indentation stack without lexing any module body tokens.
+    void skipTo(uint64_t begin, uint64_t line) {
+        cursor_ = begin; line_ = line; column_ = 1;
+        lineStart_ = true; lineContent_ = false;
+        groups_.clear(); pending_.clear(); lookahead_.reset();
+    }
 private:
     Token next();
     Token token(TokenKind kind, uint64_t start, uint64_t line, uint64_t column) const;

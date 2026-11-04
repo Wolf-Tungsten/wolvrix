@@ -36,7 +36,7 @@ void quoted(std::ostream& out, std::string_view value) {
 
 template <typename T>
 void attribute(std::ostream& out, const T& value) {
-    if constexpr (std::is_same_v<T, std::string>) quoted(out, value);
+    if constexpr (std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>) quoted(out, value);
     else if constexpr (std::is_same_v<T, bool>) out << (value ? "true" : "false");
     else if constexpr (std::is_arithmetic_v<T>) out << value;
     else {
@@ -51,6 +51,29 @@ void attribute(std::ostream& out, const T& value) {
 
 void attribute(std::ostream& out, const grh::AttributeValue& value) {
     std::visit([&](const auto& item) { attribute(out, item); }, value);
+}
+
+void attribute(std::ostream& out, grh::AttrValueView value) {
+    const auto list = [&](const auto& values) {
+        out << '[';
+        bool first = true;
+        for (const auto item : values) {
+            if (!first) out << ", ";
+            attribute(out, item);
+            first = false;
+        }
+        out << ']';
+    };
+    switch (value.kind()) {
+    case grh::AttrValueKind::Bool: attribute(out, value.asBool()); break;
+    case grh::AttrValueKind::Int: attribute(out, value.asInt()); break;
+    case grh::AttrValueKind::Double: attribute(out, value.asDouble()); break;
+    case grh::AttrValueKind::String: quoted(out, value.asString()); break;
+    case grh::AttrValueKind::BoolList: list(value.asBoolList()); break;
+    case grh::AttrValueKind::IntList: list(value.asIntList()); break;
+    case grh::AttrValueKind::DoubleList: list(value.asDoubleList()); break;
+    case grh::AttrValueKind::StringList: list(value.asStringList()); break;
+    }
 }
 
 void key(std::ostream& out, const Key& path) { attribute(out, path); }
@@ -306,9 +329,9 @@ void graphText(std::ostream& out, const grh::Graph& graph, const transform::Sess
             out << "      result[" << i << "] = "; valueRef(out, graph, results[i]);
             out << " : "; type(out, graph.valueLogicalType(results[i])); out << '\n';
         }
-        for (const auto& item : graph.opAttrs(op)) {
-            if (item.key == transform::kOriginModulesKey && std::holds_alternative<std::vector<std::string>>(item.value)) continue;
-            out << "      attr " << item.key << " = "; attribute(out, item.value); out << '\n';
+        for (const auto item : graph.opAttrRange(op)) {
+            if (item.key() == transform::kOriginModulesKey && item.value().kind() == grh::AttrValueKind::StringList) continue;
+            out << "      attr " << item.key() << " = "; attribute(out, item.value()); out << '\n';
         }
     }
     out << "}\n\n";

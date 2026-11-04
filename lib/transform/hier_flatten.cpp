@@ -1,5 +1,6 @@
 #include "transform/hier_flatten.hpp"
 
+#include "core/detail/block_executor.hpp"
 #include "core/grh.hpp"
 #include "core/transform.hpp"
 #include "ingest/node_attributes.hpp"
@@ -10,10 +11,12 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -57,6 +60,61 @@ namespace wolvrix::lib::transform
             std::chrono::nanoseconds total{};
         };
 
+        // Every expanded source value has one node, including omitted ports.
+        // Union is directed towards the first published target value; choosing
+        // a rank representative would change legacy boundary value identities.
+        struct GlobalPortUnionFind
+        {
+            static constexpr std::size_t invalid = std::numeric_limits<std::size_t>::max();
+            struct Node
+            {
+                std::size_t parent = invalid;
+                wolvrix::lib::grh::ValueId target;
+            };
+            std::vector<Node> nodes;
+            std::vector<std::size_t> targetNodes;
+
+            std::size_t root(std::size_t node) const noexcept
+            {
+                while (nodes[node].parent != invalid) node = nodes[node].parent;
+                return node;
+            }
+
+            void bind(std::size_t node, wolvrix::lib::grh::ValueId target)
+            {
+                if (node >= nodes.size() || !target.valid())
+                    throw std::invalid_argument("Flatten global port binding is outside its planned range");
+                if (targetNodes.size() <= target.index)
+                    targetNodes.resize(static_cast<std::size_t>(target.index) + 1, invalid);
+                const auto prior = targetNodes[target.index];
+                if (prior == invalid)
+                {
+                    nodes[node].target = target;
+                    targetNodes[target.index] = node;
+                    return;
+                }
+                const auto representative = root(prior);
+                if (nodes[representative].target != target)
+                    throw std::invalid_argument("Flatten global port target graph mismatch");
+                const auto current = root(node);
+                if (current != representative) nodes[current].parent = representative;
+            }
+
+            wolvrix::lib::grh::ValueId get(std::size_t node) const noexcept
+            {
+                return node < nodes.size() ? nodes[root(node)].target : wolvrix::lib::grh::ValueId{};
+            }
+
+            void compress()
+            {
+                for (std::size_t node = 0; node < nodes.size(); ++node)
+                {
+                    const auto representative = root(node);
+                    if (node != representative) nodes[node].parent = representative;
+                }
+            }
+        };
+
         // Values are allocated with monotonically increasing per-graph IDs.
         // Flattening looks up every operand/result in the current source graph;
         // hashing the full ValueId for each of those accesses dominates large
@@ -67,6 +125,14 @@ namespace wolvrix::lib::transform
         {
             wolvrix::lib::grh::GraphId graph;
             std::vector<wolvrix::lib::grh::ValueId> values;
+            // Only port equivalences participate in this directed union-find.
+            // Allocate its dense parent array lazily when two distinct source
+            // ports actually share a target; ordinary values stay direct.
+            std::vector<uint32_t> portParents;
+            slang::flat_hash_map<uint32_t, uint32_t, std::hash<uint32_t>> portRepresentatives;
+            GlobalPortUnionFind *globalPorts = nullptr;
+            std::size_t globalBase = 0;
+            std::size_t plannedInstance = GlobalPortUnionFind::invalid;
 
             DenseValueMap() = default;
 
@@ -82,8 +148,7 @@ namespace wolvrix::lib::transform
 
             bool contains(wolvrix::lib::grh::ValueId source) const noexcept
             {
-                return source.valid() && source.graph == graph && source.generation == 0 &&
-                       source.index < values.size() && values[source.index].valid();
+                return get(source).valid();
             }
 
             wolvrix::lib::grh::ValueId get(wolvrix::lib::grh::ValueId source) const noexcept
@@ -93,7 +158,10 @@ namespace wolvrix::lib::transform
                 {
                     return wolvrix::lib::grh::ValueId::invalid();
                 }
-                return values[source.index];
+                if (globalPorts) return globalPorts->get(globalBase + source.index);
+                uint32_t index = source.index;
+                while (index < portParents.size() && portParents[index]) index = portParents[index];
+                return values[index];
             }
 
             void set(wolvrix::lib::grh::ValueId source,
@@ -112,6 +180,32 @@ namespace wolvrix::lib::transform
                     values.resize(static_cast<std::size_t>(source.index) + 1);
                 }
                 values[source.index] = target;
+                if (globalPorts) globalPorts->bind(globalBase + source.index, target);
+            }
+
+            std::size_t node(wolvrix::lib::grh::ValueId source) const noexcept
+            {
+                return globalPorts && source.valid() && source.graph == graph &&
+                    source.generation == 0 && source.index < values.size() ?
+                    globalBase + source.index : GlobalPortUnionFind::invalid;
+            }
+
+            // Call only after the boundary's exact logical-type check/view.
+            // The first legacy target remains the representative; no rank
+            // heuristic may choose a different observable target ValueId.
+            void bindEquivalentPort(wolvrix::lib::grh::ValueId source,
+                                    wolvrix::lib::grh::ValueId target)
+            {
+                set(source, target);
+                if (globalPorts) return;
+                const auto [found, inserted] = portRepresentatives.try_emplace(target.index, source.index);
+                if (inserted || found->second == source.index) return;
+                if (values[found->second] != target)
+                    throw std::invalid_argument("Flatten port equivalence requires one destination graph");
+                if (portParents.size() < values.size()) portParents.resize(values.size());
+                uint32_t root = found->second;
+                while (portParents[root]) root = portParents[root];
+                portParents[source.index] = root;
             }
         };
 
@@ -121,10 +215,41 @@ namespace wolvrix::lib::transform
             std::string key;
             std::string oldValue;
             wolvrix::lib::grh::SymbolId sourceSymbol;
+            bool deferred = false;
         };
 
         // Each map belongs to one source graph and one expanded instance.
         using SymbolRenameMap = std::unordered_map<uint32_t, wolvrix::lib::grh::SymbolId>;
+
+        struct OperationRun
+        {
+            std::span<const wolvrix::lib::grh::OperationId> operations;
+            bool boundary = false;
+        };
+
+        // An instance interrupts its parent's operation allocation order.
+        // Keep ordinary interiors as consecutive runs and execute each
+        // instance/DPI boundary before allocating the following parent run.
+        std::vector<OperationRun> planOperationRuns(const wolvrix::lib::grh::Graph &source)
+        {
+            const auto operations = source.operations();
+            std::vector<OperationRun> runs;
+            std::size_t begin = 0;
+            for (std::size_t index = 0; index < operations.size(); ++index)
+            {
+                const auto kind = source.opKind(operations[index]);
+                if (kind != wolvrix::lib::grh::OperationKind::kInstance &&
+                    kind != wolvrix::lib::grh::OperationKind::kDpicImport)
+                {
+                    continue;
+                }
+                if (begin != index) runs.push_back({operations.subspan(begin, index - begin), false});
+                runs.push_back({operations.subspan(index, 1), true});
+                begin = index + 1;
+            }
+            if (begin != operations.size()) runs.push_back({operations.subspan(begin), false});
+            return runs;
+        }
 
         bool isOpSymbolReferenceAttr(std::string_view key)
         {
@@ -142,6 +267,105 @@ namespace wolvrix::lib::transform
             std::optional<std::vector<std::string>> inoutPortNames;
         };
 
+        struct GlobalInlinePlan
+        {
+            enum class EventKind { EnterValues, OpRun, Boundary, Exit };
+            struct Event
+            {
+                EventKind kind;
+                std::size_t instance;
+                std::size_t run;
+                wolvrix::lib::grh::ValueId firstValue;
+                wolvrix::lib::grh::OperationId firstOperation;
+                std::size_t count = 0;
+                std::vector<wolvrix::lib::grh::ValueId> boundaryValues;
+                std::vector<wolvrix::lib::grh::OperationId> boundaryOperations;
+            };
+            struct Instance
+            {
+                const wolvrix::lib::grh::Graph *source;
+                std::size_t nodeBase;
+                std::vector<OperationRun> runs;
+                std::string prefix;
+                SymbolRenameMap opRename;
+                std::unique_ptr<wolvrix::lib::ingest::node::QualificationContext> qualification;
+            };
+            struct OperandBlock
+            {
+                const wolvrix::lib::grh::Graph *source;
+                std::span<const wolvrix::lib::grh::OperationId> sourceOps;
+                std::size_t instance;
+                std::vector<wolvrix::lib::grh::OperationId> operations;
+                std::vector<uint32_t> offsets;
+                std::vector<std::size_t> nodes;
+                std::vector<wolvrix::lib::grh::ValueId> relocated;
+                bool consumed = false;
+            };
+            std::vector<Instance> instances;
+            std::vector<Event> events;
+            std::vector<OperandBlock> operands;
+            std::unordered_map<const wolvrix::lib::grh::Graph *, std::size_t> definitionUses;
+            GlobalPortUnionFind ports;
+            std::size_t nextInstance = 0;
+            std::size_t nextEvent = 0;
+            std::size_t currentBoundary = GlobalPortUnionFind::invalid;
+            bool enabled = false;
+            bool metadataStarted = false;
+            std::size_t committedOperandBlocks = 0;
+
+            std::size_t consume(EventKind kind, std::size_t instance, std::size_t run = 0)
+            {
+                if (!enabled) return GlobalPortUnionFind::invalid;
+                if (nextEvent == events.size() || events[nextEvent].kind != kind ||
+                    events[nextEvent].instance != instance || events[nextEvent].run != run)
+                    throw std::logic_error("Flatten global event order differs from legacy traversal");
+                const auto event = nextEvent++;
+                if (kind == EventKind::Boundary) currentBoundary = event;
+                return event;
+            }
+
+            void boundaryValue(wolvrix::lib::grh::ValueId value)
+            {
+                if (enabled) events[currentBoundary].boundaryValues.push_back(value);
+            }
+
+            void boundaryOperation(wolvrix::lib::grh::OperationId op)
+            {
+                if (enabled) events[currentBoundary].boundaryOperations.push_back(op);
+            }
+
+            // Every operand is relocated once, after all directed port unions
+            // and all target ranges (including boundary assigns) are fixed.
+            void commitOperands(wolvrix::lib::grh::Graph &target,
+                                wolvrix::lib::grh::detail::BlockExecutor *executor)
+            {
+                if (operands.empty()) return;
+                ports.compress();
+                for (auto &block : operands)
+                {
+                    if (block.consumed) continue;
+                    block.relocated.resize(block.nodes.size());
+                    auto *work = &block;
+                    executor->submit([this, work] {
+                        for (std::size_t i = 0; i < work->nodes.size(); ++i)
+                        {
+                            work->relocated[i] = ports.get(work->nodes[i]);
+                            if (!work->relocated[i].valid())
+                                throw std::logic_error("Flatten global operand has no target representative");
+                        }
+                    });
+                }
+                executor->wait();
+                for (; committedOperandBlocks < operands.size(); ++committedOperandBlocks)
+                {
+                    const auto &block = operands[committedOperandBlocks];
+                    if (block.consumed) continue;
+                    target.setOperationBlockOperands(block.operations, block.offsets, block.relocated);
+                }
+                operands.clear();
+            }
+        };
+
         struct InlineState
         {
             wolvrix::lib::grh::Design &design;
@@ -156,6 +380,11 @@ namespace wolvrix::lib::transform
                                wolvrix::lib::grh::ValueIdHash> inputTypeViews;
             std::unordered_map<const wolvrix::lib::grh::Graph *,
                                std::unordered_set<uint32_t>> neededOpSymbols;
+            // A source definition has identical provenance in every instance.
+            // Contexts live only for this flatten operation and share imports
+            // between cloned values and operations.
+            std::unordered_map<uint64_t, wolvrix::lib::grh::Graph::SrcLocImportContext> srcLocImports;
+            std::unordered_map<uint64_t, wolvrix::lib::grh::Graph::BlockImportContext> blockImports;
             std::function<void(const wolvrix::lib::grh::Graph &, std::string)> graphError;
             std::function<void(const wolvrix::lib::grh::Graph &, const wolvrix::lib::grh::Operation &,
                                std::string)> opError;
@@ -165,6 +394,11 @@ namespace wolvrix::lib::transform
             std::string currentPrefix;
             std::vector<std::string> nodeInstancePath;
             bool profile = false;
+            std::size_t numThreads = 1;
+            GlobalInlinePlan plan;
+            // Join outstanding tasks before destroying their plan captures,
+            // including allocation failures while submitting the next task.
+            std::unique_ptr<wolvrix::lib::grh::detail::BlockExecutor> executor;
             bool failed = false;
             bool changed = false;
         };
@@ -200,13 +434,13 @@ namespace wolvrix::lib::transform
         }
 
         std::optional<std::string_view> getAttrStringBorrowed(
-            std::span<const wolvrix::lib::grh::AttrKV> attrs, std::string_view key)
+            wolvrix::lib::grh::AttrRange attrs, std::string_view key)
         {
             for (const auto &entry : attrs)
             {
-                if (entry.key == key)
+                if (entry.key() == key)
                 {
-                    if (const auto *value = std::get_if<std::string>(&entry.value))
+                    if (const auto value = entry.value().get<std::string>())
                     {
                         return *value;
                     }
@@ -216,17 +450,17 @@ namespace wolvrix::lib::transform
             return std::nullopt;
         }
 
-        const std::vector<std::string> *getAttrStringsBorrowed(
-            std::span<const wolvrix::lib::grh::AttrKV> attrs, std::string_view key)
+        std::optional<wolvrix::lib::grh::StringListView> getAttrStringsBorrowed(
+            wolvrix::lib::grh::AttrRange attrs, std::string_view key)
         {
             for (const auto &entry : attrs)
             {
-                if (entry.key == key)
+                if (entry.key() == key)
                 {
-                    return std::get_if<std::vector<std::string>>(&entry.value);
+                    return entry.value().get<std::vector<std::string>>();
                 }
             }
-            return nullptr;
+            return std::nullopt;
         }
 
         std::unordered_set<uint32_t> collectNeededOpSymbols(const wolvrix::lib::grh::Graph &source)
@@ -238,13 +472,13 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                for (const auto &attr : source.opAttrs(opId))
+                for (const auto &attr : source.opAttrRange(opId))
                 {
-                    if (!isOpSymbolReferenceAttr(attr.key))
+                    if (!isOpSymbolReferenceAttr(attr.key()))
                     {
                         continue;
                     }
-                    if (const auto *name = std::get_if<std::string>(&attr.value))
+                    if (const auto name = attr.value().get<std::string>())
                     {
                         const auto symbol = source.lookupSymbol(*name);
                         if (symbol.valid())
@@ -299,11 +533,11 @@ namespace wolvrix::lib::transform
                    named("inoutPortName", source.inoutPorts());
         }
 
-        bool hasNamedPortMaps(std::span<const wolvrix::lib::grh::AttrKV> attrs,
+        bool hasNamedPortMaps(wolvrix::lib::grh::AttrRange attrs,
                               const wolvrix::lib::grh::Graph &source)
         {
             const auto named = [&](std::string_view key, const auto &ports) {
-                const auto *names = getAttrStringsBorrowed(attrs, key);
+                const auto names = getAttrStringsBorrowed(attrs, key);
                 if (!names)
                 {
                     return ports.empty();
@@ -358,7 +592,7 @@ namespace wolvrix::lib::transform
                     const auto kind = graph->opKind(opId);
                     if (kind != wolvrix::lib::grh::OperationKind::kInstance &&
                         kind != wolvrix::lib::grh::OperationKind::kBlackbox) continue;
-                    const auto attrs = graph->opAttrs(opId);
+                    const auto attrs = graph->opAttrRange(opId);
                     const auto moduleName = getAttrStringBorrowed(attrs, "moduleName");
                     auto *source = moduleName ? design.findGraph(*moduleName) : nullptr;
                     if (!source || source == &top) continue;
@@ -367,10 +601,9 @@ namespace wolvrix::lib::transform
                     references.named = references.named && hasNamedPortMaps(attrs, *source);
                 }
             }
-            // Freeze each read-only definition before retaining any flatten
-            // IDs or spans. This releases dead builder storage without keeping
-            // the builders alive alongside the growing flattened top. Freeze
-            // sorts ports, so every reference must use complete named maps.
+            // Compact each read-only definition before retaining flatten IDs
+            // or spans. Compact sorts ports, so every reference must use
+            // complete named maps.
             SourceFreezeStats stats;
             for (const auto &[source, references] : sources)
             {
@@ -383,7 +616,11 @@ namespace wolvrix::lib::transform
                 ++stats.eligible;
                 if (source->frozen())
                 {
-                    ++stats.alreadyFrozen;
+                    // Prefix workers can perform this same compact earlier.
+                    // Consume its transient receipt so the legacy diagnostic
+                    // still accounts for the work at this boundary once.
+                    if (source->consumePreparedFlattenFreeze()) ++stats.frozen;
+                    else ++stats.alreadyFrozen;
                     continue;
                 }
                 try
@@ -442,7 +679,7 @@ namespace wolvrix::lib::transform
                     continue;
                 }
                 addCapacity(estimate.symbols, 1);
-                const auto attrs = graph.opAttrs(opId);
+                const auto attrs = graph.opAttrRange(opId);
                 const auto moduleName = getAttrStringBorrowed(attrs, "moduleName");
                 auto *child = moduleName ? design.findGraph(*moduleName) : nullptr;
                 if (!child)
@@ -704,9 +941,11 @@ namespace wolvrix::lib::transform
             }
             const wolvrix::lib::grh::ValueId view =
                 target.createValue(target.makeInternalValSym(), expected);
+            state.plan.boundaryValue(view);
             const wolvrix::lib::grh::OperationId assign =
                 target.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
                                        target.makeInternalOpSym());
+            state.plan.boundaryOperation(assign);
             target.reserveOpOperandCapacity(assign, 1);
             target.reserveOpResultCapacity(assign, 1);
             target.reserveOpAttrCapacity(assign, 1);
@@ -739,7 +978,8 @@ namespace wolvrix::lib::transform
             if (!found.valid())
             {
                 found = sourceType == targetType ? targetValue : target.createValue(sourceType);
-                portMap.set(childValue, found);
+                if (sourceType != targetType) state.plan.boundaryValue(found);
+                portMap.bindEquivalentPort(childValue, found);
             }
             if (found != targetValue)
             {
@@ -750,6 +990,7 @@ namespace wolvrix::lib::transform
                     return false;
                 }
                 const auto assign = target.createOperation(wolvrix::lib::grh::OperationKind::kAssign);
+                state.plan.boundaryOperation(assign);
                 target.reserveOpOperandCapacity(assign, 1);
                 target.reserveOpResultCapacity(assign, 1);
                 target.reserveOpAttrCapacity(assign, 1);
@@ -906,6 +1147,15 @@ namespace wolvrix::lib::transform
             };
 
             DenseValueMap childPortMap(*child);
+            if (state.plan.enabled)
+            {
+                const auto instance = state.plan.nextInstance++;
+                if (instance >= state.plan.instances.size() || state.plan.instances[instance].source != child)
+                    throw std::logic_error("Flatten global instance order differs from legacy traversal");
+                childPortMap.globalPorts = &state.plan.ports;
+                childPortMap.globalBase = state.plan.instances[instance].nodeBase;
+                childPortMap.plannedInstance = instance;
+            }
 
             const auto childInputs = child->inputPorts();
             std::unordered_map<std::string_view, wolvrix::lib::grh::ValueId> childInputByName;
@@ -949,7 +1199,7 @@ namespace wolvrix::lib::transform
                 maybeRenameMappedValue(childValue, *targetValue, portName);
                 if (!childPortMap.contains(childValue))
                 {
-                    childPortMap.set(childValue, mappedInput);
+                    childPortMap.bindEquivalentPort(childValue, mappedInput);
                 }
             }
 
@@ -1041,7 +1291,7 @@ namespace wolvrix::lib::transform
                     return false;
                 if (!childPortMap.contains(childInout.in))
                 {
-                    childPortMap.set(childInout.in, mappedInput);
+                    childPortMap.bindEquivalentPort(childInout.in, mappedInput);
                 }
             }
             if (state.failed)
@@ -1072,26 +1322,110 @@ namespace wolvrix::lib::transform
                                        wolvrix::lib::grh::OperationId opId)
         {
             InstanceInfo info;
-            const auto attrs = graph.opAttrs(opId);
+            const auto attrs = graph.opAttrRange(opId);
             info.moduleName = getAttrStringBorrowed(attrs, "moduleName").value_or(std::string_view());
             info.instanceName = getAttrStringBorrowed(attrs, "instanceName").value_or(std::string_view());
             const auto operands = graph.opOperands(opId);
             const auto results = graph.opResults(opId);
             info.operands.assign(operands.begin(), operands.end());
             info.results.assign(results.begin(), results.end());
-            if (const auto *names = getAttrStringsBorrowed(attrs, "inputPortName"))
+            if (const auto names = getAttrStringsBorrowed(attrs, "inputPortName"))
             {
-                info.inputPortNames = *names;
+                info.inputPortNames = std::vector<std::string>(names->begin(), names->end());
             }
-            if (const auto *names = getAttrStringsBorrowed(attrs, "outputPortName"))
+            if (const auto names = getAttrStringsBorrowed(attrs, "outputPortName"))
             {
-                info.outputPortNames = *names;
+                info.outputPortNames = std::vector<std::string>(names->begin(), names->end());
             }
-            if (const auto *names = getAttrStringsBorrowed(attrs, "inoutPortName"))
+            if (const auto names = getAttrStringsBorrowed(attrs, "inoutPortName"))
             {
-                info.inoutPortNames = *names;
+                info.inoutPortNames = std::vector<std::string>(names->begin(), names->end());
             }
             return info;
+        }
+
+        GlobalInlinePlan planGlobalInline(wolvrix::lib::grh::Design &design,
+                                         const wolvrix::lib::grh::Graph &top,
+                                         std::span<const wolvrix::lib::grh::OperationId> topInstances)
+        {
+            GlobalInlinePlan plan;
+            if (topInstances.empty()) return plan;
+            const auto rowCount = [](const wolvrix::lib::grh::Graph &source) {
+                std::size_t count = 1;
+                for (const auto value : source.values())
+                    count = std::max(count, static_cast<std::size_t>(value.index) + 1);
+                return count;
+            };
+            std::size_t nodes = rowCount(top);
+            std::unordered_set<const wolvrix::lib::grh::Graph *> stack{&top};
+            std::unordered_set<const wolvrix::lib::grh::Graph *> validated;
+            std::function<bool(const wolvrix::lib::grh::Graph &)> expand;
+            expand = [&](const wolvrix::lib::grh::Graph &source) {
+                if (!stack.insert(&source).second) return false;
+                const auto instance = plan.instances.size();
+                const auto count = rowCount(source);
+                if (validated.insert(&source).second)
+                {
+                    std::vector<uint8_t> live(count, 0);
+                    for (const auto value : source.values()) live[value.index] = 1;
+                    const auto validValue = [&](wolvrix::lib::grh::ValueId value) {
+                        return value.valid() && value.graph == source.id() && value.generation == 0 &&
+                            value.index < live.size() && live[value.index];
+                    };
+                    for (const auto &port : source.inputPorts()) if (!validValue(port.value)) return false;
+                    for (const auto &port : source.outputPorts()) if (!validValue(port.value)) return false;
+                    for (const auto &port : source.inoutPorts())
+                        if (!validValue(port.in) || !validValue(port.out) || !validValue(port.oe)) return false;
+                    for (const auto op : source.operations())
+                    {
+                        for (const auto value : source.opOperands(op)) if (!validValue(value)) return false;
+                        for (const auto value : source.opResults(op)) if (!validValue(value)) return false;
+                        for (const auto attr : source.opAttrRange(op))
+                        {
+                            if (!isOpSymbolReferenceAttr(attr.key())) continue;
+                            if (const auto text = attr.value().get<std::string>();
+                                text && !source.findOperation(*text).valid()) return false;
+                        }
+                    }
+                    if (!wolvrix::lib::ingest::node::scanAttributeErrors(source).empty()) return false;
+                }
+                if (count > std::numeric_limits<std::size_t>::max() - nodes)
+                    throw std::length_error("Flatten global value range capacity");
+                plan.instances.push_back({&source, nodes, planOperationRuns(source)});
+                ++plan.definitionUses[&source];
+                nodes += count;
+                plan.events.push_back({GlobalInlinePlan::EventKind::EnterValues, instance, 0});
+                // Copy the small run descriptors: recursive expansion grows
+                // instances and must not invalidate the parent's iterator.
+                const auto runs = plan.instances[instance].runs;
+                for (std::size_t run = 0; run < runs.size(); ++run)
+                {
+                    const auto &entry = runs[run];
+                    plan.events.push_back({entry.boundary ? GlobalInlinePlan::EventKind::Boundary :
+                        GlobalInlinePlan::EventKind::OpRun, instance, run});
+                    if (!entry.boundary || source.opKind(entry.operations.front()) !=
+                        wolvrix::lib::grh::OperationKind::kInstance) continue;
+                    const auto name = getAttrStringBorrowed(source.opAttrRange(entry.operations.front()), "moduleName");
+                    const auto *child = name ? design.findGraph(*name) : nullptr;
+                    if (!child || !expand(*child)) return false;
+                }
+                plan.events.push_back({GlobalInlinePlan::EventKind::Exit, instance, 0});
+                stack.erase(&source);
+                return true;
+            };
+            for (std::size_t index = 0; index < topInstances.size(); ++index)
+            {
+                const auto op = topInstances[index];
+                plan.events.push_back({GlobalInlinePlan::EventKind::Boundary, GlobalPortUnionFind::invalid, index});
+                const auto name = getAttrStringBorrowed(top.opAttrRange(op), "moduleName");
+                const auto *child = name ? design.findGraph(*name) : nullptr;
+                // Invalid structures retain the old mutation and first-error
+                // route; planning itself must not publish diagnostics.
+                if (!child || !expand(*child)) return {};
+            }
+            plan.ports.nodes.resize(nodes);
+            plan.enabled = true;
+            return plan;
         }
 
         // Propagate the inlined child graph's generate groups into the target:
@@ -1193,6 +1527,14 @@ namespace wolvrix::lib::transform
                 return false;
             }
             state.stack.insert(&source);
+            const auto plannedInstance = valueMap.plannedInstance;
+            const auto enterEvent = state.plan.consume(GlobalInlinePlan::EventKind::EnterValues, plannedInstance);
+            if (state.plan.enabled)
+            {
+                auto &instance = state.plan.instances[plannedInstance];
+                instance.prefix = prefix;
+                instance.qualification = std::make_unique<wolvrix::lib::ingest::node::QualificationContext>(state.nodeInstancePath);
+            }
             ++state.metrics.sourceCalls;
             if (state.profile)
             {
@@ -1205,6 +1547,12 @@ namespace wolvrix::lib::transform
                 state.nodeInventory.record(source, state.nodeInstancePath);
             }
             wolvrix::lib::ingest::node::QualificationContext nodeQualification(state.nodeInstancePath);
+            const auto sourceGraphId = source.id();
+            const uint64_t sourceKey = (static_cast<uint64_t>(sourceGraphId.index) << 32) |
+                sourceGraphId.generation;
+            auto& srcLocImport = state.srcLocImports[sourceKey];
+            auto& blockImport = state.blockImports[sourceKey];
+            target.prepareBlockImport(source, blockImport, srcLocImport);
 
             std::unordered_set<uint32_t> declaredSet;
             declaredSet.reserve(source.declaredSymbols().size());
@@ -1281,6 +1629,10 @@ namespace wolvrix::lib::transform
             SymbolRenameMap valueRename;
             const auto valuesStarted = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
             state.metrics.valuesVisited += source.values().size();
+            std::vector<wolvrix::lib::grh::ValueId> sourceValues;
+            std::vector<wolvrix::lib::grh::SymbolId> valueSymbols;
+            sourceValues.reserve(source.values().size());
+            valueSymbols.reserve(source.values().size());
             for (const auto valueId : source.values())
             {
                 if (!valueId.valid())
@@ -1291,7 +1643,6 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                const int32_t width = source.valueWidth(valueId);
                 const wolvrix::lib::grh::SymbolId sourceSym = source.valueSymbol(valueId);
                 const std::string_view sourceName = source.symbolText(sourceSym);
                 wolvrix::lib::grh::SymbolId newSym = wolvrix::lib::grh::SymbolId::invalid();
@@ -1308,23 +1659,27 @@ namespace wolvrix::lib::transform
                 {
                     newSym = target.makeInternalValSym();
                 }
-                // stage-04: preserve the array view on cloned values.
-                wolvrix::lib::grh::ValueId newValue =
-                    target.createValue(newSym, width, source.valueSigned(valueId),
-                                       source.valueType(valueId), source.valueShape(valueId),
-                                       source.valueDomain(valueId));
-                if (auto srcLoc = source.valueSrcLoc(valueId))
-                {
-                    target.setValueSrcLoc(newValue, std::move(*srcLoc));
-                }
-                valueMap.set(valueId, newValue);
-                ++state.metrics.valuesCloned;
+                sourceValues.push_back(valueId);
+                valueSymbols.push_back(newSym);
                 if (trackValueRename && !sourceName.empty())
                 {
                     valueRename.emplace(sourceSym.value, newSym);
                 }
-                state.changed = true;
             }
+            std::vector<wolvrix::lib::grh::ValueId> newValues(sourceValues.size());
+            const bool retainColumns = state.plan.enabled && state.plan.definitionUses.at(&source) == 1;
+            target.appendValueBlock(source, sourceValues, valueSymbols, newValues, srcLocImport,
+                state.plan.enabled ? 1 : state.numThreads, retainColumns);
+            if (state.plan.enabled)
+            {
+                auto &event = state.plan.events[enterEvent];
+                event.count = newValues.size();
+                if (!newValues.empty()) event.firstValue = newValues.front();
+            }
+            for (std::size_t index = 0; index < sourceValues.size(); ++index)
+                valueMap.set(sourceValues[index], newValues[index]);
+            state.metrics.valuesCloned += sourceValues.size();
+            state.changed |= !sourceValues.empty();
             if (state.profile)
             {
                 state.metrics.values += FlattenClock::now() - valuesStarted;
@@ -1363,9 +1718,9 @@ namespace wolvrix::lib::transform
             std::vector<PendingAttr> pendingAttrs;
 
             auto rewriteAttr = [&](wolvrix::lib::grh::OperationId newOp,
-                                   const std::string &key,
-                                   const wolvrix::lib::grh::AttributeValue &value) {
-                if (const auto *strValue = std::get_if<std::string>(&value);
+                                   std::string_view key,
+                                   wolvrix::lib::grh::AttrValueView value) {
+                if (const auto strValue = value.get<std::string>();
                     strValue && isOpSymbolReferenceAttr(key))
                 {
                     const auto sourceSymbol = source.lookupSymbol(*strValue);
@@ -1375,268 +1730,381 @@ namespace wolvrix::lib::transform
                         target.setAttr(newOp, key, std::string(target.symbolText(it->second)));
                         return;
                     }
-                    pendingAttrs.push_back(PendingAttr{newOp, key, *strValue, sourceSymbol});
+                    pendingAttrs.push_back(PendingAttr{newOp, std::string(key), std::string(*strValue), sourceSymbol});
                 }
-                target.setAttr(newOp, key, value);
+                target.setAttrView(newOp, key, value);
             };
+
+            const auto planOperationSymbol = [&](wolvrix::lib::grh::OperationId opId) {
+                const auto sourceSym = source.operationSymbol(opId);
+                const auto sourceName = source.symbolText(sourceSym);
+                auto symbol = wolvrix::lib::grh::SymbolId::invalid();
+                if (shouldProtectOp(sourceSym) && !sourceName.empty())
+                {
+                    symbol = internUniqueSymbol(target, makeHierName(prefix, sourceName));
+                    target.addDeclaredSymbol(symbol);
+                }
+                return symbol.valid() ? symbol : target.makeInternalOpSym();
+            };
+
+            const wolvrix::lib::grh::AttributeValue defaultOrigins = std::vector<std::string>{prefix};
 
             const auto operationsStarted = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
             state.metrics.operationsVisited += source.operations().size();
-            for (const auto opId : source.operations())
+            const auto fallbackRuns = state.plan.enabled ? std::vector<OperationRun>{} : planOperationRuns(source);
+            const auto &runs = state.plan.enabled ? state.plan.instances[plannedInstance].runs : fallbackRuns;
+            for (std::size_t plannedRun = 0; plannedRun < runs.size(); ++plannedRun)
             {
-                if (!opId.valid())
+                if (state.failed) break;
+                const auto &run = runs[plannedRun];
+                const auto runEvent = state.plan.consume(run.boundary ? GlobalInlinePlan::EventKind::Boundary :
+                    GlobalInlinePlan::EventKind::OpRun, plannedInstance, plannedRun);
+                std::vector<wolvrix::lib::grh::OperationId> runOutput;
+                std::vector<wolvrix::lib::grh::SymbolId> runSymbols;
+                std::vector<uint32_t> operandOffsets{0}, resultOffsets{0};
+                std::vector<wolvrix::lib::grh::ValueId> operands, results;
+                std::vector<std::size_t> operandNodes;
+                std::vector<uint8_t> commonOrigins;
+                bool bulk = !run.boundary;
+                slang::flat_hash_set<uint32_t, std::hash<uint32_t>> definitions;
+                if (bulk)
                 {
-                    continue;
-                }
-                const wolvrix::lib::grh::OperationKind kind = source.opKind(opId);
-                if (kind == wolvrix::lib::grh::OperationKind::kInstance)
-                {
-                    ++state.metrics.instanceCalls;
-                    ++state.metrics.instanceOperations;
-                    const InstanceInfo info = buildInstanceInfo(source, opId);
-                    if (state.profile)
+                    // Validate the whole ordinary interior before committing
+                    // it. Invalid inputs retain the old operation-at-a-time
+                    // route and its exact first-error diagnostic.
+                    for (const auto sourceOp : run.operations)
                     {
-                        const auto started = FlattenClock::now();
-                        if (!inlineInstanceInfo(source, info, valueMap, target, prefix, state))
+                        for (const auto value : source.opOperands(sourceOp))
                         {
-                            state.failed = true;
-                            break;
-                        }
-                        state.metrics.recursiveInstances += FlattenClock::now() - started;
-                    }
-                    else if (!inlineInstanceInfo(source, info, valueMap, target, prefix, state))
-                    {
-                        state.failed = true;
-                        break;
-                    }
-                    state.changed = true;
-                    continue;
-                }
-
-                if (kind == wolvrix::lib::grh::OperationKind::kDpicImport)
-                {
-                    const wolvrix::lib::grh::Operation op = source.getOperation(opId);
-                    const std::string opName = std::string(op.symbolText());
-                    if (opName.empty())
-                    {
-                        state.opError(source, op, "kDpicImport missing symbol");
-                        state.failed = true;
-                        break;
-                    }
-                    const wolvrix::lib::grh::OperationId existing = target.findOperation(opName);
-                    if (existing.valid())
-                    {
-                        const wolvrix::lib::grh::Operation existingOp = target.getOperation(existing);
-                        if (existingOp.kind() != wolvrix::lib::grh::OperationKind::kDpicImport)
-                        {
-                            state.opError(source, op,
-                                          "kDpicImport symbol conflicts with existing operation");
-                            state.failed = true;
-                            break;
-                        }
-                        if (!dpiAttrsEqual(op, existingOp))
-                        {
-                            state.opError(source, op,
-                                          "kDpicImport attributes conflict for symbol " + opName);
-                            state.failed = true;
-                            break;
-                        }
-                        // Same import declared in another module: union the
-                        // provenance instead of dropping it. A child op
-                        // without originModules belongs to the graph being
-                        // inlined (same convention as the top-graph stamping).
-                        std::vector<std::string> origins =
-                            getOriginModules(source, op.id()).value_or(std::vector<std::string>{prefix});
-                        if (!origins.empty())
-                        {
-                            std::vector<std::string> merged =
-                                getOriginModules(target, existing).value_or(std::vector<std::string>{});
-                            for (const std::string &module : origins)
+                            if (state.plan.enabled)
                             {
-                                appendOriginModule(merged, module);
+                                const auto node = valueMap.node(value);
+                                bulk &= node != GlobalPortUnionFind::invalid;
+                                operandNodes.push_back(node);
                             }
-                            target.setAttr(existing, kOriginModulesKey, std::move(merged));
+                            else
+                            {
+                                const auto mapped = valueMap.get(value);
+                                bulk &= mapped.valid();
+                                operands.push_back(mapped);
+                            }
+                        }
+                        operandOffsets.push_back(static_cast<uint32_t>(state.plan.enabled ? operandNodes.size() : operands.size()));
+                        for (const auto value : source.opResults(sourceOp))
+                        {
+                            const auto mapped = valueMap.get(value);
+                            if (!mapped.valid() || target.valueDef(mapped).valid() ||
+                                !definitions.insert(mapped.index).second)
+                                bulk = false;
+                            results.push_back(mapped);
+                        }
+                        resultOffsets.push_back(static_cast<uint32_t>(results.size()));
+                    }
+                }
+                if (bulk)
+                {
+                    runSymbols.reserve(run.operations.size());
+                    for (const auto sourceOp : run.operations) runSymbols.push_back(planOperationSymbol(sourceOp));
+                    runOutput.resize(run.operations.size());
+                    target.appendOperationBlock(source, run.operations, runSymbols, runOutput, srcLocImport,
+                        state.plan.enabled ? 1 : state.numThreads, retainColumns);
+                    if (state.plan.enabled)
+                    {
+                        auto &event = state.plan.events[runEvent];
+                        event.count = runOutput.size();
+                        if (!runOutput.empty()) event.firstOperation = runOutput.front();
+                        target.setOperationBlockResults(runOutput, resultOffsets, results);
+                        state.plan.operands.push_back({&source, run.operations, plannedInstance, runOutput,
+                            std::move(operandOffsets), std::move(operandNodes)});
+                    }
+                    else
+                    {
+                        target.setOperationBlockEdges(runOutput, operandOffsets, operands, resultOffsets, results);
+                    }
+                    if (!state.plan.enabled)
+                    {
+                        target.appendOperationBlockAttributes(source, run.operations, runOutput, blockImport);
+                        commonOrigins.resize(run.operations.size(), 1);
+                        std::vector<wolvrix::lib::grh::OperationId> commonOriginOps;
+                        commonOriginOps.reserve(runOutput.size());
+                        for (std::size_t index = 0; index < run.operations.size(); ++index)
+                        {
+                            for (const auto attribute : source.opAttrRange(run.operations[index]))
+                            {
+                                if (attribute.key() != kOriginModulesKey) continue;
+                                if (const auto origins = attribute.value().get<std::vector<std::string>>();
+                                    origins && !origins->empty()) commonOrigins[index] = 0;
+                                break;
+                            }
+                            if (commonOrigins[index]) commonOriginOps.push_back(runOutput[index]);
+                        }
+                        target.setOperationBlockAttr(commonOriginOps, kOriginModulesKey,
+                            wolvrix::lib::grh::AttrValueView(&defaultOrigins));
+                    }
+                }
+                for (std::size_t runIndex = 0; runIndex < run.operations.size(); ++runIndex)
+                {
+                    const auto opId = run.operations[runIndex];
+                    if (!opId.valid())
+                    {
+                        continue;
+                    }
+                    const wolvrix::lib::grh::OperationKind kind = source.opKind(opId);
+                    if (kind == wolvrix::lib::grh::OperationKind::kInstance)
+                    {
+                        ++state.metrics.instanceCalls;
+                        ++state.metrics.instanceOperations;
+                        const InstanceInfo info = buildInstanceInfo(source, opId);
+                        if (state.profile)
+                        {
+                            const auto started = FlattenClock::now();
+                            if (!inlineInstanceInfo(source, info, valueMap, target, prefix, state))
+                            {
+                                state.failed = true;
+                                break;
+                            }
+                            state.metrics.recursiveInstances += FlattenClock::now() - started;
+                        }
+                        else if (!inlineInstanceInfo(source, info, valueMap, target, prefix, state))
+                        {
+                            state.failed = true;
+                            break;
+                        }
+                        state.changed = true;
+                        continue;
+                    }
+
+                    if (kind == wolvrix::lib::grh::OperationKind::kDpicImport)
+                    {
+                        const wolvrix::lib::grh::Operation op = source.getOperation(opId);
+                        const std::string opName = std::string(op.symbolText());
+                        if (opName.empty())
+                        {
+                            state.opError(source, op, "kDpicImport missing symbol");
+                            state.failed = true;
+                            break;
+                        }
+                        const wolvrix::lib::grh::OperationId existing = target.findOperation(opName);
+                        if (existing.valid())
+                        {
+                            const wolvrix::lib::grh::Operation existingOp = target.getOperation(existing);
+                            if (existingOp.kind() != wolvrix::lib::grh::OperationKind::kDpicImport)
+                            {
+                                state.opError(source, op,
+                                              "kDpicImport symbol conflicts with existing operation");
+                                state.failed = true;
+                                break;
+                            }
+                            if (!dpiAttrsEqual(op, existingOp))
+                            {
+                                state.opError(source, op,
+                                              "kDpicImport attributes conflict for symbol " + opName);
+                                state.failed = true;
+                                break;
+                            }
+                            // Same import declared in another module: union the
+                            // provenance instead of dropping it. A child op
+                            // without originModules belongs to the graph being
+                            // inlined (same convention as the top-graph stamping).
+                            std::vector<std::string> origins =
+                                getOriginModules(source, op.id()).value_or(std::vector<std::string>{prefix});
+                            if (!origins.empty())
+                            {
+                                std::vector<std::string> merged =
+                                    getOriginModules(target, existing).value_or(std::vector<std::string>{});
+                                for (const std::string &module : origins)
+                                {
+                                    appendOriginModule(merged, module);
+                                }
+                                target.setAttr(existing, kOriginModulesKey, std::move(merged));
+                            }
+                            if (neededOpSymbols.contains(op.symbol().value))
+                            {
+                                opRename.emplace(op.symbol().value, existingOp.symbol());
+                            }
+                            continue;
+                        }
+                        if (target.findValue(opName).valid())
+                        {
+                            state.opError(source, op,
+                                          "kDpicImport symbol conflicts with existing value");
+                            state.failed = true;
+                            break;
+                        }
+                        wolvrix::lib::grh::SymbolId sym = target.internSymbol(opName);
+                        if (!sym.valid())
+                        {
+                            state.opError(source, op,
+                                          "kDpicImport symbol collision during flatten");
+                            state.failed = true;
+                            break;
+                        }
+                        wolvrix::lib::grh::OperationId newOp =
+                            target.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport, sym);
+                        state.plan.boundaryOperation(newOp);
+                        ++state.metrics.operationsCloned;
+                        target.reserveOpAttrCapacity(newOp, op.attrs().size());
+                        target.copyOpSrcLoc(newOp, source, opId, srcLocImport);
+                        for (const auto &attr : op.attrs())
+                        {
+                            target.setAttr(newOp, attr.key, attr.value);
                         }
                         if (neededOpSymbols.contains(op.symbol().value))
                         {
-                            opRename.emplace(op.symbol().value, existingOp.symbol());
+                            opRename.emplace(op.symbol().value, sym);
                         }
+                        state.changed = true;
                         continue;
                     }
-                    if (target.findValue(opName).valid())
-                    {
-                        state.opError(source, op,
-                                      "kDpicImport symbol conflicts with existing value");
-                        state.failed = true;
-                        break;
-                    }
-                    wolvrix::lib::grh::SymbolId sym = target.internSymbol(opName);
-                    if (!sym.valid())
-                    {
-                        state.opError(source, op,
-                                      "kDpicImport symbol collision during flatten");
-                        state.failed = true;
-                        break;
-                    }
-                    wolvrix::lib::grh::OperationId newOp =
-                        target.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport, sym);
-                    ++state.metrics.operationsCloned;
-                    target.reserveOpAttrCapacity(newOp, op.attrs().size());
-                    if (op.srcLoc())
-                    {
-                        target.setOpSrcLoc(newOp, *op.srcLoc());
-                    }
-                    for (const auto &attr : op.attrs())
-                    {
-                        target.setAttr(newOp, attr.key, attr.value);
-                    }
-                    if (neededOpSymbols.contains(op.symbol().value))
-                    {
-                        opRename.emplace(op.symbol().value, sym);
-                    }
-                    state.changed = true;
-                    continue;
-                }
 
-                const wolvrix::lib::grh::SymbolId sourceSym = source.operationSymbol(opId);
-                const std::string_view sourceName = source.symbolText(sourceSym);
-                wolvrix::lib::grh::SymbolId newSym = wolvrix::lib::grh::SymbolId::invalid();
-                const bool protectOp = shouldProtectOp(sourceSym);
-                if (protectOp)
-                {
-                    if (!sourceName.empty())
-                    {
-                        const std::string hierName = makeHierName(prefix, sourceName);
-                        newSym = internUniqueSymbol(target, hierName);
-                        target.addDeclaredSymbol(newSym);
-                    }
-                }
-                if (!newSym.valid())
-                {
-                    newSym = target.makeInternalOpSym();
-                }
+                    const wolvrix::lib::grh::SymbolId sourceSym = source.operationSymbol(opId);
+                    const std::string_view sourceName = source.symbolText(sourceSym);
+                    const auto newSym = bulk ? runSymbols[runIndex] : planOperationSymbol(opId);
 
-                if (neededOpSymbols.contains(sourceSym.value) && !sourceName.empty())
-                {
-                    const std::string_view newOpName = target.symbolText(newSym);
-                    if (!newOpName.empty())
+                    if (neededOpSymbols.contains(sourceSym.value) && !sourceName.empty())
                     {
-                        opRename.emplace(sourceSym.value, newSym);
-                    }
-                }
-
-                wolvrix::lib::grh::OperationId newOp =
-                    target.createOperation(kind, newSym);
-                ++state.metrics.operationsCloned;
-                const auto sourceAttrs = source.opAttrs(opId);
-                target.reserveOpOperandCapacity(newOp, source.opOperands(opId).size());
-                target.reserveOpResultCapacity(newOp, source.opResults(opId).size());
-                // originModules is either replaced or appended below, so one
-                // extra slot covers the common case without growing the
-                // per-operation attribute vector while cloning.
-                target.reserveOpAttrCapacity(newOp, sourceAttrs.size() + 1);
-                if (auto srcLoc = source.opSrcLoc(opId))
-                {
-                    target.setOpSrcLoc(newOp, std::move(*srcLoc));
-                }
-
-                bool hasOrigins = false;
-                bool hasNodeAttrs = false;
-                for (const auto &attr : sourceAttrs)
-                {
-                    if (wolvrix::lib::ingest::node::isAttribute(attr.key))
-                    {
-                        hasNodeAttrs = true;
-                        // The supported associations are built once below,
-                        // after results have their final positions. Preserve
-                        // unknown attributes for the existing verifier error.
-                        if (attr.key == wolvrix::lib::ingest::node::kMembers ||
-                            attr.key == wolvrix::lib::ingest::node::kOrigins ||
-                            attr.key == wolvrix::lib::ingest::node::kRoots ||
-                            attr.key == wolvrix::lib::ingest::node::kRootResults)
+                        const std::string_view newOpName = target.symbolText(newSym);
+                        if (!newOpName.empty())
                         {
+                            opRename.emplace(sourceSym.value, newSym);
+                        }
+                    }
+
+                    wolvrix::lib::grh::OperationId newOp =
+                        bulk ? runOutput[runIndex] : target.createOperation(kind, newSym);
+                    ++state.metrics.operationsCloned;
+                    const auto sourceAttrs = source.opAttrRange(opId);
+                    if (bulk && state.plan.enabled)
+                    {
+                        // Metadata payload records are filled as one global
+                        // batch after every event has published its ID range.
+                        // Resolve references at InstanceExit to retain the
+                        // original diagnostic boundary and symbol precedence.
+                        for (const auto attr : sourceAttrs)
+                        {
+                            if (!isOpSymbolReferenceAttr(attr.key())) continue;
+                            if (const auto text = attr.value().get<std::string>())
+                                pendingAttrs.push_back({newOp, std::string(attr.key()), std::string(*text),
+                                    source.lookupSymbol(*text), true});
+                        }
+                        state.changed = true;
+                        continue;
+                    }
+                    if (!bulk)
+                    {
+                        target.reserveOpOperandCapacity(newOp, source.opOperands(opId).size());
+                        target.reserveOpResultCapacity(newOp, source.opResults(opId).size());
+                    }
+                    // originModules is either replaced or appended below, so one
+                    // extra slot covers the common case without growing the
+                    // per-operation attribute vector while cloning.
+                    target.reserveOpAttrCapacity(newOp, sourceAttrs.size() + 1);
+                    if (!bulk) target.copyOpSrcLoc(newOp, source, opId, srcLocImport);
+
+                    bool hasOrigins = false;
+                    bool hasNodeAttrs = false;
+                    for (const auto &attr : sourceAttrs)
+                    {
+                        if (wolvrix::lib::ingest::node::isAttribute(attr.key()))
+                        {
+                            hasNodeAttrs = true;
+                            // The supported associations are built once below,
+                            // after results have their final positions. Preserve
+                            // unknown attributes for the existing verifier error.
+                            if (attr.key() == wolvrix::lib::ingest::node::kMembers ||
+                                attr.key() == wolvrix::lib::ingest::node::kOrigins ||
+                                attr.key() == wolvrix::lib::ingest::node::kRoots ||
+                                attr.key() == wolvrix::lib::ingest::node::kRootResults)
+                            {
+                                if (bulk) target.eraseAttr(newOp, attr.key());
+                                continue;
+                            }
+                        }
+                        if (attr.key() != kOriginModulesKey)
+                        {
+                            if (!bulk || isOpSymbolReferenceAttr(attr.key()))
+                                rewriteAttr(newOp, attr.key(), attr.value());
                             continue;
                         }
+                        // Build the final provenance once, in its original attr
+                        // slot. Copying it into the target and reading it back
+                        // would allocate the same strings twice per cloned op.
+                        hasOrigins = true;
+                        if (bulk && commonOrigins[runIndex]) continue;
+                        std::vector<std::string> origins;
+                        if (const auto sourceOrigins = attr.value().get<std::vector<std::string>>())
+                        {
+                            origins.reserve(sourceOrigins->size() + 1);
+                            origins.assign(sourceOrigins->begin(), sourceOrigins->end());
+                        }
+                        if (origins.empty())
+                        {
+                            origins.push_back(prefix);
+                        }
+                        else
+                        {
+                            prependOriginModule(origins, prefix);
+                        }
+                        target.setAttr(newOp, kOriginModulesKey, std::move(origins));
                     }
-                    if (attr.key != kOriginModulesKey)
+                    if (!hasOrigins && !bulk)
                     {
-                        rewriteAttr(newOp, attr.key, attr.value);
-                        continue;
+                        target.setAttrView(newOp, kOriginModulesKey, wolvrix::lib::grh::AttrValueView(&defaultOrigins));
                     }
-                    // Build the final provenance once, in its original attr
-                    // slot. Copying it into the target and reading it back
-                    // would allocate the same strings twice per cloned op.
-                    hasOrigins = true;
-                    std::vector<std::string> origins;
-                    if (const auto *sourceOrigins = std::get_if<std::vector<std::string>>(&attr.value))
-                    {
-                        origins.reserve(sourceOrigins->size() + 1);
-                        origins.assign(sourceOrigins->begin(), sourceOrigins->end());
-                    }
-                    if (origins.empty())
-                    {
-                        origins.push_back(prefix);
-                    }
-                    else
-                    {
-                        prependOriginModule(origins, prefix);
-                    }
-                    target.setAttr(newOp, kOriginModulesKey, std::move(origins));
-                }
-                if (!hasOrigins)
-                {
-                    target.setAttr(newOp, kOriginModulesKey, std::vector<std::string>{prefix});
-                }
 
-                for (const auto operand : source.opOperands(opId))
-                {
-                    const auto mapped = valueMap.get(operand);
-                    if (!mapped.valid())
+                    if (!bulk)
                     {
-                        state.opError(source, source.getOperation(opId), "Flatten missing operand mapping");
-                        state.failed = true;
-                        break;
+                        for (const auto operand : source.opOperands(opId))
+                        {
+                            const auto mapped = valueMap.get(operand);
+                            if (!mapped.valid())
+                            {
+                                state.opError(source, source.getOperation(opId), "Flatten missing operand mapping");
+                                state.failed = true;
+                                break;
+                            }
+                            target.addOperand(newOp, mapped);
+                        }
+                        if (state.failed)
+                        {
+                            break;
+                        }
+                        for (const auto result : source.opResults(opId))
+                        {
+                            const auto mapped = valueMap.get(result);
+                            if (!mapped.valid())
+                            {
+                                state.opError(source, source.getOperation(opId), "Flatten missing result mapping");
+                                state.failed = true;
+                                break;
+                            }
+                            if (!addResultChecked(state, target, newOp, mapped, source, opId, result, prefix))
+                            {
+                                state.failed = true;
+                                break;
+                            }
+                        }
+                        if (state.failed)
+                        {
+                            break;
+                        }
                     }
-                    target.addOperand(newOp, mapped);
-                }
-                if (state.failed)
-                {
-                    break;
-                }
-                for (const auto result : source.opResults(opId))
-                {
-                    const auto mapped = valueMap.get(result);
-                    if (!mapped.valid())
+                    if (hasNodeAttrs)
                     {
-                        state.opError(source, source.getOperation(opId), "Flatten missing result mapping");
-                        state.failed = true;
-                        break;
+                        ++state.metrics.annotatedOperations;
+                        if (state.profile)
+                        {
+                            const auto started = FlattenClock::now();
+                            wolvrix::lib::ingest::node::copyQualified(source, opId, target, newOp, nodeQualification);
+                            state.metrics.qualification += FlattenClock::now() - started;
+                        }
+                        else
+                        {
+                            wolvrix::lib::ingest::node::copyQualified(source, opId, target, newOp, nodeQualification);
+                        }
                     }
-                    if (!addResultChecked(state, target, newOp, mapped, source, opId, result, prefix))
-                    {
-                        state.failed = true;
-                        break;
-                    }
+                    state.changed = true;
                 }
-                if (state.failed)
-                {
-                    break;
-                }
-                if (hasNodeAttrs)
-                {
-                    ++state.metrics.annotatedOperations;
-                    if (state.profile)
-                    {
-                        const auto started = FlattenClock::now();
-                        wolvrix::lib::ingest::node::copyQualified(source, opId, target, newOp, nodeQualification);
-                        state.metrics.qualification += FlattenClock::now() - started;
-                    }
-                    else
-                    {
-                        wolvrix::lib::ingest::node::copyQualified(source, opId, target, newOp, nodeQualification);
-                    }
-                }
-                state.changed = true;
             }
             if (state.profile)
             {
@@ -1655,7 +2123,8 @@ namespace wolvrix::lib::transform
                         state.failed = true;
                         break;
                     }
-                    target.setAttr(pending.op, pending.key, std::string(target.symbolText(it->second)));
+                    if (!pending.deferred)
+                        target.setAttr(pending.op, pending.key, std::string(target.symbolText(it->second)));
                 }
             }
 
@@ -1673,6 +2142,7 @@ namespace wolvrix::lib::transform
                     propagateGenerateGroups(source, target, prefix, valueRename, opRename, state);
                 }
             }
+            if (state.plan.enabled) state.plan.instances[plannedInstance].opRename = std::move(opRename);
 
             const auto qualificationStats = nodeQualification.stats();
             state.metrics.qualificationLookups += qualificationStats.lookups;
@@ -1682,7 +2152,150 @@ namespace wolvrix::lib::transform
             state.metrics.qualificationOutputBytes += qualificationStats.outputBytes;
 
             state.stack.erase(&source);
+            if (!state.failed) state.plan.consume(GlobalInlinePlan::EventKind::Exit, plannedInstance);
             return !state.failed;
+        }
+
+        void commitGlobalMetadata(InlineState &state, wolvrix::lib::grh::Graph &target)
+        {
+            if (state.plan.operands.empty() || state.plan.metadataStarted) return;
+            state.plan.metadataStarted = true;
+            std::vector<wolvrix::lib::grh::Graph::OperationBlockImport> imports;
+            imports.reserve(state.plan.operands.size());
+            for (const auto &block : state.plan.operands)
+            {
+                const auto id = block.source->id();
+                const uint64_t key = (static_cast<uint64_t>(id.index) << 32) | id.generation;
+                imports.push_back({block.source, block.sourceOps, block.operations, &state.blockImports.at(key)});
+            }
+            target.appendOperationBlocksAttributes(imports, *state.executor);
+            // Pool allocation/publication has joined. All semantic metadata
+            // edits now observe the final symbol map and result positions.
+            for (const auto &block : state.plan.operands)
+            {
+                auto &instance = state.plan.instances[block.instance];
+                const wolvrix::lib::grh::AttributeValue defaults = std::vector<std::string>{instance.prefix};
+                std::vector<wolvrix::lib::grh::OperationId> commonOrigins;
+                for (std::size_t i = 0; i < block.operations.size(); ++i)
+                {
+                    const auto sourceOp = block.sourceOps[i];
+                    const auto targetOp = block.operations[i];
+                    bool hasOrigins = false;
+                    bool hasNodes = false;
+                    for (const auto attr : block.source->opAttrRange(sourceOp))
+                    {
+                        if (wolvrix::lib::ingest::node::isAttribute(attr.key()))
+                        {
+                            hasNodes = true;
+                            if (attr.key() == wolvrix::lib::ingest::node::kMembers ||
+                                attr.key() == wolvrix::lib::ingest::node::kOrigins ||
+                                attr.key() == wolvrix::lib::ingest::node::kRoots ||
+                                attr.key() == wolvrix::lib::ingest::node::kRootResults)
+                                target.eraseAttr(targetOp, attr.key());
+                        }
+                        if (isOpSymbolReferenceAttr(attr.key()))
+                        {
+                            if (const auto text = attr.value().get<std::string>())
+                            {
+                                const auto sourceSymbol = block.source->lookupSymbol(*text);
+                                const auto found = instance.opRename.find(sourceSymbol.value);
+                                if (found != instance.opRename.end())
+                                    target.setAttr(targetOp, attr.key(), std::string(target.symbolText(found->second)));
+                            }
+                        }
+                        if (attr.key() != kOriginModulesKey) continue;
+                        hasOrigins = true;
+                        if (const auto origins = attr.value().get<std::vector<std::string>>();
+                            origins && !origins->empty())
+                        {
+                            std::vector<std::string> qualified(origins->begin(), origins->end());
+                            prependOriginModule(qualified, instance.prefix);
+                            target.setAttr(targetOp, kOriginModulesKey, std::move(qualified));
+                        }
+                        else
+                        {
+                            commonOrigins.push_back(targetOp);
+                        }
+                    }
+                    if (!hasOrigins) commonOrigins.push_back(targetOp);
+                    if (hasNodes)
+                    {
+                        ++state.metrics.annotatedOperations;
+                        const auto started = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
+                        wolvrix::lib::ingest::node::copyQualified(*block.source, sourceOp, target, targetOp,
+                            *instance.qualification);
+                        if (state.profile) state.metrics.qualification += FlattenClock::now() - started;
+                    }
+                }
+                target.setOperationBlockAttr(commonOrigins, kOriginModulesKey,
+                    wolvrix::lib::grh::AttrValueView(&defaults));
+            }
+            for (const auto &instance : state.plan.instances)
+            {
+                if (!instance.qualification) continue;
+                const auto stats = instance.qualification->stats();
+                state.metrics.qualificationLookups += stats.lookups;
+                state.metrics.qualificationHits += stats.hits;
+                state.metrics.qualificationMisses += stats.misses;
+                state.metrics.qualificationInputBytes += stats.inputBytes;
+                state.metrics.qualificationOutputBytes += stats.outputBytes;
+            }
+        }
+
+        void consumeSingleUseTopology(InlineState &state, wolvrix::lib::grh::Graph &target)
+        {
+            if (!state.plan.enabled || state.failed) return;
+            std::unordered_set<const wolvrix::lib::grh::Graph *> retained;
+            for (const auto op : target.operations())
+            {
+                if (target.opKind(op) != wolvrix::lib::grh::OperationKind::kBlackbox) continue;
+                const auto module = getAttrStringBorrowed(target.opAttrRange(op), "moduleName");
+                if (const auto *source = module ? state.design.findGraph(*module) : nullptr)
+                    retained.insert(source);
+            }
+            struct Consumption
+            {
+                wolvrix::lib::grh::Graph *source;
+                std::vector<wolvrix::lib::grh::Graph::TopologyBlock> topology;
+                std::vector<wolvrix::lib::grh::ValueId> values;
+                std::vector<std::size_t> blocks;
+            };
+            std::vector<Consumption> jobs;
+            std::unordered_map<const wolvrix::lib::grh::Graph *, std::size_t> bySource;
+            // Prepare every source-derived span and mapping before consuming
+            // any graph. After this loop, only the target and saved integers
+            // are consulted; nodeInventory already owns its imported records.
+            for (std::size_t index = 0; index < state.plan.operands.size(); ++index)
+            {
+                const auto &block = state.plan.operands[index];
+                if (state.plan.definitionUses.at(block.source) != 1 || retained.contains(block.source)) continue;
+                const auto [found, inserted] = bySource.try_emplace(block.source, jobs.size());
+                if (inserted)
+                {
+                    const auto &instance = state.plan.instances[block.instance];
+                    auto *source = state.design.findGraph(block.source->symbol());
+                    if (!source || source == &target)
+                        throw std::logic_error("Flatten consuming topology requires an owned child graph");
+                    Consumption job{source, {}, {}, {}};
+                    std::size_t count = 1;
+                    for (const auto value : source->values())
+                        count = std::max(count, static_cast<std::size_t>(value.index) + 1);
+                    job.values.resize(count);
+                    for (const auto value : source->values())
+                        job.values[value.index] = state.plan.ports.get(instance.nodeBase + value.index);
+                    jobs.push_back(std::move(job));
+                }
+                auto &job = jobs[found->second];
+                job.topology.push_back({block.sourceOps, block.operations});
+                job.blocks.push_back(index);
+            }
+            for (auto &job : jobs)
+            {
+                target.consumeBlockTopology(*job.source, job.topology, job.values);
+                // The API deleted job.source. Do not dereference any source
+                // pointer/span saved in completed plan or import contexts.
+                for (const auto block : job.blocks) state.plan.operands[block].consumed = true;
+            }
         }
 
         bool hasXmrOps(const wolvrix::lib::grh::Graph &graph)
@@ -1821,6 +2434,8 @@ namespace wolvrix::lib::transform
         wolvrix::lib::ingest::node::InventoryImportBatch nodeInventory(*top);
         InlineState state{design(), nodeInventory, metrics};
         state.profile = profile;
+        state.numThreads = options_.numThreads ? options_.numThreads :
+            std::max<std::size_t>(1, std::min<std::size_t>(10, std::thread::hardware_concurrency()));
         state.symProtect = options_.symProtect;
         state.graphError = [this](const wolvrix::lib::grh::Graph &graph, std::string message) {
             error(graph, std::move(message));
@@ -1840,6 +2455,7 @@ namespace wolvrix::lib::transform
         // module itself.
         const std::string topName = top->symbol();
         const auto topStampStarted = profile ? FlattenClock::now() : FlattenClock::time_point{};
+        std::vector<wolvrix::lib::grh::OperationId> unstampedOperations;
         for (const auto opId : top->operations())
         {
             if (!opId.valid())
@@ -1847,9 +2463,9 @@ namespace wolvrix::lib::transform
                 continue;
             }
             bool stamped = false;
-            for (const auto &kv : top->opAttrs(opId))
+            for (const auto &kv : top->opAttrRange(opId))
             {
-                if (kv.key == kOriginModulesKey)
+                if (kv.key() == kOriginModulesKey)
                 {
                     stamped = true;
                     break;
@@ -1859,8 +2475,11 @@ namespace wolvrix::lib::transform
             {
                 continue;
             }
-            top->setAttr(opId, kOriginModulesKey, std::vector<std::string>{topName});
+            unstampedOperations.push_back(opId);
         }
+        const wolvrix::lib::grh::AttributeValue topOrigins = std::vector<std::string>{topName};
+        top->setOperationBlockAttr(unstampedOperations, kOriginModulesKey,
+            wolvrix::lib::grh::AttrValueView(&topOrigins));
         if (profile)
         {
             metrics.topStamp = FlattenClock::now() - topStampStarted;
@@ -1893,6 +2512,14 @@ namespace wolvrix::lib::transform
             }
         }
 
+        if (options_.useGlobalPlan) state.plan = planGlobalInline(design(), *top, instanceOps);
+        if (state.plan.enabled)
+        {
+            state.executor = std::make_unique<wolvrix::lib::grh::detail::BlockExecutor>(state.numThreads);
+            identity.globalPorts = &state.plan.ports;
+            for (const auto value : top->values()) identity.set(value, value);
+        }
+
         // Flattening appends every reachable child value/operation to the top
         // builder. Reserve the recursively expanded shape once so the large
         // vectors do not repeatedly reallocate while each instance is cloned.
@@ -1918,33 +2545,53 @@ namespace wolvrix::lib::transform
                  " operations=" + std::to_string(capacity.operations) +
                  " symbols=" + std::to_string(capacity.symbols));
 
-        for (const auto opId : instanceOps)
+        try
         {
-            if (state.failed)
+            for (std::size_t instance = 0; instance < instanceOps.size(); ++instance)
             {
-                break;
-            }
-            const InstanceInfo info = buildInstanceInfo(*top, opId);
-            top->eraseOpUnchecked(opId);
-            state.changed = true;
-            ++metrics.instanceCalls;
-            ++metrics.instanceOperations;
-            if (profile)
-            {
-                const auto started = FlattenClock::now();
-                if (!inlineInstanceInfo(*top, info, identity, *top, std::string(), state))
+                const auto opId = instanceOps[instance];
+                if (state.failed)
+                {
+                    break;
+                }
+                state.plan.consume(GlobalInlinePlan::EventKind::Boundary, GlobalPortUnionFind::invalid, instance);
+                const InstanceInfo info = buildInstanceInfo(*top, opId);
+                top->eraseOpUnchecked(opId);
+                state.changed = true;
+                ++metrics.instanceCalls;
+                ++metrics.instanceOperations;
+                if (profile)
+                {
+                    const auto started = FlattenClock::now();
+                    if (!inlineInstanceInfo(*top, info, identity, *top, std::string(), state))
+                    {
+                        state.failed = true;
+                        break;
+                    }
+                    metrics.recursiveInstances += FlattenClock::now() - started;
+                }
+                else if (!inlineInstanceInfo(*top, info, identity, *top, std::string(), state))
                 {
                     state.failed = true;
                     break;
                 }
-                metrics.recursiveInstances += FlattenClock::now() - started;
             }
-            else if (!inlineInstanceInfo(*top, info, identity, *top, std::string(), state))
-            {
-                state.failed = true;
-                break;
-            }
+            if (state.plan.enabled && !state.failed &&
+                (state.plan.nextEvent != state.plan.events.size() ||
+                 state.plan.nextInstance != state.plan.instances.size()))
+                throw std::logic_error("Flatten global event plan was not fully consumed");
+            commitGlobalMetadata(state, *top);
+            if (!options_.preserveFlattenedModules) consumeSingleUseTopology(state, *top);
+            state.plan.commitOperands(*top, state.executor.get());
         }
+        catch (...)
+        {
+            commitGlobalMetadata(state, *top);
+            state.plan.commitOperands(*top, state.executor.get());
+            top->rebuildUseLists();
+            throw;
+        }
+        top->rebuildUseLists();
 
         if (state.failed)
         {

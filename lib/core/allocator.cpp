@@ -2,6 +2,9 @@
 
 #if defined(WOLVRIX_BUNDLED_MIMALLOC_DEFAULTS)
 #include <mimalloc.h>
+#if defined(WOLVRIX_MIMALLOC_STATS)
+#include <mimalloc-stats.h>
+#endif
 
 namespace {
 
@@ -27,6 +30,19 @@ Configuration configuration() noexcept {
     return {true, false, 0};
 #else
     return {false, false, 0};
+#endif
+}
+
+Statistics statistics() noexcept {
+#if defined(WOLVRIX_MIMALLOC_STATS)
+    mi_stats_merge();
+    mi_stats_t stats{};
+    mi_stats_get(sizeof(stats), &stats);
+    const auto normal = static_cast<uint64_t>(stats.malloc_normal_count.total);
+    const auto huge = static_cast<uint64_t>(stats.malloc_huge_count.total);
+    return {true, normal + huge, normal, huge, stats.threads.current};
+#else
+    return {};
 #endif
 }
 

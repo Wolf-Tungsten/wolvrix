@@ -358,6 +358,26 @@ public:
             }
         }, attribute);
     }
+    void attribute(AttrValueView attribute) {
+        scalar(static_cast<uint8_t>(attribute.kind()));
+        const auto list = [&](const auto& values) {
+            scalar(static_cast<uint64_t>(values.size()));
+            for (const auto value : values) {
+                if constexpr (std::is_same_v<std::decay_t<decltype(value)>, std::string_view>) text(value);
+                else scalar(value);
+            }
+        };
+        switch (attribute.kind()) {
+        case AttrValueKind::Bool: scalar(attribute.asBool()); break;
+        case AttrValueKind::Int: scalar(attribute.asInt()); break;
+        case AttrValueKind::Double: scalar(attribute.asDouble()); break;
+        case AttrValueKind::String: text(attribute.asString()); break;
+        case AttrValueKind::BoolList: list(attribute.asBoolList()); break;
+        case AttrValueKind::IntList: list(attribute.asIntList()); break;
+        case AttrValueKind::DoubleList: list(attribute.asDoubleList()); break;
+        case AttrValueKind::StringList: list(attribute.asStringList()); break;
+        }
+    }
     std::string bytes;
 private:
     ingest::node::NodeKeyInterner* interner_ = nullptr;
@@ -375,16 +395,16 @@ std::string cseKey(const Graph& graph, OperationId op, ingest::node::NodeKeyInte
     }
     key.scalar(static_cast<uint64_t>(results.size()));
     for (const auto value : results) key.type(graph, value);
-    std::vector<const AttrKV*> attributes;
-    for (const auto& entry : graph.opAttrs(op))
-        if (entry.key != kPartition && entry.key != kOriginModulesKey && entry.key != "grhsim.nodeClone" && !ingest::node::isAttribute(entry.key) &&
-            !(history && entry.key == "prevInitFallback")) attributes.push_back(&entry);
-    std::sort(attributes.begin(), attributes.end(), [](const auto* left, const auto* right) { return left->key < right->key; });
-    for (const auto* entry : attributes) {
-        key.text(entry->key);
-        if (history && entry->key == "prevInit")
-            key.attribute(slang::SVInt::fromString(std::get<std::string>(entry->value)).toString());
-        else key.attribute(entry->value);
+    std::vector<AttrRef> attributes;
+    for (const auto entry : graph.opAttrRange(op))
+        if (entry.key() != kPartition && entry.key() != kOriginModulesKey && entry.key() != "grhsim.nodeClone" && !ingest::node::isAttribute(entry.key()) &&
+            !(history && entry.key() == "prevInitFallback")) attributes.push_back(entry);
+    std::sort(attributes.begin(), attributes.end(), [](const auto left, const auto right) { return left.key() < right.key(); });
+    for (const auto entry : attributes) {
+        key.text(entry.key());
+        if (history && entry.key() == "prevInit")
+            key.attribute(slang::SVInt::fromString(entry.value().asString()).toString());
+        else key.attribute(entry.value());
     }
     return std::move(key.bytes);
 }
@@ -499,16 +519,16 @@ PassResult SimplifyPass::run()
             }
             const auto operationsBefore = graph.operations().size();
             const auto valuesBefore = graph.values().size();
-            struct Member { const detail::Owner* owner; OperationId operation; std::size_t order; };
+            struct Member { StringListView owner; OperationId operation; std::size_t order; };
             std::vector<Member> members;
             members.reserve(ordered.size());
             for (std::size_t i = 0; i < ordered.size(); ++i) {
                 const auto op = ordered[i];
                 if (operationEffect(graph, op) != OpEffect::Declaration)
-                    members.push_back({&detail::ownerView(graph, op), op, i});
+                    members.push_back({detail::ownerView(graph, op), op, i});
             }
             const auto less = [](const auto& left, const auto& right) {
-                if (*left.owner != *right.owner) return *left.owner < *right.owner;
+                if (!detail::sameOwner(left.owner, right.owner)) return detail::ownerLess(left.owner, right.owner);
                 return left.order < right.order;
             };
             if (!std::is_sorted(members.begin(), members.end(), less))
@@ -521,9 +541,9 @@ PassResult SimplifyPass::run()
             std::vector<Group> groups;
             std::vector<OperationId> grouped;
             grouped.reserve(members.size());
-            const detail::Owner* previous = nullptr;
+            std::optional<StringListView> previous;
             for (const auto& member : members) {
-                if (!previous || *previous != *member.owner)
+                if (!previous || !detail::sameOwner(*previous, member.owner))
                     groups.push_back({member.operation, grouped.size(), grouped.size()});
                 grouped.push_back(member.operation);
                 groups.back().end = grouped.size();
@@ -547,7 +567,7 @@ PassResult SimplifyPass::run()
                 destination.insert(current);
                 for (const auto operation : operations) {
                     if (!graph.findOperation(graph.operationSymbol(operation)) ||
-                        detail::ownerView(graph, operation) != current) continue;
+                        !detail::sameOwner(detail::ownerView(graph, operation), current)) continue;
                     for (const auto result : graph.opResults(operation)) {
                         for (const auto& use : graph.valueUsers(result)) addOwner(destination, use.operation);
                     }

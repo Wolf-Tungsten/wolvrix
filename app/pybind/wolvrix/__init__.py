@@ -155,6 +155,7 @@ class Session:
         external_bindings: list[dict] | None = None,
         out_design: str = "design.main",
         replace: bool = False,
+        pipeline: str = "ingest",
     ) -> list[dict]:
         self._ensure_open()
         success, diagnostics = _native.session_read_sources(
@@ -162,6 +163,7 @@ class Session:
             tops=tops or [], input_root=input_root, slang_args=slang_args or [],
             firrtl_options=firrtl_options or {}, external_bindings=external_bindings or [],
             replace=replace, log_level=self._log_level,
+            **({"pipeline": pipeline} if pipeline != "ingest" else {}),
         )
         return self._complete_action(
             "read_sources", diagnostics, success=bool(success), out_design=out_design,
@@ -179,6 +181,7 @@ class Session:
         external_bindings: list[dict] | None = None,
         out_design: str = "design.main",
         replace: bool = False,
+        pipeline: str = "ingest",
     ) -> list[dict]:
         self._ensure_open()
         success, diagnostics = _native.session_read_firrtl(
@@ -186,6 +189,7 @@ class Session:
             tops=tops or [], input_root=input_root, slang_args=slang_args or [],
             firrtl_options=firrtl_options or {}, external_bindings=external_bindings or [],
             replace=replace, log_level=self._log_level,
+            **({"pipeline": pipeline} if pipeline != "ingest" else {}),
         )
         return self._complete_action(
             "read_firrtl", diagnostics, success=bool(success), out_design=out_design, path=path,

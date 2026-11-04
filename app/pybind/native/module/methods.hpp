@@ -7,6 +7,8 @@ namespace wolvrix::app::pybind
 {
 
     PyObject *py_allocator_configuration(PyObject *self, PyObject *args);
+    PyObject *py_allocator_statistics(PyObject *self, PyObject *args);
+    PyObject *py_graph_profile_stats(PyObject *self, PyObject *args);
     PyObject *py_create_session(PyObject *self, PyObject *args);
     PyObject *py_session_close(PyObject *self, PyObject *args);
     PyObject *py_session_contains(PyObject *self, PyObject *args);

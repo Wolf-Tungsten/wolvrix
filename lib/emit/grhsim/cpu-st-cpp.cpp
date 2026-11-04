@@ -3549,8 +3549,8 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
     }
     std::set<Key> leafOwners;
     for (const auto op : graph_.operations())
-        for (const auto& entry : graph_.opAttrs(op)) if (entry.key == sim::kPartition)
-            leafOwners.insert(std::get<Key>(entry.value));
+        for (const auto entry : graph_.opAttrRange(op)) if (entry.key() == sim::kPartition)
+            leafOwners.insert(std::get<Key>(entry.value().toOwned()));
     manifest << "],\n  \"virtual_partition_count\": " << leafOwners.size();
     if (!counterSnapshot_.empty()) {
         manifest << ",\n  \"execution_counters\": " << counterMetadata();

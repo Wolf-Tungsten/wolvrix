@@ -186,12 +186,13 @@ namespace wolvrix::lib::transform
         {
             for (const auto opId : graph.operations())
             {
-                const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-                if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance &&
-                    op.kind() != wolvrix::lib::grh::OperationKind::kBlackbox)
+                const auto kind = graph.opKind(opId);
+                if (kind != wolvrix::lib::grh::OperationKind::kInstance &&
+                    kind != wolvrix::lib::grh::OperationKind::kBlackbox)
                 {
                     continue;
                 }
+                const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
                 auto name = getAttrString(op, "instanceName");
                 if (name && *name == instanceName)
                 {
@@ -1033,13 +1034,13 @@ namespace wolvrix::lib::transform
             std::vector<wolvrix::lib::grh::OperationId> xmrOps;
             for (const auto opId : graph.operations())
             {
-                const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-                if (op.kind() == wolvrix::lib::grh::OperationKind::kXMRRead ||
-                    op.kind() == wolvrix::lib::grh::OperationKind::kXMRWrite)
+                const auto kind = graph.opKind(opId);
+                if (kind == wolvrix::lib::grh::OperationKind::kXMRRead ||
+                    kind == wolvrix::lib::grh::OperationKind::kXMRWrite)
                 {
                     xmrOps.push_back(opId);
                     ++xmrOpCount;
-                    if (op.kind() == wolvrix::lib::grh::OperationKind::kXMRRead)
+                    if (kind == wolvrix::lib::grh::OperationKind::kXMRRead)
                     {
                         ++xmrReadCount;
                     }
@@ -1146,12 +1147,13 @@ namespace wolvrix::lib::transform
                 wolvrix::lib::grh::Graph &graph = *graphEntry.second;
                 for (const auto opId : graph.operations())
                 {
-                    const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-                    if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance &&
-                        op.kind() != wolvrix::lib::grh::OperationKind::kBlackbox)
+                    const auto kind = graph.opKind(opId);
+                    if (kind != wolvrix::lib::grh::OperationKind::kInstance &&
+                        kind != wolvrix::lib::grh::OperationKind::kBlackbox)
                     {
                         continue;
                     }
+                    const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
                     const auto moduleName = getAttrString(op, "moduleName");
                     if (!moduleName || moduleName->empty())
                     {

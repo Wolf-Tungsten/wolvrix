@@ -206,6 +206,41 @@ namespace
         return 0;
     }
 
+    int test_graph_selection()
+    {
+        wolvrix::lib::grh::Design source;
+        for (const auto name : {"selected", "excluded"}) {
+            auto& graph = source.createGraph(name);
+            const auto value = makeValue(graph, "feedback", 1);
+            const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot);
+            graph.addOperand(op, value); graph.addResult(op, value);
+        }
+        CombLoopElimOptions options;
+        options.failOnTrueLoop = true; options.fixFalseLoops = false;
+        options.outputKey = "selected-loops";
+        options.graphSelection = std::make_shared<const std::unordered_set<std::string>>(
+            std::initializer_list<std::string>{"selected"});
+        std::vector<std::string> expected;
+        for (const std::size_t threads : {1, 2, 4, 10}) {
+            auto design = source.clone();
+            SessionStore session;
+            PassManagerOptions managerOptions;
+            managerOptions.graphThreads = threads; managerOptions.session = &session;
+            PassManager manager(managerOptions);
+            manager.addPass(std::make_unique<CombLoopElimPass>(options));
+            PassDiagnostics diagnostics;
+            if (manager.run(design, diagnostics).success) return fail("Selected true loop was accepted");
+            const auto& reports = requireSessionValue<std::vector<CombLoopReport>>(&session, "selected-loops");
+            if (reports.size() != 1 || reports.front().graphName != "selected")
+                return fail("Loop selection leaked an excluded graph report");
+            std::vector<std::string> actual;
+            for (const auto& entry : diagnostics.messages()) actual.push_back(entry.context + ":" + entry.message);
+            if (threads == 1) expected = actual;
+            else if (actual != expected) return fail("Parallel loop selection changed diagnostics or global summary");
+        }
+        return 0;
+    }
+
     int test_true_loop_reported()
     {
         wolvrix::lib::grh::Design design;
@@ -1560,6 +1595,7 @@ namespace
 
 int main()
 {
+    if (int rc = test_graph_selection(); rc != 0) return rc;
     if (int rc = test_instance_boundary(false); rc != 0) return rc;
     if (int rc = test_instance_boundary(true); rc != 0) return rc;
     if (int rc = test_instance_boundary_keeps_local_loop(); rc != 0) return rc;

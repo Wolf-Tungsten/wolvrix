@@ -109,8 +109,22 @@ SourcePosition Source::position(Range range) const {
     return position;
 }
 
+void detail::clearParsedModules(const Source& source) {
+    auto& implementation = Access::get(source);
+    std::lock_guard lock(implementation.parsedModulesMutex);
+    implementation.parsedModules.clear();
+    implementation.parsedModules.shrink_to_fit();
+}
+
+void detail::releaseParsedModule(const Source& source, std::size_t module) {
+    auto& implementation = Access::get(source);
+    std::lock_guard lock(implementation.parsedModulesMutex);
+    if (module < implementation.parsedModules.size()) implementation.parsedModules[module].reset();
+}
+
 bool IndexResult::success() const noexcept { return source && noErrors(diagnostics); }
 bool ModuleResult::success() const noexcept { return body.has_value() && noErrors(diagnostics); }
+bool detail::SharedModuleResult::success() const noexcept { return sharedBody && noErrors(diagnostics); }
 bool ValidationResult::success() const noexcept { return noErrors(diagnostics); }
 
 IndexResult indexText(std::string text, std::filesystem::path path, std::string unit, const FirrtlOptions& options) {

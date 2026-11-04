@@ -177,6 +177,12 @@ private:
     friend struct detail::Access;
 };
 
+namespace detail {
+// Release production ASTs after lowering has published all graphs.  The
+// indexed source and its interface tables remain available to callers.
+void clearParsedModules(const Source& source);
+}
+
 struct IndexResult {
     std::shared_ptr<const Source> source;
     std::vector<IngestDiagnostic> diagnostics;
@@ -191,6 +197,9 @@ struct ModuleResult {
     // Keeps every string_view in body valid even after releasing the index result.
     std::shared_ptr<const Source> source;
     std::optional<ModuleBody> body;
+    // Borrowed immutable AST for production ingest.  `body` remains for the
+    // compatibility API, while lowering can avoid copying a cached arena.
+    std::shared_ptr<const ModuleBody> sharedBody;
     std::vector<IngestDiagnostic> diagnostics;
     bool success() const noexcept;
 };

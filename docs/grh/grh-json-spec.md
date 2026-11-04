@@ -153,7 +153,7 @@ JSON 中若仍保留该 op，表示流程未完成。
 - 标量使用 `v`，数组使用 `vs`，数组条目保持给定顺序；非有限浮点将被拒绝。
 
 ## 排序与布局约定
-- Graph 列表按名称排序；`vals`、`ops` 保留创建顺序；端口数组顺序来自 Graph 端口列表（GraphView 冻结路径会按端口名排序）；`attrs` 保持插入顺序。
+- Graph 列表按名称排序；`vals`、`ops` 保留创建顺序；端口数组顺序来自 Graph 端口列表（`compact()` / `freeze()` 会按端口名排序）；operation 的 `attrs` 按 key 文本排序，图级 metadata 保持插入顺序。
 - **op 顺序是语义的一部分**：同一 kRegister 的全部写端口（kRegisterWritePort /
   kRegisterWriteMaskPort / kRegisterWriteArrayPort / kRegisterWriteArrayMaskPort /
   kRegisterFillPort）构成唯一写组，同时激活时按 op 声明顺序依次应用、后声明者覆盖

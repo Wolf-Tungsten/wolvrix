@@ -4,7 +4,10 @@
 #include "mixed.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
+#include <numeric>
+#include <thread>
 #include <unordered_set>
 
 namespace wolvrix::lib::ingest {
@@ -137,9 +140,52 @@ InterfaceScanResult scanFirrtlInterfaces(const IngestRequest& request) {
         result.diagnostics.insert(result.diagnostics.end(), indexed.diagnostics.begin(), indexed.diagnostics.end());
         if (!indexed.success()) continue;
         result.sourceOwners.push_back(indexed.source);
-        auto validated = firrtl::validate(indexed.source);
-        result.diagnostics.insert(result.diagnostics.end(), validated.diagnostics.begin(), validated.diagnostics.end());
-        if (!validated.success()) continue;
+        // Parse each body once during the production interface scan.  The
+        // former call to validate() parsed every module only to discard its
+        // AST and then lowering parsed reachable modules again.  Keep the
+        // same source-order diagnostics while avoiding the separate census
+        // pass; the explicit validate() API remains available to callers
+        // that need construct statistics.
+        const auto modules = indexed.source->modules();
+        std::vector<firrtl::detail::SharedModuleResult> bodies(modules.size());
+        std::vector<std::exception_ptr> failures(modules.size());
+        std::vector<std::size_t> jobs(modules.size());
+        std::iota(jobs.begin(), jobs.end(), 0);
+        std::stable_sort(jobs.begin(), jobs.end(), [&](std::size_t left, std::size_t right) {
+            return modules[left].range.end - modules[left].range.begin > modules[right].range.end - modules[right].range.begin;
+        });
+        std::atomic<std::size_t> next{0};
+        const auto parse = [&] {
+            for (;;) {
+                const auto job = next.fetch_add(1, std::memory_order_relaxed);
+                if (job >= jobs.size()) return;
+                const auto index = jobs[job];
+                try {
+                    bodies[index] = firrtl::detail::parseSharedModule(indexed.source, index);
+                    const auto kind = modules[index].kind;
+                    if (bodies[index].success() && (kind == firrtl::ModuleKind::Module || kind == firrtl::ModuleKind::Class)) {
+                        // Semantic failures remain inside the summary until a
+                        // reachable module's interface is evaluated.
+                        firrtl::detail::sharedInterfaceSummary(indexed.source, index, request.firrtl);
+                    }
+                } catch (...) { failures[index] = std::current_exception(); }
+            }
+        };
+        const auto threads = std::min<std::size_t>(std::max<std::size_t>(1, request.firrtl.lowerThreads), jobs.size());
+        if (threads <= 1) parse();
+        else {
+            std::vector<std::jthread> workers;
+            workers.reserve(threads);
+            for (std::size_t worker = 0; worker < threads; ++worker) workers.emplace_back(parse);
+        }
+        bool parsed = true;
+        for (std::size_t index = 0; index < modules.size(); ++index) {
+            if (failures[index]) std::rethrow_exception(failures[index]);
+            const auto& body = bodies[index];
+            result.diagnostics.insert(result.diagnostics.end(), body.diagnostics.begin(), body.diagnostics.end());
+            if (!body.success()) parsed = false;
+        }
+        if (!parsed) continue;
         for (const auto& module : indexed.source->modules()) {
             try { result.modules.push_back(describeFirrtlModule(*indexed.source, module)); }
             catch (const std::exception& error) {
@@ -154,7 +200,7 @@ InterfaceScanResult scanFirrtlInterfaces(const IngestRequest& request) {
 }
 
 IngestResult readFirrtl(const IngestRequest& request) {
-    return readMixedSources(request);
+    return readSources(request);
 }
 
 } // namespace wolvrix::lib::ingest

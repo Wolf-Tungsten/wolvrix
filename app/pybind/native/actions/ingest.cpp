@@ -113,11 +113,45 @@ namespace wolvrix::app::pybind
             request.externalBindings.push_back(std::move(binding));
         }
     }
+    PyObject* prefixReport(const ingest::IngestResult& result) {
+        auto* stages = PyList_New(0);
+        if (!stages) return nullptr;
+        for (const auto& stage : result.prefixStages) {
+            ingest::IngestResult diagnosticResult;
+            diagnosticResult.diagnostics = stage.diagnostics;
+            auto* action = makeIngestActionResult(diagnosticResult);
+            if (!action) { Py_DECREF(stages); return nullptr; }
+            auto* wall = stage.overlapped ? Py_NewRef(Py_None) : PyFloat_FromDouble(stage.wallSeconds);
+            if (!wall) { Py_DECREF(action); Py_DECREF(stages); return nullptr; }
+            auto* row = Py_BuildValue("{s:s,s:O,s:O,s:d,s:O}", "pass", stage.pass.c_str(),
+                "diagnostics", PyTuple_GET_ITEM(action, 1), "wall_s", wall,
+                "worker_wall_s", stage.workerSeconds, "overlapped", stage.overlapped ? Py_True : Py_False);
+            Py_XDECREF(wall);
+            Py_DECREF(action);
+            if (!row || PyList_Append(stages, row) < 0) { Py_XDECREF(row); Py_DECREF(stages); return nullptr; }
+            Py_DECREF(row);
+        }
+        auto* report = Py_BuildValue("{s:d,s:n,s:O}", "prefix_wall_s", result.prefixWallSeconds,
+            "ingest_diagnostic_count", static_cast<Py_ssize_t>(result.ingestDiagnosticCount), "stages", stages);
+        Py_DECREF(stages);
+        return report;
+    }
     PyObject* readRequest(SessionHandle& session, const char* output, bool replace, ingest::IngestRequest request) {
         std::string error;
         if (!ensureSessionInsertable(session, output, replace, error)) { PyErr_SetString(PyExc_KeyError, error.c_str()); return nullptr; }
+        const std::string reportKey = std::string(output) + ".prefix";
+        const bool prefix = request.pipeline == ingest::IngestPipeline::GrhPreFlatten;
+        if (prefix && !ensureSessionInsertable(session, reportKey, replace, error)) {
+            PyErr_SetString(PyExc_KeyError, error.c_str()); return nullptr;
+        }
         auto result = ingest::readSources(request);
         auto* action = makeIngestActionResult(result); if (!action) return nullptr;
+        if (prefix) {
+            auto* report = prefixReport(result);
+            if (!report) { Py_DECREF(action); return nullptr; }
+            session.pythonValues.insert_or_assign(reportKey, PythonSessionValue{"ingest-prefix", report});
+            session.nativeValues.erase(reportKey); session.designs.erase(reportKey);
+        }
         if (result.success()) {
             session.designs.insert_or_assign(std::string(output), DesignHandle{std::move(*result.design), std::move(result.sourceOwners)});
             session.nativeValues.erase(output); session.pythonValues.erase(output);
@@ -126,15 +160,22 @@ namespace wolvrix::app::pybind
     }
     PyObject* readMixed(PyObject* args, PyObject* kwargs, bool firrtlOnly) {
         PyObject *sessionObj, *inputs, *tops = Py_None, *slangArgs = Py_None, *firrtlOptions = Py_None, *bindings = Py_None;
-        const char *output, *root = "", *level = "info"; int replace = 0; PyObject* svSources = Py_None;
-        static const char* sourceKeys[] = {"session", "sources", "out_design", "tops", "input_root", "slang_args", "firrtl_options", "external_bindings", "replace", "log_level", nullptr};
-        static const char* firrtlKeys[] = {"session", "path", "out_design", "tops", "input_root", "slang_args", "firrtl_options", "external_bindings", "replace", "log_level", "sv_sources", nullptr};
-        if (!PyArg_ParseTupleAndKeywords(args, kwargs, firrtlOnly ? "OOs|OsOOOpsO" : "OOs|OsOOOps",
-                const_cast<char**>(firrtlOnly ? firrtlKeys : sourceKeys), &sessionObj, &inputs, &output, &tops, &root,
-                &slangArgs, &firrtlOptions, &bindings, &replace, &level, &svSources)) return nullptr;
+        const char *output, *root = "", *level = "info", *pipeline = "ingest"; int replace = 0; PyObject* svSources = Py_None;
+        static const char* sourceKeys[] = {"session", "sources", "out_design", "tops", "input_root", "slang_args", "firrtl_options", "external_bindings", "replace", "log_level", "pipeline", nullptr};
+        static const char* firrtlKeys[] = {"session", "path", "out_design", "tops", "input_root", "slang_args", "firrtl_options", "external_bindings", "replace", "log_level", "sv_sources", "pipeline", nullptr};
+        const bool parsed = firrtlOnly ?
+            PyArg_ParseTupleAndKeywords(args, kwargs, "OOs|OsOOOpsOs", const_cast<char**>(firrtlKeys),
+                &sessionObj, &inputs, &output, &tops, &root, &slangArgs, &firrtlOptions, &bindings,
+                &replace, &level, &svSources, &pipeline) :
+            PyArg_ParseTupleAndKeywords(args, kwargs, "OOs|OsOOOpss", const_cast<char**>(sourceKeys),
+                &sessionObj, &inputs, &output, &tops, &root, &slangArgs, &firrtlOptions, &bindings,
+                &replace, &level, &pipeline);
+        if (!parsed) return nullptr;
         auto* session = getSessionHandle(sessionObj); if (!session) return nullptr;
         try {
             ingest::IngestRequest request; request.inputRoot = root;
+            if (std::string_view(pipeline) == "grh-pre-flatten") request.pipeline = ingest::IngestPipeline::GrhPreFlatten;
+            else if (std::string_view(pipeline) != "ingest") throw std::invalid_argument("pipeline must be 'ingest' or 'grh-pre-flatten'");
             bool ok; request.logLevel = parseLogLevel(level, ok); if (!ok) throw std::invalid_argument("unknown log_level");
             strings(tops, request.tops); strings(slangArgs, request.slangArgs); options(request, firrtlOptions, bindings);
             if (firrtlOnly) {

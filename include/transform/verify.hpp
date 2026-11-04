@@ -15,6 +15,11 @@ namespace wolvrix::lib::transform
         GrhVerifyPass();
 
         PassResult run() override;
+        bool preservesDialects() const noexcept override { return true; }
+        std::unique_ptr<Pass> cloneGraphKernel() const override {
+            return std::make_unique<GrhVerifyPass>();
+        }
+        bool usesSourceGraphOrder() const noexcept override { return true; }
         bool supportsDialect(std::string_view) const noexcept override { return true; }
     };
 

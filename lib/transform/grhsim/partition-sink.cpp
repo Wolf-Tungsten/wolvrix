@@ -29,7 +29,7 @@ std::string clockSignature(const Graph& graph, ValueId fire) {
     return signature.empty() ? "never" : signature;
 }
 
-bool isNonsink(const Owner& path) {
+bool isNonsink(StringListView path) {
     return path.size() >= 4 && path[0] == "general" && path[1] == "nonsink";
 }
 
@@ -46,7 +46,7 @@ uint64_t configHash(const Graph& graph) {
 }
 
 struct NonsinkDag {
-    std::vector<const PartitionKey*> order;
+    std::vector<StringListView> order;
     std::vector<std::size_t> prerequisiteOffsets, prerequisites;
     std::vector<std::size_t> operationNode;
     std::vector<uint8_t> general;
@@ -68,12 +68,12 @@ NonsinkDag nonsinkDag(const Graph& graph) {
     // tie breakers. This preserves the published order without millions of
     // duplicate key strings and individually allocated map/set nodes.
     std::sort(operations.begin(), operations.end(), [&](auto left, auto right) {
-        return ownerView(graph, left) < ownerView(graph, right);
+        return ownerLess(ownerView(graph, left), ownerView(graph, right));
     });
-    std::vector<const PartitionKey*> keys;
+    std::vector<StringListView> keys;
     for (const auto op : operations) {
-        const auto& key = ownerView(graph, op);
-        if (keys.empty() || *keys.back() != key) keys.push_back(&key);
+        const auto key = ownerView(graph, op);
+        if (keys.empty() || !sameOwner(keys.back(), key)) keys.push_back(key);
         result.operationNode[op.index] = keys.size() - 1;
     }
     std::vector<std::pair<std::size_t, std::size_t>> edges;
@@ -150,14 +150,14 @@ SinkSchedule buildSchedule(const Graph& graph) {
     const auto writers = orderedWriters(graph);
     const auto nonsinks = nonsinkDag(graph);
     std::vector<std::vector<std::size_t>> runRoots;
-    std::map<PartitionKey, SinkGroup> groups;
+    std::map<PartitionKey, SinkGroup, OwnerLess> groups;
     std::map<PartitionKey, std::string> clocks;
     std::map<PartitionKey, uint32_t> groupPriorities;
     std::map<PartitionKey, bool> groupHoisting;
     std::unordered_map<OperationId, uint32_t, OperationIdHash> priorities;
     std::unordered_map<ValueId, std::string, ValueIdHash> clockCache;
     for (const auto writer : writers) {
-        const auto& key = ownerView(graph, writer);
+        const auto key = copyOwner(ownerView(graph, writer));
         if (key.size() != 3 || key[0] != "general" || (key[1] != "small-sink" && key[1] != "large-sink"))
             throw std::invalid_argument("Writer has no complete sink group");
         const auto args = graph.opOperands(writer);
@@ -212,7 +212,7 @@ SinkSchedule buildSchedule(const Graph& graph) {
         std::sort(required.begin(), required.end());
         auto& keys = schedule.generalRuns[i].requiredNonsinkKeys;
         keys.reserve(required.size());
-        for (const auto key : required) keys.push_back(*nonsinks.order[key]);
+        for (const auto key : required) keys.push_back(copyOwner(nonsinks.order[key]));
     }
     for (const auto op : graph.operations()) {
         const auto& path = ownerView(graph, op);
@@ -306,7 +306,7 @@ PassResult PartitionSinkPass::run() {
                 const auto enable = args[graph->opKind(writer) == kLatchWrite ? 0 : 1];
                 const auto guard = std::string(graph->symbolText(graph->valueSymbol(enable)));
                 const bool hoist = options_.enableGuardMinSize && counts[{clocks.at(writer), guard}] >= options_.enableGuardMinSize;
-                const auto category = ownerView(*graph, writer)[1];
+                const auto category = std::string(ownerView(*graph, writer)[1]);
                 const Owner categoryOwner{"general", category};
                 const auto signature = category + "/" + clocks.at(writer) + "/priority=" + std::to_string(priorities.at(writer)) +
                     (hoist ? "/guard=" + std::to_string(guard.size()) + ":" + guard : "/local");
@@ -320,7 +320,7 @@ PassResult PartitionSinkPass::run() {
                     const auto op = pending.back(); pending.pop_back();
                     for (const auto value : graph->opOperands(op)) {
                         const auto producer = graph->valueDef(value);
-                        if (!producer || ownerView(*graph, producer) != categoryOwner) continue;
+                        if (!producer || !sameOwner(ownerView(*graph, producer), categoryOwner)) continue;
                         const auto [existing, fresh] = destinations.emplace(producer, it->second);
                         if (!fresh && existing->second != it->second && !canCloneOperation(*graph, producer))
                             throw std::invalid_argument("Effectful sink cone is shared across clock/priority groups");

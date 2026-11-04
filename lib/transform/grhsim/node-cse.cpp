@@ -163,12 +163,12 @@ struct Analysis {
             for (const auto argument : arguments) {
                 detail::encode(out, graph.valueLogicalType(argument)); out << candidate.expressions.at(argument) << ';';
             }
-            std::vector<std::pair<std::string, AttributeValue>> attributes;
-            for (const auto& entry : graph.opAttrs(op))
-                if (!node::isAttribute(entry.key) && entry.key != kPartition && entry.key != kOriginModulesKey && entry.key != "grhsim.nodeClone")
-                    attributes.emplace_back(entry.key, entry.value);
-            std::sort(attributes.begin(), attributes.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-            for (const auto& [key, attribute] : attributes) { out << key.size() << ':' << key; detail::encode(out, attribute); }
+            std::vector<AttrRef> attributes;
+            for (const auto entry : graph.opAttrRange(op))
+                if (!node::isAttribute(entry.key()) && entry.key() != kPartition && entry.key() != kOriginModulesKey && entry.key() != "grhsim.nodeClone")
+                    attributes.push_back(entry);
+            std::sort(attributes.begin(), attributes.end(), [](const auto a, const auto b) { return a.key() < b.key(); });
+            for (const auto entry : attributes) { out << entry.key().size() << ':' << entry.key(); detail::encode(out, entry.value()); }
             candidate.expressions[value] = terms.intern(out.str());
         }
         candidate.term = candidate.reason.empty() ? candidate.expressions.at(candidate.root) : boundary(candidate.root);

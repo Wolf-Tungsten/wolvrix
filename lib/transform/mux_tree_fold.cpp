@@ -289,12 +289,12 @@ namespace wolvrix::lib::transform
                 {
                     return std::nullopt;
                 }
-                const auto *attr = findAttr(graph_, def, "constValue");
+                const auto attr = findAttr(graph_, def, "constValue");
                 if (!attr)
                 {
                     return std::nullopt;
                 }
-                if (const auto *text = std::get_if<std::string>(&*attr))
+                if (const auto text = attr->get<std::string>())
                 {
                     return normalizeConstLiteral(*text);
                 }
@@ -386,18 +386,18 @@ namespace wolvrix::lib::transform
                     graph_.opKind(op) == OperationKind::kRegister)
                 {
                     info.op = op;
-                    if (const auto *attr = findAttr(graph_, op, "width"))
+                    if (const auto attr = findAttr(graph_, op, "width"))
                     {
-                        if (const auto *w = std::get_if<int64_t>(&*attr))
+                        if (const auto w = attr->get<int64_t>())
                         {
                             info.width = *w;
                         }
                     }
-                    if (const auto *attr = findAttr(graph_, op, "shape"))
+                    if (const auto attr = findAttr(graph_, op, "shape"))
                     {
-                        if (const auto *dims = std::get_if<std::vector<int64_t>>(&*attr))
+                        if (const auto dims = attr->get<std::vector<int64_t>>())
                         {
-                            info.shape = *dims;
+                            info.shape.assign(dims->begin(), dims->end());
                         }
                     }
                 }
@@ -438,12 +438,12 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    const auto *attr = findAttr(graph_, def, "regSymbol");
+                    const auto attr = findAttr(graph_, def, "regSymbol");
                     if (!attr)
                     {
                         return std::nullopt;
                     }
-                    const auto *sym = std::get_if<std::string>(&*attr);
+                    const auto sym = attr->get<std::string>();
                     if (!sym)
                     {
                         return std::nullopt;
@@ -453,7 +453,7 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    if (graph_.getValue(value).width() != info->elemWidth)
+                    if (graph_.valueWidth(value) != info->elemWidth)
                     {
                         return std::nullopt;
                     }
@@ -462,18 +462,18 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    return ElemReadMatch{*sym, static_cast<int64_t>(*index)};
+                    return ElemReadMatch{std::string(*sym), static_cast<int64_t>(*index)};
                 }
                 if (kind == OperationKind::kSliceStatic && operands.size() == 1)
                 {
-                    const auto *startAttr = findAttr(graph_, def, "sliceStart");
-                    const auto *endAttr = findAttr(graph_, def, "sliceEnd");
+                    const auto startAttr = findAttr(graph_, def, "sliceStart");
+                    const auto endAttr = findAttr(graph_, def, "sliceEnd");
                     if (!startAttr || !endAttr)
                     {
                         return std::nullopt;
                     }
-                    const auto *startPtr = std::get_if<int64_t>(&*startAttr);
-                    const auto *endPtr = std::get_if<int64_t>(&*endAttr);
+                    const auto startPtr = startAttr->get<int64_t>();
+                    const auto endPtr = endAttr->get<int64_t>();
                     if (!startPtr || !endPtr || *startPtr < 0 || *endPtr < *startPtr)
                     {
                         return std::nullopt;
@@ -484,12 +484,12 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    const auto *attr = findAttr(graph_, baseDef, "regSymbol");
+                    const auto attr = findAttr(graph_, baseDef, "regSymbol");
                     if (!attr)
                     {
                         return std::nullopt;
                     }
-                    const auto *sym = std::get_if<std::string>(&*attr);
+                    const auto sym = attr->get<std::string>();
                     if (!sym)
                     {
                         return std::nullopt;
@@ -509,7 +509,7 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    return ElemReadMatch{*sym, index};
+                    return ElemReadMatch{std::string(*sym), index};
                 }
                 if (kind == OperationKind::kSliceArray && operands.size() == 2)
                 {
@@ -519,12 +519,12 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    const auto *attr = findAttr(graph_, baseDef, "regSymbol");
+                    const auto attr = findAttr(graph_, baseDef, "regSymbol");
                     if (!attr)
                     {
                         return std::nullopt;
                     }
-                    const auto *sym = std::get_if<std::string>(&*attr);
+                    const auto sym = attr->get<std::string>();
                     if (!sym)
                     {
                         return std::nullopt;
@@ -534,7 +534,7 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    if (graph_.getValue(value).width() != info->elemWidth)
+                    if (graph_.valueWidth(value) != info->elemWidth)
                     {
                         return std::nullopt;
                     }
@@ -543,7 +543,7 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    return ElemReadMatch{*sym, static_cast<int64_t>(*index)};
+                    return ElemReadMatch{std::string(*sym), static_cast<int64_t>(*index)};
                 }
                 return std::nullopt;
             }
@@ -580,15 +580,15 @@ namespace wolvrix::lib::transform
                 if (!isSweepableKind(graph_.opKind(lhsDef)) ||
                     graph_.opResults(lhsDef).size() != 1 || graph_.opResults(rhsDef).size() != 1)
                     return false;
-                const auto lhsAttrs = graph_.opAttrs(lhsDef);
-                const auto rhsAttrs = graph_.opAttrs(rhsDef);
+                const auto lhsAttrs = graph_.opAttrRange(lhsDef);
+                const auto rhsAttrs = graph_.opAttrRange(rhsDef);
                 if (lhsAttrs.size() != rhsAttrs.size())
                 {
                     return false;
                 }
                 for (std::size_t i = 0; i < lhsAttrs.size(); ++i)
                 {
-                    if (lhsAttrs[i].key != rhsAttrs[i].key || !(lhsAttrs[i].value == rhsAttrs[i].value))
+                    if (lhsAttrs[i].key() != rhsAttrs[i].key() || !(lhsAttrs[i].value() == rhsAttrs[i].value()))
                     {
                         return false;
                     }
@@ -697,7 +697,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const int64_t elemWidth = graph_.getValue(rootResult).width();
+                    const int64_t elemWidth = graph_.valueWidth(rootResult);
                     if (elemWidth <= 0)
                     {
                         continue;
@@ -809,7 +809,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const int64_t pw = graph_.getValue(ptr).width();
+                    const int64_t pw = graph_.valueWidth(ptr);
                     if (pw <= 0 || pw > 62)
                     {
                         continue;
@@ -870,14 +870,14 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const auto *attr = findAttr(graph_, id, "regSymbol");
+                    const auto attr = findAttr(graph_, id, "regSymbol");
                     if (!attr)
                     {
                         continue;
                     }
-                    if (const auto *sym = std::get_if<std::string>(&*attr))
+                    if (const auto sym = attr->get<std::string>())
                     {
-                        groups[*sym].push_back(id);
+                        groups[std::string(*sym)].push_back(id);
                     }
                 }
                 for (auto &[sym, ops] : groups)
@@ -1060,12 +1060,12 @@ namespace wolvrix::lib::transform
                     {
                         return; // [updateCond, i0, data, events...] layout required
                     }
-                    const auto *edgeAttr = findAttr(graph_, id, "eventEdge");
+                    const auto edgeAttr = findAttr(graph_, id, "eventEdge");
                     if (!edgeAttr)
                     {
                         return;
                     }
-                    const auto *edges = std::get_if<std::vector<std::string>>(&*edgeAttr);
+                    const auto edges = edgeAttr->get<std::vector<std::string>>();
                     if (!edges)
                     {
                         return;
@@ -1078,12 +1078,12 @@ namespace wolvrix::lib::transform
                     if (!signatureKnown)
                     {
                         events.assign(opEvents.begin(), opEvents.end());
-                        eventEdges = *edges;
+                        eventEdges.emplace(edges->begin(), edges->end());
                         signatureKnown = true;
                     }
                     else
                     {
-                        if (opEvents.size() != events.size() || *edges != *eventEdges)
+                        if (opEvents.size() != events.size() || !std::equal(edges->begin(), edges->end(), eventEdges->begin(), eventEdges->end()))
                         {
                             return;
                         }
@@ -1112,7 +1112,7 @@ namespace wolvrix::lib::transform
 
                     if (const auto constText = asConstText(data))
                     {
-                        if (graph_.getValue(data).width() != elemWidth || constByEntry[entry])
+                        if (graph_.valueWidth(data) != elemWidth || constByEntry[entry])
                         {
                             return;
                         }
@@ -1200,7 +1200,7 @@ namespace wolvrix::lib::transform
                     }
                     else if (const auto tailText = asConstText(cur))
                     {
-                        if (graph_.getValue(cur).width() != elemWidth)
+                        if (graph_.valueWidth(cur) != elemWidth)
                         {
                             return;
                         }
@@ -1332,7 +1332,7 @@ namespace wolvrix::lib::transform
                 bool enableIsOne = false;
                 if (const auto c = asConstUint(ref.enable))
                 {
-                    int64_t enableWidth = graph_.getValue(ref.enable).width();
+                    int64_t enableWidth = graph_.valueWidth(ref.enable);
                     enableIsOne = *c == 1 && enableWidth == 1;
                 }
 
@@ -1578,19 +1578,22 @@ namespace wolvrix::lib::transform
                 const auto start = wolvrix::lib::grh::firstEventOperandIndex(graph_, reference);
                 if (!start) return reject("missing-event-signature");
                 // The arm planner appends gates. Retain only the event
-                // signature across its first thaw and later graph growth.
+                // signature across later graph growth.
                 const auto referenceArgs = graph_.opOperands(reference);
                 const std::vector<ValueId> referenceOperands(referenceArgs.begin(), referenceArgs.end());
-                const auto *referenceAttr = findAttr(graph_, reference, "eventEdge");
+                const auto referenceAttr = findAttr(graph_, reference, "eventEdge");
                 if (!referenceAttr) return reject("missing-event-signature");
-                const wolvrix::lib::grh::AttributeValue referenceEdges = *referenceAttr;
+                const auto referenceView = referenceAttr->get<std::vector<std::string>>();
+                if (!referenceView) return reject("missing-event-signature");
+                const std::vector<std::string> referenceEdges(referenceView->begin(), referenceView->end());
                 for (auto id : writes)
                 {
                     const auto borrowedOperands = graph_.opOperands(id);
                     const auto eventStart = wolvrix::lib::grh::firstEventOperandIndex(graph_, id);
-                    const auto *edges = findAttr(graph_, id, "eventEdge");
+                    const auto edgeAttribute = findAttr(graph_, id, "eventEdge");
+                    const auto edges = edgeAttribute ? edgeAttribute->get<std::vector<std::string>>() : std::nullopt;
                     if (!eventStart || *start != *eventStart ||
-                        !edges || *edges != referenceEdges ||
+                        !edges || !std::equal(edges->begin(), edges->end(), referenceEdges.begin(), referenceEdges.end()) ||
                         borrowedOperands.size() != referenceOperands.size()) return reject("event-signature-mismatch");
                     for (std::size_t i = *start; i < borrowedOperands.size(); ++i)
                         if (!sameValue(borrowedOperands[i], referenceOperands[i], 16)) return reject("event-value-mismatch");
@@ -1687,9 +1690,9 @@ namespace wolvrix::lib::transform
                 {
                     if (!id.valid() || erased_.contains(id) ||
                         !wolvrix::lib::grh::isRegisterWritePortKind(graph_.opKind(id))) continue;
-                    const auto *attr = findAttr(graph_, id, "regSymbol");
-                    if (const auto *symbol = attr ? std::get_if<std::string>(&*attr) : nullptr)
-                        groups[*symbol].push_back(id);
+                    const auto attr = findAttr(graph_, id, "regSymbol");
+                    if (const auto symbol = attr ? attr->get<std::string>() : std::nullopt)
+                        groups[std::string(*symbol)].push_back(id);
                 }
                 for (const auto &[symbol, writes] : groups)
                 {
@@ -1754,7 +1757,7 @@ namespace wolvrix::lib::transform
                 const ValueId stripped = strip(input);
                 if (const auto constText = asConstText(stripped))
                 {
-                    if (graph_.getValue(stripped).width() == elemWidth)
+                    if (graph_.valueWidth(stripped) == elemWidth)
                     {
                         constOut = stripped;
                         return -2;
@@ -1789,14 +1792,14 @@ namespace wolvrix::lib::transform
                 {
                     return -1;
                 }
-                const auto *startAttr = findAttr(graph_, def, "sliceStart");
-                const auto *endAttr = findAttr(graph_, def, "sliceEnd");
+                const auto startAttr = findAttr(graph_, def, "sliceStart");
+                const auto endAttr = findAttr(graph_, def, "sliceEnd");
                 if (!startAttr || !endAttr)
                 {
                     return -1;
                 }
-                const auto *startPtr = std::get_if<int64_t>(&*startAttr);
-                const auto *endPtr = std::get_if<int64_t>(&*endAttr);
+                const auto startPtr = startAttr->get<int64_t>();
+                const auto endPtr = endAttr->get<int64_t>();
                 if (!startPtr || !endPtr || *startPtr < 0 || *endPtr - *startPtr + 1 != elemWidth)
                 {
                     return -1;
@@ -1813,7 +1816,7 @@ namespace wolvrix::lib::transform
                     return -1;
                 }
                 const ValueId assembled = strip(repOperands[0]);
-                const int64_t assembledWidth = graph_.getValue(assembled).width();
+                const int64_t assembledWidth = graph_.valueWidth(assembled);
                 if (assembledWidth <= 0 || elemWidth > assembledWidth)
                 {
                     return -1;
@@ -1855,7 +1858,7 @@ namespace wolvrix::lib::transform
             ValueId findLeafAt(ValueId value, int64_t lo, int64_t hi)
             {
                 value = strip(value);
-                const int64_t width = graph_.getValue(value).width();
+                const int64_t width = graph_.valueWidth(value);
                 if (width < hi || lo < 0)
                 {
                     return ValueId::invalid();
@@ -1866,7 +1869,7 @@ namespace wolvrix::lib::transform
                     int64_t offset = width;
                     for (const ValueId child : graph_.opOperands(def))
                     {
-                        const int64_t childWidth = graph_.getValue(strip(child)).width();
+                        const int64_t childWidth = graph_.valueWidth(strip(child));
                         offset -= childWidth;
                         if (lo >= offset && hi <= offset + childWidth)
                         {
@@ -1948,21 +1951,21 @@ namespace wolvrix::lib::transform
                 {
                     return false;
                 }
-                const auto *regAttr = findAttr(graph_, lsbDef, "regSymbol");
+                const auto regAttr = findAttr(graph_, lsbDef, "regSymbol");
                 if (!regAttr)
                 {
                     return false;
                 }
-                const auto *regSymbol = std::get_if<std::string>(&*regAttr);
+                const auto regSymbol = regAttr->get<std::string>();
                 if (!regSymbol)
                 {
                     return false;
                 }
                 // Pad constants and clamping can thaw or grow the graph.
-                const std::string regSym = *regSymbol;
+                const std::string regSym(*regSymbol);
                 const RegisterInfo *info = findRegister(regSym);
                 if (!info || info->elemWidth != elemWidth ||
-                    graph_.getValue(lsb).width() != info->elemCount * elemWidth)
+                    graph_.valueWidth(lsb) != info->elemCount * elemWidth)
                 {
                     return false;
                 }
@@ -1974,7 +1977,7 @@ namespace wolvrix::lib::transform
                 for (std::size_t j = 0; j + 1 < inputs.size(); ++j)
                 {
                     const ValueId run = inputs[j];
-                    const int64_t runWidth = graph_.getValue(run).width();
+                    const int64_t runWidth = graph_.valueWidth(run);
                     if (runWidth <= 0 || runWidth % elemWidth != 0)
                     {
                         return false;
@@ -1987,18 +1990,18 @@ namespace wolvrix::lib::transform
                         {
                             return false;
                         }
-                        const auto *repAttr = findAttr(graph_, runDef, "rep");
+                        const auto repAttr = findAttr(graph_, runDef, "rep");
                         if (!repAttr)
                         {
                             return false;
                         }
-                        const auto *repCount = std::get_if<int64_t>(&*repAttr);
+                        const auto repCount = repAttr->get<int64_t>();
                         if (!repCount || *repCount <= 0 || *repCount * elemWidth != runWidth)
                         {
                             return false;
                         }
                         const ValueId elem = strip(repOperands[0]);
-                        if (graph_.getValue(elem).width() != elemWidth)
+                        if (graph_.valueWidth(elem) != elemWidth)
                         {
                             return false;
                         }
@@ -2037,7 +2040,7 @@ namespace wolvrix::lib::transform
                 {
                     return false;
                 }
-                const int64_t pw = graph_.getValue(index).width();
+                const int64_t pw = graph_.valueWidth(index);
                 if (pw <= 0 || pw > 62)
                 {
                     return false;
@@ -2106,7 +2109,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const int64_t elemWidth = graph_.getValue(result).width();
+                    const int64_t elemWidth = graph_.valueWidth(result);
                     if (elemWidth <= 0)
                     {
                         continue;
@@ -2125,12 +2128,12 @@ namespace wolvrix::lib::transform
                     if (graph_.opKind(baseDef) == OperationKind::kRegisterReadPort)
                     {
                         // dynamic read directly on a whole-register read
-                        const auto *attr = findAttr(graph_, baseDef, "regSymbol");
+                        const auto attr = findAttr(graph_, baseDef, "regSymbol");
                         if (!attr)
                         {
                             continue;
                         }
-                        const auto *sym = std::get_if<std::string>(&*attr);
+                        const auto sym = attr->get<std::string>();
                         if (!sym)
                         {
                             continue;
@@ -2140,7 +2143,7 @@ namespace wolvrix::lib::transform
                         {
                             continue;
                         }
-                        const std::string symbol = *sym;
+                        const std::string symbol(*sym);
                         const ValueId read = makeArrayRead(symbol, index, elemWidth);
                         graph_.replaceAllUsesWithView(result, read);
                         sweepSeeds_.push_back(id);
@@ -2259,7 +2262,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const int64_t pw = graph_.getValue(index).width();
+                    const int64_t pw = graph_.valueWidth(index);
                     if (pw <= 0 || pw > 62)
                     {
                         continue;
@@ -2412,9 +2415,9 @@ namespace wolvrix::lib::transform
     PassResult MuxTreeFoldPass::run()
     {
         PassResult result;
-        for (const auto &entry : design().graphs())
+        for (Graph* selected : graphs())
         {
-            Graph &graph = *entry.second;
+            Graph &graph = *selected;
             Folder folder(graph, guardedWrites_);
             const bool folded = folder.run();
             if (folded)

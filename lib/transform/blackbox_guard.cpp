@@ -39,14 +39,14 @@ namespace wolvrix::lib::transform
             std::vector<InoutSpec> inouts;
         };
 
-        std::optional<std::string_view> getAttrString(std::span<const wolvrix::lib::grh::AttrKV> attrs,
+        std::optional<std::string_view> getAttrString(wolvrix::lib::grh::AttrRange attrs,
                                                       std::string_view key)
         {
             for (const auto &entry : attrs)
             {
-                if (entry.key == key)
+                if (entry.key() == key)
                 {
-                    if (const auto *value = std::get_if<std::string>(&entry.value))
+                    if (const auto value = entry.value().get<std::string>())
                     {
                         return *value;
                     }
@@ -56,17 +56,17 @@ namespace wolvrix::lib::transform
             return std::nullopt;
         }
 
-        const std::vector<std::string> *getAttrStrings(std::span<const wolvrix::lib::grh::AttrKV> attrs,
+        std::optional<wolvrix::lib::grh::StringListView> getAttrStrings(wolvrix::lib::grh::AttrRange attrs,
                                                        std::string_view key)
         {
             for (const auto &entry : attrs)
             {
-                if (entry.key == key)
+                if (entry.key() == key)
                 {
-                    return std::get_if<std::vector<std::string>>(&entry.value);
+                    return entry.value().get<std::vector<std::string>>();
                 }
             }
-            return nullptr;
+            return std::nullopt;
         }
 
         std::string opContext(const wolvrix::lib::grh::Graph &graph,
@@ -88,12 +88,12 @@ namespace wolvrix::lib::transform
         }
 
         PortSpec makePortSpec(const wolvrix::lib::grh::Graph &graph,
-                              std::string name,
+                              std::string_view name,
                               wolvrix::lib::grh::ValueId valueId,
                               bool fallback)
         {
             PortSpec spec;
-            spec.name = std::move(name);
+            spec.name = name;
             if (!valueId.valid() || fallback)
             {
                 return spec;
@@ -190,7 +190,7 @@ namespace wolvrix::lib::transform
                     continue;
                 }
                 const std::string context = opContext(graph, opId);
-                const auto attrs = graph.opAttrs(opId);
+                const auto attrs = graph.opAttrRange(opId);
                 auto moduleName = getAttrString(attrs, "moduleName");
                 if (!moduleName || moduleName->empty())
                 {
@@ -343,7 +343,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const auto attrs = graph.opAttrs(opId);
+                    const auto attrs = graph.opAttrRange(opId);
                     auto moduleName = getAttrString(attrs, "moduleName");
                     if (!moduleName || moduleName->empty())
                     {

@@ -67,14 +67,14 @@ namespace wolvrix::lib::transform
         MaxSymbolEntry maxCombResultUsers;
         MaxSymbolEntry maxCombFanout;
         MaxSymbolEntry maxReadportFanout;
-        auto getIntAttr = [](std::span<const wolvrix::lib::grh::AttrKV> attrs,
+        auto getIntAttr = [](wolvrix::lib::grh::AttrRange attrs,
                              std::string_view key) -> std::optional<int64_t>
         {
             for (const auto &attr : attrs)
             {
-                if (attr.key == key)
+                if (attr.key() == key)
                 {
-                    if (const auto *value = std::get_if<int64_t>(&attr.value))
+                    if (const auto value = attr.value().get<int64_t>())
                     {
                         return *value;
                     }
@@ -83,17 +83,17 @@ namespace wolvrix::lib::transform
             }
             return std::nullopt;
         };
-        auto getIntArrayAttr = [](std::span<const wolvrix::lib::grh::AttrKV> attrs,
-                                  std::string_view key) -> const std::vector<int64_t> *
+        auto getIntArrayAttr = [](wolvrix::lib::grh::AttrRange attrs,
+                                  std::string_view key) -> std::optional<std::span<const int64_t>>
         {
             for (const auto &attr : attrs)
             {
-                if (attr.key == key)
+                if (attr.key() == key)
                 {
-                    return std::get_if<std::vector<int64_t>>(&attr.value);
+                    return attr.value().get<std::vector<int64_t>>();
                 }
             }
-            return nullptr;
+            return std::nullopt;
         };
 
         auto isCombinationalOp = [](wolvrix::lib::grh::OperationKind kind) -> bool
@@ -330,7 +330,7 @@ namespace wolvrix::lib::transform
                         }
                         // Array registers (shape attr) also feed the memory
                         // statistics the retired kMemory produced.
-                        if (const auto *shapeAttr = getIntArrayAttr(attrs, "shape"))
+                        if (const auto shapeAttr = getIntArrayAttr(attrs, "shape"))
                         {
                             int64_t elementCount = 1;
                             for (const int64_t dim : *shapeAttr)

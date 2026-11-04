@@ -13,14 +13,14 @@ namespace wolvrix::lib::transform
 
     namespace
     {
-        std::optional<std::string_view> getAttrString(std::span<const wolvrix::lib::grh::AttrKV> attrs,
+        std::optional<std::string_view> getAttrString(wolvrix::lib::grh::AttrRange attrs,
                                                       std::string_view key)
         {
             for (const auto &entry : attrs)
             {
-                if (entry.key == key)
+                if (entry.key() == key)
                 {
-                    if (const auto *value = std::get_if<std::string>(&entry.value))
+                    if (const auto value = entry.value().get<std::string>())
                     {
                         return *value;
                     }
@@ -60,9 +60,9 @@ namespace wolvrix::lib::transform
         const std::size_t graphCount = design().graphs().size();
         logDebug("begin graphs=" + std::to_string(graphCount));
 
-        for (const auto &entry : design().graphs())
+        for (auto* selected : graphs())
         {
-            wolvrix::lib::grh::Graph &graph = *entry.second;
+            wolvrix::lib::grh::Graph &graph = *selected;
             
             // Collect latch information
             std::unordered_map<std::string, LatchInfo> latchBySymbol;
@@ -74,7 +74,7 @@ namespace wolvrix::lib::transform
                     continue;
                 }
                 const auto kind = graph.opKind(opId);
-                const auto attrs = graph.opAttrs(opId);
+                const auto attrs = graph.opAttrRange(opId);
                 
                 if (kind == wolvrix::lib::grh::OperationKind::kLatch)
                 {
@@ -82,16 +82,16 @@ namespace wolvrix::lib::transform
                     bool isSigned = false;
                     for (const auto &attr : attrs)
                     {
-                        if (attr.key == "width")
+                        if (attr.key() == "width")
                         {
-                            if (const auto *w = std::get_if<int64_t>(&attr.value))
+                            if (const auto w = attr.value().get<int64_t>())
                             {
                                 width = static_cast<int32_t>(*w);
                             }
                         }
-                        else if (attr.key == "isSigned")
+                        else if (attr.key() == "isSigned")
                         {
-                            if (const auto *s = std::get_if<bool>(&attr.value))
+                            if (const auto s = attr.value().get<bool>())
                             {
                                 isSigned = *s;
                             }

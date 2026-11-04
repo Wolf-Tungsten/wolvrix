@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -56,8 +57,8 @@ std::string metadata(const grh::Graph& graph, std::string_view name) {
     const auto value = graph.metadata(name); return value ? std::get<std::string>(*value) : std::string{};
 }
 std::string attribute(const grh::Graph& graph, grh::OperationId op, std::string_view name) {
-    for (const auto& entry : graph.opAttrs(op))
-        if (entry.key == name) return std::get<std::string>(entry.value);
+    for (const auto& entry : graph.opAttrRange(op))
+        if (entry.key() == name) return std::string(entry.value().asString());
     return {};
 }
 int32_t flatWidth(const PortLeafSignature& port) {
@@ -88,7 +89,35 @@ struct PreloweredFirrtl {
     std::unique_ptr<grh::Graph> graph;
     ModuleSignature signature;
     std::exception_ptr failure;
+    std::vector<std::string> dependencies;
+    std::vector<SourcePosition> covers;
 };
+
+void summarizeBody(const firrtl::Source& source, const firrtl::ModuleBody& body,
+                   const FirrtlOptions& options, PreloweredFirrtl& result) {
+    const auto visit = [&](auto&& self, std::span<const firrtl::StmtId> statements,
+                           std::string layer) -> void {
+        for (const auto id : statements) {
+            const auto& statement = body.arena.statements[id];
+            if (statement.kind == firrtl::StmtKind::LayerBlock) {
+                const auto path = layer.empty() ? std::string(statement.target) :
+                    layer + "." + std::string(statement.target);
+                if (std::any_of(options.enabledLayers.begin(), options.enabledLayers.end(),
+                    [&](const auto& selected) { return selected == path || selected.starts_with(path + "."); }))
+                    self(self, statement.body, path);
+                continue;
+            }
+            if (statement.kind == firrtl::StmtKind::Instance)
+                result.dependencies.emplace_back(statement.target);
+            self(self, statement.body, layer);
+            self(self, statement.otherwise, layer);
+        }
+    };
+    visit(visit, body.statements, {});
+    // Preserve the original arena traversal, including covers in disabled layers.
+    for (const auto& statement : body.arena.statements)
+        if (statement.kind == firrtl::StmtKind::Cover) result.covers.push_back(source.position(statement.range));
+}
 
 class FirrtlThreadPool {
 public:
@@ -315,9 +344,9 @@ std::shared_ptr<const firrtl::ModuleBody> Transaction::parseFirrtlModule(const F
         return found->second;
     }
 
-    auto parsed = firrtl::parseModule(entry.source, entry.index);
+    auto parsed = firrtl::detail::parseSharedModule(entry.source, entry.index);
     if (!parsed.success()) throw std::invalid_argument("cannot parse FIRRTL module: " + std::string(name));
-    auto body = std::make_shared<firrtl::ModuleBody>(std::move(*parsed.body));
+    auto body = parsed.sharedBody;
     const auto [found, inserted] = parsedModules_.emplace(key, std::move(body));
     return found->second;
 }
@@ -362,6 +391,7 @@ void Transaction::resolveFirrtlInterfaces(const std::vector<std::string>& tops) 
         }
     }
     std::map<Endpoint, int32_t> drivenWidths;
+    std::map<ParsedModuleKey, std::shared_ptr<const firrtl::detail::InterfaceSummary>> summaries;
     const auto visit = [&](auto&& self, const std::string& name) -> void {
         const auto found = firrtl_.find(name);
         if (found == firrtl_.end() || found->second.signature.external) return;
@@ -370,77 +400,51 @@ void Transaction::resolveFirrtlInterfaces(const std::vector<std::string>& tops) 
         states[name] = 1;
         const auto& entry = found->second;
 
-        const auto parsed = parseFirrtlModule(entry, name);
         try {
             bool childChanged = false;
-            const auto dependencies = [&](auto&& walk, std::span<const firrtl::StmtId> statements, std::string layer) -> void {
-                for (const auto id : statements) {
-                    const auto& statement = parsed->arena.statements[id];
-                    if (statement.kind == firrtl::StmtKind::LayerBlock) {
-                        const auto path = layer.empty() ? std::string(statement.target) : layer + "." + std::string(statement.target);
-                        if (std::any_of(request_.firrtl.enabledLayers.begin(), request_.firrtl.enabledLayers.end(),
-                            [&](const auto& enabled) { return enabled == path || enabled.starts_with(path + "."); }))
-                            walk(walk, statement.body, path);
-                        continue;
-                    }
-                    if (statement.kind == firrtl::StmtKind::Instance) {
-                        const std::string target(statement.target);
-                        if (firrtl_.contains(target)) reverseParents[target].insert(name);
-                        self(self, target);
-                        childChanged |= changedModules.contains(target) || resolvedModules.contains(target);
-                    }
-                    walk(walk, statement.body, layer); walk(walk, statement.otherwise, layer);
-                }
-            };
-            dependencies(dependencies, parsed->statements, {});
+            const ParsedModuleKey parsedKey{entry.source.get(), entry.index};
+            auto summary = summaries.find(parsedKey);
+            if (summary == summaries.end())
+                summary = summaries.emplace(parsedKey,
+                    firrtl::detail::sharedInterfaceSummary(entry.source, entry.index, request_.firrtl)).first;
+            for (const auto& target : summary->second->dependencies) {
+                if (firrtl_.contains(target)) reverseParents[target].insert(name);
+                self(self, target);
+                childChanged |= changedModules.contains(target) || resolvedModules.contains(target);
+            }
             if (!firstRound && !dirtyModules.contains(name) && !childChanged) {
                 states[name] = 2;
                 return;
             }
 
-            firrtl::detail::Semantics semantics(*entry.source, *parsed, request_.firrtl, &interfaces_);
-            semantics.analyze(true);
+            const auto evaluation = summary->second->evaluate(interfaces_);
 
             auto signature = entry.signature; signature.ports.clear();
             std::map<uint32_t, std::size_t> groups;
-            std::map<std::string, std::string> instances;
-            for (const auto& instance : semantics.instances) instances.emplace(instance.name, instance.target);
-            for (const auto& declarationName : semantics.declarationOrder) {
-                const auto& declaration = semantics.declarations.at(declarationName);
-                if (!declaration.port && !instances.contains(declarationName)) continue;
-                for (const auto& leaf : semantics.leavesCached(declaration.type, declaration.flow)) {
-                    auto path = leaf.fields; path.insert(path.begin(), declarationName);
-                    if (instances.contains(declarationName) && semantics.width(leaf.type) >= 0) {
-                        const Endpoint target{instances.at(declarationName), leaf.fields};
-                        if (inferredWidths.contains(target)) {
-                            const auto [width, inserted] = drivenWidths.emplace(target, semantics.width(leaf.type));
-                            if (!inserted) width->second = std::max(width->second, static_cast<int32_t>(semantics.width(leaf.type)));
-                        }
+            for (const auto& leaf : summary->second->leaves) {
+                const auto& path = leaf.port.fieldPath;
+                const auto bits = evaluation.widths[leaf.width];
+                if (!leaf.target.empty() && bits >= 0) {
+                    const Endpoint target{leaf.target, leaf.fields};
+                    if (inferredWidths.contains(target)) {
+                        const auto [width, inserted] = drivenWidths.emplace(target, bits);
+                        if (!inserted) width->second = std::max(width->second, static_cast<int32_t>(bits));
                     }
-                    if (leaf.type->kind == firrtl::TypeKind::Reset) {
-                        const auto id = endpoint({name, path});
-                        resets[root(id)].flags |= semantics.resetConstraint(leaf.type);
-                        const auto [group, inserted] = groups.emplace(semantics.resetGroup(leaf.type), id);
-                        if (!inserted) merge(id, group->second, declaration.range);
-                        if (instances.contains(declarationName))
-                            merge(id, endpoint({instances.at(declarationName), leaf.fields}), declaration.range);
-                    }
-                    if (!declaration.port) continue;
-                    PortLeafSignature port; port.name = declarationName; port.fieldPath = path;
-                    for (const auto& field : leaf.fields) port.name += "__DOT__" + field;
-                    port.direction = leaf.flow == 1 ? LeafDirection::Input : LeafDirection::Output;
-                    port.elementWidth = static_cast<int32_t>(semantics.width(leaf.type)); port.shape = leaf.shape;
-                    port.shapeFieldDepths = leaf.shapeFieldDepths;
-                    port.isSigned = leaf.type->kind == firrtl::TypeKind::SInt; port.isConst = leaf.type->constant;
-                    port.requiresTypeResolution = port.elementWidth <= 0 ||
-                        std::find(port.shape.begin(), port.shape.end(), 0) != port.shape.end() || leaf.probe != firrtl::TypeKind::Unknown;
-                    const auto kind = leaf.type->kind;
-                    port.sourceType = kind == firrtl::TypeKind::Reset ? "Reset" : kind == firrtl::TypeKind::AsyncReset ? "AsyncReset" :
-                        kind == firrtl::TypeKind::Clock ? "Clock" : kind == firrtl::TypeKind::SInt ? "SInt" : "UInt";
-                    if (leaf.probe != firrtl::TypeKind::Unknown)
-                        port.sourceType = std::string(leaf.probe == firrtl::TypeKind::Probe ? "Probe<" : "RWProbe<") + port.sourceType + ">";
-                    signature.ports.push_back(std::move(port));
                 }
+                if (leaf.kind == firrtl::TypeKind::Reset) {
+                    const auto id = endpoint({name, path});
+                    resets[root(id)].flags |= evaluation.resets[leaf.resetGroup];
+                    const auto [group, inserted] = groups.emplace(leaf.resetGroup, id);
+                    if (!inserted) merge(id, group->second, leaf.range);
+                    if (!leaf.target.empty()) merge(id, endpoint({leaf.target, leaf.fields}), leaf.range);
+                }
+                if (!leaf.target.empty()) continue;
+                auto port = leaf.port;
+                port.elementWidth = static_cast<int32_t>(bits);
+                port.requiresTypeResolution = port.elementWidth <= 0 ||
+                    std::find(port.shape.begin(), port.shape.end(), 0) != port.shape.end() ||
+                    port.sourceType.starts_with("Probe<") || port.sourceType.starts_with("RWProbe<");
+                signature.ports.push_back(std::move(port));
             }
             const auto& previous = interfaces_.at(name);
             bool signatureChanged = signature.ports.size() != previous.ports.size();
@@ -487,7 +491,7 @@ void Transaction::resolveFirrtlInterfaces(const std::vector<std::string>& tops) 
         if (changed) {
             for (const auto& module : resolvedModules) {
                 // A width update is applied to the module's interface after
-                // its visit; re-analyze that module before propagating to
+                // its visit; reevaluate its summary before propagating to
                 // parents so its derived output widths become visible.
                 dirtyModules.insert(module);
                 const auto parents = reverseParents.find(module);
@@ -520,29 +524,11 @@ void Transaction::prepareFirrtlLowering(const std::vector<std::string>& roots) {
     const auto discover = [&](auto&& self, const std::string& name) -> void {
         const auto found = firrtl_.find(name);
         if (found == firrtl_.end() || found->second.signature.external ||
+            found->second.state == 2 || prelowered_.contains(name) ||
             reachable.contains(name) || !visiting.insert(name).second) return;
-        const auto parsed = parseFirrtlModule(found->second, name);
-        const auto walk = [&](auto&& walkSelf, std::span<const firrtl::StmtId> statements,
-                              std::string layer) -> void {
-            for (const auto statementId : statements) {
-                const auto& statement = parsed->arena.statements[statementId];
-                if (statement.kind == firrtl::StmtKind::LayerBlock) {
-                    const auto path = layer.empty() ? std::string(statement.target) :
-                        layer + "." + std::string(statement.target);
-                    const bool enabled = std::any_of(request_.firrtl.enabledLayers.begin(),
-                        request_.firrtl.enabledLayers.end(), [&](const auto& selected) {
-                            return selected == path || selected.starts_with(path + ".");
-                        });
-                    if (enabled) walkSelf(walkSelf, statement.body, path);
-                    continue;
-                }
-                if (statement.kind == firrtl::StmtKind::Instance)
-                    self(self, std::string(statement.target));
-                walkSelf(walkSelf, statement.body, layer);
-                walkSelf(walkSelf, statement.otherwise, layer);
-            }
-        };
-        walk(walk, parsed->statements, {});
+        const auto summary = firrtl::detail::sharedInterfaceSummary(found->second.source,
+            found->second.index, request_.firrtl);
+        for (const auto& dependency : summary->dependencies) self(self, dependency);
         visiting.erase(name);
         reachable.insert(name);
     };
@@ -562,6 +548,17 @@ void Transaction::prepareFirrtlLowering(const std::vector<std::string>& roots) {
     for (const auto& name : reachable) {
         graphs.emplace_back(name, design_.createUnpublishedGraph(name));
     }
+    // Keep graph allocation/publication order stable, but feed the largest
+    // module bodies first so workers do not leave one long tail of work.
+    std::vector<std::size_t> schedule(graphs.size());
+    std::iota(schedule.begin(), schedule.end(), 0);
+    std::sort(schedule.begin(), schedule.end(), [&](std::size_t left, std::size_t right) {
+        const auto& lhs = firrtl_.at(graphs[left].first).source->modules()[firrtl_.at(graphs[left].first).index];
+        const auto& rhs = firrtl_.at(graphs[right].first).source->modules()[firrtl_.at(graphs[right].first).index];
+        const auto lhsSize = lhs.range.end - lhs.range.begin;
+        const auto rhsSize = rhs.range.end - rhs.range.begin;
+        return lhsSize != rhsSize ? lhsSize > rhsSize : graphs[left].first < graphs[right].first;
+    });
     const auto loweringStarted = std::chrono::steady_clock::now();
     {
         // The pool is destroyed (and joins) before the mutation scope, also
@@ -570,21 +567,30 @@ void Transaction::prepareFirrtlLowering(const std::vector<std::string>& roots) {
         FirrtlThreadPool pool(workers);
         std::vector<std::pair<std::string, std::future<PreloweredFirrtl>>> pending;
         pending.reserve(graphs.size());
-        for (auto& [name, graph] : graphs) {
+        for (const auto graphIndex : schedule) {
+            auto& [name, graph] = graphs[graphIndex];
             const auto& entry = firrtl_.at(name);
-            const auto body = parseFirrtlModule(entry, name);
+            auto body = parseFirrtlModule(entry, name);
+            parsedModules_.erase(ParsedModuleKey{entry.source.get(), entry.index});
             pending.emplace_back(name, pool.submit(
-                [source = entry.source, body, graph = std::move(graph), interfaces, options]() mutable {
+                [source = entry.source, module = entry.index, body = std::move(body), graph = std::move(graph), interfaces, options]() mutable {
                     PreloweredFirrtl result;
                     result.graph = std::move(graph);
                     try {
-                        result.signature = firrtl::detail::lowerModule(*source, *body, *result.graph,
-                                                                       options, interfaces.get());
+                        summarizeBody(*source, *body, options, result);
+                        // Boundary signatures are immutable. The same worker
+                        // owns the only strict analysis and immediately lowers
+                        // it; no full semantic state waits on the coordinator.
+                        firrtl::detail::Semantics semantics(*source, *body, options, interfaces.get());
+                        semantics.analyze();
+                        result.signature = firrtl::detail::lowerModule(semantics, *result.graph, options);
                     } catch (...) {
                         // Re-throw in ensureFirrtl's deterministic dependency
                         // order through the normal source-aware diagnostics.
                         result.failure = std::current_exception();
                     }
+                    firrtl::detail::releaseParsedModule(*source, module);
+                    body.reset();
                     return result;
                 }));
         }
@@ -773,26 +779,26 @@ std::string Transaction::ensureFirrtl(const std::string& name) {
             }
             entry.graph = adapter(interfaces_.at(name), target, ports);
         } else {
-            const auto parsed = parseFirrtlModule(entry, name);
+            auto prelowered = prelowered_.find(name);
+            std::shared_ptr<const firrtl::ModuleBody> parsed;
+            PreloweredFirrtl summary;
+            if (prelowered == prelowered_.end()) {
+                parsed = parseFirrtlModule(entry, name);
+                summarizeBody(*entry.source, *parsed, request_.firrtl, summary);
+            }
+            const auto& bodySummary = prelowered == prelowered_.end() ? summary : prelowered->second;
             std::map<std::string, std::string> targets;
-            const auto dependencies = [&](auto&& self, std::span<const firrtl::StmtId> statements, std::string layer) -> void {
-                for (const auto id : statements) {
-                    const auto& statement = parsed->arena.statements[id];
-                    if (statement.kind == firrtl::StmtKind::LayerBlock) {
-                        const auto path = layer.empty() ? std::string(statement.target) : layer + "." + std::string(statement.target);
-                        const bool enabled = std::any_of(request_.firrtl.enabledLayers.begin(), request_.firrtl.enabledLayers.end(),
-                            [&](const auto& selected) { return selected == path || selected.starts_with(path + "."); });
-                        if (enabled) self(self, statement.body, path);
-                        continue;
-                    }
-                    if (statement.kind == firrtl::StmtKind::Instance) {
-                        const std::string target(statement.target); targets.emplace(target, ensureFirrtl(target));
-                    }
-                    self(self, statement.body, layer); self(self, statement.otherwise, layer);
-                }
-            };
-            dependencies(dependencies, parsed->statements, {});
-            if (const auto prelowered = prelowered_.find(name); prelowered != prelowered_.end()) {
+            for (const auto& target : bodySummary.dependencies) targets.emplace(target, ensureFirrtl(target));
+            const auto covers = bodySummary.covers;
+            if (prelowered == prelowered_.end() && request_.firrtl.lowerThreads > 1) {
+                // SV can expose FIRRTL declarations beyond the initial walk.
+                // Link their dependencies first, as in the serial endpoint,
+                // then submit strict analysis/lowering with the resolved ABI.
+                prepareFirrtlLowering({name});
+                prelowered = prelowered_.find(name);
+                parsed.reset();
+            }
+            if (prelowered != prelowered_.end()) {
                 if (prelowered->second.failure) std::rethrow_exception(prelowered->second.failure);
                 if (!prelowered->second.graph)
                     throw std::runtime_error("parallel FIRRTL lowering produced no graph: " + name);
@@ -800,18 +806,26 @@ std::string Transaction::ensureFirrtl(const std::string& name) {
                 entry.signature = std::move(prelowered->second.signature);
                 prelowered_.erase(prelowered);
             } else {
-                entry.signature = firrtl::detail::lowerModule(*entry.source, *parsed, design_, request_.firrtl, &interfaces_);
+                firrtl::detail::Semantics semantics(*entry.source, *parsed, request_.firrtl, &interfaces_);
+                semantics.analyze();
+                auto& graph = design_.createGraph(name);
+                entry.signature = firrtl::detail::lowerModule(semantics, graph, request_.firrtl);
             }
             interfaces_[name] = entry.signature; entry.graph = name;
             auto& graph = *design_.findGraph(name);
+            const bool cyclesChecked = graph.localCyclesChecked();
 
-            for (const auto& statement : parsed->arena.statements) if (statement.kind == firrtl::StmtKind::Cover)
+            for (const auto& position : covers)
                 result_.diagnostics.push_back({IngestSeverity::Warning, "FIRRTL cover uses a simulation hit trace; no formal coverage model is generated",
-                    name, "ingest-firrtl", name, entry.source->position(statement.range)});
+                    name, "ingest-firrtl", name, position});
             for (const auto op : graph.operations()) if (graph.opKind(op) == grh::OperationKind::kInstance)
                 graph.setAttr(op, "moduleName", targets.at(attribute(graph, op, "moduleName")));
             firrtl::detail::applyAnnotations(*entry.source, entry.source->modules()[entry.index], annotations_.at(entry.source.get()), graph);
+            // Binding module names and importing annotations above only change
+            // attributes/provenance, so the lowerer's edge proof still holds.
+            if (cyclesChecked) graph.markLocalCyclesChecked();
             parsedModules_.erase(ParsedModuleKey{entry.source.get(), entry.index});
+            firrtl::detail::releaseParsedModule(*entry.source, entry.index);
         }
         entry.state = 2; return entry.graph;
     } catch (const firrtl::detail::Error& failure) {
@@ -1027,7 +1041,7 @@ IngestResult Transaction::run(const ModuleSpecialization* specialization) {
             design_.markAsTop(graph);
         }
         checkHierarchy();
-        if (!verifyLinkedDesign(design_, result_.diagnostics)) return std::move(result_);
+        if (!verifyLinkedDesign(design_, result_.diagnostics, request_.firrtl.lowerThreads)) return std::move(result_);
         for (auto& signature : result_.modules) if (interfaces_.contains(signature.name)) signature = interfaces_.at(signature.name);
         // Generated sources use content identity instead of transaction paths.
         const auto transactionPrefix = directory_.empty() ? std::string{} : "sv:" + directory_.generic_string() + "/";
@@ -1050,6 +1064,10 @@ IngestResult Transaction::run(const ModuleSpecialization* specialization) {
         canonicalizeGeneratedLocations();
         if (!prelowered_.empty())
             throw std::runtime_error("unpublished FIRRTL modules remain at transaction commit");
+        for (const auto& owner : result_.sourceOwners) {
+            if (const auto source = std::dynamic_pointer_cast<const firrtl::Source>(owner))
+                firrtl::detail::clearParsedModules(*source);
+        }
         result_.design.emplace(std::move(design_));
     } catch (const std::exception& failure) { error(failure.what()); }
     return std::move(result_);
@@ -1064,7 +1082,7 @@ std::string sourceIdentity(std::string_view text) {
     return out.str();
 }
 
-bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diagnostics) {
+bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diagnostics, std::size_t threads) {
     try {
         std::map<std::string, unsigned> states;
         std::function<void(const std::string&)> visit = [&](const std::string& name) {
@@ -1082,10 +1100,10 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
                 const auto target = attribute(*graph, op, "moduleName");
                 const auto* child = design.findGraph(target);
                 if (!child) throw std::invalid_argument("unresolved linked instance: " + target);
-                const auto operation = graph->getOperation(op);
+                const auto attrs = graph->opAttrRange(op);
                 const auto check = [&](std::string_view key, const auto& ports, auto values) {
-                    const auto attr = operation.attr(key);
-                    const auto* names = attr ? std::get_if<std::vector<std::string>>(&*attr) : nullptr;
+                    const auto attr = attrs.find(key);
+                    const auto names = attr ? attr->value().get<std::vector<std::string>>() : std::nullopt;
                     if (!names || names->size() != ports.size() || values.size() != ports.size())
                         throw std::invalid_argument("linked instance port count differs: " + target + "." + std::string(key));
                     std::unordered_map<std::string_view, grh::ValueId> portValues;
@@ -1094,15 +1112,15 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
                     std::set<std::string> used;
                     for (std::size_t i = 0; i < names->size(); ++i) {
                         const auto port = portValues.find(std::string_view((*names)[i]));
-                        if (port == portValues.end() || !used.insert((*names)[i]).second)
-                            throw std::invalid_argument("unknown or duplicate linked instance port: " + target + "." + (*names)[i]);
+                        if (port == portValues.end() || !used.emplace((*names)[i]).second)
+                            throw std::invalid_argument("unknown or duplicate linked instance port: " + target + "." + std::string((*names)[i]));
                         if (graph->valueLogicalType(values[i]) != child->valueLogicalType(port->second))
-                            throw std::invalid_argument("incompatible linked instance port ABI: " + target + "." + (*names)[i]);
+                            throw std::invalid_argument("incompatible linked instance port ABI: " + target + "." + std::string((*names)[i]));
                     }
                 };
                 if (child->inoutPorts().empty()) {
-                    check("inputPortName", child->inputPorts(), operation.operands());
-                    check("outputPortName", child->outputPorts(), operation.results());
+                    check("inputPortName", child->inputPorts(), graph->opOperands(op));
+                    check("outputPortName", child->outputPorts(), graph->opResults(op));
                 }
                 visit(target);
             }
@@ -1113,16 +1131,36 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
         diagnostics.push_back({IngestSeverity::Error, failure.what(), {}, "ingest-link"});
         return false;
     }
-    transform::PassManager manager;
+    transform::PassManagerOptions managerOptions;
+    managerOptions.graphThreads = std::max(std::size_t{1}, threads);
+    transform::PassManager manager(managerOptions);
     const bool pendingCycles = std::any_of(design.graphs().begin(), design.graphs().end(), [](const auto& entry) {
         return entry.second->metadata("firrtl.pendingCombLoopCheck").has_value();
     });
-    if (pendingCycles) {
+    // FIRRTL lowerers stamp a mutation-epoch proof when their local cycle
+    // analysis completed. Imported SV graphs and graphs changed by a linker
+    // pass have no such proof even when no pending metadata was produced.
+    // Keep the old pending gate for metadata cleanup, but schedule the same
+    // local checker whenever any graph lacks a valid proof. This preserves
+    // the fast path for proven FIRRTL graphs while preventing unproved mixed
+    // designs from silently skipping cycle verification.
+    const bool cycleCheckRequired = pendingCycles || std::any_of(
+        design.graphs().begin(), design.graphs().end(), [](const auto& entry) {
+            return !entry.second->localCyclesChecked();
+        });
+    std::shared_ptr<const std::unordered_set<std::string>> selection;
+    if (cycleCheckRequired) {
         transform::CombLoopElimOptions options;
         options.failOnTrueLoop = true;
         // Check module-local array dependencies here. Instance input/output
         // dependencies become precise after the ordinary hier-flatten pass.
         options.treatInstancesAsBoundary = true;
+        auto mutableSelection = std::make_shared<std::unordered_set<std::string>>();
+        for (const auto& [name, graph] : design.graphs())
+            if (graph->metadata("firrtl.pendingCombLoopCheck") || !graph->localCyclesChecked())
+                mutableSelection->insert(name);
+        selection = std::move(mutableSelection);
+        options.graphSelection = selection;
         manager.addPass(std::make_unique<transform::CombLoopElimPass>(options));
     }
     manager.addPass(std::make_unique<transform::GrhVerifyPass>());
@@ -1145,8 +1183,16 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
         }
         diagnostics.push_back({IngestSeverity::Error, "combinational cycle in FIRRTL connections remains after range analysis", {}, "ingest-link", {}, std::move(position)});
     }
-    if (success && pendingCycles)
-        for (const auto& entry : design.graphs()) entry.second->eraseMetadata("firrtl.pendingCombLoopCheck");
+    if (success) {
+        // A successful local checker establishes a proof for exactly the
+        // graphs it inspected. The mutation epoch on Graph invalidates this
+        // marker automatically if a later pass changes topology or types.
+        if (cycleCheckRequired)
+            for (const auto& name : *selection)
+                if (auto* graph = design.findGraph(name)) graph->markLocalCyclesChecked();
+        if (pendingCycles)
+            for (const auto& entry : design.graphs()) entry.second->eraseMetadata("firrtl.pendingCombLoopCheck");
+    }
     return success;
 }
 

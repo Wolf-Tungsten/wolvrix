@@ -20,10 +20,10 @@ node::Inspection originalInspection(const grh::Graph& graph) {
         try {
             if (!schema) throw std::invalid_argument("node attributes require firrtl.nodeSchema=2");
             bool hasRoots = false, hasIndices = false;
-            for (const auto& entry : graph.opAttrs(op)) if (node::isAttribute(entry.key)) {
-                if (entry.key != node::kMembers && entry.key != node::kRoots && entry.key != node::kRootResults && entry.key != node::kOrigins)
-                    throw std::invalid_argument("unknown node attribute: " + entry.key);
-                hasRoots |= entry.key == node::kRoots; hasIndices |= entry.key == node::kRootResults;
+            for (const auto& entry : graph.opAttrRange(op)) if (node::isAttribute(entry.key())) {
+                if (entry.key() != node::kMembers && entry.key() != node::kRoots && entry.key() != node::kRootResults && entry.key() != node::kOrigins)
+                    throw std::invalid_argument("unknown node attribute: " + std::string(entry.key()));
+                hasRoots |= entry.key() == node::kRoots; hasIndices |= entry.key() == node::kRootResults;
             }
             if (hasRoots != hasIndices) throw std::invalid_argument("node roots/rootResults must be paired");
             const auto attributes = node::read(graph, op);

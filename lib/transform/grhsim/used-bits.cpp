@@ -110,9 +110,9 @@ bool mergeEquivalentStates(Scope& scope)
         for (const auto& step : state.init) encode(key, AttributeValue(step.value));
         key << static_cast<unsigned>(graph.opKind(writer)) << ';';
         for (const auto input : graph.opOperands(writer)) key << input.index << ',' << input.generation << ';';
-        for (const auto& entry : graph.opAttrs(writer))
-            if (entry.key != "regSymbol" && entry.key != "latchSymbol" && entry.key != "writerOrder" &&
-                entry.key != kOriginModulesKey) { key << entry.key << ':'; encode(key, entry.value); }
+        for (const auto entry : graph.opAttrRange(writer))
+            if (entry.key() != "regSymbol" && entry.key() != "latchSymbol" && entry.key() != "writerOrder" &&
+                entry.key() != kOriginModulesKey) { key << entry.key() << ':'; encode(key, entry.value()); }
         const auto [it, inserted] = representatives.emplace(key.str(), target);
         if (inserted) continue;
         const auto canonical = it->second;
@@ -354,9 +354,9 @@ bool simplifyUsedBits(Scope& scope)
         std::unordered_set<std::string_view> names;
         for (const auto target : deadStates) names.insert(graph.symbolText(graph.operationSymbol(target)));
         for (const auto op : graph.operations())
-            for (const auto& entry : graph.opAttrs(op))
-                if ((entry.key == "regSymbol" || entry.key == "latchSymbol") &&
-                    names.contains(std::get<std::string>(entry.value)))
+            for (const auto entry : graph.opAttrRange(op))
+                if ((entry.key() == "regSymbol" || entry.key() == "latchSymbol") &&
+                    names.contains(entry.value().asString()))
                     throw std::logic_error("Dead state still has a live reference");
         for (const auto target : deadStates) graph.eraseOp(target);
     }

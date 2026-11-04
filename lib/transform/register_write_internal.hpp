@@ -21,11 +21,11 @@ namespace wolvrix::lib::transform::write_detail
     using grh::ValueId;
 
     // Borrowed until the next graph mutation or freeze.
-    inline const grh::AttributeValue *findAttr(const Graph &graph, OperationId op, std::string_view key)
+    inline std::optional<grh::AttrValueView> findAttr(const Graph &graph, OperationId op, std::string_view key)
     {
-        for (const auto &attr : graph.opAttrs(op))
-            if (attr.key == key) return &attr.value;
-        return nullptr;
+        for (const auto &attr : graph.opAttrRange(op))
+            if (attr.key() == key) return attr.value();
+        return std::nullopt;
     }
 
     inline ValueId strip(const Graph &graph, ValueId value)
@@ -48,8 +48,8 @@ namespace wolvrix::lib::transform::write_detail
         value = strip(graph, value);
         const auto def = graph.valueDef(value);
         if (!def.valid() || graph.opKind(def) != OperationKind::kConstant) return std::nullopt;
-        const auto *attr = findAttr(graph, def, "constValue");
-        const auto *literal = attr ? std::get_if<std::string>(&*attr) : nullptr;
+        const auto attr = findAttr(graph, def, "constValue");
+        const auto literal = attr ? attr->get<std::string>() : std::nullopt;
         if (!literal) return std::nullopt;
         std::string text;
         for (unsigned char ch : *literal)

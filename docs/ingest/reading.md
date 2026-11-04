@@ -66,6 +66,60 @@ conversion. Failed reads with `replace=True` preserve the existing key. Successf
 replacement also works when the old key contains a Python session value. Cloning
 onto the same key preserves the source owners.
 
+## Explicit pre-flatten endpoint
+
+`IngestRequest::pipeline` defaults to `IngestPipeline::Ingest`. Selecting
+`IngestPipeline::GrhPreFlatten` additionally runs these eight production stages,
+in order: `xmr-resolve`, `mux-tree-fold`, `register-write-normalize`
+(`semantics=2state`), `mux-tree-fold` (`guarded_writes=2state`),
+`memory-read-retime`, `multidriven-guard`, `blackbox-guard`, and
+`latch-transparent-read`. Declared symbols are retained. The returned design is
+ready for `hier-flatten`; callers run that pass once after the read.
+
+Both Python mixed-source entry points accept `pipeline="grh-pre-flatten"`:
+
+```python
+diagnostics = session.read_firrtl(
+    "rtl/Top.fir",
+    tops=["Top"],
+    firrtl_options={"node_annotations": True, "lower_threads": 10},
+    pipeline="grh-pre-flatten",
+    out_design="design.main",
+)
+prefix = session.get("design.main.prefix")
+session.run_pass("hier-flatten", design="design.main", keep_declared_symbols=True)
+```
+
+The report key is the output design key followed by `.prefix`. Its
+`ingest_diagnostic_count` gives the number of initial frontend diagnostics in
+the returned list; subsequent entries belong to the ordered prefix stages.
+`stages` holds each stage's `pass` name, complete `diagnostics`, `overlapped`,
+`wall_s`, and `worker_wall_s`. Diagnostics retain stage order, each pass's
+original graph order, and local emission order. Overlapping graph-local stages
+have `wall_s=None`; `worker_wall_s` is accumulated worker duration and must not
+be added to wall time. `prefix_wall_s` measures the prefix after raw ingestion,
+including its barriers and final source preparation. The complete read call
+must be timed separately to measure ingestion plus prefix. C++ exposes the
+same information through `prefixStages`, `ingestDiagnosticCount`, and
+`prefixWallSeconds` in `IngestResult`.
+
+XMR resolution, recursive inout-driver checks, and blackbox catalog updates run
+at design barriers. Contiguous graph-local stages run as worker chains between
+these barriers, using the `lower_threads` budget. This is a published-design
+pipeline; it does not execute all eight stages inside each frontend lower task.
+After retention metadata is published, eligible named-port source graphs are
+compacted in parallel. Top graphs and sources with positional port references
+keep their existing IDs. Mutation-invalidated preparation receipts let the
+next flatten consume this preparation once while preserving its historical
+source-freeze diagnostic counts. These receipts are not serialized.
+
+The benchmark's `--fused-prefix` option selects this endpoint. Formal runs store
+the observed joint read duration as `ingest_prefix_s` and set `ingest_s=None`.
+Correctness mode independently reads the original sources once for the raw
+ingest identity and again for this endpoint followed by flatten; JSON and
+hashing time is excluded from formal timing runs. The default API endpoint
+continues to return the raw ingest design.
+
 Run validation through the playground Makefile:
 
 ```sh

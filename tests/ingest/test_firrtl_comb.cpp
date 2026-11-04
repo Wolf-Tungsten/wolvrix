@@ -1,5 +1,7 @@
 #include "firrtl_emit_fixture.hpp"
 
+#include <tuple>
+
 namespace {
 using namespace firrtl_test;
 
@@ -154,9 +156,116 @@ void symbolLookupSemantics() {
                 "same-name declarations or drivers crossed module scope");
     }
 }
+void interfaceSummaryFixedPoint() {
+    const auto path = artifact("firrtl-fixtures") / "interface-summary.fir";
+    const std::string source = R"FIR(FIRRTL version 6.0.0
+circuit top :
+  module leaf :
+    input a : UInt
+    input rst : Reset
+    output y : UInt
+    output resetOut : Reset
+    wire internal : UInt
+    node increment = add(a, UInt<1>(1))
+    connect internal, increment
+    connect y, internal
+    connect resetOut, rst
+  module middle :
+    input a : UInt
+    input rst : Reset
+    output y : UInt
+    output resetOut : Reset
+    inst child of leaf
+    connect child.a, a
+    connect child.rst, rst
+    node shifted = shl(child.y, 2)
+    connect y, shifted
+    connect resetOut, child.resetOut
+  module unreachable :
+    node bad = add(UInt<1>(0), SInt<1>(0))
+  public module top :
+    input a : UInt<7>
+    input arst : AsyncReset
+    output y : UInt
+    output resetOut : AsyncReset
+    inst child of middle
+    connect child.a, a
+    connect child.rst, arst
+    connect y, child.y
+    connect resetOut, child.resetOut
+)FIR";
+    std::ofstream(path) << source;
+    std::optional<std::string> expected;
+    for (const auto threads : {std::size_t{1}, std::size_t{4}, std::size_t{4}}) {
+        ingest::IngestRequest request;
+        request.sources.push_back({ingest::SourceLanguage::Firrtl, path, "summary"});
+        request.firrtl.lowerThreads = threads;
+        const auto result = ingest::readSources(request);
+        require(result.success(), diagnostics(result));
+        require(result.design->graphs().size() == 3 && !result.design->findGraph("unreachable"),
+                "summary construction eagerly lowered an unreachable semantic failure");
+        const auto check = [&](std::string_view module, int outputWidth) {
+            const auto found = std::find_if(result.modules.begin(), result.modules.end(),
+                [&](const auto& signature) { return signature.name == module; });
+            require(found != result.modules.end(), "resolved summary interface is missing");
+            for (const auto& port : found->ports) {
+                if (port.name == "a") require(port.elementWidth == 7, "parent width did not propagate through a child input");
+                if (port.name == "y") require(port.elementWidth == outputWidth, "derived output width did not propagate through the hierarchy");
+                if (port.name == "rst" || port.name == "resetOut")
+                    require(port.sourceType == "AsyncReset", "abstract Reset did not propagate through local and child connections");
+            }
+        };
+        check("leaf", 8); check("middle", 10); check("top", 10);
+        wolvrix::lib::store::StoreJson store;
+        const auto json = store.storeToString(*result.design);
+        require(json.has_value(), "summary result could not be stored");
+        if (!expected) expected = *json;
+        require(*expected == *json, "parse/summary worker completion order changed published GRH");
+    }
+    const auto invalidPath = artifact("firrtl-fixtures") / "interface-summary-syntax.fir";
+    std::ofstream(invalidPath) << source << "  module unreachableSyntax :\n    mystery first\n    mystery second\n";
+    std::vector<std::string> expectedDiagnostics;
+    for (const auto threads : {std::size_t{1}, std::size_t{4}}) {
+        ingest::IngestRequest request;
+        request.sources.push_back({ingest::SourceLanguage::Firrtl, invalidPath, "summary"});
+        request.firrtl.lowerThreads = threads;
+        const auto result = ingest::readSources(request);
+        require(!result.success() && !result.design, "unreachable syntax errors were omitted by worker parsing");
+        std::vector<std::string> actual;
+        for (const auto& diagnostic : result.diagnostics)
+            actual.push_back(diagnostic.context + ":" + std::to_string(diagnostic.location ? diagnostic.location->line : 0) + ":" + diagnostic.message);
+        require(actual.size() >= 2, "worker parser did not retain independent unreachable syntax errors");
+        if (expectedDiagnostics.empty()) expectedDiagnostics = actual;
+        require(expectedDiagnostics == actual, "parallel syntax diagnostics lost source/module ordering");
+    }
+}
+void deferredSummaryDiagnostics() {
+    for (const auto& [name, body, message] : std::vector<std::tuple<std::string, std::string, std::string>>{
+        {"predicate", "    input sel : UInt<2>\n    when sel : skip\n", "when predicate must have at most one bit"},
+        {"reset", "    input clk : Clock\n    input rst : AsyncReset\n    input d : UInt<8>\n"
+                  "    regreset state : UInt<8>, clk, rst, d\n", "asynchronous reset value"}}) {
+        const auto path = artifact("firrtl-fixtures") / ("summary-diagnostic-" + name + ".fir");
+        std::ofstream(path) << "FIRRTL version 6.0.0\ncircuit top :\n  module first :\n" << body <<
+            "  module second :\n    node bad = add(UInt<1>(0), SInt<1>(0))\n"
+            "  module top :\n    inst a of first\n    inst b of second\n";
+        for (const auto threads : {std::size_t{1}, std::size_t{4}}) {
+            ingest::IngestRequest request;
+            request.sources.push_back({ingest::SourceLanguage::Firrtl, path, "summary-diagnostics"});
+            request.firrtl.lowerThreads = threads;
+            const auto result = ingest::readSources(request);
+            require(!result.success() && !result.design && !result.diagnostics.empty(),
+                    "deferred summary validation accepted an invalid child");
+            require(result.diagnostics.front().context == "first" &&
+                    result.diagnostics.front().message.find(message) != std::string::npos,
+                    "a later immediate type error overtook an earlier child's deferred diagnostic");
+        }
+    }
+}
 void test() {
     sourceInfoOwnership();
     symbolLookupSemantics();
+    interfaceSummaryFixedPoint();
+    deferredSummaryDiagnostics();
     selection();
     const auto path = std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "comb/basic.fir";
     auto source = design(path); auto& graph = *source.findGraph("top");

@@ -3,12 +3,16 @@
 
 #include "core/transform.hpp"
 
+#include <cstddef>
+
 namespace wolvrix::lib::transform
 {
 
     struct HierFlattenOptions
     {
         bool preserveFlattenedModules = false;
+        // Zero selects up to ten hardware threads for disjoint block fills.
+        std::size_t numThreads = 0;
         // Kept for API/CLI compatibility. Declared value/op symbols from
         // inlined child graphs are now ALWAYS preserved under hierarchical
         // names (`inst$...$name`) and re-registered via addDeclaredSymbol in
@@ -25,6 +29,9 @@ namespace wolvrix::lib::transform
             None
         };
         SymProtectMode symProtect = SymProtectMode::All;
+        // Reference path for differential checks and callers that require
+        // eager publication of each run. Invalid plans select it automatically.
+        bool useGlobalPlan = true;
     };
 
     class HierFlattenPass : public Pass

@@ -213,15 +213,15 @@ namespace wolvrix::lib::transform
                 const std::string_view key =
                     (kind == OperationKind::kLatchReadPort || kind == OperationKind::kLatchWritePort)
                         ? "latchSymbol" : "regSymbol";
-                for (const auto &attribute : graph.opAttrs(opId))
+                for (const auto &attribute : graph.opAttrRange(opId))
                 {
-                    if (attribute.key != key)
+                    if (attribute.key() != key)
                     {
                         continue;
                     }
-                    if (const auto *text = std::get_if<std::string>(&attribute.value))
+                    if (const auto text = attribute.value().get<std::string>())
                     {
-                        return *text;
+                        return std::string(*text);
                     }
                     return std::nullopt;
                 }

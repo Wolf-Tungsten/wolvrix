@@ -33,13 +33,72 @@ std::string_view statementName(StmtKind kind) {
     return names[static_cast<unsigned>(kind)];
 }
 
+struct ModuleBytes {
+    uint64_t end;
+    uint64_t endLine;
+    uint64_t interfaceEnd;
+};
+
+// Recognize only indentation and lexical boundaries. No body token, identifier,
+// literal, or syntax node is constructed during the circuit index pass.
+ModuleBytes moduleBytes(std::string_view text, Range start) {
+    const uint64_t indentation = start.column - 1;
+    uint64_t cursor = start.begin - indentation, line = start.line;
+    uint64_t interfaceEnd = text.size();
+    uint64_t groups = 0;
+    bool first = true, interface = true;
+    while (cursor < text.size()) {
+        const auto lineBegin = cursor;
+        auto content = cursor;
+        while (content < text.size() && text[content] == ' ') ++content;
+        const bool blank = content == text.size() || text[content] == '\n' ||
+            text[content] == '\r' || text[content] == ';';
+        if (!first && !groups && !blank) {
+            if (content - lineBegin <= indentation) {
+                if (interface) interfaceEnd = lineBegin;
+                return {lineBegin, line, interfaceEnd};
+            }
+            if (interface) {
+                auto wordEnd = content;
+                while (wordEnd < text.size() && ((text[wordEnd] >= 'a' && text[wordEnd] <= 'z') || text[wordEnd] == '-')) ++wordEnd;
+                const auto word = text.substr(content, wordEnd - content);
+                if (word != "input" && word != "output" && word != "defname" && word != "intrinsic" && word != "parameter") {
+                    interface = false; interfaceEnd = lineBegin;
+                }
+            }
+        }
+        char quote = 0;
+        bool info = false, comment = false;
+        while (cursor < text.size()) {
+            const auto c = text[cursor++];
+            if (c == '\n') { ++line; break; }
+            if (comment) continue;
+            if (quote || info) {
+                if (c == '\\' && cursor < text.size() && text[cursor] != '\n') { ++cursor; continue; }
+                if (quote && c == quote) quote = 0;
+                else if (info && c == ']') info = false;
+                continue;
+            }
+            if (c == ';') { comment = true; continue; }
+            if (c == '\"' || c == '\'') { quote = c; continue; }
+            if (c == '@' && cursor < text.size() && text[cursor] == '[') { ++cursor; info = true; continue; }
+            if (c == '(' || c == '[' || c == '{' || c == '<') ++groups;
+            else if (c == ')' || c == ']' || c == '}' || c == '>') {
+                if (groups) --groups; // Full validation belongs to the one body parse.
+            }
+        }
+        first = false;
+    }
+    return {cursor, line, interfaceEnd};
+}
+
 class Parser {
 public:
     Parser(const Source& source, Arena& arena, std::vector<IngestDiagnostic>& diagnostics,
            uint64_t begin = 0, uint64_t end = UINT64_MAX, uint64_t line = 1, uint64_t indent = 0)
         : source_(source), arena_(arena), lexer_(source.text(), begin, end, line, indent), diagnostics_(diagnostics) {}
 
-    void index(Source::Impl& output, const FirrtlOptions& options);
+    void index(Source::Impl& output, const FirrtlOptions& options, bool byteOnly = true);
     ModuleBody module();
 
 private:
@@ -475,7 +534,7 @@ FormalValue Parser::formalValue() {
     return result;
 }
 
-void Parser::index(Source::Impl& output, const FirrtlOptions& options) {
+void Parser::index(Source::Impl& output, const FirrtlOptions& options, bool byteOnly) {
     indexing_ = true;
     const auto start = expect("FIRRTL"); expect("version");
     const auto begin = peek().range.begin;
@@ -517,9 +576,21 @@ void Parser::index(Source::Impl& output, const FirrtlOptions& options) {
                 if (!names.insert(formal.name).second) throw Error(formal.range, "duplicate circuit declaration");
                 output.formals.push_back(std::move(formal));
             } else {
-                bool indented = false; auto declaration = header(indented);
+                bool indented = false;
+                Module declaration;
+                std::optional<ModuleBytes> bytes;
+                if (byteOnly) {
+                    const auto start = peek().range;
+                    bytes = moduleBytes(source_.text(), start);
+                    Parser interfaceParser(source_, arena_, diagnostics_, start.begin - start.column + 1,
+                        bytes->interfaceEnd, start.line, start.column - 1);
+                    interfaceParser.indexing_ = true;
+                    declaration = interfaceParser.header(indented);
+                } else declaration = header(indented);
+                module_ = declaration.name;
                 if (!names.insert(declaration.name).second) throw Error(declaration.range, "duplicate circuit declaration");
-                if (indented) {
+                if (bytes) declaration.range.end = bytes->end;
+                else if (indented) {
                     unsigned depth = 1;
                     while (depth && !at(TokenKind::End)) {
                         const auto token = take();
@@ -532,6 +603,7 @@ void Parser::index(Source::Impl& output, const FirrtlOptions& options) {
                 declaration.body.end = declaration.range.end;
                 output.moduleNames.emplace(declaration.name, output.modules.size());
                 output.modules.push_back(std::move(declaration));
+                if (bytes) lexer_.skipTo(bytes->end, bytes->endLine);
             }
         } catch (const Error& error) { report(error); recover(true); }
     }
@@ -779,19 +851,49 @@ StmtId Parser::statement() {
 IndexResult index(std::unique_ptr<Source::Impl> impl, const FirrtlOptions& options) {
     IndexResult result;
     auto source = std::make_shared<Source>(std::move(impl));
-    try {
-        auto& output = Access::get(*source);
-        Parser parser(*source, output.arena, result.diagnostics); parser.index(output, options);
-    } catch (const Error& error) { if (result.diagnostics.size() < kMaxErrors) result.diagnostics.push_back(diagnostic(*source, error)); }
+    auto& output = Access::get(*source);
+    const auto run = [&](bool byteOnly) {
+        try {
+            Parser parser(*source, output.arena, result.diagnostics); parser.index(output, options, byteOnly);
+        } catch (const Error& error) {
+            if (result.diagnostics.size() < kMaxErrors) result.diagnostics.push_back(diagnostic(*source, error));
+        }
+    };
+    run(true);
+    if (!result.diagnostics.empty()) {
+        // Only malformed circuit/header input takes this compatibility path.
+        // Legacy indexing may encounter an earlier body lexical failure; retain
+        // that diagnostic selection/order without rescanning valid inputs.
+        output.version = {}; output.circuit = {}; output.annotations = {};
+        output.modules.clear(); output.layers.clear(); output.aliases.clear(); output.formals.clear();
+        output.moduleNames.clear(); output.arena = Arena{};
+        result.diagnostics.clear();
+        run(false);
+    }
     if (result.diagnostics.empty()) result.source = std::move(source);
     return result;
 }
 } // namespace detail
 
-ModuleResult parseModule(std::shared_ptr<const Source> source, std::size_t module) {
-    ModuleResult result; result.source = std::move(source);
+detail::SharedModuleResult detail::parseSharedModule(std::shared_ptr<const Source> source, std::size_t module) {
+    SharedModuleResult result; result.source = std::move(source);
     if (!result.source || module >= result.source->modules().size()) {
         result.diagnostics.push_back({IngestSeverity::Error, "invalid FIRRTL module index", {}, "ingest-firrtl"}); return result;
+    }
+    std::shared_ptr<ParsedModuleCache> cached;
+    {
+        auto& implementation = Access::get(*result.source);
+        std::lock_guard lock(implementation.parsedModulesMutex);
+        if (implementation.parsedModules.size() < result.source->modules().size())
+            implementation.parsedModules.resize(result.source->modules().size());
+        auto& slot = implementation.parsedModules[module];
+        if (!slot) slot = std::make_shared<ParsedModuleCache>();
+        cached = slot;
+    }
+    std::lock_guard lock(cached->mutex);
+    if (cached->parsed) {
+        result.sharedBody = cached->body; result.diagnostics = cached->diagnostics;
+        return result;
     }
     const auto& declaration = result.source->modules()[module];
     ModuleBody body;
@@ -801,11 +903,20 @@ ModuleResult parseModule(std::shared_ptr<const Source> source, std::size_t modul
             declaration.range.line, declaration.indentation);
         auto parsed = parser.module();
         body.interface = std::move(parsed.interface); body.statements = std::move(parsed.statements);
-        result.body = std::move(body);
+        result.sharedBody = std::make_shared<const ModuleBody>(std::move(body));
     } catch (const detail::Error& error) {
         if (result.diagnostics.size() < detail::kMaxErrors)
             result.diagnostics.push_back(detail::diagnostic(*result.source, error, declaration.name));
     }
+    cached->body = result.sharedBody; cached->diagnostics = result.diagnostics; cached->parsed = true;
+    return result;
+}
+
+ModuleResult parseModule(std::shared_ptr<const Source> source, std::size_t module) {
+    auto shared = detail::parseSharedModule(std::move(source), module);
+    ModuleResult result; result.source = std::move(shared.source);
+    result.sharedBody = std::move(shared.sharedBody); result.diagnostics = std::move(shared.diagnostics);
+    if (result.sharedBody) result.body = *result.sharedBody;
     return result;
 }
 

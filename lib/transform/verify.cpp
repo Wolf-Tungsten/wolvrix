@@ -41,12 +41,12 @@ namespace wolvrix::lib::transform
             OperationKind kind() const { return graph.opKind(id); }
             auto operands() const { return graph.opOperands(id); }
             auto results() const { return graph.opResults(id); }
-            auto attrs() const { return graph.opAttrs(id); }
+            auto attrs() const { return graph.opAttrRange(id); }
             auto srcLoc() const { return graph.opSrcLoc(id); }
             std::optional<AttributeValue> attr(std::string_view key) const
             {
                 for (const auto &entry : attrs())
-                    if (entry.key == key) return entry.value;
+                    if (entry.key() == key) return entry.value().toOwned();
                 return std::nullopt;
             }
             operator Operation() const { return graph.getOperation(id); }
@@ -226,9 +226,8 @@ namespace wolvrix::lib::transform
     PassResult GrhVerifyPass::run()
     {
         PassResult result;
-        for (const std::string &graphName : design().graphOrder())
+        for (Graph* graph : graphs(true))
         {
-            Graph *graph = design().findGraph(graphName);
             if (!graph)
             {
                 continue;
@@ -329,8 +328,8 @@ namespace wolvrix::lib::transform
                     {
                         stateLogicalType(*graph, opId);
                         bool typedInit = false;
-                        for (const AttrKV& entry : op.attrs())
-                            typedInit |= entry.key.starts_with("initSpec");
+                        for (const auto entry : op.attrs())
+                            typedInit |= entry.key().starts_with("initSpec");
                         if (typedInit)
                         {
                             if (!op.attr("initSpecKinds"))
@@ -931,9 +930,9 @@ namespace wolvrix::lib::transform
                         // Region ownership and sampling are common execution
                         // annotations checked by grhsim::verifyGraph above;
                         // they do not change arrayCreate's operand geometry.
-                        valid = valid && (ingest::node::isAttribute(attr.key) || attr.key == "originModules" ||
-                            attr.key == grhsim::kPartition || attr.key == "grhsim.sampleBoundary" ||
-                            attr.key == "grhsim.activity");
+                        valid = valid && (ingest::node::isAttribute(attr.key()) || attr.key() == "originModules" ||
+                            attr.key() == grhsim::kPartition || attr.key() == "grhsim.sampleBoundary" ||
+                            attr.key() == "grhsim.activity");
                     if (!valid)
                         error(*graph, op, "grh.verify: kArrayCreate requires identical Logic element types; "
                                           "result must have width N*W, shape [N]+S and matching signedness/domain");

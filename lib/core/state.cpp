@@ -14,21 +14,26 @@ namespace {
     };
 
     template <typename T>
-    const T* attrRef(const StateView& op, std::string_view name)
+    std::optional<AttrValueView::Borrowed<T>> attrRef(const StateView& op, std::string_view name)
     {
-        for (const auto& entry : op.graph.opAttrs(op.id)) {
-            if (entry.key != name) continue;
-            const auto* typed = std::get_if<T>(&entry.value);
+        for (const auto& entry : op.graph.opAttrRange(op.id)) {
+            if (entry.key() != name) continue;
+            const auto typed = entry.value().get<T>();
             if (!typed) throw std::runtime_error("Wrong state attribute type: " + std::string(name));
             return typed;
         }
-        return nullptr;
+        return std::nullopt;
     }
 
     template <typename T>
     std::optional<T> attr(const StateView& op, std::string_view name)
     {
-        if (const auto* value = attrRef<T>(op, name)) return *value;
+        if (const auto value = attrRef<T>(op, name)) {
+            if constexpr (std::is_same_v<T, std::string>) return std::string(*value);
+            else if constexpr (std::is_same_v<T, std::vector<int64_t>> ||
+                               std::is_same_v<T, std::vector<std::string>>) return T(value->begin(), value->end());
+            else return *value;
+        }
         return std::nullopt;
     }
 
@@ -123,16 +128,16 @@ InitSpec stateInitSpec(const Graph& graph, OperationId declaration)
 {
     const StateView op{graph, declaration};
     const LogicalType type = stateLogicalType(graph, declaration);
-    if (const auto* kinds = attrRef<std::vector<std::string>>(op, "initSpecKinds"))
+    if (const auto kinds = attrRef<std::vector<std::string>>(op, "initSpecKinds"))
     {
-        const auto* values = attrRef<std::vector<std::string>>(op, "initSpecValues");
-        const auto* files = attrRef<std::vector<std::string>>(op, "initSpecFiles");
-        const auto* formats = attrRef<std::vector<std::string>>(op, "initSpecFormats");
-        const auto* starts = attrRef<std::vector<int64_t>>(op, "initSpecStarts");
-        const auto* counts = attrRef<std::vector<int64_t>>(op, "initSpecCounts");
-        const auto* seeds = attrRef<std::vector<int64_t>>(op, "initSpecSeeds");
-        const auto* hasSeeds = attrRef<std::vector<bool>>(op, "initSpecHasSeeds");
-        const auto* random = attrRef<std::vector<bool>>(op, "initSpecRandom");
+        const auto values = attrRef<std::vector<std::string>>(op, "initSpecValues");
+        const auto files = attrRef<std::vector<std::string>>(op, "initSpecFiles");
+        const auto formats = attrRef<std::vector<std::string>>(op, "initSpecFormats");
+        const auto starts = attrRef<std::vector<int64_t>>(op, "initSpecStarts");
+        const auto counts = attrRef<std::vector<int64_t>>(op, "initSpecCounts");
+        const auto seeds = attrRef<std::vector<int64_t>>(op, "initSpecSeeds");
+        const auto hasSeeds = attrRef<std::vector<bool>>(op, "initSpecHasSeeds");
+        const auto random = attrRef<std::vector<bool>>(op, "initSpecRandom");
         const auto n = kinds->size();
         if (!values || !files || !formats || !starts || !counts || !seeds || !hasSeeds || !random ||
             values->size() != n || files->size() != n || formats->size() != n || starts->size() != n ||
@@ -144,7 +149,7 @@ InitSpec stateInitSpec(const Graph& graph, OperationId declaration)
         {
             if ((*starts)[i] < -1 || (*counts)[i] < -1)
                 throw std::invalid_argument("Invalid InitSpec range encoding");
-            result.push_back({parseKind((*kinds)[i]), (*values)[i], (*files)[i], (*formats)[i],
+            result.push_back({parseKind((*kinds)[i]), std::string((*values)[i]), std::string((*files)[i]), std::string((*formats)[i]),
                               (*starts)[i] < 0 ? std::nullopt : std::optional((*starts)[i]),
                               (*counts)[i] < 0 ? std::nullopt : std::optional((*counts)[i]),
                               (*hasSeeds)[i] ? std::optional((*seeds)[i]) : std::nullopt, (*random)[i]});

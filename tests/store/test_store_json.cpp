@@ -243,7 +243,8 @@ int main()
     }
 
     // Case 5: metadata and attribute payloads span several output buffers,
-    // including escapes that can straddle a buffer boundary.
+    // including escapes that can straddle a buffer boundary. The same fixture
+    // covers all eight AttributeValue branches (weights is the int64 list).
     std::string payload;
     const std::string escaped = std::string("quote\" slash\\\n\r\t\b\f") + char(1) + char(0);
     while (payload.size() < 3 * 65536)
@@ -251,13 +252,26 @@ int main()
         payload.append(escaped);
     }
     Graph *richGraph = design.findGraph("demo");
-    richGraph->setMetadata("z-last", std::vector<std::string>{payload, "tail"});
+    // The loader's JSON object traversal sorts metadata keys. Use that order
+    // for exact load/store bytes; Compact preserves metadata insertion order.
     richGraph->setMetadata("a-first", std::string("metadata"));
+    richGraph->setMetadata("z-last", std::vector<std::string>{payload, "tail"});
     const OperationId richAdd = richGraph->findOperation("add0");
     richGraph->setAttr(richAdd, "originModules", std::vector<std::string>{"top$core", "top$memory"});
     richGraph->setAttr(richAdd, "escaped", payload);
     richGraph->setAttr(richAdd, "flags", std::vector<bool>{true, false});
     richGraph->setAttr(richAdd, "ratios", std::vector<double>{1.25, -2.5});
+    richGraph->setAttr(richAdd, "scale", 1.125);
+    richGraph->setAttr(richAdd, "offset", int64_t(-17));
+    richGraph->setAttr(richAdd, "enabled", true);
+    const std::vector<std::string> expectedKeys{
+        "enabled", "escaped", "flags", "offset", "originModules", "ratios", "scale", "weights"};
+    std::vector<std::string> actualKeys;
+    for (const auto attr : richGraph->opAttrRange(richAdd)) actualKeys.emplace_back(attr.key());
+    if (actualKeys != expectedKeys)
+    {
+        return fail("Rich attributes were not stored in key text order");
+    }
     SrcLoc location;
     location.file = "source\\with\"escapes.sv";
     location.line = 7;
@@ -282,6 +296,25 @@ int main()
             return fail("File output differs byte-for-byte from storeToString");
         }
         Design roundtrip = Design::fromJsonString(actual);
+        const auto restoredJson = emitter.storeToString(roundtrip, options);
+        if (!restoredJson || *restoredJson != actual || diagnostics.hasError())
+        {
+            if (restoredJson)
+            {
+                const auto path = std::filesystem::path(*options.outputDir) /
+                    ("store_json_rich_restored_" + std::to_string(static_cast<int>(mode)) + ".json");
+                std::ofstream restoredFile(path, std::ios::binary);
+                restoredFile.write(restoredJson->data(), static_cast<std::streamsize>(restoredJson->size()));
+                std::size_t firstDifference = 0;
+                while (firstDifference < actual.size() && firstDifference < restoredJson->size() &&
+                       actual[firstDifference] == (*restoredJson)[firstDifference]) ++firstDifference;
+                std::cerr << "[store_json] mode=" << static_cast<int>(mode)
+                          << " first differing byte=" << firstDifference
+                          << " original bytes=" << actual.size() << " restored bytes=" << restoredJson->size()
+                          << " restored artifact=" << path << '\n';
+            }
+            return fail("Rich JSON load/store changed bytes in the same print mode");
+        }
         const Graph *restoredGraph = roundtrip.findGraph("demo");
         if (!restoredGraph)
         {
@@ -295,9 +328,15 @@ int main()
             }
         }
         const Operation restoredAdd = restoredGraph->getOperation(restoredGraph->findOperation("add0"));
-        for (const AttrKV &attr : richGraph->opAttrs(richAdd))
+        actualKeys.clear();
+        for (const auto attr : restoredGraph->opAttrRange(restoredAdd.id())) actualKeys.emplace_back(attr.key());
+        if (actualKeys != expectedKeys)
         {
-            if (restoredAdd.attr(attr.key) != std::optional<AttributeValue>(attr.value))
+            return fail("Rich JSON round-trip changed attribute key text order");
+        }
+        for (const auto attr : richGraph->opAttrRange(richAdd))
+        {
+            if (restoredAdd.attr(attr.key()) != std::optional<AttributeValue>(attr.value().toOwned()))
             {
                 return fail("Rich JSON round-trip changed an attribute or origin");
             }

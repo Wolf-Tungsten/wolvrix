@@ -3,11 +3,131 @@
 #include "ingest/firrtl.hpp"
 #include "ingest/sv.hpp"
 #include "mixed.hpp"
+#include "core/transform.hpp"
+#include "transform/blackbox_guard.hpp"
+#include "transform/latch_transparent_read.hpp"
+#include "transform/memory_read_retime.hpp"
+#include "transform/multidriven_guard.hpp"
+#include "transform/mux_tree_fold.hpp"
+#include "transform/register_write_normalize.hpp"
+#include "transform/xmr_resolve.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace wolvrix::lib::ingest {
+
+namespace detail {
+std::unordered_set<const grh::Graph*> compactablePrefixSources(const grh::Design& design) {
+    struct References { bool candidate = false, named = true; };
+    std::unordered_map<const grh::Graph*, References> references;
+    const std::unordered_set<std::string> tops(design.topGraphs().begin(), design.topGraphs().end());
+    for (const auto& [name, parent] : design.graphs()) for (const auto op : parent->operations()) {
+        const auto kind = parent->opKind(op);
+        if (kind != grh::OperationKind::kInstance && kind != grh::OperationKind::kBlackbox) continue;
+        const auto attrs = parent->opAttrRange(op);
+        const auto module = attrs.find("moduleName");
+        const auto target = module ? module->value().get<std::string>() : std::nullopt;
+        const auto* source = target ? design.findGraph(*target) : nullptr;
+        if (!source || tops.contains(source->symbol())) continue;
+        auto& entry = references[source];
+        entry.candidate |= kind == grh::OperationKind::kInstance;
+        const auto named = [&](std::string_view key, const auto& ports) {
+            const auto attr = attrs.find(key);
+            const auto names = attr ? attr->value().get<std::vector<std::string>>() : std::nullopt;
+            if (!names) return ports.empty();
+            if (names->size() != ports.size()) return false;
+            std::unordered_set<std::string_view> unique;
+            for (const auto& port : *names) unique.insert(port);
+            return unique.size() == ports.size() && std::all_of(ports.begin(), ports.end(),
+                [&](const auto& port) { return unique.contains(port.name); });
+        };
+        entry.named &= named("inputPortName", source->inputPorts()) &&
+            named("outputPortName", source->outputPorts()) && named("inoutPortName", source->inoutPorts());
+    }
+    std::unordered_set<const grh::Graph*> eligible;
+    for (const auto& [graph, entry] : references) if (entry.candidate && entry.named) eligible.insert(graph);
+    return eligible;
+}
+} // namespace detail
+
+namespace {
+IngestResult completePipeline(IngestResult result, const IngestRequest& request) {
+    if (request.pipeline == IngestPipeline::Ingest || !result.success()) return result;
+    namespace transform = wolvrix::lib::transform;
+    result.ingestDiagnosticCount = result.diagnostics.size();
+    const auto started = std::chrono::steady_clock::now();
+    transform::PassManagerOptions options;
+    options.graphThreads = std::max(std::size_t{1}, request.firrtl.lowerThreads);
+    options.keepDeclaredSymbols = true;
+    options.logLevel = request.logLevel;
+    if (request.logSink) options.logSink = [&](auto level, auto tag, auto message) {
+        request.logSink({level, std::string(tag), std::string(message)});
+    };
+    transform::PassDiagnostics diagnostics;
+    bool success = true;
+    const auto append = [&](transform::PassManagerResult stages) {
+        success &= stages.success;
+        for (auto& item : stages.stages) {
+            IngestPrefixStage stage{item.pass, {}, item.wallSeconds, item.workerSeconds, item.overlapped};
+            for (const auto& entry : item.diagnostics) {
+                const auto kind = entry.kind == diag::DiagnosticKind::Error ? IngestSeverity::Error :
+                    entry.kind == diag::DiagnosticKind::Warning ? IngestSeverity::Warning :
+                    entry.kind == diag::DiagnosticKind::Info ? IngestSeverity::Info : IngestSeverity::Debug;
+                std::optional<SourcePosition> position;
+                if (entry.sourcePosition) position = SourcePosition{{}, entry.sourcePosition->file,
+                    entry.sourcePosition->line, entry.sourcePosition->column, {}, {}};
+                stage.diagnostics.push_back({kind, entry.message, entry.context, entry.passName,
+                    entry.originSymbol, std::move(position)});
+            }
+            result.diagnostics.insert(result.diagnostics.end(), stage.diagnostics.begin(), stage.diagnostics.end());
+            result.prefixStages.push_back(std::move(stage));
+        }
+    };
+    // XMR can create cross-graph ports and writers. The local normalization
+    // kernels must observe those changes, so publication is a real barrier.
+    try {
+    transform::PassManager crossGraph(options);
+    crossGraph.addPass(std::make_unique<transform::XmrResolvePass>());
+    append(crossGraph.run(*result.design, diagnostics));
+    if (success) {
+        transform::PassManager local(options);
+        local.addPass(std::make_unique<transform::MuxTreeFoldPass>());
+        local.addPass(std::make_unique<transform::RegisterWriteNormalizePass>(true));
+        local.addPass(std::make_unique<transform::MuxTreeFoldPass>(true));
+        local.addPass(std::make_unique<transform::MemoryReadRetimePass>());
+        append(local.runGraphPipeline(*result.design, diagnostics));
+    }
+    if (success) {
+        // Inout drive summaries and blackbox stub publication depend on the
+        // complete catalog. Keep their original ordering between local chains.
+        transform::PassManager guards(options);
+        guards.addPass(std::make_unique<transform::MultiDrivenGuardPass>());
+        guards.addPass(std::make_unique<transform::BlackboxGuardPass>());
+        append(guards.run(*result.design, diagnostics));
+    }
+    if (success) {
+        auto tailOptions = options;
+        const auto eligible = std::make_shared<const std::unordered_set<const grh::Graph*>>(
+            detail::compactablePrefixSources(*result.design));
+        tailOptions.compactGraph = [eligible](const auto& graph) { return eligible->contains(&graph); };
+        tailOptions.prepareFlattenSources = true;
+        transform::PassManager tail(tailOptions);
+        tail.addPass(std::make_unique<transform::LatchTransparentReadPass>());
+        append(tail.runGraphPipeline(*result.design, diagnostics, true));
+    }
+    } catch (const std::exception& failure) {
+        result.diagnostics.push_back({IngestSeverity::Error, failure.what(), {}, "ingest-prefix"});
+        success = false;
+    }
+    result.prefixWallSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    if (!success) result.design.reset();
+    return result;
+}
+} // namespace
 
 bool IngestResult::success() const noexcept {
     return design.has_value() &&
@@ -44,7 +164,7 @@ IngestResult readSources(const IngestRequest& request) {
                                           return source.language == SourceLanguage::Firrtl;
                                       });
     if (hasFirrtl) {
-        return readMixedSources(request);
+        return completePipeline(readMixedSources(request), request);
     }
     if (!request.externalBindings.empty()) {
         IngestResult result;
@@ -81,12 +201,12 @@ IngestResult readSources(const IngestRequest& request) {
             return diagnosticKey(left) < diagnosticKey(right);
         });
     }
-    return result;
+    return completePipeline(std::move(result), request);
 }
 
 IngestResult specializeModule(const IngestRequest& request,
                              const ModuleSpecialization& specialization) {
-    return readSpecializedSources(request, specialization);
+    return completePipeline(readSpecializedSources(request, specialization), request);
 }
 
 IngestResult linkModules(const IngestRequest& request, std::vector<IngestResult> modules) {

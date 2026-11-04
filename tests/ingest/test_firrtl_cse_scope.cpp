@@ -99,8 +99,8 @@ void sameStructure(const grh::Graph& left, const grh::Graph& right) {
         require(left.opKind(x) == right.opKind(y), "annotations changed optimized operation");
         const auto attributes = [](const auto& graph, auto op) {
             std::vector<grh::AttrKV> result;
-            for (const auto& entry : graph.opAttrs(op))
-                if (!node::isAttribute(entry.key) && entry.key != "grhsim.nodeClone" && entry.key != "originModules") result.push_back(entry);
+            for (const auto& entry : graph.opAttrRange(op))
+                if (!node::isAttribute(entry.key()) && entry.key() != "grhsim.nodeClone" && entry.key() != "originModules") result.push_back({std::string(entry.key()), entry.value().toOwned()});
             std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.key < b.key; });
             return result;
         };

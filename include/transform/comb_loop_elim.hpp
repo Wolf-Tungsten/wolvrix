@@ -60,6 +60,9 @@ namespace wolvrix::lib::transform
 
         // Optional session key used to store loop reports for later inspection.
         std::string outputKey;
+        // Optional immutable coordinator selection. A null set checks all
+        // graphs; an empty set checks none. This is never serialized.
+        std::shared_ptr<const std::unordered_set<std::string>> graphSelection;
     };
 
     class CombLoopElimPass : public Pass
@@ -69,6 +72,11 @@ namespace wolvrix::lib::transform
         explicit CombLoopElimPass(CombLoopElimOptions options);
 
         PassResult run() override;
+        bool preservesDialects() const noexcept override { return true; }
+        std::unique_ptr<Pass> cloneGraphKernel() const override {
+            return std::make_unique<CombLoopElimPass>(options_);
+        }
+        void finishGraphKernels(std::span<const PassResult> results) override;
 
     private:
         CombLoopElimOptions options_;

@@ -12,6 +12,11 @@ namespace wolvrix::lib::transform
         MemoryReadRetimePass();
 
         PassResult run() override;
+        bool preservesDialects() const noexcept override { return true; }
+        std::unique_ptr<Pass> cloneGraphKernel() const override {
+            return std::make_unique<MemoryReadRetimePass>();
+        }
+        void finishGraphKernels(std::span<const PassResult> results) override;
     };
 
 } // namespace wolvrix::lib::transform

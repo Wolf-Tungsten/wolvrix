@@ -41,23 +41,32 @@ Results and failures are published in dependency order, including interleaved
 SV implementations and ABI adapters. Publication transfers the graph's
 `unique_ptr` into the design catalog without copying graph contents. This also
 preserves hash table insertion order used by verification diagnostics.
-Interface resolution, mixed-language binding, diagnostics, and the final
-linked-design verification remain serialized.
+Interface resolution, mixed-language binding, hierarchy checks, and diagnostic
+publication remain coordinated. Linked-design verification and required
+combinational-loop checks use independent graph workers and merge their
+results in the original traversal order. A lowering proof tied to the graph's
+mutation epoch can avoid repeating a local loop check; missing or invalidated
+proofs still require the check.
 
 ## Elaboration and publication
 
-The driver indexes and validates all FIRRTL bodies without retaining all body
-ASTs, then lowers reachable modules in dependency order. Each extmodule uses
+The driver indexes declarations and validates FIRRTL bodies through a shared
+immutable module parse cache. Interface summaries consume the cached bodies
+and resolve boundary widths and reset types to a fixed point. Strict semantic
+analysis runs once for each lowered module, immediately followed by lowering
+in the same worker. Dependency and cover summaries survive publication;
+completed lowering releases its body AST and semantic state. Parsing remains
+separate from indexing, and the input mappings and cached bodies still consume
+memory while their users are active. Each extmodule uses
 its `defname` and typed parameters to request a real SV specialization. A small
 generated SV wrapper passes parameters to slang and is discarded after importing
 the implementation. Integer width, sign and all bits are preserved; strings,
 reals and raw SV string parameters remain distinct.
 
-These are separate passes over the mapped input: indexing scans declarations
-and body ranges; validation parses and discards one body arena at a time;
-reachable lowering parses those bodies again. Dependency traversal may retain
-the arenas of modules on the current recursion stack. The frontend does not
-retain a whole-chip body AST, but it is not a single-pass streaming lowering.
+The validation, interface-summary and lowering paths share the same parsed
+module body within a transaction. Cached parse failures retain their original
+source-aware diagnostics. The public owning parser API can still return a
+copy for callers that need independent mutable storage.
 
 SV references to FIRRTL modules receive generated interface declarations. These
 carry no executable behavior. SV conversion preserves a binding request and
@@ -77,6 +86,14 @@ C++ provides `readSources`, `readFirrtl`, `specializeModule` and `linkModules`.
 The last assembles already completed results; cross-language elaboration belongs
 in one `readSources` request. Duplicate graphs, missing references, recursive
 hierarchies and incompatible port signatures fail.
+
+An explicit `pipeline="grh-pre-flatten"` option on `read_sources` or
+`read_firrtl` selects the production eight-pass endpoint before hierarchy
+flattening. It uses local worker chains between XMR, recursive-driver and
+blackbox catalog barriers. The default `pipeline="ingest"` selects the original
+raw ingest endpoint. See [endpoint and report fields](reading.md#explicit-pre-flatten-endpoint)
+for diagnostics, overlapped stage timing, final source preparation, and the
+additional `<out_design>.prefix` report.
 
 ## Boundary ABI
 

@@ -371,11 +371,11 @@ CloneStats cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
                      std::span<const OperationId> originals) {
     CloneStats stats;
     if (!options.cloneShared || options.maxClones == 0) return stats;
-    const auto nonsink = [&](const Owner& path) { return path.size() >= 4 && path[0] == "general" && path[1] == "nonsink"; };
+    const auto nonsink = [&](StringListView path) { return path.size() >= 4 && path[0] == "general" && path[1] == "nonsink"; };
     std::unordered_set<ValueId, ValueIdHash> boundaries;
     for (const auto op : originals) for (const auto value : graph.opResults(op)) {
         for (const auto& user : graph.valueUsers(value))
-            if (ownerView(graph, user.operation) != ownerView(graph, op)) boundaries.insert(value);
+            if (!sameOwner(ownerView(graph, user.operation), ownerView(graph, op))) boundaries.insert(value);
     }
     for (const auto op : originals) {
         if (!canCloneOperation(graph, op) || graph.opResults(op).size() != 1) continue;
@@ -406,7 +406,7 @@ CloneStats cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
         std::map<Owner, std::vector<ValueUser>> destinations;
         for (const auto& user : graph.valueUsers(result)) {
             const auto& path = ownerView(graph, user.operation);
-            if (path != originalOwner && nonsink(path)) destinations[path].push_back(user);
+            if (!sameOwner(path, originalOwner) && nonsink(path)) destinations[copyOwner(path)].push_back(user);
         }
         if (destinations.empty() || destinations.size() > options.cloneMaxFanout) continue;
         // One bounded round over the original candidates, with no recursive
@@ -418,7 +418,7 @@ CloneStats cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
             uint64_t extra = work(graph, op);
             for (const auto input : args) {
                 const auto constant = graph.valueDef(input);
-                if (constant && graph.opKind(constant) == OperationKind::kConstant && ownerView(graph, constant) != path &&
+                if (constant && graph.opKind(constant) == OperationKind::kConstant && !sameOwner(ownerView(graph, constant), path) &&
                     constants.insert(constant.index).second) extra += work(graph, constant);
             }
             // The input must already reach this execution owner. Then copying a
@@ -440,7 +440,7 @@ CloneStats cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
             std::vector<ValueId> inputs(args.begin(), args.end());
             for (auto& input : inputs) {
                 const auto constant = graph.valueDef(input);
-                if (constant && graph.opKind(constant) == OperationKind::kConstant && ownerView(graph, constant) != path) {
+                if (constant && graph.opKind(constant) == OperationKind::kConstant && !sameOwner(ownerView(graph, constant), path)) {
                     const auto copy = cloneOperation(graph, constant, {}, path);
                     input = graph.opResults(copy)[0];
                 }
@@ -487,7 +487,7 @@ PassResult PartitionNonsinkPass::run() {
         }
         if (stage(*graph) != "nonsink-sink-split") throw std::invalid_argument("Activity partitioning requires nonsink-sink-split stage");
         const Owner nonsinkOwner{"general", "nonsink"};
-        const auto topo = topological(*graph, [&](OperationId op) { return ownerView(*graph, op) == nonsinkOwner; });
+        const auto topo = topological(*graph, [&](OperationId op) { return sameOwner(ownerView(*graph, op), nonsinkOwner); });
         const auto analysisStarted = std::chrono::steady_clock::now();
         const auto analysis = buildNodes(*graph, topo, options_);
         const auto& nodes = analysis.nodes;

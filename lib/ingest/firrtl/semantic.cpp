@@ -21,6 +21,32 @@ bool storable(TypePtr type) {
     return integerKind(type->kind);
 }
 int reversed(int flow) { return flow == 3 ? 3 : 3 - flow; }
+
+template <typename Value>
+void solveWidths(const std::vector<Width>& widths, const std::vector<WidthConstraint>& constraints,
+                 Value&& value) {
+    std::deque<std::size_t> pending;
+    std::vector<bool> queued(constraints.size(), true);
+    std::size_t steps = 0;
+    const auto limit = std::max<std::size_t>(1000000, constraints.size() * 64);
+    for (std::size_t i = 0; i < constraints.size(); ++i) pending.push_back(i);
+    std::vector<int64_t> args;
+    while (!pending.empty()) {
+        const auto id = pending.front(); pending.pop_front(); queued[id] = false;
+        const auto& constraint = constraints[id];
+        if (++steps > limit)
+            throw Error(constraint.range, "FIRRTL width inference resource limit exceeded (cyclic constraints may be unbounded)");
+        args.clear(); bool ready = true;
+        for (const auto arg : constraint.arguments) { args.push_back(value(arg)); ready &= args.back() >= 0; }
+        if (!ready) continue;
+        auto& result = value(constraint.result);
+        const auto next = checked(constraint.calculate(args), constraint.range);
+        if (result >= next) continue;
+        result = next;
+        for (const auto user : widths[constraint.result].users)
+            if (!queued[user]) { queued[user] = true; pending.push_back(user); }
+    }
+}
 }
 
 Literal literal(std::string_view text, bool isSigned, Range range) {
@@ -151,7 +177,8 @@ void Semantics::unifyReset(TypePtr left, TypePtr right, Range range) {
     if (resetFlags_[a] == 3) throw Error(range, "Reset is connected to both synchronous and asynchronous resets");
     for (const auto& type : {left, right}) if (type->kind == TypeKind::UInt) {
         constrain(type->width, {}, [](const auto&) { return 1; }, range);
-        checks_.push_back([this, type, range] { if (width(type) != 1) throw Error(range, "Reset requires a one-bit UInt"); });
+        defer([this, type, range] { if (width(type) != 1) throw Error(range, "Reset requires a one-bit UInt"); });
+        if (summarizing_) summaryChecks_.push_back({InterfaceCheck::Kind::ExactlyOne, type->width, 0, range, "Reset requires a one-bit UInt"});
     }
 }
 void Semantics::constrain(uint32_t result, std::vector<uint32_t> args,
@@ -346,7 +373,8 @@ TypePtr Semantics::expression(ExprId id) {
     } else if (expr.kind == ExprKind::Mux) {
         const auto select = expression(expr.operands[0]);
         if (select->kind != TypeKind::UInt) throw Error(expr.range, "mux selector must have UInt type");
-        checks_.push_back([this, select, range = expr.range] { if (width(select) > 1) throw Error(range, "mux selector must have at most one bit"); });
+        defer([this, select, range = expr.range] { if (width(select) > 1) throw Error(range, "mux selector must have at most one bit"); });
+        if (summarizing_) summaryChecks_.push_back({InterfaceCheck::Kind::AtMostOne, select->width, 0, expr.range, "mux selector must have at most one bit"});
         const auto a = expression(expr.operands[1]), b = expression(expr.operands[2]);
         if (!passive(a) || !passive(b)) throw Error(expr.range, "mux arguments must have passive types");
         result = merge(a, b, expr.range);
@@ -405,7 +433,8 @@ TypePtr Semantics::expression(ExprId id) {
         if (word == "asAsyncReset") kind = TypeKind::AsyncReset;
         if (word == "asReset") kind = TypeKind::Reset;
         if (word == "asReset" && args[0]->kind != TypeKind::UInt) throw Error(expr.range, "asReset requires UInt<1>");
-        if (word == "asReset") checks_.push_back([this, arg = args[0], range = expr.range] { if (width(arg) != 1) throw Error(range, "asReset requires UInt<1>"); });
+        if (word == "asReset") defer([this, arg = args[0], range = expr.range] { if (width(arg) != 1) throw Error(range, "asReset requires UInt<1>"); });
+        if (summarizing_ && word == "asReset") summaryChecks_.push_back({InterfaceCheck::Kind::ExactlyOne, args[0]->width, 0, expr.range, "asReset requires UInt<1>"});
         const bool signedArgument = !args.empty() && args[0]->kind == TypeKind::SInt;
         auto calculate = [word, parameters, signedArgument, range = expr.range](const std::vector<int64_t>& w) -> int64_t {
             const int64_t a = w.empty() ? 0 : w[0], b = w.size() > 1 ? w[1] : 0;
@@ -496,7 +525,8 @@ void Semantics::connect(Projection left, TypePtr leftType, Projection right, Typ
     // Hardware declarations are unconditional; only interleaving conditions
     // (blocks not containing the destination declaration) control a connect.
     guard = 1;
-    for (std::size_t i = depth; i < conditionGuards_.size(); ++i) guard = guards.conjunction(guard, conditionGuards_[i]);
+    if (!summarizing_ || captureSummaryConnections_)
+        for (std::size_t i = depth; i < conditionGuards_.size(); ++i) guard = guards.conjunction(guard, conditionGuards_[i]);
     if (!invalid) {
         if (leftType->constant && !rightType->constant) throw Error(range, "non-constant source drives a const destination");
         if (leftType->constant)
@@ -504,7 +534,7 @@ void Semantics::connect(Projection left, TypePtr leftType, Projection right, Typ
                 if (!conditions_[i]->constant) throw Error(range, "non-constant when predicate controls a const destination");
         constrain(leftType->width, {rightType->width}, [](const auto& args) { return args[0]; }, range);
     }
-    connections.push_back({std::move(left), std::move(right), guard, invalid, range});
+    if (!summarizing_ || captureSummaryConnections_) connections.push_back({std::move(left), std::move(right), guard, invalid, range});
 }
 std::string Semantics::expressionKey(ExprId id) const {
     const auto& expr = body.arena.expressions[id];
@@ -540,7 +570,7 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
                     const auto& data = leavesCached(declaration.type), values = leavesCached(initial);
                     for (std::size_t i = 0; i < data.size(); ++i)
                         constrain(data[i].type->width, {values[i].type->width}, [](const auto& args) { return args[0]; }, statement.range);
-                    checks_.push_back([this, reset, initial, expression = *declaration.state->initial, range = statement.range] {
+                    defer([this, reset, initial, expression = *declaration.state->initial, range = statement.range] {
                         if (width(reset) != 1) throw Error(range, "register reset requires a one-bit UInt");
                         if (resolvedKind(reset) == TypeKind::AsyncReset) {
                             const auto& values = leavesCached(initial);
@@ -549,6 +579,15 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
                                 throw Error(range, "asynchronous reset value must have const type or provably constant drivers");
                         }
                     });
+                    if (summarizing_) {
+                        summaryChecks_.push_back({InterfaceCheck::Kind::ExactlyOne, reset->width, 0, statement.range, "register reset requires a one-bit UInt"});
+                        const auto& values = leavesCached(initial);
+                        InterfaceCheck check{InterfaceCheck::Kind::ResetConstant, reset->width, reset->reset, statement.range,
+                            "asynchronous reset value must have const type or provably constant drivers"};
+                        check.resetKind = reset->kind; check.expression = *declaration.state->initial;
+                        check.provenConstant = std::none_of(values.begin(), values.end(), [](const auto& leaf) { return !leaf.type->constant; });
+                        summaryChecks_.push_back(check);
+                    }
                 }
             }
         } else if (statement.kind == StmtKind::Node) {
@@ -586,10 +625,12 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
             const auto& left = leavesCached(a->element), right = leavesCached(b->element);
             for (std::size_t i = 0; i < left.size(); ++i) {
                 constrain(left[i].type->width, {right[i].type->width}, [](const auto& args) { return args[0]; }, statement.range);
-                checks_.push_back([this, a = left[i].type, b = right[i].type, range = statement.range] {
+                defer([this, a = left[i].type, b = right[i].type, range = statement.range] {
                     if (width(a) != width(b)) throw Error(range, "probe definition requires matching element widths");
                 });
-                connections.push_back({{statement.operands[0], left[i].fields}, {statement.operands[1], right[i].fields}, 1, false, statement.range, true});
+                if (summarizing_) summaryChecks_.push_back({InterfaceCheck::Kind::Equal, left[i].type->width, right[i].type->width, statement.range, "probe definition requires matching element widths"});
+                if (!summarizing_ || captureSummaryConnections_)
+                    connections.push_back({{statement.operands[0], left[i].fields}, {statement.operands[1], right[i].fields}, 1, false, statement.range, true});
             }
         } else if (statement.kind == StmtKind::Connect) {
             auto a = expression(statement.operands[0]), b = expression(statement.operands[1]);
@@ -602,10 +643,17 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
         } else if (statement.kind == StmtKind::When) {
             auto type = expression(statement.operands[0]);
             if (type->kind != TypeKind::UInt) throw Error(statement.range, "when predicate must have UInt type");
-            checks_.push_back([this, type, range = statement.range] { if (width(type) > 1) throw Error(range, "when predicate must have at most one bit"); });
+            defer([this, type, range = statement.range] { if (width(type) > 1) throw Error(range, "when predicate must have at most one bit"); });
+            if (summarizing_) summaryChecks_.push_back({InterfaceCheck::Kind::AtMostOne, type->width, 0, statement.range, "when predicate must have at most one bit"});
+            conditions_.push_back(type);
+            if (summarizing_ && !captureSummaryConnections_) {
+                this->statements(statement.body, 1);
+                this->statements(statement.otherwise, 1);
+                conditions_.pop_back();
+                continue;
+            }
             const auto fixed = staticIndex(statement.operands[0]);
             const int condition = fixed ? (*fixed != 0) : guards.variable(expressionKey(statement.operands[0]), statement.operands[0]);
-            conditions_.push_back(type);
             conditionGuards_.push_back(condition);
             this->statements(statement.body, guards.conjunction(guard, condition));
             conditionGuards_.back() = guards.negate(condition);
@@ -634,7 +682,8 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
                 auto type = expression(operands[i]);
                 if (type->kind != TypeKind::UInt) throw Error(statement.range, "effect predicate and enable must have UInt<1> type");
                 constrain(type->width, {}, [](const auto&) { return 1; }, statement.range);
-                checks_.push_back([this, type, range = statement.range] { if (width(type) != 1) throw Error(range, "effect predicate and enable must have UInt<1> type"); });
+                defer([this, type, range = statement.range] { if (width(type) != 1) throw Error(range, "effect predicate and enable must have UInt<1> type"); });
+                if (summarizing_) summaryChecks_.push_back({InterfaceCheck::Kind::ExactlyOne, type->width, 0, statement.range, "effect predicate and enable must have UInt<1> type"});
             }
             if (statement.kind == StmtKind::Printf || statement.kind == StmtKind::Assert || statement.kind == StmtKind::Assume || statement.kind == StmtKind::Intrinsic) {
                 const auto start = statement.kind == StmtKind::Printf || statement.kind == StmtKind::Intrinsic ? 3u : 4u;
@@ -644,30 +693,12 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
                         throw Error(statement.range, "print argument must have a ground hardware type");
                 }
             }
-            effects.push_back({id, guard});
+            if (!summarizing_) effects.push_back({id, guard});
         }
     }
 }
 void Semantics::solve(bool allowUnknownWidths) {
-    std::deque<std::size_t> pending;
-    std::vector<bool> queued(constraints_.size(), true);
-    std::size_t steps = 0;
-    const auto limit = std::max<std::size_t>(1000000, constraints_.size() * 64);
-    for (std::size_t i = 0; i < constraints_.size(); ++i) pending.push_back(i);
-    while (!pending.empty()) {
-        const auto id = pending.front(); pending.pop_front(); queued[id] = false;
-        const auto& constraint = constraints_[id];
-        if (++steps > limit)
-            throw Error(constraint.range, "FIRRTL width inference resource limit exceeded (cyclic constraints may be unbounded)");
-        std::vector<int64_t> args; bool ready = true;
-        for (const auto arg : constraint.arguments) { args.push_back(widths_[arg].value); ready &= args.back() >= 0; }
-        if (!ready) continue;
-        auto& result = widths_[constraint.result];
-        const auto next = checked(constraint.calculate(args), constraint.range);
-        if (result.value >= next) continue;
-        result.value = next;
-        for (const auto user : result.users) if (!queued[user]) { queued[user] = true; pending.push_back(user); }
-    }
+    solveWidths(widths_, constraints_, [&](uint32_t id) -> int64_t& { return widths_[id].value; });
     for (const auto& bits : widths_) if (bits.value < 0) {
         if (allowUnknownWidths) return;
         throw Error(bits.range, "FIRRTL width cannot be inferred from its drivers");
@@ -797,7 +828,7 @@ void Semantics::normalizeGuards() {
     guards = std::move(normalized);
     constantValues_.clear();
 }
-void Semantics::analyze(bool allowUnknownWidths) {
+void Semantics::prepare() {
     for (const auto& port : body.interface.ports) {
         auto type = declaredType(body.arena, port.type, port.range);
         if (interfaces_ && interfaces_->contains(std::string(body.interface.name))) {
@@ -820,10 +851,212 @@ void Semantics::analyze(bool allowUnknownWidths) {
         const auto& port = memories.at(entry.first).ports[entry.second];
         declarations.at(name).flow = (port.read ? 1 : 0) | (port.write ? 2 : 0);
     }
+}
+void Semantics::analyze(bool allowUnknownWidths) {
+    prepare();
     statements(body.statements, 1); solve(allowUnknownWidths); normalizeGuards();
     for (const auto& [name, declaration] : declarations) for (const auto& leaf : leavesCached(declaration.type, declaration.flow))
         if (!allowUnknownWidths || width(leaf.type) >= 0) total(leaf);
+    analyzed_ = true;
 }
+
+InterfaceSummary Semantics::interfaceSummary() {
+    summarizing_ = true;
+    prepare();
+    // Only a non-literal register initialization can require a driver/guard
+    // constant proof. Build those temporary records once for such modules,
+    // then retain the proof bit rather than the connections or guard DAG.
+    const auto literalExpression = [&](auto&& self, ExprId id) -> bool {
+        const auto& expression = body.arena.expressions[id];
+        if (expression.kind == ExprKind::UInt || expression.kind == ExprKind::SInt || expression.kind == ExprKind::Integer) return true;
+        if (expression.kind != ExprKind::Primitive && expression.kind != ExprKind::Mux) return false;
+        return std::all_of(expression.operands.begin(), expression.operands.end(), [&](ExprId operand) { return self(self, operand); });
+    };
+    for (const auto id : activeStatements) {
+        const auto& statement = body.arena.statements[id];
+        if (statement.kind == StmtKind::RegReset && !literalExpression(literalExpression, statement.operands[2])) {
+            captureSummaryConnections_ = true;
+            break;
+        }
+    }
+    statements(body.statements, 1);
+    InterfaceSummary result;
+    result.module_ = body.interface.name;
+    std::map<std::string, std::string> targets;
+    for (const auto& instance : instances) targets.emplace(instance.name, instance.target);
+    for (const auto& name : declarationOrder) {
+        const auto& declaration = declarations.at(name);
+        const auto instance = targets.find(name);
+        if (!declaration.port && instance == targets.end()) continue;
+        for (const auto& leaf : leavesCached(declaration.type, declaration.flow)) {
+            InterfaceLeaf endpoint;
+            endpoint.declaration = name; endpoint.fields = leaf.fields;
+            if (instance != targets.end()) endpoint.target = instance->second;
+            endpoint.width = leaf.type->width;
+            endpoint.resetGroup = resetGroup(leaf.type);
+            endpoint.kind = leaf.type->kind; endpoint.range = declaration.range;
+            auto& port = endpoint.port;
+            port.name = name; port.fieldPath = leaf.fields; port.fieldPath.insert(port.fieldPath.begin(), name);
+            for (const auto& field : leaf.fields) port.name += "__DOT__" + field;
+            port.direction = leaf.flow == 1 ? LeafDirection::Input : LeafDirection::Output;
+            port.elementWidth = static_cast<int32_t>(width(leaf.type)); port.shape = leaf.shape;
+            port.shapeFieldDepths = leaf.shapeFieldDepths;
+            port.isSigned = leaf.type->kind == TypeKind::SInt; port.isConst = leaf.type->constant;
+            port.requiresTypeResolution = port.elementWidth <= 0 ||
+                std::find(port.shape.begin(), port.shape.end(), 0) != port.shape.end() || leaf.probe != TypeKind::Unknown;
+            const auto kind = leaf.type->kind;
+            port.sourceType = kind == TypeKind::Reset ? "Reset" : kind == TypeKind::AsyncReset ? "AsyncReset" :
+                kind == TypeKind::Clock ? "Clock" : kind == TypeKind::SInt ? "SInt" : "UInt";
+            if (leaf.probe != TypeKind::Unknown)
+                port.sourceType = std::string(leaf.probe == TypeKind::Probe ? "Probe<" : "RWProbe<") + port.sourceType + ">";
+            result.leaves.push_back(std::move(endpoint));
+        }
+    }
+    result.resets_.reserve(resetParents_.size());
+    for (uint32_t i = 0; i < resetParents_.size(); ++i) result.resets_.push_back(resetFlags(i));
+    for (auto& check : summaryChecks_) if (check.kind == InterfaceCheck::Kind::ResetConstant) {
+        check.right = resetRoot(check.right);
+        if (!check.provenConstant) check.provenConstant = constantValue(check.expression);
+    }
+    result.checks_ = std::move(summaryChecks_);
+    // Match analyze(true)'s declaration/leaf order, including known arrays
+    // when another local width is still unknown.
+    for (const auto& [name, declaration] : declarations) {
+        for (const auto& leaf : leavesCached(declaration.type, declaration.flow)) {
+            if (leaf.shape.empty() || std::find(leaf.shape.begin(), leaf.shape.end(), 0) != leaf.shape.end()) continue;
+            int64_t maximum = kMaximumWidth;
+            for (const auto extent : leaf.shape) maximum /= extent;
+            result.limits_.push_back({leaf.type->width, maximum, widths_[leaf.type->width].range});
+        }
+    }
+    result.widths_ = std::move(widths_);
+    result.constraints_ = std::move(constraints_);
+    // Every calculate closure captures only source views and scalar width-rule
+    // operands. No closure in this network borrows the temporary Semantics.
+    return result;
+}
+
+InterfaceSummary summarizeInterface(const Source& source, const ModuleBody& body,
+                                     const FirrtlOptions& options) {
+    std::vector<std::string> dependencies;
+    const auto collectDependencies = [&](auto&& self, std::span<const StmtId> statements,
+                                         const std::string& layer) -> void {
+        for (const auto id : statements) {
+            const auto& statement = body.arena.statements[id];
+            if (statement.kind == StmtKind::LayerBlock) {
+                const auto path = layer.empty() ? std::string(statement.target) : layer + "." + std::string(statement.target);
+                if (std::any_of(options.enabledLayers.begin(), options.enabledLayers.end(),
+                    [&](const auto& enabled) { return enabled == path || enabled.starts_with(path + "."); }))
+                    self(self, statement.body, path);
+                continue;
+            }
+            if (statement.kind == StmtKind::Instance) dependencies.emplace_back(statement.target);
+            self(self, statement.body, layer); self(self, statement.otherwise, layer);
+        }
+    };
+    collectDependencies(collectDependencies, body.statements, {});
+    InterfaceSummary result;
+    try {
+        Semantics semantics(source, body, options);
+        result = semantics.interfaceSummary();
+    } catch (const Error&) {
+        // Keep dependency order available even when this module has an error.
+        // The coordinator reports it after visiting children, as before.
+        result.failure_ = std::current_exception();
+    }
+    result.dependencies = std::move(dependencies);
+    return result;
+}
+
+std::shared_ptr<const InterfaceSummary> sharedInterfaceSummary(std::shared_ptr<const Source> source,
+                                                              std::size_t module,
+                                                              const FirrtlOptions& options) {
+    const auto parsed = parseSharedModule(std::move(source), module);
+    if (!parsed.success()) throw std::invalid_argument("cannot summarize an unparsed FIRRTL module");
+    auto& implementation = Access::get(*parsed.source);
+    std::shared_ptr<ParsedModuleCache> cached;
+    {
+        std::lock_guard lock(implementation.parsedModulesMutex);
+        cached = implementation.parsedModules.at(module);
+        if (!cached) {
+            // A completed lowering can release the cache while an independent
+            // shared reader still owns this AST.
+            cached = std::make_shared<ParsedModuleCache>();
+            cached->body = parsed.sharedBody; cached->parsed = true;
+            implementation.parsedModules[module] = cached;
+        }
+    }
+    std::lock_guard lock(cached->mutex);
+    if (!cached->summarized || cached->summaryLayers != options.enabledLayers) {
+        cached->summary.reset(); cached->summaryFailure = {};
+        cached->summaryLayers = options.enabledLayers;
+        try {
+            cached->summary = std::make_shared<const InterfaceSummary>(
+                summarizeInterface(*parsed.source, *parsed.sharedBody, options));
+        } catch (...) {
+            cached->summaryFailure = std::current_exception();
+        }
+        cached->summarized = true;
+    }
+    if (cached->summaryFailure) std::rethrow_exception(cached->summaryFailure);
+    return cached->summary;
+}
+
+InterfaceEvaluation InterfaceSummary::evaluate(const std::map<std::string, ModuleSignature>& interfaces) const {
+    if (failure_) std::rethrow_exception(failure_);
+    InterfaceEvaluation result;
+    result.widths.reserve(widths_.size());
+    for (const auto& width : widths_) result.widths.push_back(width.value);
+    result.resets = resets_;
+    std::map<std::string_view, std::map<std::vector<std::string>, const PortLeafSignature*>> ports;
+    for (const auto& endpoint : leaves) {
+        const std::string_view module = endpoint.target.empty() ? std::string_view(module_) : std::string_view(endpoint.target);
+        auto indexed = ports.find(module);
+        if (indexed == ports.end()) {
+            const auto signature = interfaces.find(std::string(module));
+            if (signature == interfaces.end()) continue;
+            std::map<std::vector<std::string>, const PortLeafSignature*> byPath;
+            for (const auto& port : signature->second.ports) byPath.emplace(port.fieldPath, &port);
+            indexed = ports.emplace(module, std::move(byPath)).first;
+        }
+        const auto& path = endpoint.target.empty() ? endpoint.port.fieldPath : endpoint.fields;
+        const auto found = indexed->second.find(path);
+        if (found == indexed->second.end()) {
+            if (endpoint.target.empty()) continue;
+            throw Error(endpoint.range, "instance port missing from resolved interface");
+        }
+        const auto& port = *found->second;
+        if (!endpoint.target.empty() && port.shape != endpoint.port.shape)
+            throw Error(endpoint.range, "instance array geometry differs from resolved interface");
+        if (!widths_[endpoint.width].fixed && port.elementWidth >= 0)
+            result.widths[endpoint.width] = std::max(result.widths[endpoint.width], static_cast<int64_t>(port.elementWidth));
+        if (endpoint.kind == TypeKind::Reset && port.sourceType != "Reset") {
+            auto& flags = result.resets[endpoint.resetGroup];
+            flags |= port.sourceType == "AsyncReset" ? 2 : 1;
+            if (flags == 3) throw Error(endpoint.range, "Reset is connected to both synchronous and asynchronous resets");
+        }
+    }
+    solveWidths(widths_, constraints_, [&](uint32_t id) -> int64_t& { return result.widths[id]; });
+    if (std::none_of(result.widths.begin(), result.widths.end(), [](int64_t width) { return width < 0; })) {
+        for (const auto& check : checks_) {
+            bool valid = true;
+            if (check.kind == InterfaceCheck::Kind::ExactlyOne) valid = result.widths[check.left] == 1;
+            else if (check.kind == InterfaceCheck::Kind::AtMostOne) valid = result.widths[check.left] <= 1;
+            else if (check.kind == InterfaceCheck::Kind::Equal) valid = result.widths[check.left] == result.widths[check.right];
+            else if (check.kind == InterfaceCheck::Kind::ResetConstant) {
+                const bool asynchronous = check.resetKind == TypeKind::AsyncReset ||
+                    (check.resetKind == TypeKind::Reset && result.resets[check.right] == 2);
+                valid = !asynchronous || check.provenConstant;
+            }
+            if (!valid) throw Error(check.range, std::string(check.message));
+        }
+    }
+    for (const auto& limit : limits_)
+        if (result.widths[limit.width] >= 0 && result.widths[limit.width] > limit.maximum)
+            throw Error(limit.range, "FIRRTL Vector total width exceeds GRH range");
+    return result;
+}
+
 int64_t Semantics::width(TypePtr type) const { return widths_.at(type->width).value; }
 TypeKind Semantics::resolvedKind(TypePtr type) const {
     return type->kind == TypeKind::Reset ? (resetFlags(type->reset) == 2 ? TypeKind::AsyncReset : TypeKind::UInt) : type->kind;

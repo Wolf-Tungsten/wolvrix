@@ -1,3 +1,4 @@
+#include "core/decode_table.hpp"
 #include "transform/const_fold.hpp"
 
 #include "core/grh.hpp"
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -19,6 +21,16 @@
 
 namespace wolvrix::lib::transform
 {
+
+    // The decode-table frontend selects this explicitly for a build.  Keep the
+    // old research name as a compatibility fallback for diagnostic fixtures and
+    // frozen experiments created before the option became a normal build input.
+    static bool foldConstantDecode() {
+        const char* value = std::getenv("WOLVRIX_FOLD_CONSTANT_DECODE");
+        if (!value)
+            value = std::getenv("WOLVRIX_RESEARCH_FOLD_CONSTANT_DECODE");
+        return value && std::string_view(value) == "1";
+    }
 
     // Definitions for forward-declared types from the header
     struct ConstantValue
@@ -93,6 +105,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLogicNot:
             case wolvrix::lib::grh::OperationKind::kCountTrailingZeros:
             case wolvrix::lib::grh::OperationKind::kCountOnes:
+            case wolvrix::lib::grh::OperationKind::kDecodeTable:
             case wolvrix::lib::grh::OperationKind::kGrayDecode:
             case wolvrix::lib::grh::OperationKind::kReduceAnd:
             case wolvrix::lib::grh::OperationKind::kReduceOr:
@@ -382,6 +395,18 @@ namespace wolvrix::lib::transform
                     count += operand[i].value != 0;
                 return slang::SVInt(count);
             }
+            case wolvrix::lib::grh::OperationKind::kDecodeTable: {
+                if (operand.hasUnknown()) return std::nullopt;
+                auto attr=op.attr("decode.table");
+                if (!attr || !std::holds_alternative<std::string>(*attr)) return std::nullopt;
+                auto table=wolvrix::lib::decode::parse(std::get<std::string>(*attr));
+                wolvrix::lib::decode::Words input((table.input+63)/64,0);
+                for(int i=0;i<table.input;++i) if(operand[i].value) input[i/64]|=uint64_t(1)<<(i%64);
+                auto words=wolvrix::lib::decode::evaluate(table,input);
+                slang::SVInt result(table.output,0,false);
+                for(int i=0;i<table.output;++i) if((words[i/64]>>(i%64))&1) result.set(i,i,slang::SVInt(1,1,false));
+                return result;
+            }
             case wolvrix::lib::grh::OperationKind::kGrayDecode: {
                 if (operand.hasUnknown()) return std::nullopt;
                 slang::SVInt result(operand.getBitWidth(), 0, false);
@@ -419,11 +444,40 @@ namespace wolvrix::lib::transform
 
             if ((op.kind() == wolvrix::lib::grh::OperationKind::kCountTrailingZeros ||
                  op.kind() == wolvrix::lib::grh::OperationKind::kCountOnes ||
-                 op.kind() == wolvrix::lib::grh::OperationKind::kGrayDecode) &&
+                 op.kind() == wolvrix::lib::grh::OperationKind::kGrayDecode ||
+                 op.kind() == wolvrix::lib::grh::OperationKind::kDecodeTable) &&
                 (op.operands().size() != 1 || op.results().size() != 1))
             {
                 onError("unary intrinsic requires one input and one result");
                 return std::nullopt;
+            }
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kDecodeTable &&
+                options.semantics == ConstantFoldOptions::Semantics::TwoState && foldConstantDecode()) {
+                try {
+                    const auto attr = getStringAttr(graph, op, "decode.table");
+                    if (!attr) {
+                        onError("kDecodeTable missing decode.table attribute");
+                        return std::nullopt;
+                    }
+                    const auto table = wolvrix::lib::decode::parse(*attr);
+                    if (graph.getValue(op.operands()[0]).width() != table.input ||
+                        graph.getValue(op.results()[0]).width() != table.output) {
+                        onError("kDecodeTable width mismatch");
+                        return std::nullopt;
+                    }
+                    if (const auto words = wolvrix::lib::decode::constantOutput(table)) {
+                        slang::SVInt value(table.output, 0, false);
+                        for (int bit = 0; bit < table.output; ++bit) {
+                            if (((*words)[bit / 64] >> (bit % 64)) & 1) {
+                                value.set(bit, bit, slang::SVInt(1, 1, false));
+                            }
+                        }
+                        return std::vector<slang::SVInt>{normalizeToValue(graph.getValue(op.results()[0]), value)};
+                    }
+                } catch (const std::exception &e) {
+                    onError(std::string("Invalid decode table during folding: ") + e.what());
+                    return std::nullopt;
+                }
             }
             std::vector<slang::SVInt> operands;
             operands.reserve(op.operands().size());
@@ -509,6 +563,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLogicNot:
             case wolvrix::lib::grh::OperationKind::kCountTrailingZeros:
             case wolvrix::lib::grh::OperationKind::kCountOnes:
+            case wolvrix::lib::grh::OperationKind::kDecodeTable:
             case wolvrix::lib::grh::OperationKind::kGrayDecode:
             case wolvrix::lib::grh::OperationKind::kReduceAnd:
             case wolvrix::lib::grh::OperationKind::kReduceOr:
@@ -758,7 +813,12 @@ namespace wolvrix::lib::transform
             graph.setAttr(constOp, "constValue", formatConstLiteral(value));
             std::string note = "from_";
             note.append(wolvrix::lib::grh::toString(sourceOp.kind()));
-            const wolvrix::lib::grh::SrcLoc genLoc = makeTransformSrcLoc("const-fold", note);
+            auto genLoc = makeTransformSrcLoc("const-fold", note);
+            if (sourceOp.kind() == wolvrix::lib::grh::OperationKind::kDecodeTable && sourceOp.srcLoc() && foldConstantDecode()) {
+                genLoc = *sourceOp.srcLoc();
+                genLoc.pass = "const-fold";
+                genLoc.note += (genLoc.note.empty() ? "" : "; ") + note;
+            }
             graph.setValueSrcLoc(newValue, genLoc);
             graph.setOpSrcLoc(constOp, genLoc);
             pool.emplace(std::move(key), newValue);
@@ -957,7 +1017,8 @@ namespace wolvrix::lib::transform
             {
                 continue;
             }
-            if (!operandsAreConstant(op, ctx.constants))
+            if (!operandsAreConstant(op, ctx.constants) &&
+                !(op.kind() == wolvrix::lib::grh::OperationKind::kDecodeTable && foldConstantDecode()))
             {
                 continue;
             }

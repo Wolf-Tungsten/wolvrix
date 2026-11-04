@@ -6026,6 +6026,9 @@ namespace wolvrix::lib::emit
                 case wolvrix::lib::grh::OperationKind::kCountOnes:
                     reportError("kCountOnes currently requires the GrhSIM backend", opContext);
                     break;
+                case wolvrix::lib::grh::OperationKind::kDecodeTable:
+                    reportError("kDecodeTable currently requires the GrhSIM backend", opContext);
+                    break;
                 case wolvrix::lib::grh::OperationKind::kGrayDecode:
                     reportError("kGrayDecode currently requires the GrhSIM backend", opContext);
                     break;

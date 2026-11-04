@@ -736,6 +736,40 @@ binary[i]   = binary[i+1] ^ gray[i]
 
 ---
 
+### 6.2.5.3 译码表（`kDecodeTable`）
+
+`kDecodeTable` 是无状态的纯组合二态操作。它保存原始 mask/value 表语义，
+不要求先将表展开为门级译码网络。
+
+**operands**:
+- `oper[0]`: `N` 位无符号译码输入，`N > 0`；这是唯一动态依赖
+
+**results**:
+- `res[0]`: `M` 位无符号打包输出，`M > 0`；字段零位于最高位
+
+**attrs**:
+- `decode.table` (`string`): 不可变的版本化表载荷，包含输入／输出宽度、字段宽度、
+  默认 value/care 及各行的输入 mask/value、输出 value/care
+
+表模式 `P` 保留行顺序并返回首个匹配行；模式 `T` 合并所有匹配行的有效输出约束，
+相交且矛盾的约束不合法。没有匹配行时使用默认值。输出未约束位确定性填零；
+输入通配位仍必须按 mask 匹配语义处理。
+
+例如载荷 `WDT1|P|3|4|4|f|f|1,1,3,f;7,7,5,f` 表示：
+
+```text
+input 0 -> 15 (默认值)
+input 1 ->  3 (第一行)
+input 7 ->  3 (第一行优先于第二行)
+```
+
+该操作没有时钟、enable、隐藏状态或外部调用，按普通 SSA 操作参与常量折叠、
+CSE、DCE、活动传播及结果变化检测。表属性不形成运行时输入。
+当前保留常量输入求值，但动态输入上的恒定表提前折叠在消融实验中关闭。
+GrhSIM emitter 生成布尔位图、只读 LUT 或分层匹配函数；SystemVerilog emitter 明确拒绝
+此专用操作。载荷、DPI 中转契约及代码生成规则见
+[译码表 intrinsic](../emit/decode-table-intrinsic.md)。
+
 ### 6.2.6 移位运算
 
 四态语义：遵循 SystemVerilog 规则；当操作数或移位量含 `X`/`Z` 时，结果可能为 `X`（保守传播）。

@@ -3,6 +3,7 @@
 #include "transform/activity_schedule.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -2317,6 +2318,19 @@ int main()
             validateCommonScheduleShape(*highCapGraph, highCapSchedule) != 0)
         {
             return 1;
+        }
+        wolvrix::lib::grh::Design tracedDesign;
+        buildFixture(tracedDesign);
+        SessionStore tracedSession;
+        const auto traceDir = std::filesystem::path(WOLF_SV_TEST_ARTIFACT_DIR) / "activity-stage-trace";
+        setenv("WOLVRIX_ACTIVITY_STAGE_TRACE", traceDir.c_str(), 1);
+        const bool traceOk = runFixture(tracedDesign, tracedSession, std::nullopt);
+        unsetenv("WOLVRIX_ACTIVITY_STAGE_TRACE");
+        const auto tracedSchedule = loadSchedule(tracedSession, std::string(kGraphName));
+        if (!traceOk || !schedulesEqual(defaultSchedule, tracedSchedule) ||
+            !std::filesystem::is_regular_file(traceDir / "shared-decisions.bin") ||
+            !std::filesystem::is_regular_file(traceDir / "final-supernodes.groups.bin")) {
+            return fail("Read-only stage exports must preserve the complete schedule");
         }
         if (!schedulesEqual(defaultSchedule, explicit8192Schedule))
         {

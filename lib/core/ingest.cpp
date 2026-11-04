@@ -1,3 +1,4 @@
+#include "core/decode_table.hpp"
 #include "core/ingest.hpp"
 
 #include "slang/ast/ASTVisitor.h"
@@ -3212,6 +3213,67 @@ private:
         return true;
     }
 
+    bool handleDecodeTable(const slang::ast::CallExpression& call,
+                           const slang::ast::SubroutineSymbol& subroutine)
+    {
+        const std::string_view name = subroutine.name;
+        if (!name.starts_with("wolvrix_decode_table_")) return false;
+        const auto reject = [&](const std::string& reason) {
+            reportUnsupported(call, "Invalid decode-table intrinsic: " + reason);
+            return true;
+        };
+        try {
+            const std::string_view prefix = "wolvrix_decode_table_v1_";
+            if (!name.starts_with(prefix)) return reject("unknown version");
+            auto parts = wolvrix::lib::decode::split(name.substr(prefix.size()), '_');
+            if (parts.size()!=3 || parts[0][0]!='i' || parts[1][0]!='o' || parts[2][0]!='b')
+                return reject("invalid contract name");
+            const int iw=wolvrix::lib::decode::positive(parts[0].substr(1));
+            const int ow=wolvrix::lib::decode::positive(parts[1].substr(1));
+            const int bytes=wolvrix::lib::decode::positive(parts[2].substr(1));
+            auto carrier=[](int w) {for(int c:{1,8,16,32,64}) if(c>=w)return c;return w;};
+            const auto args=call.arguments(); const auto formals=subroutine.getArguments();
+            if(subroutine.subroutineKind!=slang::ast::SubroutineKind::Function ||
+               !subroutine.getReturnType().isVoid() || args.size()!=3 || formals.size()!=3)
+                return reject("expected two inputs and one output");
+            const int widths[]={carrier(iw),bytes*8,carrier(ow)};
+            for(size_t i=0;i<3;++i)
+                if(formals[i]->direction!=(i==2 ? slang::ast::ArgumentDirection::Out : slang::ast::ArgumentDirection::In) ||
+                   !formals[i]->getType().isIntegral() || formals[i]->getType().isFourState() ||
+                   formals[i]->getType().getBitWidth()!=uint64_t(widths[i])) return reject("signature mismatch");
+            if(const auto* syntax=subroutine.getSyntax())
+                if(const auto* d=syntax->as_if<slang::syntax::DPIImportSyntax>())
+                    if(!d->c_identifier.valueText().empty() && d->c_identifier.valueText()!=name)
+                        return reject("linkage alias");
+            if(domain!=ControlDomain::Combinational || !eventContext.edges.empty() || eventContext.hasTiming)
+                return reject("expected unclocked call");
+            const auto loc=call.sourceRange.start(); const auto guard=currentGuard(loc);
+            if(guard!=kInvalidPlanIndex) {
+                const auto c=evalConstInt(plan,lowering,guard);
+                if(!c || *c!=1) return reject("enable must be constant true");
+            }
+            slang::ast::EvalContext ctx(*plan.body);
+            auto payload=evalConstantValue(unwrapDpiArgument(*args[1],false),ctx);
+            if(!payload || payload->hasUnknown()) return reject("table must be a known constant");
+            std::string text;
+            for(int i=bytes-1;i>=0;--i) text.push_back(char(payload->slice(i*8+7,i*8).as<uint64_t>().value()));
+            const auto table=wolvrix::lib::decode::parse(text);
+            if(table.input!=iw || table.output!=ow) return reject("payload width mismatch");
+            auto input=lowerExpression(unwrapDpiArgument(*args[0],false));
+            const auto target=resolveSimpleSymbol(unwrapDpiArgument(*args[2],true));
+            if(input==kInvalidPlanIndex || !target.valid()) return reject("unsupported binding");
+            if(carrier(iw)!=iw) input=makeSliceDynamic(input,addConstantLiteral("0",loc),iw,loc);
+            // The constant operand carries metadata through expression rewriting;
+            // graph emission below consumes it as an attribute, not a dependency.
+            const auto constant=addConstantLiteral(formatIntegerLiteral(*payload),loc);
+            const auto result=makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kDecodeTable,{input,constant},ow,loc);
+            WriteIntent intent;
+            intent.target=target;intent.value=resizeValueToWidth(result,carrier(ow),false,loc);
+            intent.guard=guard;intent.domain=ControlDomain::Combinational;intent.location=loc;
+            recordWriteIntent(std::move(intent));return true;
+        } catch(const std::exception& e) {return reject(e.what());}
+    }
+
     // Versioned semantic transport. This call is consumed before the generic
     // event-driven DPI path and produces an ordinary combinational SSA value.
     bool handleSimulationIntrinsic(const slang::ast::CallExpression& call,
@@ -3293,6 +3355,7 @@ private:
     bool handleDpiCall(const slang::ast::CallExpression& call,
                        const slang::ast::SubroutineSymbol& subroutine)
     {
+        if (handleDecodeTable(call, subroutine)) return true;
         if (handleSimulationIntrinsic(call, subroutine)) return true;
         if (!ensureEdgeSensitive(call.sourceRange.start(), "dpi"))
         {
@@ -21376,8 +21439,19 @@ private:
 
         wolvrix::lib::grh::OperationId op =
             createOp(node.op, wolvrix::lib::grh::SymbolId::invalid(), node.location);
-        for (const auto& operand : operands)
-        {
+        if (node.op == wolvrix::lib::grh::OperationKind::kDecodeTable) {
+            if (operands.size()!=2) throw std::runtime_error("decode table expression lost payload");
+            const auto def=graph_.getOperation(graph_.valueDef(operands[1]));
+            auto attr=def.attr("constValue");
+            if (!attr || !std::holds_alternative<std::string>(*attr)) throw std::runtime_error("decode table constant payload missing");
+            const auto literal=slang::SVInt::fromString(std::get<std::string>(*attr));
+            std::string payload;
+            for(int i=(literal.getBitWidth()+7)/8-1;i>=0;--i)
+                payload.push_back(char(literal.slice(i*8+7,i*8).as<uint64_t>().value()));
+            (void)wolvrix::lib::decode::parse(payload);
+            graph_.setAttr(op,"decode.table",payload);
+            graph_.addOperand(op,operands[0]);
+        } else for (const auto& operand : operands) {
             graph_.addOperand(op, operand);
         }
         if (node.op == wolvrix::lib::grh::OperationKind::kSystemFunction)

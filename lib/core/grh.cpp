@@ -2648,7 +2648,8 @@ namespace wolvrix::lib::grh
             "kXMRWrite",
             "kCountTrailingZeros",
             "kCountOnes",
-            "kGrayDecode"};
+            "kGrayDecode",
+            "kDecodeTable"};
 
         void writeAttributeValue(slang::JsonWriter &writer, const AttributeValue &value)
         {

@@ -1,3 +1,4 @@
+#include "core/decode_table.hpp"
 #include "emit/grhsim_cpp.hpp"
 #include "grhsim_compiler_compat.hpp"
 
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -8990,6 +8992,7 @@ namespace wolvrix::lib::emit
             case OperationKind::kReduceAnd:
             case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
+            case OperationKind::kDecodeTable:
             case OperationKind::kGrayDecode:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceXor:
@@ -13272,6 +13275,21 @@ namespace wolvrix::lib::emit
             for (OperationId opId : graph.operations())
             {
                 const Operation op = graph.getOperation(opId);
+                if (op.kind() == OperationKind::kDecodeTable) {
+                    try {
+                        auto attr=getAttribute<std::string>(op,"decode.table");
+                        if (!attr) throw std::runtime_error("missing payload");
+                        const auto table=wolvrix::lib::decode::parse(*attr);
+                        if(op.operands().size()!=1 || op.results().size()!=1 ||
+                           graph.valueWidth(op.operands()[0])!=table.input ||
+                           graph.valueWidth(op.results()[0])!=table.output ||
+                           graph.valueType(op.operands()[0])!=ValueType::Logic ||
+                           graph.valueType(op.results()[0])!=ValueType::Logic ||
+                           graph.valueSigned(op.results()[0])) throw std::runtime_error("type or arity mismatch");
+                    } catch(const std::exception& e) {
+                        error="invalid kDecodeTable: "+std::string(e.what());return false;
+                    }
+                }
                 if (op.kind() == OperationKind::kCountTrailingZeros ||
                     op.kind() == OperationKind::kCountOnes ||
                     op.kind() == OperationKind::kGrayDecode)
@@ -17191,6 +17209,7 @@ template<class Index>
             case OperationKind::kReduceNand:
             case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
+            case OperationKind::kDecodeTable:
             case OperationKind::kGrayDecode:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceNor:
@@ -20337,6 +20356,8 @@ template<class Index>
             case OperationKind::kCountTrailingZeros:
                 return "grhsim_ctz_words(" + operandExprs[0] + ", " +
                        std::to_string(graph.valueWidth(operands[0])) + ")";
+            case OperationKind::kDecodeTable:
+                return wolvrix::lib::decode::name(getAttribute<std::string>(op,"decode.table").value()) + "(" + operandExprs[0] + ")";
             case OperationKind::kGrayDecode:
                 return "grhsim_gray_decode_words(" + operandExprs[0] + ", " +
                        std::to_string(graph.valueWidth(operands[0])) + ")";
@@ -20564,7 +20585,8 @@ template<class Index>
                 case OperationKind::kReduceNand:
                 case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
-                case OperationKind::kGrayDecode:
+                case OperationKind::kDecodeTable:
+            case OperationKind::kGrayDecode:
                 case OperationKind::kReduceOr:
                 case OperationKind::kReduceNor:
                 case OperationKind::kReduceXor:
@@ -21130,7 +21152,8 @@ template<class Index>
                     case OperationKind::kReduceNand:
                     case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
-                    case OperationKind::kGrayDecode:
+                    case OperationKind::kDecodeTable:
+            case OperationKind::kGrayDecode:
                     case OperationKind::kReduceOr:
                     case OperationKind::kReduceNor:
                     case OperationKind::kReduceXor:
@@ -21541,6 +21564,8 @@ template<class Index>
             case OperationKind::kCountTrailingZeros:
                 return ScalarLogicExpr{"grhsim_ctz_u64(" + operands[0] + ", " +
                     std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
+            case OperationKind::kDecodeTable:
+                return ScalarLogicExpr{wolvrix::lib::decode::name(getAttribute<std::string>(op,"decode.table").value()) + "(" + operands[0] + ")", true};
             case OperationKind::kGrayDecode:
                 return ScalarLogicExpr{"grhsim_gray_decode_u64(" + operands[0] + ", " +
                     std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
@@ -22557,6 +22582,7 @@ template<class Index>
             case OperationKind::kReduceAnd:
             case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
+            case OperationKind::kDecodeTable:
             case OperationKind::kGrayDecode:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceXor:
@@ -26849,7 +26875,8 @@ template<class Index>
                     case OperationKind::kReduceNand:
                     case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
-                    case OperationKind::kGrayDecode:
+                    case OperationKind::kDecodeTable:
+            case OperationKind::kGrayDecode:
                     case OperationKind::kReduceOr:
                     case OperationKind::kReduceNor:
                     case OperationKind::kReduceXor:
@@ -28416,6 +28443,9 @@ template<class Index>
                                 case OperationKind::kCountTrailingZeros:
                                     addShape("wide.helper.ctz_word_iterations", operandWords);
                                     break;
+                                case OperationKind::kDecodeTable:
+                                    addShape("wide.helper.decode_table_input_words", operandWords);
+                                    break;
                                 case OperationKind::kGrayDecode:
                                     addShape("wide.helper.gray_decode_word_iterations", operandWords);
                                     break;
@@ -28640,6 +28670,50 @@ template<class Index>
                     for (auto &body : entry.bodies) snapshotCommitBodyWork(graph, model, body);
                     plan.commitWriteRuns.push_back(std::move(entry));
                     i = run->end;
+                }
+            }
+        }
+
+        // Research-only snapshot after storage allocation. It never inserts
+        // graph attributes or changes planner containers.
+        void exportResearchStorage(const Graph &graph, const EmitModel &model,
+                                   const std::vector<ScheduleBatch> &batches) {
+            const char* directory = std::getenv("WOLVRIX_ACTIVITY_STAGE_TRACE");
+            if (!directory || !*directory) return;
+            const std::filesystem::path root(directory);
+            std::filesystem::create_directories(root);
+            std::ofstream values(root / "storage-values.tsv");
+            std::ofstream states(root / "storage-states.tsv");
+            std::ofstream groups(root / "batches.tsv");
+            values.exceptions(std::ios::badbit | std::ios::failbit);
+            states.exceptions(std::ios::badbit | std::ios::failbit);
+            groups.exceptions(std::ios::badbit | std::ios::failbit);
+            values << "id\tname\twidth\tmaterialized\tcanonical\tcpp_ref\n";
+            for (const auto value : graph.values()) {
+                if (!model.materializedValues.contains(value) &&
+                    !model.directStateReadSymbolByValue.contains(value) &&
+                    !model.inputFieldByValue.contains(value)) continue;
+                values << value.index << '\t' << std::quoted(std::string(graph.symbolText(graph.valueSymbol(value))))
+                       << '\t' << graph.valueWidth(value) << '\t' << model.materializedValues.contains(value)
+                       << '\t' << canonicalMaterializedStorageValue(model, value).index
+                       << '\t' << std::quoted(valueRef(model, value)) << '\n';
+            }
+            states << "name\twidth\trows\tslot\tlogic_slot\tcpp_ref\n";
+            for (const auto& name : model.stateOrder) {
+                const auto& state = model.stateBySymbol.at(name);
+                states << std::quoted(name) << '\t' << state.width << '\t' << state.rowCount
+                       << '\t' << state.slotIndex << '\t' << state.logicSlotIndex
+                       << '\t' << std::quoted(stateRef(state)) << '\n';
+            }
+            groups << "batch\tphase\tgroup\tactive_id\tword\n";
+            for (const auto& batch : batches) {
+                for (const auto& word : batch.words) {
+                    for (const auto id : word.supernodeIds) {
+                        groups << batch.index << '\t'
+                               << (batch.phase == ScheduleBatch::Phase::kCommit ? "commit" : "compute")
+                               << '\t' << id << '\t' << model.activeIdBySupernode.at(id)
+                               << '\t' << word.activeFlagWordIndex << '\n';
+                    }
                 }
             }
         }
@@ -29826,6 +29900,7 @@ template<class Index>
             }
         }
 
+        exportResearchStorage(graph, model, scheduleBatches);
         if (plan != nullptr)
         {
             *plan = snapshotExecutionPlan(graph, model, schedule, scheduleBatches);
@@ -30502,6 +30577,20 @@ template<class Index>
             *stream << "#include <string>\n";
             *stream << "#include <utility>\n";
             *stream << "#include <vector>\n\n";
+            std::map<std::string,std::string> decodeTables;
+            for (auto opId : graph.operations()) {
+                const auto op=graph.getOperation(opId);
+                if(op.kind()!=OperationKind::kDecodeTable) continue;
+                const auto payload=getAttribute<std::string>(op,"decode.table").value();
+                const auto id=wolvrix::lib::decode::name(payload);
+                const auto [it,inserted]=decodeTables.emplace(id,payload);
+                if(!inserted && it->second!=payload) {
+                    reportError("decode table hash collision",id);result.success=false;return result;
+                }
+            }
+            for(const auto& [id,payload]:decodeTables)
+                wolvrix::lib::decode::emit(*stream,wolvrix::lib::decode::parse(payload),id);
+
             if (model.wordwiseWideConcatBoolPack)
                 *stream << "#include <bit>\n#include <iterator>\n#include <type_traits>\n\n";
             if (model.emitWaveform)
@@ -33685,6 +33774,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             *stream << "#include <utility>\n";
             *stream << "#include <string>\n";
             *stream << "#include <vector>\n\n";
+
             *stream << "#include \"" << runtimePath.filename().string() << "\"\n\n";
             *stream << "#define WOLVRIX_GRHSIM_PERF " << (model.emitPerf ? "1" : "0") << "\n\n";
             *stream << "class " << className << " {\n";

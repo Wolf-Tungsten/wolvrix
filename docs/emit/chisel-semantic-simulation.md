@@ -297,3 +297,10 @@ commit 一次性及外部观察验证。
 CRC 的共同调用循环复核还表明：原独立 binary 中的查表优势并不稳定，生成体已经被
 编译成向量 parity/位计数。后续候选要同时考虑调用上下文与布局，不只选择目录中最大
 的百分比。参考 [CRC 复核记录](../../../pdocs/grhsim_opt_thj/TNO0379_chisel_crc_call_context_control_20261029.md)。
+
+
+### 2026-11-03：译码表 intrinsic
+
+真实香山的 ListLookup、DecodeLogic 和 decoder 已接入可选的 `decode-table` 模式。
+纯组合 GRH、表约束、DontCare 口径和复现入口见 [译码表 intrinsic](./decode-table-intrinsic.md)。
+性能结论以本轮完整 A/B 的产物为准，实施进度另记 TNO。

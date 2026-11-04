@@ -1,6 +1,7 @@
 #include "transform/activity_schedule.hpp"
 
 #include "core/toposort.hpp"
+#include "activity_stage_trace.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1897,7 +1898,11 @@ namespace wolvrix::lib::transform
                 }
             }
 
-            for (const auto sourceOp : originalSourceOps)
+            std::vector<OperationId> sourceOrder(originalSourceOps.begin(), originalSourceOps.end());
+            stage_trace::sourceOrder(graph, sourceOrder);
+            stage_trace::order(sourceOrder, "source-original-iteration");
+            auto cloneTrace = stage_trace::open("source-clones.bin");
+            for (const auto sourceOp : sourceOrder)
             {
                 const auto results = graph.opResults(sourceOp);
                 if (results.size() != 1)
@@ -1937,6 +1942,11 @@ namespace wolvrix::lib::transform
                 }
                 opClasses[cloneOp.index] = ActivityOpClass::Source;
                 canonicalValues[cloneValue] = rewrite.sourceValue;
+                if (cloneTrace.is_open()) {
+                    for (uint32_t value : {rewrite.sourceOp.index, rewrite.sourceValue.index,
+                                          rewrite.userOp.index, rewrite.operandIndex,
+                                          cloneOp.index, cloneValue.index}) stage_trace::word(cloneTrace, value);
+                }
                 try
                 {
                     graph.replaceOperand(rewrite.userOp, rewrite.operandIndex, cloneValue);
@@ -2457,6 +2467,9 @@ namespace wolvrix::lib::transform
                   build_(build),
                   error_(error)
             {
+                if (!stage_trace::directory().empty()) {
+                    decisions_ = stage_trace::open("shared-decisions.bin");
+                }
             }
 
             uint32_t ensureSourceOwnerNode(wolvrix::lib::grh::OperationId opId)
@@ -2907,16 +2920,22 @@ namespace wolvrix::lib::transform
                     const bool shared = consumers > 1;
                     if (shared)
                     {
-                        if (canAddRawOp(nodeId) &&
-                            nodeId < build_.computeNodes.size() &&
-                            !build_.computeNodes[nodeId].commonExpr &&
-                            isEarliestSemanticConsumer(graph_, operand, opId, opClasses_, opData_) &&
-                            !otherSemanticConsumerCanReachNode(graph_,
-                                                               operand,
-                                                               opId,
-                                                               build_.computeNodes[nodeId].ops,
-                                                               opClasses_,
-                                                               opData_))
+                        // Keep the original short-circuit evaluation order. A failed
+                        // predicate is the reason for creating a separate common node.
+                        uint32_t reason = 0;
+                        if (!canAddRawOp(nodeId)) reason = 1;
+                        else if (nodeId >= build_.computeNodes.size()) reason = 2;
+                        else if (build_.computeNodes[nodeId].commonExpr) reason = 3;
+                        else if (!isEarliestSemanticConsumer(graph_, operand, opId, opClasses_, opData_)) reason = 4;
+                        else if (otherSemanticConsumerCanReachNode(graph_, operand, opId,
+                                     build_.computeNodes[nodeId].ops, opClasses_, opData_)) reason = 5;
+                        if (decisions_.is_open()) {
+                            for (uint32_t value : {nodeId, opId.index, defOp.index, operand.index,
+                                                   static_cast<uint32_t>(consumers), reason}) {
+                                stage_trace::word(decisions_, value);
+                            }
+                        }
+                        if (reason == 0)
                         {
                             absorbOp(nodeId, defOp);
                             if (!error_.empty())
@@ -2953,6 +2972,7 @@ namespace wolvrix::lib::transform
             std::vector<ActivityOpClass> &opClasses_;
             ComputeRewriteBuild &build_;
             std::string &error_;
+            std::ofstream decisions_;
             static constexpr std::size_t kMaxOperandProcessRecursion = 256;
             std::size_t operandProcessDepth_ = 0;
             bool drainingPendingOperands_ = false;
@@ -7844,6 +7864,15 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            if (!stage_trace::directory().empty()) {
+                auto trace = stage_trace::open("commit-roots.bin");
+                stage_trace::word(trace, static_cast<uint32_t>(out.commitNodes.size()));
+                for (const auto& node : out.commitNodes) {
+                    stage_trace::ids(trace, node.ops);
+                    stage_trace::ids(trace, node.inputValues);
+                }
+            }
+
             auto ensureRootValue = [&](wolvrix::lib::grh::ValueId value, bool commitRoot) {
                 if (!value.valid() || value.graph != graph.id())
                 {
@@ -7939,12 +7968,14 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            stage_trace::nodes(out.computeNodes, "nodes-created");
             if (!splitDeclaredCutComputeNodes(out, graph, opData))
             {
                 error = "activity-schedule declared-value compute-node boundary invariant failed";
                 return false;
             }
 
+            stage_trace::nodes(out.computeNodes, "nodes-declared-split");
             constexpr std::size_t kMaxComputeNodeCycleSplitIters = 1024;
             std::size_t cycleSplitIters = 0;
             while (true)
@@ -7958,10 +7989,12 @@ namespace wolvrix::lib::transform
                 catch (const std::exception &ex)
                 {
                     const auto cycle = findCyclePath(out.computeDag);
+                    stage_trace::order(cycle, "cycle-" + std::to_string(cycleSplitIters));
                     if (cycleSplitIters < kMaxComputeNodeCycleSplitIters &&
                         splitCycleComputeNodesToSingletons(out, graph, opData, cycle))
                     {
                         ++cycleSplitIters;
+                        stage_trace::nodes(out.computeNodes, "nodes-cycle-split-" + std::to_string(cycleSplitIters));
                         if (!splitDeclaredCutComputeNodes(out, graph, opData))
                         {
                             error =
@@ -8024,6 +8057,8 @@ namespace wolvrix::lib::transform
                     return false;
                 }
             }
+            stage_trace::nodes(out.computeNodes, "nodes-final");
+            stage_trace::order(out.computeTopoOrder, "nodes-final-topo");
             out.stats.computeNodes = out.computeNodes.size();
             out.stats.computeNodeCycleSplitIters = cycleSplitIters;
             out.stats.computeNodeOpsTotal = 0;
@@ -9915,6 +9950,7 @@ namespace wolvrix::lib::transform
                 perf->topoBeforeCoarsenMs = elapsedMs(topoBeforeStart);
             }
 
+            stage_trace::groups(clusters, "clusters-before-coarsen");
             const auto coarsenStart = std::chrono::steady_clock::now();
             if (options.enableCoarsen)
             {
@@ -9942,6 +9978,7 @@ namespace wolvrix::lib::transform
                                                        coarsenMaxOps,
                                                        rewrite,
                                                        graph);
+                        stage_trace::groups(clusters, "clusters-" + std::to_string(perf->coarsenIterations) + "-out1");
                         if (out1Changed && perf)
                         {
                             perf->coarsenOut1Merges += clustersBeforeOut1 >= clusters.size()
@@ -9959,6 +9996,7 @@ namespace wolvrix::lib::transform
                                                      coarsenMaxOps,
                                                      rewrite,
                                                      graph);
+                        stage_trace::groups(clusters, "clusters-" + std::to_string(perf->coarsenIterations) + "-in1");
                         if (in1Changed && perf)
                         {
                             perf->coarsenIn1Merges += clustersBeforeIn1 >= clusters.size()
@@ -9976,6 +10014,7 @@ namespace wolvrix::lib::transform
                                                            coarsenMaxOps,
                                                            rewrite,
                                                            graph);
+                    stage_trace::groups(clusters, "clusters-" + std::to_string(perf->coarsenIterations) + "-siblings");
                     if (siblingsChanged && perf)
                     {
                         perf->coarsenSiblingMerges += clustersBeforeSiblings >= clusters.size()
@@ -10060,6 +10099,7 @@ namespace wolvrix::lib::transform
                 perf->topoAfterCoarsenMs = elapsedMs(topoAfterStart);
             }
 
+            stage_trace::groups(clusters, "clusters-after-coarsen-topo");
             const auto buildClusterViewStart = std::chrono::steady_clock::now();
             NodeClusterView clusterView =
                 buildNodeClusterView(clusters, rewrite.computeDag, rewrite.computeNodes.size());
@@ -15296,6 +15336,7 @@ namespace wolvrix::lib::transform
                 " topo_edges=" + std::to_string(opData.topoEdges.size()) +
                 " elapsed_ms=" + std::to_string(buildOpDataMs));
 
+        stage_trace::graph(*graph, opData, ValueCanonicalMap{}, "before-clone");
         std::vector<ActivityOpClass> opClasses = buildOpClasses(*graph, opData.maxOpIndex);
         ComputeNodeRewriteStats precloneStats;
         ValueCanonicalMap canonicalValues;
@@ -15336,6 +15377,7 @@ namespace wolvrix::lib::transform
                     " topo_edges=" + std::to_string(opData.topoEdges.size()) +
                     " elapsed_ms=" + std::to_string(elapsedMs(refreezeStart)));
         }
+        stage_trace::graph(*graph, opData, canonicalValues, "after-clone");
         ComputeRewriteBuild rewrite;
         const auto computeNodeStart = std::chrono::steady_clock::now();
         logInfo("activity-schedule progress: compute_node_build start mode=default");
@@ -16636,6 +16678,10 @@ namespace wolvrix::lib::transform
             return result;
         }
 
+        stage_trace::groups(build.supernodeToOps, "final-supernodes");
+        stage_trace::groups(build.computeNodesBySupernode, "final-compute-members");
+        stage_trace::groups(build.valueFanout, "final-value-fanout");
+        stage_trace::order(build.topoOrder, "final-supernode-topo");
         const std::string keyPrefix = options_.path + ".activity_schedule.";
         const auto exportStart = std::chrono::steady_clock::now();
         logInfo("activity-schedule progress: export_session start");

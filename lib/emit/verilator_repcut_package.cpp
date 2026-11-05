@@ -58,13 +58,17 @@ namespace wolvrix::lib::emit
         std::string opSymbolRequired(const wolvrix::lib::grh::Graph &graph,
                                      wolvrix::lib::grh::OperationId opId)
         {
-            return graphSymbolRequired(graph, graph.operationSymbol(opId), "Operation");
+            const auto text = graph.operationDisplayName(opId);
+            if (text.empty()) throw std::runtime_error("Operation missing symbol");
+            return text;
         }
 
         std::string valueSymbolRequired(const wolvrix::lib::grh::Graph &graph,
                                         wolvrix::lib::grh::ValueId valueId)
         {
-            return graphSymbolRequired(graph, graph.valueSymbol(valueId), "Value");
+            const auto text = graph.valueDisplayName(valueId);
+            if (text.empty()) throw std::runtime_error("Value missing symbol");
+            return text;
         }
 
         std::vector<const wolvrix::lib::grh::Graph *> graphsInDesignOrder(

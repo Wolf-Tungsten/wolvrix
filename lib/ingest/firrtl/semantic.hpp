@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 namespace wolvrix::lib::ingest::firrtl::detail {
@@ -191,6 +192,16 @@ struct Instance {
     Range range;
 };
 
+struct SemanticNameHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view value) const noexcept { return std::hash<std::string_view>{}(value); }
+    std::size_t operator()(const std::string& value) const noexcept { return (*this)(std::string_view(value)); }
+};
+struct SemanticNameEqual {
+    using is_transparent = void;
+    bool operator()(std::string_view left, std::string_view right) const noexcept { return left == right; }
+};
+
 class Semantics {
 public:
     Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options,
@@ -214,13 +225,14 @@ public:
 
     const Source& source;
     const ModuleBody& body;
-    std::map<std::string, Declaration, std::less<>> declarations;
+    std::unordered_map<std::string, Declaration, SemanticNameHash, SemanticNameEqual> declarations;
     std::vector<std::string> declarationOrder;
     std::vector<Connection> connections;
     std::vector<TypePtr> expressions;
     Guards guards;
     std::map<std::string, Memory> memories;
-    std::map<std::string, std::pair<std::string, std::size_t>, std::less<>> memoryPorts;
+    std::unordered_map<std::string, std::pair<std::string, std::size_t>,
+                       SemanticNameHash, SemanticNameEqual> memoryPorts;
     std::vector<Effect> effects;
     std::vector<Instance> instances;
     std::unordered_set<StmtId> activeStatements;

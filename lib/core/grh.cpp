@@ -2,6 +2,7 @@
 #include "core/detail/attribute_keys.hpp"
 #include "core/detail/block_executor.hpp"
 #include "core/op_descriptor.hpp"
+#include "slang/util/SmallVector.h"
 
 #include <algorithm>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -641,6 +643,7 @@ namespace wolvrix::lib::grh
         if (!sourceValues.empty()) clone.reserveValueCapacity(sourceValues.size());
         if (!sourceOperations.empty()) clone.reserveOperationCapacity(sourceOperations.size());
         for (const AttrKV& entry : source.metadata()) clone.setMetadata(entry.key, entry.value);
+        if (source.semanticTree_) clone.semanticTree_ = std::make_shared<SemanticTree>(*source.semanticTree_);
 
         std::vector<SymbolId> symbolMap(source.symbols_.textById_.size());
         const auto mapSymbol = [&](SymbolId symbol) {
@@ -677,14 +680,20 @@ namespace wolvrix::lib::grh
         };
         for (ValueId sourceId : sourceValues) {
             const auto value = source.store_->values_[sourceId.index - 1];
-            const ValueId destination = clone.createValue(mapSymbol(value.symbol), value.width, value.isSigned,
-                                                          value.type, value.shape, value.domain);
+            const auto mappedSymbol = mapSymbol(value.symbol);
+            const ValueId destination = mappedSymbol.valid() ?
+                clone.createValue(mappedSymbol, value.width, value.isSigned, value.type, value.shape, value.domain) :
+                clone.createTemporaryValue(value.width, value.isSigned, value.type, value.shape, value.domain);
             clone.store_->values_[destination.index - 1].srcLoc = copySrcLoc(value.srcLoc);
+            clone.setValueSemanticIds(destination, source.valueSemanticIds(sourceId));
             valueMap[sourceId.index] = destination;
         }
         for (OperationId sourceId : sourceOperations) {
             const auto operation = source.store_->operations_[sourceId.index - 1];
-            const OperationId destination = clone.createOperation(operation.kind, mapSymbol(operation.symbol));
+            const auto mappedSymbol = mapSymbol(operation.symbol);
+            const OperationId destination = mappedSymbol.valid() ?
+                clone.createOperation(operation.kind, mappedSymbol) :
+                clone.createTemporaryOperation(operation.kind);
             clone.reserveOpOperandCapacity(destination, operation.operands.size());
             clone.reserveOpResultCapacity(destination, operation.results.size());
             clone.reserveOpAttrCapacity(destination, operation.attrs.size());
@@ -695,6 +704,7 @@ namespace wolvrix::lib::grh
             for (ValueId result : operation.results)
                 clone.addResult(destination, mapValue(result, "Missing result during graph clone"));
             clone.store_->operations_[destination.index - 1].srcLoc = copySrcLoc(operation.srcLoc);
+            clone.setOpSemanticIds(destination, source.opSemanticIds(sourceId));
         }
         for (const Port& port : source.inputPorts())
             clone.bindInputPort(port.name, mapValue(port.value, "Missing input port value during graph clone"));
@@ -1095,6 +1105,17 @@ namespace wolvrix::lib::grh
             if (!mapped) mapped = next.importSrcLoc(*this, id);
             return mapped;
         };
+        const auto copySemantics = [&](Range range) {
+            if (!range.count) return Range{};
+            const auto& sourceIds = topology_->semantics;
+            if (range.offset > sourceIds.size() || range.count > sourceIds.size() - range.offset)
+                throw std::out_of_range("semantic list is out of range during compact");
+            auto& targetIds = next.topology_->semantics;
+            const Range result{static_cast<uint32_t>(targetIds.size()), range.count};
+            targetIds.insert(targetIds.end(), sourceIds.begin() + range.offset,
+                             sourceIds.begin() + range.offset + range.count);
+            return result;
+        };
         next.reserveValues(valueCount);
         next.reserveOperations(opCount);
         next.reserveSymbols(valueCount + opCount);
@@ -1113,10 +1134,12 @@ namespace wolvrix::lib::grh
             value.isInout = source.isInout;
             value.definingOp = remapOp(source.definingOp);
             value.srcLoc = remapSrcLoc(source.srcLoc);
+            value.semantics = copySemantics(source.semantics);
             next.valueUsers_.emplace_back(next.topology_->users);
             next.valueUsers_.back().reserve(valueUsers_[i].size());
             next.liveValues_.push_back(ValueId{valueRemap[i + 1], 0, graphId_});
-            next.bindSymbol(value.symbol, SymbolKind::kValue, valueRemap[i + 1], "Value");
+            if (value.symbol.valid())
+                next.bindSymbol(value.symbol, SymbolKind::kValue, valueRemap[i + 1], "Value");
         }
         for (std::size_t i = 0; i < operations_.size(); ++i) {
             const auto source = operations_[i];
@@ -1125,6 +1148,7 @@ namespace wolvrix::lib::grh
             operation.kind = source.kind;
             operation.symbol = source.symbol;
             operation.srcLoc = remapSrcLoc(source.srcLoc);
+            operation.semantics = copySemantics(source.semantics);
             operation.operands.reserve(source.operands.size());
             operation.operandUseIndices.reserve(source.operands.size());
             operation.results.reserve(source.results.size());
@@ -1135,7 +1159,8 @@ namespace wolvrix::lib::grh
                 operation.attrs.push_back(next.internAttribute(string(attribute(attr).key), AttrValueView(this, attr)));
             const OperationId id{opRemap[i + 1], 0, graphId_};
             next.liveOperations_.push_back(id);
-            next.bindSymbol(operation.symbol, SymbolKind::kOperation, id.index, "Operation");
+            if (operation.symbol.valid())
+                next.bindSymbol(operation.symbol, SymbolKind::kOperation, id.index, "Operation");
             next.addOpUses(id, operation.operands);
         }
         next.inputPorts_.reserve(inputPorts_.size());
@@ -1154,6 +1179,7 @@ namespace wolvrix::lib::grh
         next.topology_->operandUseIndices.shrink_to_fit();
         next.topology_->users.shrink_to_fit();
         next.topology_->attrs.shrink_to_fit();
+        next.topology_->semantics.shrink_to_fit();
         next.topology_->shapes.dims.shrink_to_fit();
         next.topology_->shapes.ranges.shrink_to_fit();
         next.topology_->shapes.hashNext.shrink_to_fit();
@@ -1200,7 +1226,8 @@ namespace wolvrix::lib::grh
     }
 
     ValueId GraphStore::addValue(SymbolId sym, int32_t width, bool isSigned, ValueType type,
-                                   std::span<const int64_t> shape, LogicDomain domain)
+                                   std::span<const int64_t> shape, LogicDomain domain,
+                                   bool allowInvalidSymbol)
     {
         // Normalize scalar fields without copying the borrowed shape twice.
         const LogicalType logical = LogicalType{type, width, isSigned, domain, {}}.normalized();
@@ -1208,13 +1235,13 @@ namespace wolvrix::lib::grh
         width = logical.width;
         isSigned = logical.isSigned;
         domain = logical.domain;
-        validateSymbol(sym, "Value");
+        if (sym.valid() || !allowInvalidSymbol) validateSymbol(sym, "Value");
 
         ValueId id;
         id.index = static_cast<uint32_t>(values_.size() + 1);
         id.generation = 0;
         id.graph = graphId_;
-        bindSymbol(sym, SymbolKind::kValue, id.index, "Value");
+        if (sym.valid()) bindSymbol(sym, SymbolKind::kValue, id.index, "Value");
         auto data = values_.emplace_back();
         data.symbol = sym;
         data.width = width;
@@ -1228,15 +1255,15 @@ namespace wolvrix::lib::grh
         return id;
     }
 
-    OperationId GraphStore::addOp(OperationKind kind, SymbolId sym)
+    OperationId GraphStore::addOp(OperationKind kind, SymbolId sym, bool allowInvalidSymbol)
     {
-        validateSymbol(sym, "Operation");
+        if (sym.valid() || !allowInvalidSymbol) validateSymbol(sym, "Operation");
 
         OperationId id;
         id.index = static_cast<uint32_t>(operations_.size() + 1);
         id.generation = 0;
         id.graph = graphId_;
-        bindSymbol(sym, SymbolKind::kOperation, id.index, "Operation");
+        if (sym.valid()) bindSymbol(sym, SymbolKind::kOperation, id.index, "Operation");
         auto data = operations_.emplace_back();
         data.kind = kind;
         data.symbol = sym;
@@ -3291,6 +3318,191 @@ namespace wolvrix::lib::grh
         if (!graphId_.valid()) throw std::invalid_argument("GraphId must be valid");
     }
 
+    SemanticTree& Graph::getOrCreateSemanticTree(std::string sourceUnit, std::string circuit,
+                                                 std::string module)
+    {
+        if (semanticTree_) {
+            if (semanticTree_->sourceUnit() != sourceUnit || semanticTree_->circuit() != circuit ||
+                semanticTree_->node(semanticTree_->root()).name != module)
+                throw std::invalid_argument("Graph SemanticTree identity mismatch");
+            return *semanticTree_;
+        }
+        auto tree = std::make_shared<SemanticTree>(std::move(sourceUnit), std::move(circuit),
+                                                   std::move(module));
+        mutableStore();
+        semanticTree_ = std::move(tree);
+        return *semanticTree_;
+    }
+
+    SemanticId Graph::appendSemanticInstance(const Graph& source, SemanticId parent,
+                                             std::string_view instanceName)
+    {
+        if (!source.semanticTree_ || this == &source) return 0;
+        if (!semanticTree_) throw std::invalid_argument("target Graph has no SemanticTree");
+        mutableStore();
+        return semanticScope(semanticTree_->appendInstance(*source.semanticTree_, parent, instanceName));
+    }
+
+    std::span<const SemanticId> Graph::valueSemanticIds(ValueId value) const
+    {
+        const std::size_t row = store_->valueIndex(value);
+        const Range range = store_->values_.semantics_[row];
+        const auto& ids = store_->topology_->semantics;
+        if (range.offset > ids.size() || range.count > ids.size() - range.offset)
+            throw std::out_of_range("value semantic list is out of range");
+        return std::span<const SemanticId>(ids.data() + range.offset, range.count);
+    }
+
+    void Graph::setValueSemanticIds(ValueId value, std::span<const SemanticId> ids)
+    {
+        GraphStore& builder = mutableStore();
+        const std::size_t row = builder.valueIndex(value);
+        if (!ids.empty() && !semanticTree_) throw std::invalid_argument("value has no SemanticTree");
+        for (const SemanticId id : ids)
+            if (!semanticTree_->contains(id)) throw std::invalid_argument("invalid value SemanticId");
+        if (ids.size() > std::numeric_limits<uint32_t>::max() ||
+            builder.topology_->semantics.size() > std::numeric_limits<uint32_t>::max() - ids.size())
+            throw std::length_error("value semantic list capacity");
+        const Range range{static_cast<uint32_t>(builder.topology_->semantics.size()),
+                          static_cast<uint32_t>(ids.size())};
+        builder.topology_->semantics.insert(builder.topology_->semantics.end(), ids.begin(), ids.end());
+        builder.values_.semantics_[row] = range;
+    }
+
+    void Graph::addValueSemanticIds(ValueId value, std::span<const SemanticId> ids)
+    {
+        if (ids.empty()) return;
+        slang::SmallVector<SemanticId, 4> merged;
+        const auto existing = valueSemanticIds(value);
+        merged.append(existing.begin(), existing.end());
+        for (const SemanticId id : ids)
+            if (std::find(merged.begin(), merged.end(), id) == merged.end()) merged.push_back(id);
+        if (merged.size() != existing.size()) setValueSemanticIds(value,
+            std::span<const SemanticId>(merged.data(), merged.size()));
+    }
+
+    void Graph::mergeValueSemanticIds(ValueId target, ValueId source)
+    {
+        if (target == source) return;
+        addValueSemanticIds(target, valueSemanticIds(source));
+    }
+
+    std::span<const SemanticId> Graph::opSemanticIds(OperationId op) const
+    {
+        const std::size_t row = store_->opIndex(op);
+        const Range range = store_->operations_.semantics_[row];
+        const auto& ids = store_->topology_->semantics;
+        if (range.offset > ids.size() || range.count > ids.size() - range.offset)
+            throw std::out_of_range("operation semantic list is out of range");
+        return std::span<const SemanticId>(ids.data() + range.offset, range.count);
+    }
+
+    void Graph::setOpSemanticIds(OperationId op, std::span<const SemanticId> ids)
+    {
+        GraphStore& builder = mutableStore();
+        const std::size_t row = builder.opIndex(op);
+        if (!ids.empty() && !semanticTree_) throw std::invalid_argument("operation has no SemanticTree");
+        for (const SemanticId id : ids)
+            if (!semanticTree_->contains(id)) throw std::invalid_argument("invalid operation SemanticId");
+        if (ids.size() > std::numeric_limits<uint32_t>::max() ||
+            builder.topology_->semantics.size() > std::numeric_limits<uint32_t>::max() - ids.size())
+            throw std::length_error("operation semantic list capacity");
+        const Range range{static_cast<uint32_t>(builder.topology_->semantics.size()),
+                          static_cast<uint32_t>(ids.size())};
+        builder.topology_->semantics.insert(builder.topology_->semantics.end(), ids.begin(), ids.end());
+        builder.operations_.semantics_[row] = range;
+    }
+
+    void Graph::addOpSemanticIds(OperationId op, std::span<const SemanticId> ids)
+    {
+        if (ids.empty()) return;
+        slang::SmallVector<SemanticId, 4> merged;
+        const auto existing = opSemanticIds(op);
+        merged.append(existing.begin(), existing.end());
+        for (const SemanticId id : ids)
+            if (std::find(merged.begin(), merged.end(), id) == merged.end()) merged.push_back(id);
+        if (merged.size() != existing.size()) setOpSemanticIds(op,
+            std::span<const SemanticId>(merged.data(), merged.size()));
+    }
+
+    void Graph::mergeOpSemanticIds(OperationId target, OperationId source)
+    {
+        if (target == source) return;
+        addOpSemanticIds(target, opSemanticIds(source));
+    }
+
+    std::size_t Graph::remapValueBlockSemantics(const Graph& source,
+                                                std::span<const ValueId> sourceValues,
+                                                std::span<const ValueId> targetValues,
+                                                SemanticId scope)
+    {
+        if (sourceValues.size() != targetValues.size())
+            throw std::invalid_argument("semantic value block column lengths differ");
+        std::size_t total = 0, annotated = 0;
+        for (const ValueId value : sourceValues) {
+            const auto ids = source.valueSemanticIds(value);
+            annotated += !ids.empty();
+            total += ids.size();
+            for (const SemanticId id : ids)
+                if (!id || semanticInstance(id))
+                    throw std::invalid_argument("value SemanticId is not definition-local");
+        }
+        if (!total) return 0;
+        GraphStore& builder = mutableStore();
+        auto& payload = builder.topology_->semantics;
+        if (total > std::numeric_limits<uint32_t>::max() - payload.size())
+            throw std::length_error("value semantic block capacity");
+        payload.reserve(payload.size() + total);
+        for (std::size_t i = 0; i < sourceValues.size(); ++i) {
+            const auto ids = source.valueSemanticIds(sourceValues[i]);
+            const std::size_t offset = payload.size();
+            for (const SemanticId id : ids) {
+                const SemanticId mapped = qualifiedSemantic(scope, id);
+                if (std::find(payload.begin() + offset, payload.end(), mapped) == payload.end())
+                    payload.push_back(mapped);
+            }
+            builder.values_.semantics_[builder.valueIndex(targetValues[i])] =
+                Range{static_cast<uint32_t>(offset), static_cast<uint32_t>(payload.size() - offset)};
+        }
+        return annotated;
+    }
+
+    std::size_t Graph::remapOperationBlockSemantics(const Graph& source,
+                                                    std::span<const OperationId> sourceOps,
+                                                    std::span<const OperationId> targetOps,
+                                                    SemanticId scope)
+    {
+        if (sourceOps.size() != targetOps.size())
+            throw std::invalid_argument("semantic operation block column lengths differ");
+        std::size_t total = 0, annotated = 0;
+        for (const OperationId op : sourceOps) {
+            const auto ids = source.opSemanticIds(op);
+            annotated += !ids.empty();
+            total += ids.size();
+            for (const SemanticId id : ids)
+                if (!id || semanticInstance(id))
+                    throw std::invalid_argument("operation SemanticId is not definition-local");
+        }
+        if (!total) return 0;
+        GraphStore& builder = mutableStore();
+        auto& payload = builder.topology_->semantics;
+        if (total > std::numeric_limits<uint32_t>::max() - payload.size())
+            throw std::length_error("operation semantic block capacity");
+        payload.reserve(payload.size() + total);
+        for (std::size_t i = 0; i < sourceOps.size(); ++i) {
+            const auto ids = source.opSemanticIds(sourceOps[i]);
+            const std::size_t offset = payload.size();
+            for (const SemanticId id : ids) {
+                const SemanticId mapped = qualifiedSemantic(scope, id);
+                if (std::find(payload.begin() + offset, payload.end(), mapped) == payload.end())
+                    payload.push_back(mapped);
+            }
+            builder.operations_.semantics_[builder.opIndex(targetOps[i])] =
+                Range{static_cast<uint32_t>(offset), static_cast<uint32_t>(payload.size() - offset)};
+        }
+        return annotated;
+    }
+
 
     std::optional<AttributeValue> Graph::metadata(std::string_view key) const
     {
@@ -3633,6 +3845,103 @@ namespace wolvrix::lib::grh
         return createOperation(kind, makeInternalOpSym());
     }
 
+    ValueId Graph::createTemporaryValue(SymbolId symbol, int32_t width, bool isSigned,
+                                        ValueType type, std::span<const int64_t> shape,
+                                        LogicDomain domain)
+    {
+        // The symbol overload is useful to block import callers that already
+        // have a semantic symbol.  Ordinary temporary construction passes an
+        // invalid symbol and therefore performs no string-table work.
+        GraphStore &builder = mutableStore();
+        return builder.addValue(symbol, width, isSigned, type, shape, domain, true);
+    }
+
+    ValueId Graph::createTemporaryValue(int32_t width, bool isSigned, ValueType type,
+                                        std::span<const int64_t> shape, LogicDomain domain)
+    {
+        return createTemporaryValue(SymbolId::invalid(), width, isSigned, type, shape, domain);
+    }
+
+    ValueId Graph::createTemporaryValue(SymbolId symbol, const LogicalType& type)
+    {
+        return createTemporaryValue(symbol, type.width, type.isSigned, type.kind, type.shape, type.domain);
+    }
+
+    ValueId Graph::createTemporaryValue(const LogicalType& type)
+    {
+        return createTemporaryValue(SymbolId::invalid(), type);
+    }
+
+    OperationId Graph::createTemporaryOperation(OperationKind kind)
+    {
+        GraphStore &builder = mutableStore();
+        return builder.addOp(kind, SymbolId::invalid(), true);
+    }
+
+    namespace {
+
+        std::string generatedDisplayName(const Graph& graph, std::string_view prefix, uint32_t index)
+        {
+            std::string base;
+            base.reserve(prefix.size() + 24);
+            base.append(prefix);
+            base.push_back('_');
+            base.append(std::to_string(index));
+            std::string candidate = base;
+            uint32_t suffix = 0;
+            while (graph.lookupSymbol(candidate).valid()) {
+                candidate = base;
+                candidate.push_back('_');
+                candidate.append(std::to_string(++suffix));
+            }
+            return candidate;
+        }
+
+    }
+
+    std::string Graph::valueDisplayName(ValueId value) const
+    {
+        const auto symbol = valueSymbol(value);
+        if (symbol.valid()) return std::string(symbolText(symbol));
+        if (value.graph != graphId_ || !value.valid()) return {};
+        return generatedDisplayName(*this, "tmp_val", value.index);
+    }
+
+    std::string Graph::operationDisplayName(OperationId op) const
+    {
+        const auto symbol = operationSymbol(op);
+        if (symbol.valid()) return std::string(symbolText(symbol));
+        if (op.graph != graphId_ || !op.valid()) return {};
+        return generatedDisplayName(*this, "tmp_op", op.index);
+    }
+
+    void Graph::materializeInternalSymbols()
+    {
+        // Materialization is deliberately a boundary operation.  Allocate all
+        // names before mutating rows so a collision cannot leave a half named
+        // graph behind after a caller catches an exception.
+        std::vector<std::pair<ValueId, SymbolId>> values;
+        std::vector<std::pair<OperationId, SymbolId>> operations;
+        values.reserve(store_->values_.size());
+        operations.reserve(store_->operations_.size());
+        for (const auto value : this->values()) {
+            if (valueSymbol(value).valid()) continue;
+            const auto name = valueDisplayName(value);
+            const auto symbol = internSymbol(name);
+            if (!symbol.valid()) throw std::runtime_error("Failed to materialize temporary value symbol");
+            values.emplace_back(value, symbol);
+        }
+        for (const auto op : this->operations()) {
+            if (operationSymbol(op).valid()) continue;
+            const auto name = operationDisplayName(op);
+            const auto symbol = internSymbol(name);
+            if (!symbol.valid()) throw std::runtime_error("Failed to materialize temporary operation symbol");
+            operations.emplace_back(op, symbol);
+        }
+        for (const auto [value, symbol] : values) setValueSymbol(value, symbol);
+        for (const auto [op, symbol] : operations) setOpSymbol(op, symbol);
+    }
+
     void Graph::appendValueBlock(const Graph& source, std::span<const ValueId> sourceValues,
                                   std::span<const SymbolId> symbols, std::span<ValueId> output,
                                   SrcLocImportContext& context, std::size_t threads,
@@ -3647,14 +3956,17 @@ namespace wolvrix::lib::grh
         const std::size_t base = target.values_.size();
         if (count > std::numeric_limits<uint32_t>::max() - base)
             throw std::length_error("value block ID capacity");
+        const std::size_t symbolCount = static_cast<std::size_t>(
+            std::count_if(symbols.begin(), symbols.end(), [](SymbolId symbol) { return symbol.valid(); }));
         slang::flat_hash_set<uint32_t, std::hash<uint32_t>> bindings;
-        bindings.reserve(count);
+        bindings.reserve(symbolCount);
         std::vector<std::size_t> rows(count);
         for (std::size_t i = 0; i < count; ++i) {
             rows[i] = input.valueIndex(sourceValues[i]);
             if (!input.values_[rows[i]].alive) throw std::runtime_error("ValueId refers to erased value");
-            target.validateSymbol(symbols[i], "Value");
-            if (target.symbolIndex_.contains(symbols[i].value) || !bindings.insert(symbols[i].value).second)
+            if (symbols[i].valid()) target.validateSymbol(symbols[i], "Value");
+            if (symbols[i].valid() &&
+                (target.symbolIndex_.contains(symbols[i].value) || !bindings.insert(symbols[i].value).second))
                 throw std::invalid_argument("value block symbol already bound");
         }
         if (!count) return;
@@ -3670,7 +3982,7 @@ namespace wolvrix::lib::grh
             shapes[i] = shapeMap[shape];
         }
         target.reserveValues(base + count);
-        target.symbolIndex_.reserve(target.symbolIndex_.size() + count);
+        target.symbolIndex_.reserve(target.symbolIndex_.size() + symbolCount);
         auto& values = target.values_;
         const std::size_t size = base + count;
         values.symbol_.resize(size);
@@ -3692,13 +4004,15 @@ namespace wolvrix::lib::grh
         values.isInout_.resize(size, 0);
         values.definingOp_.resize(size);
         values.srcLoc_.resize(size);
+        values.semantics_.resize(size);
         values.alive_.resize(size, 1);
         target.valueUsers_.resize(size);
         target.liveValues_.resize(target.liveValues_.size() + count);
         const std::size_t liveBase = target.liveValues_.size() - count;
         for (std::size_t i = 0; i < count; ++i)
-            target.bindSymbol(symbols[i], GraphStore::SymbolKind::kValue,
-                              static_cast<uint32_t>(base + i + 1), "Value");
+            if (symbols[i].valid())
+                target.bindSymbol(symbols[i], GraphStore::SymbolKind::kValue,
+                                  static_cast<uint32_t>(base + i + 1), "Value");
         fillBlockRows(count, threads, [&](std::size_t begin, std::size_t end) {
             for (std::size_t i = begin; i < end; ++i) {
                 const std::size_t from = rows[i], to = base + i;
@@ -3743,14 +4057,17 @@ namespace wolvrix::lib::grh
         const std::size_t base = target.operations_.size();
         if (count > std::numeric_limits<uint32_t>::max() - base)
             throw std::length_error("operation block ID capacity");
+        const std::size_t symbolCount = static_cast<std::size_t>(
+            std::count_if(symbols.begin(), symbols.end(), [](SymbolId symbol) { return symbol.valid(); }));
         slang::flat_hash_set<uint32_t, std::hash<uint32_t>> bindings;
-        bindings.reserve(count);
+        bindings.reserve(symbolCount);
         std::vector<std::size_t> rows(count);
         for (std::size_t i = 0; i < count; ++i) {
             rows[i] = input.opIndex(sourceOps[i]);
             if (!input.operations_[rows[i]].alive) throw std::runtime_error("OperationId refers to erased operation");
-            target.validateSymbol(symbols[i], "Operation");
-            if (target.symbolIndex_.contains(symbols[i].value) || !bindings.insert(symbols[i].value).second)
+            if (symbols[i].valid()) target.validateSymbol(symbols[i], "Operation");
+            if (symbols[i].valid() &&
+                (target.symbolIndex_.contains(symbols[i].value) || !bindings.insert(symbols[i].value).second))
                 throw std::invalid_argument("operation block symbol already bound");
         }
         if (!count) return;
@@ -3759,7 +4076,7 @@ namespace wolvrix::lib::grh
         for (std::size_t i = 0; i < count; ++i)
             locations[i] = importSrcLoc(source, input.operations_.srcLoc_[rows[i]], context);
         target.reserveOperations(base + count);
-        target.symbolIndex_.reserve(target.symbolIndex_.size() + count);
+        target.symbolIndex_.reserve(target.symbolIndex_.size() + symbolCount);
         auto& operations = target.operations_;
         const std::size_t size = base + count;
         if (retainSourceColumns)
@@ -3771,12 +4088,14 @@ namespace wolvrix::lib::grh
         operations.results_.resize(size);
         operations.attrs_.resize(size);
         operations.srcLoc_.resize(size);
+        operations.semantics_.resize(size);
         operations.alive_.resize(size, 1);
         target.liveOperations_.resize(target.liveOperations_.size() + count);
         const std::size_t liveBase = target.liveOperations_.size() - count;
         for (std::size_t i = 0; i < count; ++i)
-            target.bindSymbol(symbols[i], GraphStore::SymbolKind::kOperation,
-                              static_cast<uint32_t>(base + i + 1), "Operation");
+            if (symbols[i].valid())
+                target.bindSymbol(symbols[i], GraphStore::SymbolKind::kOperation,
+                                  static_cast<uint32_t>(base + i + 1), "Operation");
         fillBlockRows(count, threads, [&](std::size_t begin, std::size_t end) {
             for (std::size_t i = begin; i < end; ++i) {
                 const std::size_t to = base + i;
@@ -4051,10 +4370,13 @@ namespace wolvrix::lib::grh
         context.prepared_ = false;
         auto& target = mutableStore();
         const auto& input = *source.store_;
-        context.strings_ = std::make_shared<const std::vector<GraphPayload::StringId>>(
-            target.stringPool_->retain(*input.stringPool_));
+        context.strings_ = std::make_shared<std::vector<GraphPayload::StringId>>(
+            input.GraphPayload::stats().strings + 1, 0);
         const auto remapString = [&](GraphPayload::StringId id) {
-            return id & uint32_t{0x80000000} ? id : context.strings_->at(id);
+            if (!id || (id & uint32_t{0x80000000})) return id;
+            auto& mapped = (*context.strings_)[id];
+            if (!mapped) mapped = target.stringPool_->intern(input.string(id));
+            return mapped;
         };
         const auto capacity = [](std::size_t base, std::size_t count) {
             if (base > std::numeric_limits<uint32_t>::max() ||
@@ -4099,13 +4421,26 @@ namespace wolvrix::lib::grh
         context.sourceMutation_ = source.mutationEpoch_;
         context.prepared_ = true;
 
-        // Prime provenance's integer text relocation. The first location then
-        // only deduplicates its integer record, never its four long strings.
+        locations.records_.resize(input.srcLocs_.size());
+        for (GraphPayload::RecordId id = 1; id < input.srcLocs_.size(); ++id) {
+            auto record = input.srcLoc(id);
+            record.file = remapString(record.file);
+            record.origin = remapString(record.origin);
+            record.pass = remapString(record.pass);
+            record.note = remapString(record.note);
+            if (const auto found = target.srcLocIds_.find(record); found != target.srcLocIds_.end()) {
+                locations.records_[id] = found->second;
+                continue;
+            }
+            const auto mapped = static_cast<GraphPayload::RecordId>(target.srcLocs_.size());
+            target.srcLocs_.push_back(record);
+            target.srcLocIds_.emplace(record, mapped);
+            locations.records_[id] = mapped;
+        }
         locations.source_ = source.store_;
         locations.target_ = store_;
         locations.sourceEpoch_ = source.srcLocEpoch_;
         locations.targetEpoch_ = srcLocEpoch_;
-        locations.records_.clear();
         locations.strings_.clear();
         locations.blockStrings_ = context.strings_;
     }
@@ -4337,7 +4672,7 @@ namespace wolvrix::lib::grh
             const Value value = getValue(element);
             if (value.logicalType() != first.logicalType()) {
                 const auto describe = [&](const Value& item) {
-                    std::string text = std::string(item.symbolText()) + ":" + std::string(toString(item.type())) +
+                    std::string text = valueDisplayName(item.id()) + ":" + std::string(toString(item.type())) +
                         "/" + std::to_string(item.width()) + "/" + (item.isSigned() ? "signed/" : "unsigned/") + std::string(toString(item.domain()));
                     for (const auto extent : item.shape()) text += "[" + std::to_string(extent) + "]";
                     return text;
@@ -4652,8 +4987,12 @@ namespace wolvrix::lib::grh
         // 不在这里做 shape 校验：replaceResult 只改变 op 产出哪个 value，不改变
         // 任何 value 自身的类型（shape 创建即定型，不可变）。op 自身的结果类型
         // 契约由 grh.verify 事后强制。真正的别名通道是 replaceAllUses/eraseOp。
+        const auto results = opResults(op);
+        if (index >= results.size()) throw std::runtime_error("Result index out of range");
+        const ValueId current = results[index];
         GraphStore &builder = mutableStore();
         builder.replaceResult(op, index, value);
+        mergeValueSemanticIds(value, current);
     }
 
     void Graph::replaceAllUses(ValueId from, ValueId to)
@@ -4661,6 +5000,7 @@ namespace wolvrix::lib::grh
         guardShapeAlias(from, to, "replaceAllUses");
         GraphStore &builder = mutableStore();
         builder.replaceAllUses(from, to);
+        mergeValueSemanticIds(to, from);
     }
 
     ValueId Graph::replaceAllUsesWithView(ValueId from, ValueId to)
@@ -4689,6 +5029,7 @@ namespace wolvrix::lib::grh
         const OperationId viewOp = createOperation(OperationKind::kAssign, makeInternalOpSym());
         addOperand(viewOp, to);
         addResult(viewOp, view);
+        setValueSemanticIds(view, valueSemanticIds(from));
         replaceAllUses(from, view);
         return view;
     }
@@ -4747,6 +5088,8 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseOp(op, replacementResults);
         if (result)
         {
+            for (std::size_t i = 0; i < results.size(); ++i)
+                mergeValueSemanticIds(replacementResults[i], results[i]);
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -5059,6 +5402,29 @@ namespace wolvrix::lib::grh
             return name;
         };
 
+        uint32_t maxValueIndex = 0;
+        for (const auto valueId : values()) maxValueIndex = std::max(maxValueIndex, valueId.index);
+        uint32_t maxOperationIndex = 0;
+        for (const auto opId : operations()) maxOperationIndex = std::max(maxOperationIndex, opId.index);
+        std::vector<uint32_t> valueLocalIds(static_cast<std::size_t>(maxValueIndex) + 1, 0);
+        std::vector<uint32_t> operationLocalIds(static_cast<std::size_t>(maxOperationIndex) + 1, 0);
+        uint32_t nextValueId = 1;
+        for (const auto valueId : values())
+            valueLocalIds[valueId.index] = nextValueId++;
+        uint32_t nextOperationId = 1;
+        for (const auto opId : operations())
+            operationLocalIds[opId.index] = nextOperationId++;
+        const auto valueLocalId = [&](ValueId value) -> uint32_t {
+            if (value.index >= valueLocalIds.size() || valueLocalIds[value.index] == 0)
+                throw std::runtime_error("JSON value reference is not a live graph value");
+            return valueLocalIds[value.index];
+        };
+        const auto operationLocalId = [&](OperationId op) -> uint32_t {
+            if (op.index >= operationLocalIds.size() || operationLocalIds[op.index] == 0)
+                throw std::runtime_error("JSON operation reference is not a live graph operation");
+            return operationLocalIds[op.index];
+        };
+
         writer.startObject();
         writer.writeProperty("symbol");
         if (symbol_.empty())
@@ -5068,7 +5434,7 @@ namespace wolvrix::lib::grh
         writer.writeValue(symbol_);
 
         writer.writeProperty("formatVersion");
-        writer.writeValue(int64_t{2});
+        writer.writeValue(int64_t{3});
         writer.writeProperty("dialects");
         writer.startObject();
         for (const auto& [dialect, version] : requiredDialects(*this))
@@ -5125,8 +5491,13 @@ namespace wolvrix::lib::grh
         {
             const Value value = getValue(valueId);
             writer.startObject();
-            writer.writeProperty("sym");
-            writer.writeValue(requireSymbolText(value.symbol(), "Value"));
+            writer.writeProperty("id");
+            writer.writeValue(static_cast<int64_t>(valueLocalId(value.id())));
+            if (value.symbol().valid())
+            {
+                writer.writeProperty("sym");
+                writer.writeValue(requireSymbolText(value.symbol(), "Value"));
+            }
             writer.writeProperty("w");
             writer.writeValue(static_cast<int64_t>(value.width()));
             writer.writeProperty("sgn");
@@ -5155,17 +5526,22 @@ namespace wolvrix::lib::grh
             {
                 Operation defOp = getOperation(value.definingOp());
                 writer.writeProperty("def");
-                writer.writeValue(requireSymbolText(defOp.symbol(), "Operation"));
+                writer.writeValue(static_cast<int64_t>(operationLocalId(defOp.id())));
             }
 
             writer.writeProperty("users");
             writer.startArray();
-            for (const auto &user : value.users())
+            std::vector<ValueUser> orderedUsers(value.users().begin(), value.users().end());
+            std::sort(orderedUsers.begin(), orderedUsers.end(), [&](const ValueUser &left, const ValueUser &right) {
+                if (operationLocalId(left.operation) != operationLocalId(right.operation))
+                    return operationLocalId(left.operation) < operationLocalId(right.operation);
+                return left.operandIndex < right.operandIndex;
+            });
+            for (const auto &user : orderedUsers)
             {
                 writer.startObject();
                 writer.writeProperty("op");
-                Operation userOp = getOperation(user.operation);
-                writer.writeValue(requireSymbolText(userOp.symbol(), "Operation"));
+                writer.writeValue(static_cast<int64_t>(operationLocalId(user.operation)));
                 writer.writeProperty("idx");
                 writer.writeValue(static_cast<int64_t>(user.operandIndex));
                 writer.endObject();
@@ -5187,8 +5563,7 @@ namespace wolvrix::lib::grh
             writer.writeProperty("name");
             writer.writeValue(requirePortName(port.name, "Input port"));
             writer.writeProperty("val");
-            Value value = getValue(port.value);
-            writer.writeValue(requireSymbolText(value.symbol(), "Value"));
+            writer.writeValue(static_cast<int64_t>(valueLocalId(port.value)));
             writer.endObject();
         }
         writer.endArray();
@@ -5201,8 +5576,7 @@ namespace wolvrix::lib::grh
             writer.writeProperty("name");
             writer.writeValue(requirePortName(port.name, "Output port"));
             writer.writeProperty("val");
-            Value value = getValue(port.value);
-            writer.writeValue(requireSymbolText(value.symbol(), "Value"));
+            writer.writeValue(static_cast<int64_t>(valueLocalId(port.value)));
             writer.endObject();
         }
         writer.endArray();
@@ -5215,11 +5589,11 @@ namespace wolvrix::lib::grh
             writer.writeProperty("name");
             writer.writeValue(requirePortName(port.name, "Inout port"));
             writer.writeProperty("in");
-            writer.writeValue(requireSymbolText(getValue(port.in).symbol(), "Value"));
+            writer.writeValue(static_cast<int64_t>(valueLocalId(port.in)));
             writer.writeProperty("out");
-            writer.writeValue(requireSymbolText(getValue(port.out).symbol(), "Value"));
+            writer.writeValue(static_cast<int64_t>(valueLocalId(port.out)));
             writer.writeProperty("oe");
-            writer.writeValue(requireSymbolText(getValue(port.oe).symbol(), "Value"));
+            writer.writeValue(static_cast<int64_t>(valueLocalId(port.oe)));
             writer.endObject();
         }
         writer.endArray();
@@ -5232,8 +5606,13 @@ namespace wolvrix::lib::grh
         {
             const Operation op = getOperation(opId);
             writer.startObject();
-            writer.writeProperty("sym");
-            writer.writeValue(requireSymbolText(op.symbol(), "Operation"));
+            writer.writeProperty("id");
+            writer.writeValue(static_cast<int64_t>(operationLocalId(op.id())));
+            if (op.symbol().valid())
+            {
+                writer.writeProperty("sym");
+                writer.writeValue(requireSymbolText(op.symbol(), "Operation"));
+            }
             writer.writeProperty("kind");
             writer.writeValue(toString(op.kind()));
 
@@ -5241,8 +5620,7 @@ namespace wolvrix::lib::grh
             writer.startArray();
             for (const auto &operand : op.operands())
             {
-                Value value = getValue(operand);
-                writer.writeValue(requireSymbolText(value.symbol(), "Value"));
+                writer.writeValue(static_cast<int64_t>(valueLocalId(operand)));
             }
             writer.endArray();
 
@@ -5250,8 +5628,7 @@ namespace wolvrix::lib::grh
             writer.startArray();
             for (const auto &result : op.results())
             {
-                Value value = getValue(result);
-                writer.writeValue(requireSymbolText(value.symbol(), "Value"));
+                writer.writeValue(static_cast<int64_t>(valueLocalId(result)));
             }
             writer.endArray();
 

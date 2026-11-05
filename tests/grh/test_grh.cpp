@@ -2564,6 +2564,99 @@ int main()
         }
 
         {
+            // Temporary entities carry topology and type information without
+            // reserving a semantic symbol.  Their display names are only a
+            // serialization aid and must not become SymbolTable entries.
+            Design temporaryDesign;
+            Graph &temporaryGraph = temporaryDesign.createGraph("temporary");
+            temporaryDesign.markAsTop("temporary");
+            const auto semanticValue = temporaryGraph.createValue(
+                temporaryGraph.internSymbol("semantic"), 1, false);
+            const auto temporaryValue = temporaryGraph.createTemporaryValue(8, false);
+            const auto temporaryResult = temporaryGraph.createTemporaryValue(8, false);
+            const auto firstTemporaryOp = temporaryGraph.createTemporaryOperation(OperationKind::kAdd);
+            const auto secondTemporaryOp = temporaryGraph.createTemporaryOperation(OperationKind::kAssign);
+            temporaryGraph.addOperand(secondTemporaryOp, temporaryValue);
+            temporaryGraph.addResult(secondTemporaryOp, temporaryResult);
+            temporaryGraph.addOperand(firstTemporaryOp, temporaryValue);
+            temporaryGraph.addOperand(firstTemporaryOp, semanticValue);
+
+            const auto temporaryValueName = temporaryGraph.valueDisplayName(temporaryValue);
+            const auto temporaryOpName = temporaryGraph.operationDisplayName(firstTemporaryOp);
+            if (temporaryValueName.empty() || temporaryOpName.empty() ||
+                temporaryGraph.valueSymbol(temporaryValue).valid() ||
+                temporaryGraph.operationSymbol(firstTemporaryOp).valid() ||
+                temporaryGraph.lookupSymbol(temporaryValueName).valid() ||
+                temporaryGraph.lookupSymbol(temporaryOpName).valid() ||
+                temporaryGraph.findValue(temporaryValueName).valid() ||
+                temporaryGraph.findOperation(temporaryOpName).valid())
+            {
+                return fail("Temporary entity unexpectedly entered the symbol table");
+            }
+            if (!temporaryGraph.valueSymbol(semanticValue).valid() ||
+                temporaryGraph.symbolText(temporaryGraph.valueSymbol(semanticValue)) != "semantic")
+            {
+                return fail("Semantic value lost its symbol beside temporary entities");
+            }
+
+            StoreJson temporaryStore;
+            StoreOptions temporaryOptions;
+            temporaryOptions.jsonMode = JsonPrintMode::PrettyCompact;
+            const auto temporaryJson = temporaryStore.storeToString(temporaryDesign, temporaryOptions);
+            if (!temporaryJson || temporaryJson->find("\"formatVersion\": 3") == std::string::npos ||
+                temporaryJson->find("\"tmp\"") != std::string::npos ||
+                temporaryJson->find("tmp_val_") != std::string::npos ||
+                temporaryJson->find("tmp_op_") != std::string::npos)
+            {
+                return fail("Temporary entities acquired a JSON symbol or legacy temporary marker");
+            }
+            const auto usersStart = temporaryJson->find("\"users\"");
+            const auto firstUser = usersStart == std::string::npos ? std::string::npos :
+                temporaryJson->find("\"op\": 1", usersStart);
+            const auto secondUser = usersStart == std::string::npos ? std::string::npos :
+                temporaryJson->find("\"op\": 2", usersStart);
+            if (usersStart == std::string::npos || firstUser == std::string::npos ||
+                secondUser == std::string::npos || firstUser > secondUser)
+            {
+                return fail("JSON use-list was not sorted by operation ID and operand index");
+            }
+
+            Design temporaryRoundTrip = Design::fromJsonString(*temporaryJson);
+            const Graph *roundTripGraph = temporaryRoundTrip.findGraph("temporary");
+            if (!roundTripGraph)
+            {
+                return fail("Temporary graph missing after JSON load");
+            }
+            const auto roundTripValue = roundTripGraph->values()[1];
+            const auto roundTripOp = roundTripGraph->operations()[0];
+            if (roundTripGraph->valueSymbol(roundTripValue).valid() ||
+                roundTripGraph->operationSymbol(roundTripOp).valid())
+            {
+                return fail("JSON load materialized temporary symbols");
+            }
+            const auto temporaryJsonAgain = temporaryStore.storeToString(temporaryRoundTrip, temporaryOptions);
+            if (!temporaryJsonAgain || *temporaryJsonAgain != *temporaryJson)
+            {
+                return fail("Temporary JSON store/load/store was not deterministic");
+            }
+            if (temporaryRoundTrip.findGraph("temporary")->lookupSymbol("semantic").valid() == false ||
+                temporaryRoundTrip.findGraph("temporary")->lookupSymbol("tmp_val_2").valid() ||
+                temporaryRoundTrip.findGraph("temporary")->lookupSymbol("tmp_op_3").valid())
+            {
+                return fail("Temporary JSON round-trip changed semantic symbol table");
+            }
+
+            temporaryGraph.materializeInternalSymbols();
+            if (!temporaryGraph.valueSymbol(temporaryValue).valid() ||
+                !temporaryGraph.operationSymbol(firstTemporaryOp).valid() ||
+                temporaryGraph.findValue(temporaryValueName) != temporaryValue ||
+                temporaryGraph.findOperation(temporaryOpName) != firstTemporaryOp)
+            {
+                return fail("Temporary symbol materialization failed at downstream boundary");
+            }
+        }
+
+        {
             GraphPayload store;
             const auto intRecord = store.internAttribute("int", int64_t(-3));
             const auto boolRecord = store.internAttribute("bool", true);

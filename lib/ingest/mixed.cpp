@@ -12,11 +12,14 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
+#include <ctime>
 #include <exception>
 #include <fstream>
 #include <functional>
 #include <future>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -30,6 +33,45 @@
 
 namespace wolvrix::lib::ingest {
 namespace {
+
+// See firrtl.cpp.  The switch is sampled once per process so the default
+// path pays only the branch in each timer constructor and no clock calls.
+bool stageProfileEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("WOLVRIX_FIRRTL_INGEST_PROFILE");
+        return value && value[0] && value[0] != '0';
+    }();
+    return enabled;
+}
+
+double processCpuSeconds() {
+    timespec value{};
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value);
+    return static_cast<double>(value.tv_sec) + static_cast<double>(value.tv_nsec) * 1e-9;
+}
+
+class StageTimer {
+public:
+    explicit StageTimer(const char* name) : enabled_(stageProfileEnabled()), name_(name) {
+        if (enabled_) {
+            wall_ = std::chrono::steady_clock::now();
+            cpu_ = processCpuSeconds();
+        }
+    }
+    ~StageTimer() {
+        if (!enabled_) return;
+        const auto wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_).count();
+        std::cerr << "stage_profile name=" << name_ << " wall_s=" << wall
+                  << " cpu_s=" << (processCpuSeconds() - cpu_) << '\n';
+    }
+
+private:
+    bool enabled_ = false;
+    const char* name_ = nullptr;
+    std::chrono::steady_clock::time_point wall_{};
+    double cpu_ = 0.0;
+};
+
 std::string quoteString(std::string_view text) {
     std::string result = "\"";
     for (const char c : text) {
@@ -352,6 +394,7 @@ std::shared_ptr<const firrtl::ModuleBody> Transaction::parseFirrtlModule(const F
 }
 
 void Transaction::resolveFirrtlInterfaces(const std::vector<std::string>& tops) {
+    StageTimer stageTimer("firrtl_interface_fixed_point");
     // Abstract Reset belongs to the connected hierarchy. Defaulting an isolated
     // child port to UInt before seeing its parent loses asynchronous resets.
     using Endpoint = std::pair<std::string, std::vector<std::string>>;
@@ -515,6 +558,7 @@ void Transaction::resolveFirrtlInterfaces(const std::vector<std::string>& tops) 
 void Transaction::prepareFirrtlLowering(const std::vector<std::string>& roots) {
     const std::size_t requested = request_.firrtl.lowerThreads;
     if (requested <= 1 || roots.empty()) return;
+    StageTimer stageTimer("firrtl_strict_analyze_lower");
     const auto preparationStarted = std::chrono::steady_clock::now();
 
     // Discover reachable modules before workers start. This mirrors
@@ -573,7 +617,8 @@ void Transaction::prepareFirrtlLowering(const std::vector<std::string>& roots) {
             auto body = parseFirrtlModule(entry, name);
             parsedModules_.erase(ParsedModuleKey{entry.source.get(), entry.index});
             pending.emplace_back(name, pool.submit(
-                [source = entry.source, module = entry.index, body = std::move(body), graph = std::move(graph), interfaces, options]() mutable {
+                [source = entry.source, module = entry.index, body = std::move(body), graph = std::move(graph), interfaces, options,
+                 annotations = &annotations_.at(entry.source.get())]() mutable {
                     PreloweredFirrtl result;
                     result.graph = std::move(graph);
                     try {
@@ -584,6 +629,7 @@ void Transaction::prepareFirrtlLowering(const std::vector<std::string>& roots) {
                         firrtl::detail::Semantics semantics(*source, *body, options, interfaces.get());
                         semantics.analyze();
                         result.signature = firrtl::detail::lowerModule(semantics, *result.graph, options);
+                        firrtl::detail::applyAnnotations(*source, source->modules()[module], *annotations, *result.graph);
                     } catch (...) {
                         // Re-throw in ensureFirrtl's deterministic dependency
                         // order through the normal source-aware diagnostics.
@@ -658,14 +704,14 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
             (scalarized && !targetType.shape.empty()) ||
             (!sourceType.shape.empty() && !targetType.shape.empty() && sourceType.shape != targetType.shape))
             throw std::invalid_argument("incompatible boundary ABI width, kind, domain or shape: " + source.name + "." + port.name);
-        const auto bridge = sourceType == targetType ? value : graph.createValue(targetType);
+        const auto bridge = sourceType == targetType ? value : graph.createTemporaryValue(targetType);
         if (port.direction == LeafDirection::Input) {
             inputs.push_back(targetPort); graph.addOperand(instance, bridge);
         } else {
             outputs.push_back(targetPort); graph.addResult(instance, bridge);
         }
         if (bridge != value) {
-            const auto assign = graph.createOperation(grh::OperationKind::kAssign);
+            const auto assign = graph.createTemporaryOperation(grh::OperationKind::kAssign);
             graph.setAttr(assign, "ingest.abi.view", true);
             graph.addOperand(assign, port.direction == LeafDirection::Input ? value : bridge);
             graph.addResult(assign, port.direction == LeafDirection::Input ? bridge : value);
@@ -724,19 +770,20 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
             elementType.shape.erase(elementType.shape.begin());
             std::vector<grh::ValueId> elements;
             for (int64_t index = 0; index < port.shape[dimension]; ++index) {
-                const auto element = graph.createValue(elementType);
+                const auto element = graph.createTemporaryValue(elementType);
                 if (port.direction == LeafDirection::Input) {
-                    const auto offset = graph.createValue(grh::LogicalType{grh::ValueType::Logic, 32, false, grh::LogicDomain::FourState, {}});
-                    const auto constant = graph.createOperation(grh::OperationKind::kConstant);
+                    const auto offset = graph.createTemporaryValue(
+                        grh::LogicalType{grh::ValueType::Logic, 32, false, grh::LogicDomain::FourState, {}});
+                    const auto constant = graph.createTemporaryOperation(grh::OperationKind::kConstant);
                     graph.setAttr(constant, "constValue", "32'd" + std::to_string(index)); graph.addResult(constant, offset);
-                    const auto slice = graph.createOperation(grh::OperationKind::kSliceArray);
+                    const auto slice = graph.createTemporaryOperation(grh::OperationKind::kSliceArray);
                     graph.addOperand(slice, aggregate); graph.addOperand(slice, offset); graph.addResult(slice, element);
                 }
                 indices.push_back(index); self(self, dimension + 1, element); indices.pop_back();
                 elements.push_back(element);
             }
             if (port.direction == LeafDirection::Output) {
-                const auto create = graph.createOperation(grh::OperationKind::kArrayCreate);
+                const auto create = graph.createTemporaryOperation(grh::OperationKind::kArrayCreate);
                 for (const auto element : elements) graph.addOperand(create, element);
                 graph.addResult(create, aggregate);
             }
@@ -810,6 +857,8 @@ std::string Transaction::ensureFirrtl(const std::string& name) {
                 semantics.analyze();
                 auto& graph = design_.createGraph(name);
                 entry.signature = firrtl::detail::lowerModule(semantics, graph, request_.firrtl);
+                firrtl::detail::applyAnnotations(*entry.source, entry.source->modules()[entry.index],
+                    annotations_.at(entry.source.get()), graph);
             }
             interfaces_[name] = entry.signature; entry.graph = name;
             auto& graph = *design_.findGraph(name);
@@ -820,7 +869,6 @@ std::string Transaction::ensureFirrtl(const std::string& name) {
                     name, "ingest-firrtl", name, position});
             for (const auto op : graph.operations()) if (graph.opKind(op) == grh::OperationKind::kInstance)
                 graph.setAttr(op, "moduleName", targets.at(attribute(graph, op, "moduleName")));
-            firrtl::detail::applyAnnotations(*entry.source, entry.source->modules()[entry.index], annotations_.at(entry.source.get()), graph);
             // Binding module names and importing annotations above only change
             // attributes/provenance, so the lowerer's edge proof still holds.
             if (cyclesChecked) graph.markLocalCyclesChecked();
@@ -956,14 +1004,23 @@ void Transaction::canonicalizeGeneratedLocations() {
     if (directory_.empty()) return;
     const auto prefix = directory_.generic_string() + "/";
     std::map<std::string, std::string> identities;
+    std::unordered_map<std::string, std::string> canonicalCache;
     const auto canonical = [&](const std::string& file) -> std::string {
         if (file.empty()) return file;
+        if (const auto cached = canonicalCache.find(file); cached != canonicalCache.end()) return cached->second;
         const auto path = std::filesystem::absolute(file).lexically_normal().generic_string();
-        if (!path.starts_with(prefix)) return file;
+        if (!path.starts_with(prefix)) {
+            canonicalCache.emplace(file, file);
+            return file;
+        }
         const auto found = identities.find(path);
-        if (found != identities.end()) return found->second;
+        if (found != identities.end()) {
+            canonicalCache.emplace(file, found->second);
+            return found->second;
+        }
         const auto name = "generated-sv:fnv1a64:" + identity(readText(path)) + "/" + path.substr(prefix.size());
         identities.emplace(path, name);
+        canonicalCache.emplace(file, name);
         return name;
     };
     // Source-unit binding checks use physical paths until linking is complete.
@@ -972,13 +1029,18 @@ void Transaction::canonicalizeGeneratedLocations() {
         auto* graph = design_.findGraph(name);
         if (!graph) continue; // Specialization wrappers have already been removed.
         const auto file = metadata(*graph, "ingest.sourceFile");
-        if (!file.empty()) graph->setMetadata("ingest.sourceFile", canonical(file));
+        if (const auto normalized = canonical(file); normalized != file)
+            graph->setMetadata("ingest.sourceFile", normalized);
         for (const auto value : graph->values()) if (auto loc = graph->valueSrcLoc(value)) {
-            loc->file = canonical(loc->file);
+            const auto normalized = canonical(loc->file);
+            if (normalized == loc->file) continue;
+            loc->file = normalized;
             graph->setValueSrcLoc(value, std::move(*loc));
         }
         for (const auto op : graph->operations()) if (auto loc = graph->opSrcLoc(op)) {
-            loc->file = canonical(loc->file);
+            const auto normalized = canonical(loc->file);
+            if (normalized == loc->file) continue;
+            loc->file = normalized;
             graph->setOpSrcLoc(op, std::move(*loc));
         }
     }
@@ -994,6 +1056,7 @@ IngestResult Transaction::run(const ModuleSpecialization* specialization) {
     result_.sourceOwners = std::move(scanned.sourceOwners); result_.modules = std::move(scanned.modules);
     result_.diagnostics = std::move(scanned.diagnostics); if (!scanned.success) return std::move(result_);
     try {
+        StageTimer annotationTimer("firrtl_annotation_and_interface_publish");
         for (const auto& owner : result_.sourceOwners) {
             const auto source = std::dynamic_pointer_cast<const firrtl::Source>(owner); if (!source) continue;
             result_.dependencies.push_back("firrtl:" + std::string(source->unit()) + ":fnv1a64:" + identity(source->text()));
@@ -1034,6 +1097,7 @@ IngestResult Transaction::run(const ModuleSpecialization* specialization) {
             resolveFirrtlInterfaces(tops);
             prepareFirrtlLowering(tops);
         }
+        StageTimer publishTimer("firrtl_graph_publish_and_hierarchy");
         std::set<std::string> selected;
         for (const auto& top : tops) {
             if (!selected.insert(top).second) throw std::invalid_argument("duplicate top module: " + top);
@@ -1041,7 +1105,10 @@ IngestResult Transaction::run(const ModuleSpecialization* specialization) {
             design_.markAsTop(graph);
         }
         checkHierarchy();
-        if (!verifyLinkedDesign(design_, result_.diagnostics, request_.firrtl.lowerThreads)) return std::move(result_);
+        {
+            StageTimer verifyTimer("firrtl_linked_verify_total");
+            if (!verifyLinkedDesign(design_, result_.diagnostics, request_.firrtl.lowerThreads)) return std::move(result_);
+        }
         for (auto& signature : result_.modules) if (interfaces_.contains(signature.name)) signature = interfaces_.at(signature.name);
         // Generated sources use content identity instead of transaction paths.
         const auto transactionPrefix = directory_.empty() ? std::string{} : "sv:" + directory_.generic_string() + "/";
@@ -1165,7 +1232,16 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
     }
     manager.addPass(std::make_unique<transform::GrhVerifyPass>());
     transform::PassDiagnostics verification;
-    const bool success = manager.run(design, verification).success;
+    StageTimer verifyPassesTimer("firrtl_linked_verify_passes");
+    const auto verifyResult = manager.run(design, verification);
+    if (stageProfileEnabled()) {
+        for (const auto& stage : verifyResult.stages)
+            std::cerr << "stage_profile name=firrtl_linked_verify_pass pass=" << stage.pass
+                      << " wall_s=" << stage.wallSeconds
+                      << " worker_wall_s=" << stage.workerSeconds
+                      << " overlapped=" << (stage.overlapped ? 1 : 0) << '\n';
+    }
+    const bool success = verifyResult.success;
     for (const auto& entry : verification.messages()) {
         std::optional<SourcePosition> position;
         if (entry.sourcePosition) position = SourcePosition{{}, entry.sourcePosition->file, entry.sourcePosition->line, entry.sourcePosition->column, {}, {}};

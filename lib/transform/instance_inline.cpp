@@ -392,11 +392,9 @@ namespace wolvrix::lib::transform
                 error = "instance-inline input port requires equal width and compatible kind/domain";
                 return {};
             }
-            const wolvrix::lib::grh::ValueId view =
-                parent.createValue(parent.makeInternalValSym(), expected);
+            const wolvrix::lib::grh::ValueId view = parent.createTemporaryValue(expected);
             const wolvrix::lib::grh::OperationId assign =
-                parent.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                       parent.makeInternalOpSym());
+                parent.createTemporaryOperation(wolvrix::lib::grh::OperationKind::kAssign);
             parent.addOperand(assign, parentValue);
             parent.addResult(assign, view);
             return view;
@@ -420,7 +418,7 @@ namespace wolvrix::lib::transform
             auto found = portMap.find(childValue);
             if (found == portMap.end())
             {
-                const auto value = sourceType == targetType ? parentValue : parent.createValue(sourceType);
+                const auto value = sourceType == targetType ? parentValue : parent.createTemporaryValue(sourceType);
                 found = portMap.emplace(childValue, value).first;
             }
             if (found->second != parentValue) aliases.push_back({found->second, parentValue});

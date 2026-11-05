@@ -127,7 +127,17 @@ int main()
     {
         return fail("Attribute payload missing expected compact layout");
     }
-    const std::size_t valsInlinePos = prettyCompactJson.find("{\"sym\": \"in\"");
+    // v3 graph-local references are JSON numbers.  A quoted number would
+    // silently reintroduce the v2 string-reference ABI at the new boundary.
+    if (prettyCompactJson.find("\"val\": \"") != std::string::npos ||
+        prettyCompactJson.find("\"def\": \"") != std::string::npos ||
+        prettyCompactJson.find("\"op\": \"") != std::string::npos ||
+        prettyCompactJson.find("\"in\": [\"") != std::string::npos ||
+        prettyCompactJson.find("\"out\": [\"") != std::string::npos)
+    {
+        return fail("v3 graph-local references were emitted as JSON strings");
+    }
+    const std::size_t valsInlinePos = prettyCompactJson.find("{\"id\": 1, \"sym\": \"in\"");
     if (valsInlinePos == std::string::npos)
     {
         return fail("Value entry not rendered inline in prettyCompact mode");
@@ -185,7 +195,112 @@ int main()
         return fail("Round-trip parsed design lost the kAssign view");
     }
 
-    // Case 3: compact mode should differ from prettyCompact output and avoid newlines.
+    // Case 3: the v2 string-reference format remains readable, including its
+    // legacy temporary marker, but re-emits in v3 without promoting the old
+    // display names into semantic symbols.
+    const std::string legacyJson = R"({
+  "graphs": [{
+    "symbol": "legacy",
+    "formatVersion": 2,
+    "dialects": {"grh": 2},
+    "metadata": {},
+    "declaredSymbols": [],
+    "vals": [
+      {"sym": "in", "w": 1, "sgn": false, "type": "logic", "domain": "4state", "in": true, "out": false, "users": [{"op": "legacy_op", "idx": 0}]},
+      {"tmp": true, "sym": "tmp_val_1", "w": 1, "sgn": false, "type": "logic", "domain": "4state", "in": false, "out": false, "def": "legacy_op", "users": []}
+    ],
+    "ports": {"in": [{"name": "in", "val": "in"}], "out": [], "inout": []},
+    "ops": [{"tmp": true, "sym": "legacy_op", "kind": "kAssign", "in": ["in"], "out": ["tmp_val_1"]}]
+  }],
+  "aliases": {},
+  "declaredSymbols": [],
+  "tops": ["legacy"]
+})";
+    Design legacy = Design::fromJsonString(legacyJson);
+    Graph *legacyGraph = legacy.findGraph("legacy");
+    if (!legacyGraph || !legacyGraph->findValue("in").valid() ||
+        legacyGraph->findValue("tmp_val_1").valid() ||
+        legacyGraph->findOperation("legacy_op").valid())
+    {
+        return fail("v2 temporary string references were not relocated without symbols");
+    }
+    const auto legacyV3 = emitterPrettyCompact.storeToString(legacy);
+    if (!legacyV3 || legacyV3->find("\"formatVersion\": 3") == std::string::npos ||
+        legacyV3->find("\"tmp\"") != std::string::npos ||
+        legacyV3->find("tmp_val_1") != std::string::npos ||
+        legacyV3->find("legacy_op") != std::string::npos)
+    {
+        return fail("v2 temporary names were promoted during v3 re-emission");
+    }
+
+    // Case 4: v3 local IDs are graph-local and must remain valid when the
+    // operation array is reordered and its IDs are sparse.  In particular,
+    // use-list validation must compare encoded local IDs rather than runtime
+    // OperationId indices, which follow parse order.
+    const std::string reorderedV3 = R"({
+  "graphs": [{
+    "symbol": "reordered",
+    "formatVersion": 3,
+    "dialects": {"grh": 2},
+    "metadata": {},
+    "declaredSymbols": [],
+    "vals": [
+      {"id": 41, "sym": "in", "w": 1, "sgn": false, "type": "logic", "domain": "4state", "in": true, "out": false, "inout": false, "users": [{"op": 1001, "idx": 0}, {"op": 73, "idx": 0}]},
+      {"id": 900, "w": 1, "sgn": false, "type": "logic", "domain": "4state", "in": false, "out": false, "inout": false, "def": 1001, "users": []},
+      {"id": 901, "w": 1, "sgn": false, "type": "logic", "domain": "4state", "in": false, "out": false, "inout": false, "def": 73, "users": []}
+    ],
+    "ports": {"in": [{"name": "in", "val": 41}], "out": [], "inout": []},
+    "ops": [
+      {"id": 1001, "kind": "kAssign", "in": [41], "out": [900]},
+      {"id": 73, "kind": "kAssign", "in": [41], "out": [901]}
+    ]
+  }],
+  "aliases": {},
+  "declaredSymbols": [],
+  "tops": ["reordered"]
+})";
+    Design reordered = Design::fromJsonString(reorderedV3);
+    Graph *reorderedGraph = reordered.findGraph("reordered");
+    if (!reorderedGraph || reorderedGraph->operations().size() != 2 ||
+        reorderedGraph->valueUsers(reorderedGraph->findValue("in")).size() != 2)
+    {
+        return fail("v3 sparse local IDs or reordered operations were not loaded");
+    }
+
+    const auto replaceOnce = [](std::string text, const std::string &from, const std::string &to) {
+        const std::size_t position = text.find(from);
+        if (position == std::string::npos) return std::string{};
+        text.replace(position, from.size(), to);
+        return text;
+    };
+    const auto expectLoadFailure = [&](const std::string &json, const char *label) {
+        if (json.empty()) return fail(std::string("Could not construct malformed JSON for ") + label);
+        try
+        {
+            auto ignored = Design::fromJsonString(json);
+            (void)ignored;
+        }
+        catch (const std::exception &)
+        {
+            return 0;
+        }
+        return fail(std::string("Malformed v3 JSON was accepted: ") + label);
+    };
+    if (expectLoadFailure(replaceOnce(reorderedV3, "\"id\": 901", "\"id\": 900"),
+                          "duplicate value ID") != 0 ||
+        expectLoadFailure(replaceOnce(reorderedV3, "\"id\": 73", "\"id\": 1001"),
+                          "duplicate operation ID") != 0 ||
+        expectLoadFailure(replaceOnce(reorderedV3, "\"val\": 41", "\"val\": \"41\""),
+                          "string value reference") != 0 ||
+        expectLoadFailure(replaceOnce(reorderedV3, "\"in\": [41]", "\"in\": [1001]"),
+                          "operation/value namespace mismatch") != 0 ||
+        expectLoadFailure(replaceOnce(reorderedV3, "\"def\": 73", "\"def\": 9999"),
+                          "unknown operation reference") != 0)
+    {
+        return 1;
+    }
+
+    // Case 6: compact mode should differ from prettyCompact output and avoid newlines.
     StoreDiagnostics diagCompact;
     StoreJson emitterCompact(&diagCompact);
     StoreOptions compactOptions = prettyCompactOptions;
@@ -208,7 +323,7 @@ int main()
         return fail("Compact JSON should not contain newlines");
     }
 
-    // Case 4: preserve the existing small-design byte layout independently of
+    // Case 5: preserve the existing small-design byte layout independently of
     // the shared string/file writer.
     Design goldenDesign;
     goldenDesign.createGraph("empty");
@@ -217,7 +332,7 @@ int main()
   "graphs": [
     {
       "symbol": "empty",
-      "formatVersion": 2,
+      "formatVersion": 3,
       "dialects": {"grh": 2},
       "metadata": {},
       "declaredSymbols": [],
@@ -242,7 +357,7 @@ int main()
         return fail("PrettyCompact layout differs from the existing golden bytes");
     }
 
-    // Case 5: metadata and attribute payloads span several output buffers,
+    // Case 6: metadata and attribute payloads span several output buffers,
     // including escapes that can straddle a buffer boundary. The same fixture
     // covers all eight AttributeValue branches (weights is the int64 list).
     std::string payload;

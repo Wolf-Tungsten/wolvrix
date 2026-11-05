@@ -33,7 +33,7 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
 
 ## Graph 结构（按字段顺序输出）
 - `symbol`: 图名称（必需，缺失视为错误）。
-- `formatVersion`: 当前为 2，版本属于每个 Graph。
+- `formatVersion`: 当前为 3，版本属于每个 Graph。版本 2 的字符串引用格式仍可加载，重新导出时写为版本 3。
 - `dialects`: 方言名到整数版本的对象；基础 `grh:2` 必需，使用扩展 op 时声明对应版本，
   如 `grhsim:1`、`grhsim.cpu:1`。未知方言、kind 或不支持的版本拒绝读取。
 - `metadata`: Graph 属性对象，负载编码与 op attrs 相同；保存转换阶段及逻辑域等语义。
@@ -44,7 +44,8 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
   - `name`: 裸声明名（flatten 不改动该字段）。
   - `symbols`: 按 elaboration 顺序排列的副本符号名（如 `gen_loop$0$sig`；flatten 后为 `u_inst$gen_loop$0$sig`）。
 - `vals`: 值列表，保持创建顺序。每个值包含：
-  - `sym`: 符号名（必需，缺失视为错误）。
+  - `id`: 本份 Graph JSON 内从 1 开始的局部值 ID；只用于结构关联，不是运行时 `ValueId`，也不保证跨 compact 或变换稳定。
+  - `sym`: 符号名；仅语义对象写出，临时对象省略。版本 3 中缺失表示无语义 symbol。
   - `w`: 位宽（数组值为总位宽，含全部维度）。
   - `sgn`: 是否有符号。
   - `type`: kind 名称，`logic` / `real` / `string`；logic 可省略。
@@ -52,17 +53,18 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
   - `shape`: 可选，int64 数组，非空时写出（见 grh-ir.md §2.3 的数组类型模型；
     元素位宽 = `w / ∏shape`，必须整除）。
   - `in` / `out` / `inout`: 输入/输出/inout 标记（`inout` 不可与 `in/out` 同时为真）。
-  - `def`: 可选，定义该值的 Operation 符号。
-  - `users`: 使用者数组 `{ op, idx }`，描述操作与操作数索引。
+  - `def`: 可选，定义该值的 Operation 局部 ID。
+  - `users`: 使用者数组 `{ op, idx }`，`op` 为 Operation 局部 ID，描述操作与操作数索引。
   - `loc`: 可选，源码位置与扩展调试信息 `{ file, line, col, endLine, endCol, origin, pass, note }`。
 - `ports`: 端口对象。
-  - `in`: 输入端口数组，每项 `{ name, val }`。
-  - `out`: 输出端口数组，每项 `{ name, val }`。
-  - `inout`: inout 端口数组，每项 `{ name, in, out, oe }`。
+  - `in`: 输入端口数组，每项 `{ name, val }`，其中 `val` 为值局部 ID。
+  - `out`: 输出端口数组，每项 `{ name, val }`，其中 `val` 为值局部 ID。
+  - `inout`: inout 端口数组，每项 `{ name, in, out, oe }`，三个引用均为值局部 ID。
 - `ops`: 操作列表，保持创建顺序。每个操作包含：
-  - `sym`: 符号名（必需，缺失视为错误）。
+  - `id`: 本份 Graph JSON 内从 1 开始的局部操作 ID；只用于结构关联。
+  - `sym`: 符号名；仅语义对象写出，临时对象省略。
   - `kind`: 操作类型字符串（来自 `wolvrix::lib::grh::toString(OperationKind)`）。
-  - `in` / `out`: 操作数与结果符号数组，保持插入顺序。
+  - `in` / `out`: 操作数与结果值局部 ID 数组，保持插入顺序。
   - `attrs`: 可选属性对象，键为属性名，值为属性负载。
   - `loc`: 可选，源码位置与扩展调试信息 `{ file, line, col, endLine, endCol, origin, pass, note }`。
 
@@ -163,6 +165,8 @@ JSON 中若仍保留该 op，表示流程未完成。
 
 ## 兼容性
 
+版本 3 为值和操作使用独立的 Graph-local 整数命名空间：`vals[].id` 与 `ops[].id` 均为正整数且在各自数组内唯一；`ports`、操作的 `in/out`、值的 `def` 和 `users[].op` 只能引用对应命名空间中已定义的 ID。临时对象没有 `sym` 字段，round trip 不会将局部 ID 或旧版本的临时显示名提升为 SymbolTable symbol。局部 ID 由当前导出顺序决定，不能作为跨文件句柄。
+
 `LoadJson::loadFile(path)` 和 Python `read_json_file` 使用 64 KiB 输入缓冲，
 将 JSON 数组保留为可定位的文件区间，按记录读取 value/op 和属性数组。
 因此不同时保存完整文件文本和完整 JSON DOM；对象字段顺序、端口顺序、
@@ -195,19 +199,19 @@ JSON 中若仍保留该 op，表示流程未完成。
     {
       "name": "sample",
       "vals": [
-        {"sym": "in", "w": 1, "sgn": false, "in": true, "out": false, "users": []},
-        {"sym": "out", "w": 1, "sgn": false, "in": false, "out": true, "users": []}
+        {"id": 1, "sym": "in", "w": 1, "sgn": false, "in": true, "out": false, "users": [{"op": 1, "idx": 0}]},
+        {"id": 2, "sym": "out", "w": 1, "sgn": false, "in": false, "out": true, "users": []}
       ],
       "ports": {
         "in": [
-          {"name": "in", "val": "in"}
+          {"name": "in", "val": 1}
         ],
         "out": [
-          {"name": "out", "val": "out"}
+          {"name": "out", "val": 2}
         ]
       },
       "ops": [
-        {"sym": "drv", "kind": "kAssign", "in": ["in"], "out": ["out"]}
+        {"id": 1, "sym": "drv", "kind": "kAssign", "in": [1], "out": [2]}
       ]
     }
   ],

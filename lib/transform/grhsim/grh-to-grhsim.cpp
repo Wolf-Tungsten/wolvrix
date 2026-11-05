@@ -244,6 +244,11 @@ PassResult GrhToGrhsimPass::run()
         }
         graph = design().findGraph(top);
         if (!graph) throw std::invalid_argument("Top graph does not exist: " + top);
+        // FIRRTL lowering and hierarchy flattening may leave implementation
+        // temporaries without SymbolTable entries. GrhSIM still uses symbol
+        // text as its identity, so materialize that legacy ABI exactly at its
+        // boundary instead of paying the cost during ingest/flatten.
+        graph->materializeInternalSymbols();
         // Pre-F08 checkpoints can still be inspected, but cannot be upgraded
         // into a node-aware simulation merely by attaching a new policy.
         if (graph->metadata(ingest::node::kScopePolicy)) ingest::node::requirePolicy(*graph);

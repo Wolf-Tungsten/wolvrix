@@ -58,7 +58,7 @@ namespace wolvrix::lib::transform
                 {
                     ctx += "::";
                 }
-                ctx.append(op->symbolText());
+                ctx.append(graph ? graph->operationDisplayName(op->id()) : std::string(op->symbolText()));
             }
             if (value)
             {
@@ -66,7 +66,7 @@ namespace wolvrix::lib::transform
                 {
                     ctx += "::";
                 }
-                ctx.append(value->symbolText());
+                ctx.append(graph ? graph->valueDisplayName(value->id()) : std::string(value->symbolText()));
             }
             return ctx;
         }
@@ -451,7 +451,8 @@ namespace wolvrix::lib::transform
             } else {
                 passResult = pass->run();
             }
-            // partition-sink records before capturing its revision-local schedule.
+            // Record retention at each changed pass so later passes and
+            // checkpoint consumers observe the same stage-local metadata.
             if (!passResult.failed && passResult.changed && pass->id() != "grhsim-partition-sink") {
                 const auto retain = [&](auto& graph) {
                     try { ingest::node::recordRetention(graph); }
@@ -625,10 +626,6 @@ namespace wolvrix::lib::transform
                             stage.result.failed = true;
                         } else {
                             stage.result = pass->run();
-                            // Compute the local census while this exact stage's
-                            // graph state is available. The coordinator decides
-                            // whether the whole-design changed/failed boundary
-                            // actually publishes it, including unchanged graphs.
                             if (!stage.result.failed) {
                                 try {
                                     stage.retention = ingest::node::retentionCensus(*task.graph);

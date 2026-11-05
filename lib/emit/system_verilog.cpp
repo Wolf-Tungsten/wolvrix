@@ -648,12 +648,18 @@ namespace wolvrix::lib::emit
 
         std::string valueSymbolRequired(const wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::ValueId value)
         {
-            return graphSymbolRequired(graph, graph.valueSymbol(value), "Value");
+            if (graph.valueSymbol(value).valid()) return std::string(graph.symbolText(graph.valueSymbol(value)));
+            const auto display = graph.valueDisplayName(value);
+            if (!display.empty()) return display;
+            throw std::runtime_error("Value missing symbol during emit");
         }
 
         std::string opSymbolRequired(const wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::OperationId op)
         {
-            return graphSymbolRequired(graph, graph.operationSymbol(op), "Operation");
+            if (graph.operationSymbol(op).valid()) return std::string(graph.symbolText(graph.operationSymbol(op)));
+            const auto display = graph.operationDisplayName(op);
+            if (!display.empty()) return display;
+            throw std::runtime_error("Operation missing symbol during emit");
         }
 
         void validateGraphSymbols(const wolvrix::lib::grh::Graph &graph)
@@ -664,16 +670,14 @@ namespace wolvrix::lib::emit
             }
             for (const auto valueId : graph.values())
             {
-                const wolvrix::lib::grh::SymbolId sym = graph.valueSymbol(valueId);
-                if (!sym.valid() || graph.symbolText(sym).empty())
+                if (graph.valueDisplayName(valueId).empty())
                 {
                     throw std::runtime_error("Graph value missing symbol during emit");
                 }
             }
             for (const auto opId : graph.operations())
             {
-                const wolvrix::lib::grh::SymbolId sym = graph.operationSymbol(opId);
-                if (!sym.valid() || graph.symbolText(sym).empty())
+                if (graph.operationDisplayName(opId).empty())
                 {
                     throw std::runtime_error("Graph operation missing symbol during emit");
                 }
@@ -1607,7 +1611,7 @@ namespace wolvrix::lib::emit
                 {
                     continue;
                 }
-                const std::string opName = std::string(graph->symbolText(opSym));
+                const std::string opName = opSymbolRequired(*graph, opId);
                 if (opName.empty())
                 {
                     continue;
@@ -1772,8 +1776,7 @@ namespace wolvrix::lib::emit
 
             auto ensureWireDecl = [&](wolvrix::lib::grh::ValueId valueId)
             {
-                const wolvrix::lib::grh::SymbolId sym = graph->valueSymbol(valueId);
-                const std::string name = std::string(graph->symbolText(sym));
+                const std::string name = valueSymbolRequired(*graph, valueId);
                 const auto type = graph->valueType(valueId);
                 const auto debug = graph->valueSrcLoc(valueId);
                 if (type != wolvrix::lib::grh::ValueType::Logic)
@@ -2047,7 +2050,7 @@ namespace wolvrix::lib::emit
                     return "<invalid>";
                 }
                 const wolvrix::lib::grh::Operation sinkOp = graph->getOperation(sinkOpId);
-                const std::string opName = std::string(sinkOp.symbolText());
+                const std::string opName = opSymbolRequired(*graph, sinkOpId);
                 if (!opName.empty())
                 {
                     return opName;
@@ -2151,7 +2154,7 @@ namespace wolvrix::lib::emit
                 {
                     continue;
                 }
-                const std::string opContext = std::string(op.symbolText());
+                const std::string opContext = opSymbolRequired(*graph, opId);
                 const std::string dpiName = formatDpiName(op);
                 const auto hasReturn = getAttribute<bool>(*graph, op, "hasReturn").value_or(false);
                 wolvrix::lib::grh::OperationId returnSinkOpId = wolvrix::lib::grh::OperationId::invalid();
@@ -2281,7 +2284,7 @@ namespace wolvrix::lib::emit
                         wolvrix::lib::grh::firstEventOperandIndex(sinkOp);
                     auto sinkKey = sinkEventStart
                                        ? computeEventKey(sinkOp, *sinkEventStart,
-                                                         std::string(sinkOp.symbolText()))
+                                                         opSymbolRequired(*graph, sinkOp.id()))
                                        : std::nullopt;
                     if (!dpiKey || !sinkKey || !sameSeqKey(*dpiKey, *sinkKey))
                     {
@@ -2449,7 +2452,7 @@ namespace wolvrix::lib::emit
 
             auto buildDpiCallExpr = [&](const wolvrix::lib::grh::Operation &dpiOp) -> std::optional<std::string>
             {
-                const std::string opContext = std::string(dpiOp.symbolText());
+                const std::string opContext = opSymbolRequired(*graph, dpiOp.id());
                 const auto &operands = dpiOp.operands();
                 auto targetImport = getAttribute<std::string>(*graph, dpiOp, "targetImportSymbol");
                 auto inArgName = getAttribute<std::vector<std::string>>(*graph, dpiOp, "inArgName");
@@ -3671,7 +3674,7 @@ namespace wolvrix::lib::emit
                 const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
                 const auto &operands = op.operands();
                 const auto &results = op.results();
-                const std::string opContext = std::string(op.symbolText());
+                const std::string opContext = opSymbolRequired(*graph, opId);
                 auto buildEventKey = [&](const wolvrix::lib::grh::Operation &eventOp,
                                          std::size_t eventStart) -> std::optional<SeqKey>
                 {
@@ -5994,8 +5997,7 @@ namespace wolvrix::lib::emit
                     // Declare intermediate regs for outputs and connect them back.
                     for (const auto res : results)
                     {
-                        const wolvrix::lib::grh::SymbolId sym = graph->valueSymbol(res);
-                        const std::string tempName = std::string(graph->symbolText(sym)) + "_intm";
+                        const std::string tempName = valueName(res) + "_intm";
                         ensureRegDecl(tempName,
                                       graph->valueWidth(res),
                                       graph->valueSigned(res),

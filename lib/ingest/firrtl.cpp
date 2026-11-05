@@ -5,6 +5,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <thread>
@@ -12,6 +16,47 @@
 
 namespace wolvrix::lib::ingest {
 namespace {
+
+// Native stage timing is deliberately runtime-disabled.  The benchmark
+// driver can enable it with WOLVRIX_FIRRTL_INGEST_PROFILE=1 without changing
+// the normal ingest path or its output.  CPU time is process-wide, so nested
+// and overlapping timers are diagnostic intervals and must not be summed.
+bool stageProfileEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("WOLVRIX_FIRRTL_INGEST_PROFILE");
+        return value && value[0] && value[0] != '0';
+    }();
+    return enabled;
+}
+
+double processCpuSeconds() {
+    timespec value{};
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value);
+    return static_cast<double>(value.tv_sec) + static_cast<double>(value.tv_nsec) * 1e-9;
+}
+
+class StageTimer {
+public:
+    explicit StageTimer(const char* name) : enabled_(stageProfileEnabled()), name_(name) {
+        if (enabled_) {
+            wall_ = std::chrono::steady_clock::now();
+            cpu_ = processCpuSeconds();
+        }
+    }
+    ~StageTimer() {
+        if (!enabled_) return;
+        const auto wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_).count();
+        std::cerr << "stage_profile name=" << name_ << " wall_s=" << wall
+                  << " cpu_s=" << (processCpuSeconds() - cpu_) << '\n';
+    }
+
+private:
+    bool enabled_ = false;
+    const char* name_ = nullptr;
+    std::chrono::steady_clock::time_point wall_{};
+    double cpu_ = 0.0;
+};
+
 IntegerParameter integerParameter(std::string_view literal) {
     const bool negative = literal.front() == '-';
     if (negative) literal.remove_prefix(1);
@@ -136,6 +181,7 @@ InterfaceScanResult scanFirrtlInterfaces(const IngestRequest& request) {
             result.diagnostics.push_back({IngestSeverity::Error, "duplicate FIRRTL source unit '" + unit + "'", {}, "ingest-firrtl"}); continue;
         }
         const auto path = input.path.is_absolute() || request.inputRoot.empty() ? input.path : request.inputRoot / input.path;
+        StageTimer indexTimer("firrtl_index");
         auto indexed = firrtl::indexFile(path, unit, request.firrtl);
         result.diagnostics.insert(result.diagnostics.end(), indexed.diagnostics.begin(), indexed.diagnostics.end());
         if (!indexed.success()) continue;
@@ -155,6 +201,7 @@ InterfaceScanResult scanFirrtlInterfaces(const IngestRequest& request) {
             return modules[left].range.end - modules[left].range.begin > modules[right].range.end - modules[right].range.begin;
         });
         std::atomic<std::size_t> next{0};
+        StageTimer parseTimer("firrtl_parse_interface_summary");
         const auto parse = [&] {
             for (;;) {
                 const auto job = next.fetch_add(1, std::memory_order_relaxed);

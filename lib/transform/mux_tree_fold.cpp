@@ -1656,9 +1656,9 @@ namespace wolvrix::lib::transform
                                                ? elementCount : maximum + 1;
                     if (port.rows.size() != count)
                         return reject("row-coverage-" + std::to_string(port.rows.size()) + "/" + std::to_string(count) +
-                            " pointer=" + std::string(graph_.getValue(port.pointer).symbolText()) +
-                            " enable=" + std::string(graph_.getValue(port.enable).symbolText()) +
-                            " data=" + std::string(graph_.getValue(port.data).symbolText()));
+                            " pointer=" + graph_.valueDisplayName(port.pointer) +
+                            " enable=" + graph_.valueDisplayName(port.enable) +
+                            " data=" + graph_.valueDisplayName(port.data));
                     for (uint64_t row = 0; row < count; ++row)
                         if (!port.rows.contains(row)) return reject("missing-row-" + std::to_string(row));
                 }

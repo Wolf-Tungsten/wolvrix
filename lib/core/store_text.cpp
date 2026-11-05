@@ -90,13 +90,13 @@ Key executionOwner(Key path) {
 void opRef(std::ostream& out, const grh::Graph& graph, grh::OperationId op) {
     if (!op) { out << "none"; return; }
     out << "op" << op.index << '.' << op.generation << ' ';
-    quoted(out, graph.symbolText(graph.operationSymbol(op)));
+    quoted(out, graph.operationDisplayName(op));
 }
 
 void valueRef(std::ostream& out, const grh::Graph& graph, grh::ValueId value) {
     if (!value) { out << "none"; return; }
     out << 'v' << value.index << '.' << value.generation << ' ';
-    quoted(out, graph.symbolText(graph.valueSymbol(value)));
+    quoted(out, graph.valueDisplayName(value));
 }
 
 void type(std::ostream& out, const grh::LogicalType& value) {

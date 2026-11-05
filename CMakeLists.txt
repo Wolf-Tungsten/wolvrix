@@ -114,6 +114,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/allocator.cpp
     lib/core/diagnostics.cpp
     lib/core/grh.cpp
+    lib/core/semantic_tree.cpp
     lib/core/op_descriptor.cpp
     lib/core/state.cpp
     lib/core/load.cpp
@@ -415,6 +416,10 @@ target_link_libraries(grh-clone-tests
 )
 
 register_test_exe(grh-clone-tests)
+
+add_executable(grh-semantic-tree tests/grh/test_semantic_tree.cpp)
+target_link_libraries(grh-semantic-tree PRIVATE wolvrix-lib)
+register_test_exe(grh-semantic-tree)
 
 add_executable(grh-sim-foundation-tests tests/grh/test_grh_sim_foundation.cpp)
 target_link_libraries(grh-sim-foundation-tests PRIVATE wolvrix-lib)
@@ -887,7 +892,7 @@ target_compile_definitions(transform-repcut-partition-count
 register_test_exe(transform-repcut-partition-count)
 
 # ingest: FIRRTL syntax, combinational lowering and node CSE boundaries
-foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects ingest-mixed ingest-indexes grhsim-node-cse firrtl-node-pipeline)
+foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects firrtl-semantic-tree ingest-mixed ingest-indexes grhsim-node-cse firrtl-node-pipeline)
     string(REPLACE "-" "_" test_file ${test_name})
     add_executable(${test_name} tests/ingest/test_${test_file}.cpp)
     target_link_libraries(${test_name} PRIVATE wolvrix-lib)

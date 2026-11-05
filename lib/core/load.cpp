@@ -1156,12 +1156,15 @@ namespace wolvrix::lib::load
             }
             const auto &graphObj = graphValue.asObject("graph");
             bool versioned = false;
+            int64_t formatVersion = 0;
             if (const auto version = graphObj.find("formatVersion"); version != graphObj.end())
             {
-                if (version->second.asInt("graph.formatVersion") != 2)
+                formatVersion = version->second.asInt("graph.formatVersion");
+                if (formatVersion != 2 && formatVersion != 3)
                     throw std::runtime_error("Unsupported GRH formatVersion; regenerate from SV");
                 versioned = true;
             }
+            const bool localIds = formatVersion == 3;
             std::unordered_map<std::string, uint32_t> dialects;
             if (const auto declared = graphObj.find("dialects"); declared != graphObj.end())
             {
@@ -1304,6 +1307,64 @@ namespace wolvrix::lib::load
             std::unordered_set<uint32_t> declaredInputs;
             std::unordered_set<uint32_t> declaredOutputs;
             std::unordered_set<uint32_t> declaredInouts;
+            // v2 references use display names for temporary entities. Keep
+            // those names in a graph-local relocation table instead of
+            // interning them into the semantic SymbolTable; v3 uses the
+            // separate integer tables below.
+            std::unordered_map<std::string, ValueId> valueRefs;
+            std::unordered_map<std::string, OperationId> operationRefs;
+            std::unordered_map<uint32_t, ValueId> valueIds;
+            std::unordered_map<uint32_t, OperationId> operationIds;
+            std::unordered_map<OperationId, uint32_t, wolvrix::lib::grh::OperationIdHash> operationLocalIds;
+            valueRefs.reserve(valuesArray.size() * 2 + 16);
+            operationRefs.reserve(opReserve * 2 + 16);
+            valueIds.reserve(valuesArray.size() * 2 + 1);
+            operationIds.reserve(opReserve * 2 + 1);
+            operationLocalIds.reserve(opReserve * 2 + 1);
+            const auto parseLocalId = [&](const JsonValue &entry, std::string_view context) -> uint32_t {
+                const int64_t id = entry.asInt(context);
+                if (id <= 0 || static_cast<uint64_t>(id) > std::numeric_limits<uint32_t>::max())
+                    throw std::runtime_error(std::string(context) + ": expected positive 32-bit ID");
+                return static_cast<uint32_t>(id);
+            };
+            const auto findValueRef = [&](std::string_view name) {
+                if (const auto it = valueRefs.find(std::string(name)); it != valueRefs.end()) return it->second;
+                return graph.findValue(name);
+            };
+            const auto parseValueRef = [&](const JsonValue &entry, std::string_view context) -> ValueId {
+                if (localIds)
+                {
+                    const uint32_t id = parseLocalId(entry, context);
+                    const auto it = valueIds.find(id);
+                    if (it == valueIds.end())
+                        throw std::runtime_error(std::string(context) + ": unknown value ID " + std::to_string(id));
+                    return it->second;
+                }
+                const std::string &name = entry.asString(context);
+                if (name.empty())
+                    throw std::runtime_error(std::string(context) + ": empty value reference");
+                const auto value = findValueRef(name);
+                if (!value.valid())
+                    throw std::runtime_error("Unknown value reference: " + name);
+                return value;
+            };
+            const auto parseOperationRef = [&](const JsonValue &entry, std::string_view context) -> OperationId {
+                if (localIds)
+                {
+                    const uint32_t id = parseLocalId(entry, context);
+                    const auto it = operationIds.find(id);
+                    if (it == operationIds.end())
+                        throw std::runtime_error(std::string(context) + ": unknown operation ID " + std::to_string(id));
+                    return it->second;
+                }
+                const std::string &name = entry.asString(context);
+                if (name.empty())
+                    throw std::runtime_error(std::string(context) + ": empty operation reference");
+                const auto it = operationRefs.find(name);
+                if (it == operationRefs.end())
+                    throw std::runtime_error("Unknown operation reference: " + name);
+                return it->second;
+            };
 
             const std::size_t ioReserve = std::max<std::size_t>(32, valuesArray.size() / 32);
             declaredInputs.reserve(ioReserve);
@@ -1324,20 +1385,29 @@ namespace wolvrix::lib::load
             {
                 const auto &valueObj = valueEntry.asObject("value");
                 const auto symIt = valueObj.find("sym");
+                const auto idIt = valueObj.find("id");
                 const auto widthIt = valueObj.find("w");
                 const auto signIt = valueObj.find("sgn");
                 const auto inIt = valueObj.find("in");
                 const auto outIt = valueObj.find("out");
-                if (symIt == valueObj.end() || widthIt == valueObj.end() ||
+                if ((localIds ? idIt == valueObj.end() : symIt == valueObj.end()) || widthIt == valueObj.end() ||
                     signIt == valueObj.end() || inIt == valueObj.end() || outIt == valueObj.end())
                 {
                     throw std::runtime_error("Value entry missing required fields");
                 }
+                if (localIds && valueObj.find("tmp") != valueObj.end())
+                    throw std::runtime_error("formatVersion 3 value must not contain tmp marker");
 
-                const auto &symbol = symIt->second.asString("value.sym");
-                if (symbol.empty())
+                std::string symbol;
+                if (symIt != valueObj.end())
                 {
-                    throw std::runtime_error("Value symbol is empty");
+                    symbol = symIt->second.asString("value.sym");
+                    if (symbol.empty())
+                        throw std::runtime_error("Value symbol is empty");
+                }
+                else if (!localIds)
+                {
+                    throw std::runtime_error("Value entry missing symbol");
                 }
                 int64_t width = widthIt->second.asInt("value.w");
                 if (width < std::numeric_limits<int32_t>::min() || width > std::numeric_limits<int32_t>::max())
@@ -1369,13 +1439,18 @@ namespace wolvrix::lib::load
                 {
                     valueSymbolStart = TimingClock::now();
                 }
-                SymbolId valueSym = graph.internSymbol(symbol);
+                const bool temporary = localIds ? symIt == valueObj.end() : [&] {
+                    if (const auto tmpIt = valueObj.find("tmp"); tmpIt != valueObj.end())
+                        return tmpIt->second.asBool("value.tmp");
+                    return false;
+                }();
+                SymbolId valueSym = temporary ? SymbolId::invalid() : graph.internSymbol(symbol);
                 if (timingEnabled)
                 {
                     const auto now = TimingClock::now();
                     valuesSymbolMs += toMillis(now - valueSymbolStart);
                 }
-                if (!valueSym.valid())
+                if (!temporary && !valueSym.valid())
                 {
                     throw std::runtime_error("Value symbol already bound to value/operation: " + symbol);
                 }
@@ -1392,8 +1467,18 @@ namespace wolvrix::lib::load
                         valueShape.push_back(dimEntry.asInt("value.shape[]"));
                     }
                 }
-                ValueId valueId = graph.createValue(valueSym, static_cast<int32_t>(width), isSigned, valueType,
-                                                    valueShape, domain);
+                ValueId valueId = graph.createTemporaryValue(valueSym, static_cast<int32_t>(width), isSigned,
+                                                              valueType, valueShape, domain);
+                if (localIds)
+                {
+                    const uint32_t localId = parseLocalId(idIt->second, "value.id");
+                    if (!valueIds.emplace(localId, valueId).second)
+                        throw std::runtime_error("Duplicate value ID: " + std::to_string(localId));
+                }
+                else if (!valueRefs.emplace(symbol, valueId).second)
+                {
+                    throw std::runtime_error("Duplicate value display name: " + symbol);
+                }
                 if (timingEnabled)
                 {
                     const auto now = TimingClock::now();
@@ -1410,6 +1495,10 @@ namespace wolvrix::lib::load
                 if (isInout && (isInput || isOutput))
                 {
                     throw std::runtime_error("Value cannot be both inout and input/output in JSON");
+                }
+                if (temporary && (isInput || isOutput || isInout))
+                {
+                    throw std::runtime_error("Temporary value cannot be a graph port in JSON");
                 }
 
                 if (isInput)
@@ -1511,16 +1600,7 @@ namespace wolvrix::lib::load
                         {
                             throw std::runtime_error("Port name is empty");
                         }
-                        const std::string &valueName = valField->second.asString("graph.port.val");
-                        if (valueName.empty())
-                        {
-                            throw std::runtime_error("Port value symbol is empty");
-                        }
-                        const auto valueId = graph.findValue(valueName);
-                        if (!valueId.valid())
-                        {
-                            throw std::runtime_error("Port references unknown value: " + valueName);
-                        }
+                        const auto valueId = parseValueRef(valField->second, "graph.port.val");
                         if (isInput)
                         {
                             inputPorts.push_back(Port{portNameText, valueId});
@@ -1574,20 +1654,9 @@ namespace wolvrix::lib::load
                         {
                             throw std::runtime_error("Inout port name is empty");
                         }
-                        const std::string &inName = inField->second.asString("graph.port.in");
-                        const std::string &outName = outField->second.asString("graph.port.out");
-                        const std::string &oeName = oeField->second.asString("graph.port.oe");
-                        if (inName.empty() || outName.empty() || oeName.empty())
-                        {
-                            throw std::runtime_error("Inout port value symbol is empty");
-                        }
-                        const auto inValue = graph.findValue(inName);
-                        const auto outValue = graph.findValue(outName);
-                        const auto oeValue = graph.findValue(oeName);
-                        if (!inValue.valid() || !outValue.valid() || !oeValue.valid())
-                        {
-                            throw std::runtime_error("Inout port references unknown value");
-                        }
+                        const auto inValue = parseValueRef(inField->second, "graph.port.in");
+                        const auto outValue = parseValueRef(outField->second, "graph.port.out");
+                        const auto oeValue = parseValueRef(oeField->second, "graph.port.oe");
                         inoutPorts.push_back(InoutPort{portNameText, inValue, outValue, oeValue});
                         if (timingEnabled)
                         {
@@ -1781,28 +1850,36 @@ namespace wolvrix::lib::load
                         throw std::runtime_error("Dialect operation requires an explicit format/dialect version");
 
                     auto symIt = opObj.find("sym");
-                    if (symIt == opObj.end())
-                    {
-                        throw std::runtime_error("Operation missing symbol");
-                    }
+                    const auto idIt = opObj.find("id");
+                    if ((localIds ? idIt == opObj.end() : symIt == opObj.end()))
+                        throw std::runtime_error("Operation entry missing required identity field");
+                    if (localIds && opObj.find("tmp") != opObj.end())
+                        throw std::runtime_error("formatVersion 3 operation must not contain tmp marker");
 
-                    const std::string &opSymbol = symIt->second.asString("operation.sym");
-                    if (opSymbol.empty())
+                    std::string opSymbol;
+                    if (symIt != opObj.end())
                     {
-                        throw std::runtime_error("Operation symbol is empty");
+                        opSymbol = symIt->second.asString("operation.sym");
+                        if (opSymbol.empty())
+                            throw std::runtime_error("Operation symbol is empty");
                     }
                     TimingClock::time_point opSymbolStart;
                     if (timingEnabled)
                     {
                         opSymbolStart = TimingClock::now();
                     }
-                    SymbolId opSym = graph.internSymbol(opSymbol);
+                    const bool temporary = localIds ? symIt == opObj.end() : [&] {
+                        if (const auto tmpIt = opObj.find("tmp"); tmpIt != opObj.end())
+                            return tmpIt->second.asBool("operation.tmp");
+                        return false;
+                    }();
+                    SymbolId opSym = temporary ? SymbolId::invalid() : graph.internSymbol(opSymbol);
                     if (timingEnabled)
                     {
                         const auto now = TimingClock::now();
                         opsSymbolMs += toMillis(now - opSymbolStart);
                     }
-                    if (!opSym.valid())
+                    if (!temporary && !opSym.valid())
                     {
                         throw std::runtime_error("Operation symbol already bound to value/operation: " + opSymbol);
                     }
@@ -1811,7 +1888,19 @@ namespace wolvrix::lib::load
                     {
                         opCreateStart = TimingClock::now();
                     }
-                    OperationId opId = graph.createOperation(*kind, opSym);
+                    OperationId opId = temporary ? graph.createTemporaryOperation(*kind) :
+                        graph.createOperation(*kind, opSym);
+                    if (localIds)
+                    {
+                        const uint32_t localId = parseLocalId(idIt->second, "operation.id");
+                        if (!operationIds.emplace(localId, opId).second)
+                            throw std::runtime_error("Duplicate operation ID: " + std::to_string(localId));
+                        operationLocalIds.emplace(opId, localId);
+                    }
+                    else if (!operationRefs.emplace(opSymbol, opId).second)
+                    {
+                        throw std::runtime_error("Duplicate operation display name: " + opSymbol);
+                    }
                     if (timingEnabled)
                     {
                         const auto now = TimingClock::now();
@@ -1834,12 +1923,7 @@ namespace wolvrix::lib::load
                     {
                         for (const auto &entry : *inputsArray)
                         {
-                            const std::string &symbol = entry.asString("operation.in[]");
-                            const auto valueId = graph.findValue(symbol);
-                            if (!valueId.valid())
-                            {
-                                throw std::runtime_error("Operand references unknown value: " + symbol);
-                            }
+                            const auto valueId = parseValueRef(entry, "operation.in[]");
                             graph.addOperand(opId, valueId);
                             ++opsInRefs;
                         }
@@ -1866,12 +1950,7 @@ namespace wolvrix::lib::load
                     {
                         for (const auto &entry : *outputsArray)
                         {
-                            const std::string &symbol = entry.asString("operation.out[]");
-                            const auto valueId = graph.findValue(symbol);
-                            if (!valueId.valid())
-                            {
-                                throw std::runtime_error("Result references unknown value: " + symbol);
-                            }
+                            const auto valueId = parseValueRef(entry, "operation.out[]");
                             graph.addResult(opId, valueId);
                             ++opsOutRefs;
                         }
@@ -1930,6 +2009,75 @@ namespace wolvrix::lib::load
                                 << " elapsed=" << toMillis(now - opsStart) << "ms";
                         logJsonTiming("load_json.ops.progress", toMillis(now - opsStart), details.str());
                     }
+                }
+            }
+
+            // v3 keeps def/use lists as redundant, checkable topology facts.
+            // The operation edge arrays above are authoritative for rebuilding
+            // the graph; reject stale or cross-namespace references instead of
+            // silently accepting a malformed checkpoint.
+            if (localIds)
+            {
+                for (const auto &valueEntry : valuesArray)
+                {
+                    const auto &valueObj = valueEntry.asObject("value");
+                    const uint32_t valueLocalId = parseLocalId(valueObj.at("id"), "value.id");
+                    const auto valueIt = valueIds.find(valueLocalId);
+                    if (valueIt == valueIds.end())
+                        throw std::runtime_error("Value ID table is incomplete");
+                    const ValueId valueId = valueIt->second;
+                    const auto defIt = valueObj.find("def");
+                    const OperationId actualDef = graph.valueDef(valueId);
+                    if (defIt == valueObj.end())
+                    {
+                        if (actualDef.valid())
+                            throw std::runtime_error("Value is missing its defining operation ID");
+                    }
+                    else
+                    {
+                        const OperationId encodedDef = parseOperationRef(defIt->second, "value.def");
+                        if (encodedDef != actualDef)
+                            throw std::runtime_error("Value defining operation ID does not match operation edges");
+                    }
+
+                    std::vector<std::pair<uint32_t, std::size_t>> encodedUsers;
+                    if (const auto usersIt = valueObj.find("users"); usersIt != valueObj.end())
+                    {
+                        for (const auto &userEntry : usersIt->second.asArray("value.users"))
+                        {
+                            const auto &userObj = userEntry.asObject("value.users[]");
+                            const auto opIt = userObj.find("op");
+                            const auto idxIt = userObj.find("idx");
+                            if (opIt == userObj.end() || idxIt == userObj.end())
+                                throw std::runtime_error("Value user entry missing op or idx");
+                            const int64_t idx = idxIt->second.asInt("value.users[].idx");
+                            if (idx < 0 || static_cast<uint64_t>(idx) > std::numeric_limits<std::size_t>::max())
+                                throw std::runtime_error("Value user operand index is invalid");
+                            const OperationId operation = parseOperationRef(opIt->second, "value.users[].op");
+                            const auto operationLocalIt = operationLocalIds.find(operation);
+                            if (operationLocalIt == operationLocalIds.end())
+                                throw std::runtime_error("Value user operation is missing from the local ID table");
+                            encodedUsers.emplace_back(operationLocalIt->second, static_cast<std::size_t>(idx));
+                        }
+                    }
+                    std::vector<std::pair<uint32_t, std::size_t>> actualUsers;
+                    for (const auto &user : graph.valueUsers(valueId))
+                    {
+                        const auto operationLocalIt = operationLocalIds.find(user.operation);
+                        if (operationLocalIt == operationLocalIds.end())
+                            throw std::runtime_error("Graph user operation is missing from the local ID table");
+                        actualUsers.emplace_back(operationLocalIt->second, user.operandIndex);
+                    }
+                    auto sortUsers = [](auto &users) {
+                        std::sort(users.begin(), users.end(), [](const auto &lhs, const auto &rhs) {
+                            if (lhs.first != rhs.first) return lhs.first < rhs.first;
+                            return lhs.second < rhs.second;
+                        });
+                    };
+                    sortUsers(encodedUsers);
+                    sortUsers(actualUsers);
+                    if (encodedUsers != actualUsers)
+                        throw std::runtime_error("Value user list does not match operation edges");
                 }
             }
             totalOps += opsCount;

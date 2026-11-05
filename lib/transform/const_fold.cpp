@@ -222,7 +222,8 @@ namespace wolvrix::lib::transform
                 slang::SVInt parsed = slang::SVInt::fromString(literal);
                 if (value.width() <= 0)
                 {
-                    onError("Value width must be positive for constant propagation: " + std::string(value.symbolText()));
+                    onError("Value width must be positive for constant propagation: " +
+                            graph.valueDisplayName(value.id()));
                     return std::nullopt;
                 }
                 parsed.setSigned(value.isSigned());
@@ -585,9 +586,7 @@ namespace wolvrix::lib::transform
                             + " defKind=" + (baseDefId.valid()
                                                  ? std::string(wolvrix::lib::grh::toString(graph.opKind(baseDefId)))
                                                  : std::string("none"))
-                            + " baseSym=" + std::string(graph.valueSymbol(baseId).valid()
-                                                           ? graph.symbolText(graph.valueSymbol(baseId))
-                                                           : std::string_view("<none>")));
+                            + " baseSym=" + graph.valueDisplayName(baseId));
                     return std::nullopt;
                 }
                 const int64_t baseWidth = graph.valueWidth(baseId);

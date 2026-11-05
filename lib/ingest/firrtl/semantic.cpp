@@ -119,6 +119,8 @@ int Guards::negate(int value) {
 Semantics::Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options,
                      const std::map<std::string, ModuleSignature>* interfaces)
     : source(source), body(body), expressions(body.arena.expressions.size()), enabledLayers_(options.enabledLayers), interfaces_(interfaces) {
+    declarations.reserve(body.arena.statements.size() + body.interface.ports.size());
+    memoryPorts.reserve(body.arena.statements.size() / 4 + 1);
     const auto visit = [&](auto&& self, std::span<const Layer> layers, const std::string& parent) -> void {
         for (const auto& layer : layers) {
             const auto path = parent.empty() ? std::string(layer.name) : parent + "." + std::string(layer.name);

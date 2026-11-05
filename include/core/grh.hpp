@@ -6,6 +6,7 @@
 #include "core/detail/pool_vector.hpp"
 #include "core/detail/payload_pool.hpp"
 #include "core/detail/shared_column.hpp"
+#include "core/semantic_tree.hpp"
 #include "slang/util/FlatMap.h"
 
 #include <array>
@@ -753,8 +754,9 @@ public:
     ValueId addValue(SymbolId sym, int32_t width, bool isSigned,
                      ValueType type = ValueType::Logic,
                      std::span<const int64_t> shape = {},
-                     LogicDomain domain = LogicDomain::FourState);
-    OperationId addOp(OperationKind kind, SymbolId sym);
+                     LogicDomain domain = LogicDomain::FourState,
+                     bool allowInvalidSymbol = false);
+    OperationId addOp(OperationKind kind, SymbolId sym, bool allowInvalidSymbol = false);
     void addOperand(OperationId op, ValueId value);
     void addResult(OperationId op, ValueId value);
     void insertOperand(OperationId op, std::size_t index, ValueId value);
@@ -866,6 +868,7 @@ private:
         std::vector<ValueUser> users;
         ShapePool shapes;
         std::vector<RecordId> attrs;
+        std::vector<SemanticId> semantics;
     };
     struct ValueRow {
         SymbolId& symbol;
@@ -879,6 +882,7 @@ private:
         uint8_t& isInout;
         OperationId& definingOp;
         RecordId& srcLoc;
+        Range& semantics;
         uint8_t& alive;
     };
     struct ValueColumns {
@@ -895,6 +899,7 @@ private:
         std::vector<uint8_t> isInout_;
         std::vector<OperationId> definingOp_;
         std::vector<RecordId> srcLoc_;
+        std::vector<Range> semantics_;
         std::vector<uint8_t> alive_;
         std::size_t size() const noexcept { return symbol_.size(); }
         void reserve(std::size_t count) {
@@ -909,10 +914,11 @@ private:
             isInout_.reserve(count);
             definingOp_.reserve(count);
             srcLoc_.reserve(count);
+            semantics_.reserve(count);
             alive_.reserve(count);
         }
         ValueRow operator[](std::size_t index) const {
-            return {const_cast<SymbolId&>(symbol_[index]), const_cast<int32_t&>(width_[index]), const_cast<uint8_t&>(isSigned_[index]), const_cast<ValueType&>(type_[index]), const_cast<LogicDomain&>(domain_[index]), ShapeRef{pools_->shapes, const_cast<RecordId&>(shape_[index])}, const_cast<uint8_t&>(isInput_[index]), const_cast<uint8_t&>(isOutput_[index]), const_cast<uint8_t&>(isInout_[index]), const_cast<OperationId&>(definingOp_[index]), const_cast<RecordId&>(srcLoc_[index]), const_cast<uint8_t&>(alive_[index])};
+            return {const_cast<SymbolId&>(symbol_[index]), const_cast<int32_t&>(width_[index]), const_cast<uint8_t&>(isSigned_[index]), const_cast<ValueType&>(type_[index]), const_cast<LogicDomain&>(domain_[index]), ShapeRef{pools_->shapes, const_cast<RecordId&>(shape_[index])}, const_cast<uint8_t&>(isInput_[index]), const_cast<uint8_t&>(isOutput_[index]), const_cast<uint8_t&>(isInout_[index]), const_cast<OperationId&>(definingOp_[index]), const_cast<RecordId&>(srcLoc_[index]), const_cast<Range&>(semantics_[index]), const_cast<uint8_t&>(alive_[index])};
         }
         ValueRow at(std::size_t index) const { if (index >= size()) throw std::out_of_range("graph column index"); return (*this)[index]; }
         ValueRow emplace_back() {
@@ -927,6 +933,7 @@ private:
             isInout_.emplace_back(0);
             definingOp_.emplace_back(OperationId::invalid());
             srcLoc_.emplace_back();
+            semantics_.emplace_back();
             alive_.emplace_back(1);
             return (*this)[size() - 1];
         }
@@ -939,6 +946,7 @@ private:
         detail::PoolVector<ValueId>& results;
         detail::PoolVector<RecordId>& attrs;
         RecordId& srcLoc;
+        Range& semantics;
         uint8_t& alive;
     };
     struct OperationColumns {
@@ -951,6 +959,7 @@ private:
         std::vector<detail::PoolVector<ValueId>> results_;
         std::vector<detail::PoolVector<RecordId>> attrs_;
         std::vector<RecordId> srcLoc_;
+        std::vector<Range> semantics_;
         std::vector<uint8_t> alive_;
         std::size_t size() const noexcept { return kind_.size(); }
         void reserve(std::size_t count) {
@@ -961,10 +970,11 @@ private:
             results_.reserve(count);
             attrs_.reserve(count);
             srcLoc_.reserve(count);
+            semantics_.reserve(count);
             alive_.reserve(count);
         }
         OperationRow operator[](std::size_t index) const {
-            return {const_cast<OperationKind&>(kind_[index]), const_cast<SymbolId&>(symbol_[index]), const_cast<detail::PoolVector<ValueId>&>(operands_[index]), const_cast<detail::PoolVector<std::size_t>&>(operandUseIndices_[index]), const_cast<detail::PoolVector<ValueId>&>(results_[index]), const_cast<detail::PoolVector<RecordId>&>(attrs_[index]), const_cast<RecordId&>(srcLoc_[index]), const_cast<uint8_t&>(alive_[index])};
+            return {const_cast<OperationKind&>(kind_[index]), const_cast<SymbolId&>(symbol_[index]), const_cast<detail::PoolVector<ValueId>&>(operands_[index]), const_cast<detail::PoolVector<std::size_t>&>(operandUseIndices_[index]), const_cast<detail::PoolVector<ValueId>&>(results_[index]), const_cast<detail::PoolVector<RecordId>&>(attrs_[index]), const_cast<RecordId&>(srcLoc_[index]), const_cast<Range&>(semantics_[index]), const_cast<uint8_t&>(alive_[index])};
         }
         OperationRow at(std::size_t index) const { if (index >= size()) throw std::out_of_range("graph column index"); return (*this)[index]; }
         OperationRow emplace_back() {
@@ -975,6 +985,7 @@ private:
             results_.emplace_back(pools_->results);
             attrs_.emplace_back(pools_->attrs);
             srcLoc_.emplace_back();
+            semantics_.emplace_back();
             alive_.emplace_back(1);
             return (*this)[size() - 1];
         }
@@ -1148,7 +1159,8 @@ public:
 
     // Per-definition payload relocation, shared by all instances in one
     // flatten. Attribute records remain private to each destination op, while
-    // immutable list buffers and string arena pages retain source ownership.
+    // immutable list buffers retain source ownership. String IDs are remapped
+    // lazily so only text referenced by imported payloads is interned.
     class BlockImportContext {
     public:
         BlockImportContext() = default;
@@ -1158,7 +1170,7 @@ public:
         uint64_t sourceEpoch_ = 0, targetEpoch_ = 0, sourceMutation_ = 0;
         bool prepared_ = false;
         std::vector<GraphPayload::AttributeRecord> attributes_;
-        std::shared_ptr<const std::vector<GraphPayload::StringId>> strings_;
+        std::shared_ptr<std::vector<GraphPayload::StringId>> strings_;
     };
     struct OperationBlockImport {
         const Graph* source = nullptr;
@@ -1264,6 +1276,13 @@ public:
     void markLocalCyclesChecked() noexcept { localCycleProof_ = mutationEpoch_; }
     [[nodiscard]] const GraphStore& payloadStore() const noexcept { return *store_; }
 
+    SemanticTree* semanticTree() noexcept { return semanticTree_.get(); }
+    const SemanticTree* semanticTree() const noexcept { return semanticTree_.get(); }
+    SemanticTree& getOrCreateSemanticTree(std::string sourceUnit, std::string circuit,
+                                          std::string module);
+    SemanticId appendSemanticInstance(const Graph& source, SemanticId parent,
+                                      std::string_view instanceName);
+
     std::span<const OperationId> operations() const;
     std::span<const ValueId> values() const;
     std::span<const Port> inputPorts() const;
@@ -1280,8 +1299,31 @@ public:
                         LogicDomain domain = LogicDomain::FourState);
     ValueId createValue(SymbolId symbol, const LogicalType& type);
     ValueId createValue(const LogicalType& type);
+    // Create an implementation temporary without reserving a text symbol.
+    // Temporary entities are identified by their ValueId/OperationId and only
+    // acquire a display name at a serialization or downstream boundary.
+    ValueId createTemporaryValue(SymbolId symbol, int32_t width, bool isSigned,
+                                 ValueType type = ValueType::Logic,
+                                 std::span<const int64_t> shape = {},
+                                 LogicDomain domain = LogicDomain::FourState);
+    ValueId createTemporaryValue(int32_t width, bool isSigned,
+                                 ValueType type = ValueType::Logic,
+                                 std::span<const int64_t> shape = {},
+                                 LogicDomain domain = LogicDomain::FourState);
+    ValueId createTemporaryValue(SymbolId symbol, const LogicalType& type);
+    ValueId createTemporaryValue(const LogicalType& type);
     OperationId createOperation(OperationKind kind, SymbolId symbol);
     OperationId createOperation(OperationKind kind);
+    OperationId createTemporaryOperation(OperationKind kind);
+
+    // Stable, generated names for diagnostics and serialization.  A valid
+    // symbol returns its text; an invalid symbol gets a deterministic name
+    // derived from the current entity id without entering SymbolTable.
+    std::string valueDisplayName(ValueId value) const;
+    std::string operationDisplayName(OperationId op) const;
+    // Materialize all temporary entities for a consumer whose ABI uses symbol
+    // text as identity (for example GrhSIM IR).
+    void materializeInternalSymbols();
     // result[i] = elements[i]; adds an outer dimension, including N=1.
     ValueId createArray(std::span<const ValueId> elements);
 
@@ -1306,9 +1348,17 @@ public:
     bool valueIsInout(ValueId value) const;
     OperationId valueDef(ValueId value) const;
     std::optional<SrcLoc> valueSrcLoc(ValueId value) const;
+    std::span<const SemanticId> valueSemanticIds(ValueId value) const;
+    void setValueSemanticIds(ValueId value, std::span<const SemanticId> ids);
+    void addValueSemanticIds(ValueId value, std::span<const SemanticId> ids);
+    void mergeValueSemanticIds(ValueId target, ValueId source);
     OperationKind opKind(OperationId op) const;
     std::span<const ValueId> opOperands(OperationId op) const;
     std::span<const ValueId> opResults(OperationId op) const;
+    std::span<const SemanticId> opSemanticIds(OperationId op) const;
+    void setOpSemanticIds(OperationId op, std::span<const SemanticId> ids);
+    void addOpSemanticIds(OperationId op, std::span<const SemanticId> ids);
+    void mergeOpSemanticIds(OperationId target, OperationId source);
     AttrRange opAttrs(OperationId op) const;
     AttrRange opAttrRange(OperationId op) const;
     std::optional<SrcLoc> opSrcLoc(OperationId op) const;
@@ -1389,6 +1439,14 @@ public:
                               std::span<const SymbolId> symbols, std::span<OperationId> output,
                               SrcLocImportContext& context, std::size_t threads = 1,
                               bool retainSourceColumns = false);
+    std::size_t remapValueBlockSemantics(const Graph& source,
+                                         std::span<const ValueId> sourceValues,
+                                         std::span<const ValueId> targetValues,
+                                         SemanticId scope);
+    std::size_t remapOperationBlockSemantics(const Graph& source,
+                                             std::span<const OperationId> sourceOps,
+                                             std::span<const OperationId> targetOps,
+                                             SemanticId scope);
     // Offsets have ops.size()+1 entries, begin at zero, and terminate at the
     // corresponding flat edge count. Results acquire their definitions now;
     // reverse uses must be rebuilt before querying or mutating imported edges.
@@ -1456,6 +1514,7 @@ private:
     std::vector<AttrKV> metadata_;
     GraphSymbolTable symbols_;
     std::shared_ptr<GraphStore> store_;
+    std::shared_ptr<SemanticTree> semanticTree_;
     bool compacted_ = true;
     uint64_t srcLocEpoch_ = 0;
     uint64_t mutationEpoch_ = 0;

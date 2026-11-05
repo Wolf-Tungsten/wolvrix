@@ -1,6 +1,5 @@
 #include "semantic.hpp"
 #include "core/state.hpp"
-#include "ingest/node_attributes.hpp"
 #include "slang/util/SmallVector.h"
 
 #include <algorithm>
@@ -63,6 +62,7 @@ struct Driver {
     std::map<int64_t, int> coverage;
     std::string regSymbol;
     ValueId memoryMask;
+    grh::SemanticId semantic = 0;
 };
 
 struct LeafKeyView {
@@ -126,9 +126,7 @@ private:
     std::unordered_map<std::string_view, Driver*> rootDrivers_;
     std::map<int, ValueId> guards_;
     std::unordered_map<ValueId, ValueId, grh::ValueIdHash> clockPulses_;
-    std::string nodeKey_;
-    bool nodeSchemaReady_ = false;
-    void ensureNodeSchema();
+    grh::SemanticId currentSemantic_ = 0;
     Driver* rootDriver(std::string_view name) const;
     Driver& findDriver(std::string_view name, std::span<const std::string> fields);
     const Driver& findDriver(std::string_view name, std::span<const std::string> fields) const;
@@ -168,12 +166,6 @@ private:
     void effects();
     void instances();
 };
-
-void Lowerer::ensureNodeSchema() {
-    if (nodeSchemaReady_) return;
-    graph_.setMetadata(node::kSchema, node::kSchemaRevision);
-    nodeSchemaReady_ = true;
-}
 
 grh::SrcLocView Lowerer::location(Range range) const {
     grh::SrcLocView result;
@@ -237,11 +229,10 @@ const Leaf& Lowerer::projected(ExprId id, const std::vector<std::string>& fields
 ValueId Lowerer::op(OperationKind kind, const LogicalType& type, std::span<const ValueId> args, Range range) {
     if (!type.width) return {};
 
-    const auto operation = graph_.createOperation(kind);
+    const auto operation = graph_.createTemporaryOperation(kind);
 
-    const auto result = graph_.createValue(type);
+    const auto result = graph_.createTemporaryValue(type);
 
-    if (!nodeKey_.empty()) graph_.reserveOpAttrCapacity(operation, 2);
     if (args.size() > 1) graph_.reserveOpOperandCapacity(operation, args.size());
     for (const auto value : args) {
         if (!value) throw std::logic_error("zero-width FIRRTL operand was not eliminated");
@@ -253,11 +244,8 @@ ValueId Lowerer::op(OperationKind kind, const LogicalType& type, std::span<const
     // Both entities borrow the same source text and share one pooled record.
     graph_.setOpAndValueSrcLocView(operation, result, location(range));
 
-    if (!nodeKey_.empty()) {
-        ensureNodeSchema();
-
-        node::writeSingleCanonicalReady(graph_, operation, nodeKey_);
-    }
+    if (currentSemantic_)
+        graph_.setOpSemanticIds(operation, std::span<const grh::SemanticId>(&currentSemantic_, 1));
     return result;
 }
 ValueId Lowerer::constant(const LogicalType& type, std::string bits, Range range) {
@@ -492,15 +480,15 @@ ValueId Lowerer::stateRead(const Driver& driver, std::span<const ExprId> indices
         valid = valid ? op(OperationKind::kAnd, {grh::ValueType::Logic, 1, false}, {valid, inside}, range) : inside;
     }
     // A state observation is an external node dependency, never node-owned work.
-    auto key = std::exchange(nodeKey_, {});
+    const auto semantic = std::exchange(currentSemantic_, 0);
     const auto result = op(OperationKind::kRegisterReadArrayPort, type, args, range);
     graph_.setAttr(graph_.valueDef(result), "regSymbol", driver.regSymbol);
-    nodeKey_ = std::move(key);
+    currentSemantic_ = semantic;
     return valid ? op(OperationKind::kMux, type, {valid, result, invalid(type, range)}, range) : result;
 }
 void Lowerer::stateWrite(const Driver& driver, const Declaration::Register& state, ValueId enable,
                          const std::vector<ValueId>& indices, ValueId data, Range range) {
-    const auto writer = graph_.createOperation(indices.empty() ? OperationKind::kRegisterWritePort : OperationKind::kRegisterWriteArrayPort);
+    const auto writer = graph_.createTemporaryOperation(indices.empty() ? OperationKind::kRegisterWritePort : OperationKind::kRegisterWriteArrayPort);
     graph_.addOperand(writer, enable);
     for (const auto value : indices) graph_.addOperand(writer, value);
     graph_.addOperand(writer, data); graph_.addOperand(writer, expression(state.clock));
@@ -646,12 +634,12 @@ void Lowerer::connect(const Connection& connection) {
 }
 void Lowerer::drive(ValueId target, ValueId source, Range range, bool root) {
     if (!target) return;
-    const auto operation = graph_.createOperation(OperationKind::kAssign);
+    const auto operation = graph_.createTemporaryOperation(OperationKind::kAssign);
     graph_.addOperand(operation, source); graph_.addResult(operation, target); graph_.setOpSrcLocView(operation, location(range));
-    if (root && !nodeKey_.empty()) {
-        ensureNodeSchema();
-        graph_.reserveOpAttrCapacity(operation, 4);
-        node::writeSingleCanonicalReady(graph_, operation, nodeKey_, true);
+    if (root && currentSemantic_) {
+        const std::span<const grh::SemanticId> semantic(&currentSemantic_, 1);
+        graph_.setOpSemanticIds(operation, semantic);
+        graph_.setValueSemanticIds(target, semantic);
     }
 }
 
@@ -671,7 +659,7 @@ ValueId Lowerer::pipeline(ValueId data, ValueId clock, int64_t stages, Range ran
         grh::InitStep init; init.value = std::to_string(type.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
         grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLocView(state, location(range));
         graph_.setAttr(state, "firrtl.memoryPipeline", true);
-        const auto write = graph_.createOperation(OperationKind::kRegisterWritePort);
+        const auto write = graph_.createTemporaryOperation(OperationKind::kRegisterWritePort);
         for (const auto value : {number(1, 1, range), data, clock}) graph_.addOperand(write, value);
         graph_.setAttr(write, "regSymbol", symbol); graph_.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
         graph_.setOpSrcLocView(write, location(range));
@@ -689,7 +677,7 @@ ValueId Lowerer::clockPulse(ValueId clock, Range range) {
     graph_.setAttr(state, "firrtl.memoryClockHistory", true);
     const auto previous = op(OperationKind::kRegisterReadPort, bit, {}, range);
     graph_.setAttr(graph_.valueDef(previous), "regSymbol", symbol);
-    const auto writer = graph_.createOperation(OperationKind::kRegisterWritePort);
+    const auto writer = graph_.createTemporaryOperation(OperationKind::kRegisterWritePort);
     for (const auto value : {number(1, 1, range), clock, clock}) graph_.addOperand(writer, value);
     graph_.setAttr(writer, "regSymbol", symbol);
     graph_.setAttr(writer, "eventEdge", std::vector<std::string>{"both"});
@@ -816,7 +804,7 @@ void Lowerer::memories() {
                     // FIRRTL independent writers have undefined collisions, never last-connect priority.
                     data = op(OperationKind::kMux, type, {conflict, invalid(type, port.source->range), data}, port.source->range);
                 }
-                const auto writer = graph_.createOperation(OperationKind::kRegisterWriteArrayMaskPort);
+                const auto writer = graph_.createTemporaryOperation(OperationKind::kRegisterWriteArrayMaskPort);
                 for (const auto value : {port.writeEnable, port.writeAddress, data, port.writeMask, port.clock}) graph_.addOperand(writer, value);
                 graph_.setAttr(writer, "regSymbol", symbol); graph_.setAttr(writer, "eventEdge", std::vector<std::string>{"posedge"});
                 graph_.setOpSrcLocView(writer, location(port.source->range));
@@ -858,7 +846,7 @@ void Lowerer::memories() {
                                 collide(writer.address, both(writer.initiatingEnable, clockPulse(writer.clock, range), range));
                                 for (const auto& pending : writer.pendingWrites) collide(pending.first, pending.second);
                             }
-                            const auto update = graph_.createOperation(OperationKind::kRegisterWritePort);
+                            const auto update = graph_.createTemporaryOperation(OperationKind::kRegisterWritePort);
                             // Completed tokens remain stable until the next result.
                             graph_.addOperand(update, stage + 1 == memory.readLatency ? readPulse : number(1, 1, range));
                             graph_.addOperand(update, next);
@@ -938,8 +926,8 @@ void Lowerer::effects() {
             }
             if (statement.kind != StmtKind::Cover && text.find("{{") != std::string::npos) throw Error(statement.range, "FIRRTL special format substitution is not supported yet");
             if (statement.kind != StmtKind::Cover && placeholders != arguments.size()) throw Error(statement.range, "FIRRTL format argument count mismatch");
-            const auto constant = graph_.createOperation(OperationKind::kConstant);
-            const auto value = graph_.createValue({grh::ValueType::String, 0, false});
+            const auto constant = graph_.createTemporaryOperation(OperationKind::kConstant);
+            const auto value = graph_.createTemporaryValue({grh::ValueType::String, 0, false});
             graph_.addResult(constant, value); graph_.setAttr(constant, "constValue", text); graph_.setOpSrcLocView(constant, location(statement.range));
             arguments.insert(arguments.begin(), value);
             name = verification && statement.kind != StmtKind::Cover ? "fatal" : "write";
@@ -1022,6 +1010,11 @@ ModuleSignature Lowerer::run() {
     graph_.setMetadata("firrtl.invalidPolicy", std::string(options_.invalidPolicy == FirrtlInvalidPolicy::Unknown ? "unknown" : "zero"));
     graph_.setMetadata("firrtl.initPolicy", std::string(options_.initPolicy == FirrtlInitPolicy::Unknown ? "unknown" : "zero"));
     graph_.setMetadata("firrtl.enabledLayers", options_.enabledLayers);
+    grh::SemanticTree* semanticTree = nullptr;
+    if (options_.nodeAnnotations)
+        semanticTree = &graph_.getOrCreateSemanticTree(std::string(semantics_.source.unit()),
+            std::string(semantics_.source.circuit()), std::string(module.name));
+    std::unordered_map<std::string_view, grh::SemanticId> semanticDeclarations;
     std::set<std::string> names; std::vector<std::string> elided;
     rootDrivers_.reserve(semantics_.declarationOrder.size());
     for (const auto& name : semantics_.declarationOrder) {
@@ -1030,23 +1023,38 @@ ModuleSignature Lowerer::run() {
             auto symbol = name; for (const auto& field : leaf.fields) symbol += "__DOT__" + field;
             if (!names.insert(symbol).second) throw Error(declaration.range, "flattened FIRRTL name collision '" + symbol + "'");
             const auto type = logical(leaf); ValueId value;
+            grh::SemanticId semantic = 0;
+            if (semanticTree && type.width) {
+                auto [it, inserted] = semanticDeclarations.try_emplace(name);
+                if (inserted) {
+                    const auto kind = declaration.definition ? grh::SemanticNodeKind::Expression : grh::SemanticNodeKind::Declaration;
+                    it->second = semanticTree->addNode(semanticTree->root(), kind, name);
+                }
+                semantic = semanticTree->addFieldPath(it->second, leaf.fields);
+            }
             if (type.width) {
-                value = declaration.state ? graph_.createValue(type) : graph_.createValue(graph_.internSymbol(symbol), type);
+                value = declaration.state ? graph_.createTemporaryValue(type) : graph_.createValue(graph_.internSymbol(symbol), type);
                 graph_.setValueSrcLocView(value, location(declaration.range));
+                if (semantic) graph_.setValueSemanticIds(value, std::span<const grh::SemanticId>(&semantic, 1));
                 if (declaration.port) {
                     if (leaf.flow == 1) graph_.bindInputPort(symbol, value);
                     else graph_.bindOutputPort(symbol, value);
                 }
             } else elided.push_back(symbol);
             Driver driver{leaf, value, {}, declaration.range, {{0, 0}, {type.width, 0}}};
+            driver.semantic = semantic;
             if (declaration.state && value) {
                 driver.regSymbol = symbol;
                 const auto state = graph_.createOperation(OperationKind::kRegister, graph_.internSymbol(symbol));
                 grh::setStateLogicalType(graph_, state, type);
                 grh::InitStep init; init.value = std::to_string(type.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
                 grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLocView(state, location(declaration.range));
-                const auto read = graph_.createOperation(OperationKind::kRegisterReadPort);
+                const auto read = graph_.createTemporaryOperation(OperationKind::kRegisterReadPort);
                 graph_.addResult(read, value); graph_.setAttr(read, "regSymbol", symbol); graph_.setOpSrcLocView(read, location(declaration.range));
+                if (semantic) {
+                    graph_.setOpSemanticIds(state, std::span<const grh::SemanticId>(&semantic, 1));
+                    graph_.setOpSemanticIds(read, std::span<const grh::SemanticId>(&semantic, 1));
+                }
             }
             const auto entry = drivers_.emplace(LeafKey{name, leaf.fields}, std::move(driver)).first;
             if (leaf.fields.empty()) rootDrivers_.emplace(entry->first.first, &entry->second);
@@ -1072,11 +1080,11 @@ ModuleSignature Lowerer::run() {
         const auto& declaration = semantics_.declaration(name);
         if (!declaration.definition) continue;
         for (const auto& leaf : semantics_.leavesCached(declaration.type)) {
-            const auto value = findDriver(name, leaf.fields).value;
-            if (!value) continue;
-            if (options_.nodeAnnotations) nodeKey_ = node::key({std::string(semantics_.source.unit()), std::string(semantics_.source.circuit()), std::string(module.name), {}, name, leaf.fields});
-            drive(value, expression(*declaration.definition, leaf.fields), declaration.range, true);
-            nodeKey_.clear();
+            auto& driver = findDriver(name, leaf.fields);
+            if (!driver.value) continue;
+            currentSemantic_ = driver.semantic;
+            drive(driver.value, expression(*declaration.definition, leaf.fields), declaration.range, true);
+            currentSemantic_ = 0;
         }
     }
     instances();
@@ -1104,8 +1112,7 @@ ModuleSignature Lowerer::run() {
                 throw Error(driver.range, "FIRRTL component '" + key.first + "' is not fully initialized on every path");
         drive(driver.value, driver.current ? driver.current : invalid(graph_.valueLogicalType(driver.value), driver.range), driver.range);
     }
-    checkCycles(); node::requireValid(graph_);
-    if (options_.nodeAnnotations) { node::establishPolicy(graph_); node::recordRetention(graph_); }
+    checkCycles();
     if (!graph_.metadata("firrtl.pendingCombLoopCheck")) graph_.markLocalCyclesChecked();
     return signature;
 }

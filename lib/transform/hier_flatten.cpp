@@ -4,6 +4,7 @@
 #include "core/grh.hpp"
 #include "core/transform.hpp"
 #include "ingest/node_attributes.hpp"
+#include "slang/util/SmallVector.h"
 
 #include <algorithm>
 #include <chrono>
@@ -288,7 +289,6 @@ namespace wolvrix::lib::transform
                 std::vector<OperationRun> runs;
                 std::string prefix;
                 SymbolRenameMap opRename;
-                std::unique_ptr<wolvrix::lib::ingest::node::QualificationContext> qualification;
             };
             struct OperandBlock
             {
@@ -389,10 +389,8 @@ namespace wolvrix::lib::transform
             std::function<void(const wolvrix::lib::grh::Graph &, const wolvrix::lib::grh::Operation &,
                                std::string)> opError;
             HierFlattenOptions::SymProtectMode symProtect = HierFlattenOptions::SymProtectMode::All;
-            // Instance path of the graph currently being inlined; synthetic
-            // assigns created on its behalf are stamped with it.
-            std::string currentPrefix;
             std::vector<std::string> nodeInstancePath;
+            wolvrix::lib::grh::SemanticId currentSemanticParent = 0;
             bool profile = false;
             std::size_t numThreads = 1;
             GlobalInlinePlan plan;
@@ -876,14 +874,14 @@ namespace wolvrix::lib::transform
                 const wolvrix::lib::grh::Operation existing = target.getOperation(definingOp);
                 std::string message = "Flatten result value already has defining op";
                 message.append(" target_value=");
-                message.append(dstValue.symbolText());
+                message.append(target.valueDisplayName(dstValue.id()));
                 message.append(" target_graph=");
                 message.append(target.symbol());
                 if (srcValue.valid())
                 {
                     const wolvrix::lib::grh::Value srcVal = source.getValue(srcValue);
                     message.append(" source_value=");
-                    message.append(srcVal.symbolText());
+                    message.append(source.valueDisplayName(srcVal.id()));
                     const std::string portDesc = describePort(source, srcValue);
                     if (!portDesc.empty())
                     {
@@ -897,7 +895,7 @@ namespace wolvrix::lib::transform
                     message.append(prefix);
                 }
                 message.append(" existing_def=");
-                message.append(existing.symbolText());
+                message.append(target.operationDisplayName(existing.id()));
                 message.append(" existing_kind=");
                 message.append(std::string(wolvrix::lib::grh::toString(existing.kind())));
                 state.opError(source, source.getOperation(srcOp), std::move(message));
@@ -940,20 +938,15 @@ namespace wolvrix::lib::transform
                 }
             }
             const wolvrix::lib::grh::ValueId view =
-                target.createValue(target.makeInternalValSym(), expected);
+                target.createTemporaryValue(expected);
             state.plan.boundaryValue(view);
             const wolvrix::lib::grh::OperationId assign =
-                target.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                       target.makeInternalOpSym());
+                target.createTemporaryOperation(wolvrix::lib::grh::OperationKind::kAssign);
             state.plan.boundaryOperation(assign);
             target.reserveOpOperandCapacity(assign, 1);
             target.reserveOpResultCapacity(assign, 1);
-            target.reserveOpAttrCapacity(assign, 1);
             target.addOperand(assign, targetValue);
             target.addResult(assign, view);
-            // Synthetic shape-view assign exists because of this instance.
-            target.setAttr(assign, kOriginModulesKey,
-                           std::vector<std::string>{state.currentPrefix});
             views.emplace_back(expected, view);
             state.changed = true;
             return view;
@@ -963,7 +956,7 @@ namespace wolvrix::lib::transform
                                const wolvrix::lib::grh::Graph &child,
                                wolvrix::lib::grh::ValueId childValue,
                                wolvrix::lib::grh::ValueId targetValue,
-                               DenseValueMap &portMap, InlineState &state, const std::string &prefix)
+                               DenseValueMap &portMap, InlineState &state)
         {
             const auto sourceType = child.valueLogicalType(childValue);
             const auto targetType = target.valueLogicalType(targetValue);
@@ -977,7 +970,11 @@ namespace wolvrix::lib::transform
             auto found = portMap.get(childValue);
             if (!found.valid())
             {
-                found = sourceType == targetType ? targetValue : target.createValue(sourceType);
+                // A type bridge is a structural flattening temporary.  It has
+                // no semantic reference attribute, so keep it out of the
+                // SymbolTable until a textual downstream ABI explicitly
+                // requests materialization.
+                found = sourceType == targetType ? targetValue : target.createTemporaryValue(sourceType);
                 if (sourceType != targetType) state.plan.boundaryValue(found);
                 portMap.bindEquivalentPort(childValue, found);
             }
@@ -989,14 +986,12 @@ namespace wolvrix::lib::transform
                     state.failed = true;
                     return false;
                 }
-                const auto assign = target.createOperation(wolvrix::lib::grh::OperationKind::kAssign);
+                const auto assign = target.createTemporaryOperation(wolvrix::lib::grh::OperationKind::kAssign);
                 state.plan.boundaryOperation(assign);
                 target.reserveOpOperandCapacity(assign, 1);
                 target.reserveOpResultCapacity(assign, 1);
-                target.reserveOpAttrCapacity(assign, 1);
                 target.addOperand(assign, found);
                 target.addResult(assign, targetValue);
-                target.setAttr(assign, kOriginModulesKey, std::vector<std::string>{prefix});
                 target.setOpSrcLoc(assign, makeTransformSrcLoc("hier-flatten", "output-view"));
                 state.changed = true;
             }
@@ -1073,7 +1068,6 @@ namespace wolvrix::lib::transform
             std::string component = normalizeComponent(baseName);
             component = uniqueInstanceComponent(state, prefix, component);
             const std::string childPrefix = makeHierName(prefix, component);
-            state.currentPrefix = childPrefix;
 
             auto mapValue = [&](wolvrix::lib::grh::ValueId src) -> std::optional<wolvrix::lib::grh::ValueId> {
                 const auto mapped = valueMap.get(src);
@@ -1240,7 +1234,7 @@ namespace wolvrix::lib::transform
                     return false;
                 }
                 maybeRenameMappedValue(childValue, *targetValue, portName);
-                if (!mapOutputPortType(target, *child, childValue, *targetValue, childPortMap, state, childPrefix))
+                if (!mapOutputPortType(target, *child, childValue, *targetValue, childPortMap, state))
                     return false;
             }
 
@@ -1286,8 +1280,8 @@ namespace wolvrix::lib::transform
                 maybeRenameMappedValue(childInout.out, *outValue, std::string_view());
                 maybeRenameMappedValue(childInout.oe, *oeValue, std::string_view());
                 maybeRenameMappedValue(childInout.in, *inValue, std::string_view());
-                if (!mapOutputPortType(target, *child, childInout.out, *outValue, childPortMap, state, childPrefix) ||
-                    !mapOutputPortType(target, *child, childInout.oe, *oeValue, childPortMap, state, childPrefix))
+                if (!mapOutputPortType(target, *child, childInout.out, *outValue, childPortMap, state) ||
+                    !mapOutputPortType(target, *child, childInout.oe, *oeValue, childPortMap, state))
                     return false;
                 if (!childPortMap.contains(childInout.in))
                 {
@@ -1527,32 +1521,76 @@ namespace wolvrix::lib::transform
                 return false;
             }
             state.stack.insert(&source);
+            struct SemanticParentGuard {
+                InlineState& state;
+                wolvrix::lib::grh::SemanticId parent;
+                ~SemanticParentGuard() { state.currentSemanticParent = parent; }
+            } semanticParentGuard{state, state.currentSemanticParent};
+            wolvrix::lib::grh::SemanticId semanticScopeId = 0;
+            if (source.semanticTree())
+            {
+                if (!target.semanticTree())
+                {
+                    state.graphError(source, "Flatten source has a SemanticTree but target does not");
+                    state.failed = true;
+                    state.stack.erase(&source);
+                    return false;
+                }
+                const std::string_view component = state.nodeInstancePath.empty() ?
+                    std::string_view(prefix) : std::string_view(state.nodeInstancePath.back());
+                semanticScopeId = target.appendSemanticInstance(source, state.currentSemanticParent, component);
+                if (semanticScopeId) state.currentSemanticParent = wolvrix::lib::grh::semanticInstance(semanticScopeId);
+            }
             const auto plannedInstance = valueMap.plannedInstance;
             const auto enterEvent = state.plan.consume(GlobalInlinePlan::EventKind::EnterValues, plannedInstance);
             if (state.plan.enabled)
             {
                 auto &instance = state.plan.instances[plannedInstance];
                 instance.prefix = prefix;
-                instance.qualification = std::make_unique<wolvrix::lib::ingest::node::QualificationContext>(state.nodeInstancePath);
             }
             ++state.metrics.sourceCalls;
-            if (state.profile)
-            {
-                const auto started = FlattenClock::now();
-                state.nodeInventory.record(source, state.nodeInstancePath);
-                state.metrics.inventory += FlattenClock::now() - started;
-            }
-            else
-            {
-                state.nodeInventory.record(source, state.nodeInstancePath);
-            }
-            wolvrix::lib::ingest::node::QualificationContext nodeQualification(state.nodeInstancePath);
             const auto sourceGraphId = source.id();
             const uint64_t sourceKey = (static_cast<uint64_t>(sourceGraphId.index) << 32) |
                 sourceGraphId.generation;
             auto& srcLocImport = state.srcLocImports[sourceKey];
             auto& blockImport = state.blockImports[sourceKey];
             target.prepareBlockImport(source, blockImport, srcLocImport);
+
+            const auto remapSemantics = [&](std::span<const wolvrix::lib::grh::SemanticId> sourceIds,
+                                            slang::SmallVector<wolvrix::lib::grh::SemanticId, 4>& targetIds) {
+                targetIds.clear();
+                for (const auto sourceId : sourceIds)
+                {
+                    const auto targetId = wolvrix::lib::grh::qualifiedSemantic(semanticScopeId, sourceId);
+                    if (!targetId) throw std::invalid_argument("Flatten SemanticId relocation produced zero");
+                    if (std::find(targetIds.begin(), targetIds.end(), targetId) == targetIds.end())
+                        targetIds.push_back(targetId);
+                }
+            };
+            slang::SmallVector<wolvrix::lib::grh::SemanticId, 4> mappedSemantics;
+            const auto copyOperationSemantics = [&](wolvrix::lib::grh::OperationId sourceOp,
+                                                    wolvrix::lib::grh::OperationId targetOp) {
+                const auto sourceIds = source.opSemanticIds(sourceOp);
+                if (sourceIds.empty()) return;
+                ++state.metrics.annotatedOperations;
+                remapSemantics(sourceIds, mappedSemantics);
+                target.setOpSemanticIds(targetOp,
+                    std::span<const wolvrix::lib::grh::SemanticId>(mappedSemantics.data(), mappedSemantics.size()));
+            };
+            const auto mergeValueSemantics = [&](wolvrix::lib::grh::ValueId sourceValue,
+                                                 wolvrix::lib::grh::ValueId targetValue) {
+                const auto sourceIds = source.valueSemanticIds(sourceValue);
+                if (sourceIds.empty()) return;
+                remapSemantics(sourceIds, mappedSemantics);
+                slang::SmallVector<wolvrix::lib::grh::SemanticId, 4> merged;
+                const auto existing = target.valueSemanticIds(targetValue);
+                merged.append(existing.begin(), existing.end());
+                for (const auto id : mappedSemantics)
+                    if (std::find(merged.begin(), merged.end(), id) == merged.end()) merged.push_back(id);
+                if (merged.size() != existing.size())
+                    target.setValueSemanticIds(targetValue,
+                        std::span<const wolvrix::lib::grh::SemanticId>(merged.data(), merged.size()));
+            };
 
             std::unordered_set<uint32_t> declaredSet;
             declaredSet.reserve(source.declaredSymbols().size());
@@ -1630,6 +1668,7 @@ namespace wolvrix::lib::transform
             const auto valuesStarted = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
             state.metrics.valuesVisited += source.values().size();
             std::vector<wolvrix::lib::grh::ValueId> sourceValues;
+            std::vector<wolvrix::lib::grh::ValueId> semanticPorts;
             std::vector<wolvrix::lib::grh::SymbolId> valueSymbols;
             sourceValues.reserve(source.values().size());
             valueSymbols.reserve(source.values().size());
@@ -1641,6 +1680,7 @@ namespace wolvrix::lib::transform
                 }
                 if (valueMap.contains(valueId))
                 {
+                    semanticPorts.push_back(valueId);
                     continue;
                 }
                 const wolvrix::lib::grh::SymbolId sourceSym = source.valueSymbol(valueId);
@@ -1655,10 +1695,9 @@ namespace wolvrix::lib::transform
                         target.addDeclaredSymbol(newSym);
                     }
                 }
-                if (!newSym.valid())
-                {
-                    newSym = target.makeInternalValSym();
-                }
+                // Unprotected values are implementation temporaries.  Keep
+                // their source identity only in the dense relocation map;
+                // names are materialized at a downstream boundary if needed.
                 sourceValues.push_back(valueId);
                 valueSymbols.push_back(newSym);
                 if (trackValueRename && !sourceName.empty())
@@ -1670,6 +1709,7 @@ namespace wolvrix::lib::transform
             const bool retainColumns = state.plan.enabled && state.plan.definitionUses.at(&source) == 1;
             target.appendValueBlock(source, sourceValues, valueSymbols, newValues, srcLocImport,
                 state.plan.enabled ? 1 : state.numThreads, retainColumns);
+            target.remapValueBlockSemantics(source, sourceValues, newValues, semanticScopeId);
             if (state.plan.enabled)
             {
                 auto &event = state.plan.events[enterEvent];
@@ -1678,6 +1718,11 @@ namespace wolvrix::lib::transform
             }
             for (std::size_t index = 0; index < sourceValues.size(); ++index)
                 valueMap.set(sourceValues[index], newValues[index]);
+            for (const auto sourceValue : semanticPorts)
+            {
+                const auto targetValue = valueMap.get(sourceValue);
+                if (targetValue.valid()) mergeValueSemantics(sourceValue, targetValue);
+            }
             state.metrics.valuesCloned += sourceValues.size();
             state.changed |= !sourceValues.empty();
             if (state.profile)
@@ -1738,16 +1783,22 @@ namespace wolvrix::lib::transform
             const auto planOperationSymbol = [&](wolvrix::lib::grh::OperationId opId) {
                 const auto sourceSym = source.operationSymbol(opId);
                 const auto sourceName = source.symbolText(sourceSym);
+                const auto kind = source.opKind(opId);
+                const bool stateOrExternal =
+                    kind == wolvrix::lib::grh::OperationKind::kRegister ||
+                    kind == wolvrix::lib::grh::OperationKind::kLatch ||
+                    kind == wolvrix::lib::grh::OperationKind::kSystemTask ||
+                    kind == wolvrix::lib::grh::OperationKind::kSystemFunction ||
+                    kind == wolvrix::lib::grh::OperationKind::kBlackbox ||
+                    neededOpSymbols.contains(sourceSym.value);
                 auto symbol = wolvrix::lib::grh::SymbolId::invalid();
-                if (shouldProtectOp(sourceSym) && !sourceName.empty())
+                if ((shouldProtectOp(sourceSym) || stateOrExternal) && !sourceName.empty())
                 {
                     symbol = internUniqueSymbol(target, makeHierName(prefix, sourceName));
-                    target.addDeclaredSymbol(symbol);
+                    if (shouldProtectOp(sourceSym)) target.addDeclaredSymbol(symbol);
                 }
-                return symbol.valid() ? symbol : target.makeInternalOpSym();
+                return symbol;
             };
-
-            const wolvrix::lib::grh::AttributeValue defaultOrigins = std::vector<std::string>{prefix};
 
             const auto operationsStarted = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
             state.metrics.operationsVisited += source.operations().size();
@@ -1764,7 +1815,6 @@ namespace wolvrix::lib::transform
                 std::vector<uint32_t> operandOffsets{0}, resultOffsets{0};
                 std::vector<wolvrix::lib::grh::ValueId> operands, results;
                 std::vector<std::size_t> operandNodes;
-                std::vector<uint8_t> commonOrigins;
                 bool bulk = !run.boundary;
                 slang::flat_hash_set<uint32_t, std::hash<uint32_t>> definitions;
                 if (bulk)
@@ -1808,6 +1858,8 @@ namespace wolvrix::lib::transform
                     runOutput.resize(run.operations.size());
                     target.appendOperationBlock(source, run.operations, runSymbols, runOutput, srcLocImport,
                         state.plan.enabled ? 1 : state.numThreads, retainColumns);
+                    state.metrics.annotatedOperations += target.remapOperationBlockSemantics(
+                        source, run.operations, runOutput, semanticScopeId);
                     if (state.plan.enabled)
                     {
                         auto &event = state.plan.events[runEvent];
@@ -1822,25 +1874,7 @@ namespace wolvrix::lib::transform
                         target.setOperationBlockEdges(runOutput, operandOffsets, operands, resultOffsets, results);
                     }
                     if (!state.plan.enabled)
-                    {
                         target.appendOperationBlockAttributes(source, run.operations, runOutput, blockImport);
-                        commonOrigins.resize(run.operations.size(), 1);
-                        std::vector<wolvrix::lib::grh::OperationId> commonOriginOps;
-                        commonOriginOps.reserve(runOutput.size());
-                        for (std::size_t index = 0; index < run.operations.size(); ++index)
-                        {
-                            for (const auto attribute : source.opAttrRange(run.operations[index]))
-                            {
-                                if (attribute.key() != kOriginModulesKey) continue;
-                                if (const auto origins = attribute.value().get<std::vector<std::string>>();
-                                    origins && !origins->empty()) commonOrigins[index] = 0;
-                                break;
-                            }
-                            if (commonOrigins[index]) commonOriginOps.push_back(runOutput[index]);
-                        }
-                        target.setOperationBlockAttr(commonOriginOps, kOriginModulesKey,
-                            wolvrix::lib::grh::AttrValueView(&defaultOrigins));
-                    }
                 }
                 for (std::size_t runIndex = 0; runIndex < run.operations.size(); ++runIndex)
                 {
@@ -1902,22 +1936,6 @@ namespace wolvrix::lib::transform
                                 state.failed = true;
                                 break;
                             }
-                            // Same import declared in another module: union the
-                            // provenance instead of dropping it. A child op
-                            // without originModules belongs to the graph being
-                            // inlined (same convention as the top-graph stamping).
-                            std::vector<std::string> origins =
-                                getOriginModules(source, op.id()).value_or(std::vector<std::string>{prefix});
-                            if (!origins.empty())
-                            {
-                                std::vector<std::string> merged =
-                                    getOriginModules(target, existing).value_or(std::vector<std::string>{});
-                                for (const std::string &module : origins)
-                                {
-                                    appendOriginModule(merged, module);
-                                }
-                                target.setAttr(existing, kOriginModulesKey, std::move(merged));
-                            }
                             if (neededOpSymbols.contains(op.symbol().value))
                             {
                                 opRename.emplace(op.symbol().value, existingOp.symbol());
@@ -1943,10 +1961,13 @@ namespace wolvrix::lib::transform
                             target.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport, sym);
                         state.plan.boundaryOperation(newOp);
                         ++state.metrics.operationsCloned;
+                        copyOperationSemantics(opId, newOp);
                         target.reserveOpAttrCapacity(newOp, op.attrs().size());
                         target.copyOpSrcLoc(newOp, source, opId, srcLocImport);
                         for (const auto &attr : op.attrs())
                         {
+                            if (wolvrix::lib::ingest::node::isAttribute(attr.key) ||
+                                attr.key == kOriginModulesKey) continue;
                             target.setAttr(newOp, attr.key, attr.value);
                         }
                         if (neededOpSymbols.contains(op.symbol().value))
@@ -1970,9 +1991,11 @@ namespace wolvrix::lib::transform
                         }
                     }
 
-                    wolvrix::lib::grh::OperationId newOp =
-                        bulk ? runOutput[runIndex] : target.createOperation(kind, newSym);
+                    wolvrix::lib::grh::OperationId newOp = bulk ? runOutput[runIndex] :
+                        (newSym.valid() ? target.createOperation(kind, newSym) :
+                                          target.createTemporaryOperation(kind));
                     ++state.metrics.operationsCloned;
+                    if (!bulk) copyOperationSemantics(opId, newOp);
                     const auto sourceAttrs = source.opAttrRange(opId);
                     if (bulk && state.plan.enabled)
                     {
@@ -1995,61 +2018,19 @@ namespace wolvrix::lib::transform
                         target.reserveOpOperandCapacity(newOp, source.opOperands(opId).size());
                         target.reserveOpResultCapacity(newOp, source.opResults(opId).size());
                     }
-                    // originModules is either replaced or appended below, so one
-                    // extra slot covers the common case without growing the
-                    // per-operation attribute vector while cloning.
-                    target.reserveOpAttrCapacity(newOp, sourceAttrs.size() + 1);
+                    target.reserveOpAttrCapacity(newOp, sourceAttrs.size());
                     if (!bulk) target.copyOpSrcLoc(newOp, source, opId, srcLocImport);
 
-                    bool hasOrigins = false;
-                    bool hasNodeAttrs = false;
                     for (const auto &attr : sourceAttrs)
                     {
-                        if (wolvrix::lib::ingest::node::isAttribute(attr.key()))
+                        if (wolvrix::lib::ingest::node::isAttribute(attr.key()) ||
+                            attr.key() == kOriginModulesKey)
                         {
-                            hasNodeAttrs = true;
-                            // The supported associations are built once below,
-                            // after results have their final positions. Preserve
-                            // unknown attributes for the existing verifier error.
-                            if (attr.key() == wolvrix::lib::ingest::node::kMembers ||
-                                attr.key() == wolvrix::lib::ingest::node::kOrigins ||
-                                attr.key() == wolvrix::lib::ingest::node::kRoots ||
-                                attr.key() == wolvrix::lib::ingest::node::kRootResults)
-                            {
-                                if (bulk) target.eraseAttr(newOp, attr.key());
-                                continue;
-                            }
-                        }
-                        if (attr.key() != kOriginModulesKey)
-                        {
-                            if (!bulk || isOpSymbolReferenceAttr(attr.key()))
-                                rewriteAttr(newOp, attr.key(), attr.value());
+                            if (bulk) target.eraseAttr(newOp, attr.key());
                             continue;
                         }
-                        // Build the final provenance once, in its original attr
-                        // slot. Copying it into the target and reading it back
-                        // would allocate the same strings twice per cloned op.
-                        hasOrigins = true;
-                        if (bulk && commonOrigins[runIndex]) continue;
-                        std::vector<std::string> origins;
-                        if (const auto sourceOrigins = attr.value().get<std::vector<std::string>>())
-                        {
-                            origins.reserve(sourceOrigins->size() + 1);
-                            origins.assign(sourceOrigins->begin(), sourceOrigins->end());
-                        }
-                        if (origins.empty())
-                        {
-                            origins.push_back(prefix);
-                        }
-                        else
-                        {
-                            prependOriginModule(origins, prefix);
-                        }
-                        target.setAttr(newOp, kOriginModulesKey, std::move(origins));
-                    }
-                    if (!hasOrigins && !bulk)
-                    {
-                        target.setAttrView(newOp, kOriginModulesKey, wolvrix::lib::grh::AttrValueView(&defaultOrigins));
+                        if (!bulk || isOpSymbolReferenceAttr(attr.key()))
+                            rewriteAttr(newOp, attr.key(), attr.value());
                     }
 
                     if (!bulk)
@@ -2087,20 +2068,6 @@ namespace wolvrix::lib::transform
                         if (state.failed)
                         {
                             break;
-                        }
-                    }
-                    if (hasNodeAttrs)
-                    {
-                        ++state.metrics.annotatedOperations;
-                        if (state.profile)
-                        {
-                            const auto started = FlattenClock::now();
-                            wolvrix::lib::ingest::node::copyQualified(source, opId, target, newOp, nodeQualification);
-                            state.metrics.qualification += FlattenClock::now() - started;
-                        }
-                        else
-                        {
-                            wolvrix::lib::ingest::node::copyQualified(source, opId, target, newOp, nodeQualification);
                         }
                     }
                     state.changed = true;
@@ -2144,13 +2111,6 @@ namespace wolvrix::lib::transform
             }
             if (state.plan.enabled) state.plan.instances[plannedInstance].opRename = std::move(opRename);
 
-            const auto qualificationStats = nodeQualification.stats();
-            state.metrics.qualificationLookups += qualificationStats.lookups;
-            state.metrics.qualificationHits += qualificationStats.hits;
-            state.metrics.qualificationMisses += qualificationStats.misses;
-            state.metrics.qualificationInputBytes += qualificationStats.inputBytes;
-            state.metrics.qualificationOutputBytes += qualificationStats.outputBytes;
-
             state.stack.erase(&source);
             if (!state.failed) state.plan.consume(GlobalInlinePlan::EventKind::Exit, plannedInstance);
             return !state.failed;
@@ -2169,76 +2129,33 @@ namespace wolvrix::lib::transform
                 imports.push_back({block.source, block.sourceOps, block.operations, &state.blockImports.at(key)});
             }
             target.appendOperationBlocksAttributes(imports, *state.executor);
-            // Pool allocation/publication has joined. All semantic metadata
-            // edits now observe the final symbol map and result positions.
+            // Pool allocation/publication has joined. Symbol references now
+            // observe the final symbol map and result positions.
             for (const auto &block : state.plan.operands)
             {
                 auto &instance = state.plan.instances[block.instance];
-                const wolvrix::lib::grh::AttributeValue defaults = std::vector<std::string>{instance.prefix};
-                std::vector<wolvrix::lib::grh::OperationId> commonOrigins;
                 for (std::size_t i = 0; i < block.operations.size(); ++i)
                 {
                     const auto sourceOp = block.sourceOps[i];
                     const auto targetOp = block.operations[i];
-                    bool hasOrigins = false;
-                    bool hasNodes = false;
                     for (const auto attr : block.source->opAttrRange(sourceOp))
                     {
-                        if (wolvrix::lib::ingest::node::isAttribute(attr.key()))
+                        if (wolvrix::lib::ingest::node::isAttribute(attr.key()) ||
+                            attr.key() == kOriginModulesKey)
                         {
-                            hasNodes = true;
-                            if (attr.key() == wolvrix::lib::ingest::node::kMembers ||
-                                attr.key() == wolvrix::lib::ingest::node::kOrigins ||
-                                attr.key() == wolvrix::lib::ingest::node::kRoots ||
-                                attr.key() == wolvrix::lib::ingest::node::kRootResults)
-                                target.eraseAttr(targetOp, attr.key());
+                            target.eraseAttr(targetOp, attr.key());
+                            continue;
                         }
-                        if (isOpSymbolReferenceAttr(attr.key()))
+                        if (!isOpSymbolReferenceAttr(attr.key())) continue;
+                        if (const auto text = attr.value().get<std::string>())
                         {
-                            if (const auto text = attr.value().get<std::string>())
-                            {
-                                const auto sourceSymbol = block.source->lookupSymbol(*text);
-                                const auto found = instance.opRename.find(sourceSymbol.value);
-                                if (found != instance.opRename.end())
-                                    target.setAttr(targetOp, attr.key(), std::string(target.symbolText(found->second)));
-                            }
+                            const auto sourceSymbol = block.source->lookupSymbol(*text);
+                            const auto found = instance.opRename.find(sourceSymbol.value);
+                            if (found != instance.opRename.end())
+                                target.setAttr(targetOp, attr.key(), std::string(target.symbolText(found->second)));
                         }
-                        if (attr.key() != kOriginModulesKey) continue;
-                        hasOrigins = true;
-                        if (const auto origins = attr.value().get<std::vector<std::string>>();
-                            origins && !origins->empty())
-                        {
-                            std::vector<std::string> qualified(origins->begin(), origins->end());
-                            prependOriginModule(qualified, instance.prefix);
-                            target.setAttr(targetOp, kOriginModulesKey, std::move(qualified));
-                        }
-                        else
-                        {
-                            commonOrigins.push_back(targetOp);
-                        }
-                    }
-                    if (!hasOrigins) commonOrigins.push_back(targetOp);
-                    if (hasNodes)
-                    {
-                        ++state.metrics.annotatedOperations;
-                        const auto started = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
-                        wolvrix::lib::ingest::node::copyQualified(*block.source, sourceOp, target, targetOp,
-                            *instance.qualification);
-                        if (state.profile) state.metrics.qualification += FlattenClock::now() - started;
                     }
                 }
-                target.setOperationBlockAttr(commonOrigins, kOriginModulesKey,
-                    wolvrix::lib::grh::AttrValueView(&defaults));
-            }
-            for (const auto &instance : state.plan.instances)
-            {
-                if (!instance.qualification) continue;
-                const auto stats = instance.qualification->stats();
-                state.metrics.qualificationLookups += stats.lookups;
-                state.metrics.qualificationHits += stats.hits;
-                state.metrics.qualificationMisses += stats.misses;
-                state.metrics.qualificationInputBytes += stats.inputBytes;
-                state.metrics.qualificationOutputBytes += stats.outputBytes;
             }
         }
 
@@ -2450,40 +2367,8 @@ namespace wolvrix::lib::transform
         // every hierarchical path. Only symbols cloned from inlined child
         // graphs receive the `inst$...$` prefix (and only child graphs'
         // generate groups gain the scope prefix).
-        // Top-graph ops are never recreated during flatten, so stamp them
-        // here: pre-existing ops without originModules belong to the top
-        // module itself.
         const std::string topName = top->symbol();
-        const auto topStampStarted = profile ? FlattenClock::now() : FlattenClock::time_point{};
-        std::vector<wolvrix::lib::grh::OperationId> unstampedOperations;
-        for (const auto opId : top->operations())
-        {
-            if (!opId.valid())
-            {
-                continue;
-            }
-            bool stamped = false;
-            for (const auto &kv : top->opAttrRange(opId))
-            {
-                if (kv.key() == kOriginModulesKey)
-                {
-                    stamped = true;
-                    break;
-                }
-            }
-            if (stamped)
-            {
-                continue;
-            }
-            unstampedOperations.push_back(opId);
-        }
-        const wolvrix::lib::grh::AttributeValue topOrigins = std::vector<std::string>{topName};
-        top->setOperationBlockAttr(unstampedOperations, kOriginModulesKey,
-            wolvrix::lib::grh::AttrValueView(&topOrigins));
-        if (profile)
-        {
-            metrics.topStamp = FlattenClock::now() - topStampStarted;
-        }
+        if (top->semanticTree()) state.currentSemanticParent = top->semanticTree()->root();
 
         DenseValueMap identity(*top);
         for (const auto valueId : top->values())

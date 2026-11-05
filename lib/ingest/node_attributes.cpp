@@ -622,7 +622,7 @@ std::vector<std::string> scanAttributes(const grh::Graph& graph, Attributes attr
                 root(op, view->roots[i], index, outputs[index]);
             }
         } catch (const std::exception& error) {
-            errors.push_back(std::string(graph.getOperation(op).symbolText()) + ": " + error.what());
+            errors.push_back(graph.operationDisplayName(op) + ": " + error.what());
         }
     }
     return errors;
@@ -870,11 +870,11 @@ std::string Inspection::report(const grh::Graph& graph) const {
     for (const auto& record : nodes) {
         out << record.key << " members=" << record.members.size();
         for (const auto& root : record.roots)
-            out << " root=" << graph.getOperation(root.operation).symbolText() << ':' << root.result
-                << " value=" << graph.symbolText(graph.valueSymbol(root.value));
+            out << " root=" << graph.operationDisplayName(root.operation) << ':' << root.result
+                << " value=" << graph.valueDisplayName(root.value);
         out << '\n';
     }
-    for (const auto op : isolatedFragments) out << "isolated=" << graph.getOperation(op).symbolText() << '\n';
+    for (const auto op : isolatedFragments) out << "isolated=" << graph.operationDisplayName(op) << '\n';
     for (const auto& error : errors) out << "error: " << error << '\n';
     return out.str();
 }

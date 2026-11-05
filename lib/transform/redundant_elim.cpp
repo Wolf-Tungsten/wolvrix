@@ -191,6 +191,13 @@ namespace wolvrix::lib::transform
             {
                 return false;
             }
+            // F18.2 temporary entities deliberately have no SymbolId. Their
+            // absence is the semantic marker that the old `_val_` prefix
+            // check provided for generated intermediates.
+            if (!symbol.valid())
+            {
+                return true;
+            }
             const std::string_view name = graph.symbolText(symbol);
             if (name.rfind("_val_", 0) == 0)
             {

@@ -67,7 +67,9 @@ Verilog、GRH 和 C++ lowering fixture，没有据此宣称香山整机 walltime
 作者可以声明 `input`、同步 `register`、小型 `memory`、`update` 和 `output`。这些调用
 仍然生成普通 Chisel 状态和组合逻辑，不是 BlackBox 或不透明 DPI。生成阶段同时写出
 `build/simulation_models.json`，其中包含模型版本、observer-only 属性、时钟/复位、状态
-布局、输入输出、debug capability、检查输出和更新组。
+布局、输入输出、debug capability、检查输出和更新组。对于小型表状态，模型作者可以用
+`array(name, rows, init)` 声明可索引数组，并用一次 `update(enable, index, value)` 描述
+单点更新；这保持模型源代码在数组抽象层，而不是要求作者手工展开每个寄存器。
 
 第一版刻意不新增 `kBehaviorRegister` 或 `kBehaviorMemory`。现有 GRH 已经把
 `kRegister/kMemory` 纳入 source/sink 分类、commit phase、state-reader 激活、变化检测和

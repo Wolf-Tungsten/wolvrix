@@ -53,6 +53,40 @@ Wolvrix 导入器把这个版本化 transport 转成同宽的 `kGrayDecode`，�
 Verilog、GRH 和 C++ lowering fixture，没有据此宣称香山整机 walltime 收益；完整整机
 测量须先找到实际使用点或加入明确的局部调用。
 
+## 行为模型 API：先复用 GRH 状态，再按实测增加专用 lowering
+
+行为模型与纯组合 intrinsic 的目标不同。它允许在 Chisel elaboration 阶段用另一套代码
+描述 observer/debug 状态，但必须保留时钟、复位、更新条件和输出依赖。当前入口为：
+
+```text
+--wolvrix-sim-models hardware
+--wolvrix-sim-models commit-rat
+```
+
+`hardware` 是默认模式。`commit-rat` 模式使用 utility 中的 `SimulationModels` API，模型
+作者可以声明 `input`、同步 `register`、小型 `memory`、`update` 和 `output`。这些调用
+仍然生成普通 Chisel 状态和组合逻辑，不是 BlackBox 或不透明 DPI。生成阶段同时写出
+`build/simulation_models.json`，其中包含模型版本、observer-only 属性、时钟/复位、状态
+布局、输入输出和更新组。
+
+第一版刻意不新增 `kBehaviorRegister` 或 `kBehaviorMemory`。现有 GRH 已经把
+`kRegister/kMemory` 纳入 source/sink 分类、commit phase、state-reader 激活、变化检测和
+scalar commit write 优化。增加同语义的 OperationKind 不会自动减少运行时工作；实际
+性能收益首先来自裁剪 DiffTest 字段和 Gateway/Preprocess 路径。
+
+如果普通 GRH 行为模型的状态更新仍是热点，后续应增加**分组级**的专用状态 lowering，
+而不是逐个复制 Register/Memory 类型。该 lowering 必须显式携带输入、状态、更新条件、
+commit 事件和输出依赖，使 scheduler 与 activity analysis 可见；C++ emitter 才能把一组
+observer commit 更新合并成一次 helper，并跳过不必要的 state shadow、event guard 和
+fixed-point 反馈。模型 manifest 会作为 lowering 的边界和校验输入，当前 Python GrhSIM
+驱动会把它复制到生成模型目录，但默认仍走普通 GRH 状态路径。
+
+示例 fixture 为 `testcase/chisel-intrinsic/BehaviorModelStudy.scala`，脚本为
+`scripts/behavior_model_study.py`。它生成硬件版和 `commit-rat` 版相同端口的 RTL；行为
+版 manifest 声明 32 个架构寄存器、32 个 RAT 寄存器、commit/RAT 输入和两个状态输出。
+Wolvrix frontend 将行为版状态识别为普通 `kRegister`/`kRegisterWritePort`，没有引入
+专用 OperationKind。
+
 当前实验覆盖 `1,2,3,4,5,6,7,8,9,10,14,15,16,17,31,32,33,36,38,63,64,65,
 127,128,129,255,256,257,511,512,1024` 位的打包和分散 Bool 输入；实际 XiangShan
 配置额外包含 `5,6,10,14,36,38` 位。所有宽度都保留为矩阵项，不按速度挑选。

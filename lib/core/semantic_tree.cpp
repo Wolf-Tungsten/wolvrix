@@ -72,28 +72,42 @@ SemanticId SemanticTree::addFieldPath(SemanticId parent, std::span<const std::st
     return current;
 }
 
-SemanticId SemanticTree::appendTree(const SemanticTree& source, SemanticId parent) {
+SemanticId SemanticTree::appendTree(const SemanticTree& source, SemanticId parent,
+                                    std::string_view rootName) {
+    if (rootName.empty()) throw std::invalid_argument("SemanticTree copy root name is empty");
     if (this == &source) throw std::invalid_argument("cannot append a SemanticTree to itself");
     if (!contains(parent)) throw std::invalid_argument("SemanticTree copy parent is invalid");
+    const auto& sourceRoot = source.nodes_[source.root()];
+    if (sourceRoot.nameOffset != 0 || sourceRoot.nameSize > source.names_.size())
+        throw std::invalid_argument("SemanticTree source root name must be first");
     if (source.size() > std::numeric_limits<SemanticId>::max() - nodes_.size())
         throw std::length_error("SemanticTree copy node capacity");
-    if (source.names_.size() > std::numeric_limits<uint32_t>::max() - names_.size())
+    const std::size_t suffixBytes = source.names_.size() - sourceRoot.nameSize;
+    if (rootName.size() > std::numeric_limits<uint32_t>::max() - names_.size() ||
+        suffixBytes > std::numeric_limits<uint32_t>::max() - names_.size() - rootName.size())
         throw std::length_error("SemanticTree copy name capacity");
 
     const auto copiedRoot = static_cast<SemanticId>(nodes_.size());
     const auto nameBase = static_cast<uint32_t>(names_.size());
     const auto nodeCapacity = nodes_.size() + source.size();
-    const auto nameCapacity = names_.size() + source.names_.size();
+    const auto nameCapacity = names_.size() + rootName.size() + suffixBytes;
     if (nodes_.capacity() < nodeCapacity)
         nodes_.reserve(std::max(nodeCapacity, nodes_.capacity() + nodes_.capacity() / 2));
     if (names_.capacity() < nameCapacity)
         names_.reserve(std::max(nameCapacity, names_.capacity() + names_.capacity() / 2));
     nodes_.insert(nodes_.end(), source.nodes_.begin() + 1, source.nodes_.end());
-    names_.insert(names_.end(), source.names_.begin(), source.names_.end());
+    names_.insert(names_.end(), rootName.begin(), rootName.end());
+    names_.insert(names_.end(), source.names_.begin() + sourceRoot.nameSize, source.names_.end());
     for (std::size_t offset = 0; offset < source.size(); ++offset) {
         auto& copied = nodes_[copiedRoot + offset];
         copied.parent = offset == 0 ? parent : copiedRoot + copied.parent - 1;
-        copied.nameOffset += nameBase;
+        if (offset == 0) {
+            copied.nameOffset = nameBase;
+            copied.nameSize = static_cast<uint32_t>(rootName.size());
+        } else {
+            copied.nameOffset = nameBase + static_cast<uint32_t>(rootName.size()) +
+                copied.nameOffset - sourceRoot.nameSize;
+        }
     }
     return copiedRoot;
 }

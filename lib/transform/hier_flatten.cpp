@@ -264,6 +264,7 @@ namespace wolvrix::lib::transform
         {
             std::string moduleName;
             std::string instanceName;
+            wolvrix::lib::grh::SemanticId semantic = 0;
             std::vector<wolvrix::lib::grh::ValueId> operands;
             std::vector<wolvrix::lib::grh::ValueId> results;
             std::optional<std::vector<std::string>> inputPortNames;
@@ -394,6 +395,7 @@ namespace wolvrix::lib::transform
             HierFlattenOptions::SymProtectMode symProtect = HierFlattenOptions::SymProtectMode::All;
             std::vector<std::string> nodeInstancePath;
             wolvrix::lib::grh::SemanticId currentSemanticParent = 0;
+            wolvrix::lib::grh::SemanticId currentInstanceSemantic = 0;
             bool profile = false;
             std::size_t numThreads = 1;
             GlobalInlinePlan plan;
@@ -950,6 +952,8 @@ namespace wolvrix::lib::transform
             target.reserveOpResultCapacity(assign, 1);
             target.addOperand(assign, targetValue);
             target.addResult(assign, view);
+            const auto semantics = target.valueSemanticIds(targetValue);
+            if (!semantics.empty()) target.setOpSemanticIds(assign, semantics);
             views.emplace_back(expected, view);
             state.changed = true;
             return view;
@@ -995,6 +999,8 @@ namespace wolvrix::lib::transform
                 target.reserveOpResultCapacity(assign, 1);
                 target.addOperand(assign, found);
                 target.addResult(assign, targetValue);
+                const auto semantics = target.valueSemanticIds(targetValue);
+                if (!semantics.empty()) target.setOpSemanticIds(assign, semantics);
                 target.setOpSrcLoc(assign, makeTransformSrcLoc("hier-flatten", "output-view"));
                 state.changed = true;
             }
@@ -1296,9 +1302,12 @@ namespace wolvrix::lib::transform
                 return false;
             }
 
+            const auto previousInstanceSemantic = state.currentInstanceSemantic;
+            if (info.semantic) state.currentInstanceSemantic = info.semantic;
             state.nodeInstancePath.push_back(component);
             const bool success = inlineGraphContents(*child, target, childPrefix, std::move(childPortMap), state);
             state.nodeInstancePath.pop_back();
+            state.currentInstanceSemantic = previousInstanceSemantic;
             return success;
         }
 
@@ -1322,6 +1331,8 @@ namespace wolvrix::lib::transform
             const auto attrs = graph.opAttrRange(opId);
             info.moduleName = getAttrStringBorrowed(attrs, "moduleName").value_or(std::string_view());
             info.instanceName = getAttrStringBorrowed(attrs, "instanceName").value_or(std::string_view());
+            const auto semantics = graph.opSemanticIds(opId);
+            if (!semantics.empty()) info.semantic = semantics.front();
             const auto operands = graph.opOperands(opId);
             const auto results = graph.opResults(opId);
             info.operands.assign(operands.begin(), operands.end());
@@ -1539,16 +1550,26 @@ namespace wolvrix::lib::transform
                     state.stack.erase(&source);
                     return false;
                 }
+                if (state.nodeInstancePath.empty())
+                {
+                    state.graphError(source, "Flatten instance path is empty during SemanticTree copy");
+                    state.failed = true;
+                    state.stack.erase(&source);
+                    return false;
+                }
                 const auto semanticStarted = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
-                copiedSemanticRoot = target.appendSemanticTree(source, state.currentSemanticParent);
+                const auto nameBytesBefore = target.semanticTree()->nameBytes();
+                copiedSemanticRoot = target.appendSemanticTree(source, state.currentSemanticParent,
+                                                               state.nodeInstancePath.back());
                 if (state.profile)
                 {
                     state.metrics.semanticCopy += FlattenClock::now() - semanticStarted;
                     state.metrics.semanticNodesCopied += source.semanticTree()->size();
-                    state.metrics.semanticNameBytesCopied += source.semanticTree()->nameBytes();
+                    state.metrics.semanticNameBytesCopied += target.semanticTree()->nameBytes() - nameBytesBefore;
                 }
                 if (copiedSemanticRoot) state.currentSemanticParent = copiedSemanticRoot;
             }
+            const auto fallbackSemantic = state.currentInstanceSemantic;
             const auto plannedInstance = valueMap.plannedInstance;
             const auto enterEvent = state.plan.consume(GlobalInlinePlan::EventKind::EnterValues, plannedInstance);
             if (state.plan.enabled)
@@ -1574,15 +1595,22 @@ namespace wolvrix::lib::transform
                     const auto targetId = copiedSemanticRoot + sourceId - 1;
                     if (!target.semanticTree()->contains(targetId))
                         throw std::invalid_argument("Flatten SemanticId relocation left the copied tree");
-                    if (std::find(targetIds.begin(), targetIds.end(), targetId) == targetIds.end())
-                        targetIds.push_back(targetId);
+                    targetIds.push_back(targetId);
                 }
             };
             slang::SmallVector<wolvrix::lib::grh::SemanticId, 4> mappedSemantics;
             const auto copyOperationSemantics = [&](wolvrix::lib::grh::OperationId sourceOp,
                                                     wolvrix::lib::grh::OperationId targetOp) {
                 const auto sourceIds = source.opSemanticIds(sourceOp);
-                if (sourceIds.empty()) return;
+                if (sourceIds.empty())
+                {
+                    if (!source.semanticTree() && fallbackSemantic)
+                    {
+                        target.setOpSemanticIds(targetOp, std::span<const wolvrix::lib::grh::SemanticId>(&fallbackSemantic, 1));
+                        ++state.metrics.annotatedOperations;
+                    }
+                    return;
+                }
                 ++state.metrics.annotatedOperations;
                 remapSemantics(sourceIds, mappedSemantics);
                 target.setOpSemanticIds(targetOp,
@@ -1869,8 +1897,21 @@ namespace wolvrix::lib::transform
                     runOutput.resize(run.operations.size());
                     target.appendOperationBlock(source, run.operations, runSymbols, runOutput, srcLocImport,
                         state.plan.enabled ? 1 : state.numThreads, retainColumns);
-                    state.metrics.annotatedOperations += target.remapOperationBlockSemantics(
-                        source, run.operations, runOutput, copiedSemanticRoot);
+                    if (!source.semanticTree())
+                    {
+                        if (fallbackSemantic)
+                        {
+                            for (const auto targetOp : runOutput)
+                                target.setOpSemanticIds(targetOp,
+                                    std::span<const wolvrix::lib::grh::SemanticId>(&fallbackSemantic, 1));
+                            state.metrics.annotatedOperations += runOutput.size();
+                        }
+                    }
+                    else
+                    {
+                        state.metrics.annotatedOperations += target.remapOperationBlockSemantics(
+                            source, run.operations, runOutput, copiedSemanticRoot);
+                    }
                     if (state.plan.enabled)
                     {
                         auto &event = state.plan.events[runEvent];
@@ -1899,7 +1940,13 @@ namespace wolvrix::lib::transform
                     {
                         ++state.metrics.instanceCalls;
                         ++state.metrics.instanceOperations;
-                        const InstanceInfo info = buildInstanceInfo(source, opId);
+                        InstanceInfo info = buildInstanceInfo(source, opId);
+                        if (info.semantic)
+                        {
+                            if (!copiedSemanticRoot || !source.semanticTree()->contains(info.semantic))
+                                throw std::invalid_argument("Flatten encountered an invalid instance SemanticId");
+                            info.semantic = copiedSemanticRoot + info.semantic - 1;
+                        }
                         if (state.profile)
                         {
                             const auto started = FlattenClock::now();

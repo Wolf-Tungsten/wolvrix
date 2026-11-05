@@ -40,7 +40,7 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
   - `sourceUnit` / `circuit`: 来源单元和电路名。
   - `nodes`: 节点数组，节点 ID 为数组下标加 1，根 ID 固定为 1。
   - 每项为 `{ parent, kind, name, index? }`。根必须是 `parent=0, kind=module`；其他 parent 必须指向更早节点。
-  - `kind` 只接受 `module/declaration/expression/field/element`。flatten 深拷贝来源树时，源 Module 根可以成为非根节点。
+  - `kind` 只接受 `module/declaration/expression/field/element`。flatten 深拷贝来源树时，源 Module 根可以成为非根节点；F20.P1 起，复制根的 `name` 使用规范化并唯一化后的实例名，不再使用来源模块定义名。
   - Element 必须有非负 `index`，允许空 name；其他节点名称非空且不允许 index。
   - SemanticId 就是该 Graph 树内的节点 ID，不包含实例 scope、外部树编号或指针。
 - `metadata`: Graph 属性对象，负载编码与 op attrs 相同；保存转换阶段及逻辑域等语义。
@@ -79,7 +79,7 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
 
 FIRRTL 来源由 semanticTree 和 value/op 的 semanticIds 持久化，不生成旧
 `firrtl.node.members/origins/roots/rootResults` 或 `originModules`。flatten 将完整来源树深拷贝到目标 Graph，
-所有来源 ID 平移为新的本地编号；实例名由电路层次和 symbol 表达，不作为 SemanticTree 节点。
+所有来源 ID 平移为新的本地编号；F20.P1 起，复制出的 Module 根使用实例名，声明及字段路径保持来源结构。
 没有 semanticTree 的 Graph 不允许出现非空 semanticIds；无效节点或引用直接拒绝，不静默丢弃。
 
 生产环境默认省略全部 `def/users` 和 `loc`。加载后以 operation 的 `in/out` 边重建拓扑；`def/users`

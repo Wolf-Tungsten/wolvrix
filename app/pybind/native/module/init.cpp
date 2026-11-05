@@ -108,6 +108,8 @@ static PyMethodDef WolvrixMethods[] = {
      "Read graph metadata without exporting graph entities or resolved analysis IDs."},
     {"session_semantic_stats", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_semantic_stats), METH_VARARGS | METH_KEYWORDS,
      "Count SemanticTree nodes and value/operation SemanticId associations in a loaded design."},
+    {"session_semantic_validate", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_semantic_validate), METH_VARARGS | METH_KEYWORDS,
+     "Validate unique instance paths and register symbols against SemanticTree paths."},
     {"session_emit_sv", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_emit_sv), METH_VARARGS | METH_KEYWORDS,
      "session_emit_sv(session, design, output, top=None, split_modules=False) -> (success, diagnostics)"},
     {"session_emit_grhsim_cpu_st_cpp", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_emit_grhsim_cpu_st_cpp),

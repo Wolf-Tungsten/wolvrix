@@ -1046,6 +1046,81 @@ namespace wolvrix::lib::grh
         symbols_ = &symbols;
     }
 
+    void GraphStore::reserveSemanticIds(std::size_t additional)
+    {
+        auto& payload = topology_->semantics;
+        if (additional > std::numeric_limits<uint32_t>::max() - payload.size())
+            throw std::length_error("SemanticId pool capacity");
+        const std::size_t required = payload.size() + additional;
+        if (payload.capacity() >= required) return;
+        const std::size_t grown = payload.empty() ? 16 : payload.capacity() + payload.capacity() / 2;
+        payload.reserve(std::max(required, std::min<std::size_t>(grown,
+            std::numeric_limits<uint32_t>::max())));
+    }
+
+    Range GraphStore::storeSemanticIds(std::span<const SemanticId> ids)
+    {
+        if (ids.empty()) return {};
+        auto& payload = topology_->semantics;
+        if (ids.size() == 1) {
+            const SemanticId id = ids.front();
+            reserveSemanticIds(1);
+            const Range result{payload.size(), 1};
+            payload.push_back(id);
+            return result;
+        }
+        if (ids.size() < 64) {
+            std::vector<SemanticId> aliased;
+            const std::less<const SemanticId*> before;
+            if (!payload.empty() && !before(ids.data(), payload.data()) &&
+                before(ids.data(), payload.data() + payload.size())) {
+                aliased.assign(ids.begin(), ids.end());
+                ids = aliased;
+            }
+            reserveSemanticIds(ids.size());
+            const Range result{payload.size(), ids.size()};
+            payload.insert(payload.end(), ids.begin(), ids.end());
+            return result;
+        }
+
+        std::size_t hash = ids.size();
+        for (const SemanticId id : ids)
+            hash ^= std::hash<SemanticId>{}(id) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+        const auto found = topology_->semanticListIds.find(hash);
+        uint32_t first = found == topology_->semanticListIds.end() ? 0 : found->second;
+        for (uint32_t current = first; current; current = topology_->semanticHashNext[current]) {
+            const Range candidate = topology_->semanticLists[current];
+            const auto existing = std::span<const SemanticId>(payload.data() + candidate.offset, candidate.count);
+            if (existing.size() == ids.size() && std::equal(existing.begin(), existing.end(), ids.begin()))
+                return candidate;
+        }
+
+        constexpr std::size_t cacheLimit = 4096;
+        if (topology_->semanticLists.size() > cacheLimit) {
+            topology_->semanticListIds.clear();
+            topology_->semanticLists.resize(1);
+            topology_->semanticHashNext.resize(1);
+            first = 0;
+        }
+        std::vector<SemanticId> aliased;
+        const std::less<const SemanticId*> before;
+        if (!payload.empty() && !before(ids.data(), payload.data()) &&
+            before(ids.data(), payload.data() + payload.size())) {
+            aliased.assign(ids.begin(), ids.end());
+            ids = aliased;
+        }
+        reserveSemanticIds(ids.size());
+        if (topology_->semanticLists.size() >= std::numeric_limits<uint32_t>::max())
+            throw std::length_error("SemanticId list record capacity");
+        const Range result{payload.size(), ids.size()};
+        payload.insert(payload.end(), ids.begin(), ids.end());
+        topology_->semanticLists.push_back(result);
+        topology_->semanticHashNext.push_back(first);
+        topology_->semanticListIds.insert_or_assign(hash,
+            static_cast<uint32_t>(topology_->semanticLists.size() - 1));
+        return result;
+    }
+
     GraphStore::Stats GraphStore::stats() const noexcept
     {
         Stats result = GraphPayload::stats();
@@ -1053,6 +1128,8 @@ namespace wolvrix::lib::grh
         result.shapeDims = topology_->shapes.dims.size();
         result.useSlots = topology_->users.size();
         result.operandIndexSlots = topology_->operandUseIndices.size();
+        result.semanticIds = topology_->semantics.size();
+        result.semanticLists = topology_->semanticLists.size() - 1;
         for (std::size_t i = 0; i < operations_.size(); ++i) {
             const auto op = operations_[i];
             if (!op.alive) continue;
@@ -1110,11 +1187,8 @@ namespace wolvrix::lib::grh
             const auto& sourceIds = topology_->semantics;
             if (range.offset > sourceIds.size() || range.count > sourceIds.size() - range.offset)
                 throw std::out_of_range("semantic list is out of range during compact");
-            auto& targetIds = next.topology_->semantics;
-            const Range result{static_cast<uint32_t>(targetIds.size()), range.count};
-            targetIds.insert(targetIds.end(), sourceIds.begin() + range.offset,
-                             sourceIds.begin() + range.offset + range.count);
-            return result;
+            return next.storeSemanticIds(std::span<const SemanticId>(
+                sourceIds.data() + range.offset, range.count));
         };
         next.reserveValues(valueCount);
         next.reserveOperations(opCount);
@@ -3332,12 +3406,13 @@ namespace wolvrix::lib::grh
         return *semanticTree_;
     }
 
-    SemanticId Graph::appendSemanticTree(const Graph& source, SemanticId parent)
+    SemanticId Graph::appendSemanticTree(const Graph& source, SemanticId parent,
+                                         std::string_view rootName)
     {
         if (!source.semanticTree_ || this == &source) return 0;
         if (!semanticTree_) throw std::invalid_argument("target Graph has no SemanticTree");
         mutableStore();
-        return semanticTree_->appendTree(*source.semanticTree_, parent);
+        return semanticTree_->appendTree(*source.semanticTree_, parent, rootName);
     }
 
     std::span<const SemanticId> Graph::valueSemanticIds(ValueId value) const
@@ -3357,13 +3432,7 @@ namespace wolvrix::lib::grh
         if (!ids.empty() && !semanticTree_) throw std::invalid_argument("value has no SemanticTree");
         for (const SemanticId id : ids)
             if (!semanticTree_->contains(id)) throw std::invalid_argument("invalid value SemanticId");
-        if (ids.size() > std::numeric_limits<uint32_t>::max() ||
-            builder.topology_->semantics.size() > std::numeric_limits<uint32_t>::max() - ids.size())
-            throw std::length_error("value semantic list capacity");
-        const Range range{static_cast<uint32_t>(builder.topology_->semantics.size()),
-                          static_cast<uint32_t>(ids.size())};
-        builder.topology_->semantics.insert(builder.topology_->semantics.end(), ids.begin(), ids.end());
-        builder.values_.semantics_[row] = range;
+        builder.values_.semantics_[row] = builder.storeSemanticIds(ids);
     }
 
     void Graph::addValueSemanticIds(ValueId value, std::span<const SemanticId> ids)
@@ -3401,13 +3470,7 @@ namespace wolvrix::lib::grh
         if (!ids.empty() && !semanticTree_) throw std::invalid_argument("operation has no SemanticTree");
         for (const SemanticId id : ids)
             if (!semanticTree_->contains(id)) throw std::invalid_argument("invalid operation SemanticId");
-        if (ids.size() > std::numeric_limits<uint32_t>::max() ||
-            builder.topology_->semantics.size() > std::numeric_limits<uint32_t>::max() - ids.size())
-            throw std::length_error("operation semantic list capacity");
-        const Range range{static_cast<uint32_t>(builder.topology_->semantics.size()),
-                          static_cast<uint32_t>(ids.size())};
-        builder.topology_->semantics.insert(builder.topology_->semantics.end(), ids.begin(), ids.end());
-        builder.operations_.semantics_[row] = range;
+        builder.operations_.semantics_[row] = builder.storeSemanticIds(ids);
     }
 
     void Graph::addOpSemanticIds(OperationId op, std::span<const SemanticId> ids)
@@ -3445,23 +3508,25 @@ namespace wolvrix::lib::grh
                     throw std::invalid_argument("invalid source value SemanticId");
         }
         if (!total) return 0;
-        if (!copiedRoot || !semanticTree_) throw std::invalid_argument("missing copied SemanticTree root");
+        if (!copiedRoot || !semanticTree_ || copiedRoot > semanticTree_->size() ||
+            source.semanticTree_->size() > semanticTree_->size() - copiedRoot + 1)
+            throw std::invalid_argument("missing copied SemanticTree root");
         GraphStore& builder = mutableStore();
-        auto& payload = builder.topology_->semantics;
-        if (total > std::numeric_limits<uint32_t>::max() - payload.size())
-            throw std::length_error("value semantic block capacity");
-        payload.reserve(payload.size() + total);
-        for (std::size_t i = 0; i < sourceValues.size(); ++i) {
-            const auto ids = source.valueSemanticIds(sourceValues[i]);
-            const std::size_t offset = payload.size();
-            for (const SemanticId id : ids) {
-                const SemanticId mapped = copiedRoot + id - 1;
-                if (!semanticTree_->contains(mapped)) throw std::invalid_argument("invalid copied value SemanticId");
-                if (std::find(payload.begin() + offset, payload.end(), mapped) == payload.end())
-                    payload.push_back(mapped);
+        std::vector<SemanticId> mapped;
+        const auto storeMapped = [&](std::span<const SemanticId> ids) {
+            if (ids.empty()) return Range{};
+            if (ids.size() == 1) {
+                const SemanticId id = copiedRoot + ids.front() - 1;
+                return builder.storeSemanticIds(std::span<const SemanticId>(&id, 1));
             }
-            builder.values_.semantics_[builder.valueIndex(targetValues[i])] =
-                Range{static_cast<uint32_t>(offset), static_cast<uint32_t>(payload.size() - offset)};
+            mapped.resize(ids.size());
+            std::transform(ids.begin(), ids.end(), mapped.begin(),
+                [copiedRoot](SemanticId id) { return copiedRoot + id - 1; });
+            return builder.storeSemanticIds(mapped);
+        };
+        for (std::size_t i = 0; i < sourceValues.size(); ++i) {
+            const auto range = storeMapped(source.valueSemanticIds(sourceValues[i]));
+            builder.values_.semantics_[builder.valueIndex(targetValues[i])] = range;
         }
         return annotated;
     }
@@ -3483,23 +3548,25 @@ namespace wolvrix::lib::grh
                     throw std::invalid_argument("invalid source operation SemanticId");
         }
         if (!total) return 0;
-        if (!copiedRoot || !semanticTree_) throw std::invalid_argument("missing copied SemanticTree root");
+        if (!copiedRoot || !semanticTree_ || copiedRoot > semanticTree_->size() ||
+            source.semanticTree_->size() > semanticTree_->size() - copiedRoot + 1)
+            throw std::invalid_argument("missing copied SemanticTree root");
         GraphStore& builder = mutableStore();
-        auto& payload = builder.topology_->semantics;
-        if (total > std::numeric_limits<uint32_t>::max() - payload.size())
-            throw std::length_error("operation semantic block capacity");
-        payload.reserve(payload.size() + total);
-        for (std::size_t i = 0; i < sourceOps.size(); ++i) {
-            const auto ids = source.opSemanticIds(sourceOps[i]);
-            const std::size_t offset = payload.size();
-            for (const SemanticId id : ids) {
-                const SemanticId mapped = copiedRoot + id - 1;
-                if (!semanticTree_->contains(mapped)) throw std::invalid_argument("invalid copied operation SemanticId");
-                if (std::find(payload.begin() + offset, payload.end(), mapped) == payload.end())
-                    payload.push_back(mapped);
+        std::vector<SemanticId> mapped;
+        const auto storeMapped = [&](std::span<const SemanticId> ids) {
+            if (ids.empty()) return Range{};
+            if (ids.size() == 1) {
+                const SemanticId id = copiedRoot + ids.front() - 1;
+                return builder.storeSemanticIds(std::span<const SemanticId>(&id, 1));
             }
-            builder.operations_.semantics_[builder.opIndex(targetOps[i])] =
-                Range{static_cast<uint32_t>(offset), static_cast<uint32_t>(payload.size() - offset)};
+            mapped.resize(ids.size());
+            std::transform(ids.begin(), ids.end(), mapped.begin(),
+                [copiedRoot](SemanticId id) { return copiedRoot + id - 1; });
+            return builder.storeSemanticIds(mapped);
+        };
+        for (std::size_t i = 0; i < sourceOps.size(); ++i) {
+            const auto range = storeMapped(source.opSemanticIds(sourceOps[i]));
+            builder.operations_.semantics_[builder.opIndex(targetOps[i])] = range;
         }
         return annotated;
     }

@@ -372,6 +372,11 @@ class Session:
         self._ensure_open()
         return _native.session_semantic_stats(self._capsule, design=design)
 
+    def semantic_validate(self, *, design: str) -> dict:
+        """Validate unique instance paths and register symbols against SemanticTree paths."""
+        self._ensure_open()
+        return _native.session_semantic_validate(self._capsule, design=design)
+
     def emit_grhsim_cpu_st_cpp(
         self,
         *,

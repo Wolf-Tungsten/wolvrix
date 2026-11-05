@@ -585,6 +585,8 @@ public:
         std::size_t shapeDims = 0;
         std::size_t useSlots = 0;
         std::size_t operandIndexSlots = 0;
+        std::size_t semanticIds = 0;
+        std::size_t semanticLists = 0;
     };
 
     explicit GraphPayload(std::shared_ptr<detail::StringPool> strings = {});
@@ -869,6 +871,9 @@ private:
         ShapePool shapes;
         std::vector<RecordId> attrs;
         std::vector<SemanticId> semantics;
+        std::vector<Range> semanticLists{{0, 0}};
+        slang::flat_hash_map<std::size_t, uint32_t, std::hash<std::size_t>> semanticListIds;
+        std::vector<uint32_t> semanticHashNext{0};
     };
     struct ValueRow {
         SymbolId& symbol;
@@ -1003,6 +1008,8 @@ private:
 
     std::size_t valueIndex(ValueId value) const;
     std::size_t opIndex(OperationId op) const;
+    void reserveSemanticIds(std::size_t additional);
+    Range storeSemanticIds(std::span<const SemanticId> ids);
     void setAttrRecord(std::size_t opIndex, std::string_view key, RecordId record);
     bool valueAlive(ValueId value) const;
     bool opAlive(OperationId op) const;
@@ -1280,7 +1287,8 @@ public:
     const SemanticTree* semanticTree() const noexcept { return semanticTree_ ? &*semanticTree_ : nullptr; }
     SemanticTree& getOrCreateSemanticTree(std::string sourceUnit, std::string circuit,
                                           std::string module);
-    SemanticId appendSemanticTree(const Graph& source, SemanticId parent);
+    SemanticId appendSemanticTree(const Graph& source, SemanticId parent,
+                                  std::string_view rootName);
 
     std::span<const OperationId> operations() const;
     std::span<const ValueId> values() const;

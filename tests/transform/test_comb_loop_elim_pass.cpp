@@ -206,6 +206,66 @@ namespace
         return 0;
     }
 
+    int test_semantic_loop_split()
+    {
+        wolvrix::lib::grh::Design design;
+        auto& graph = design.createGraph("g_semantic");
+        auto& tree = graph.getOrCreateSemanticTree("unit", "circuit", "g_semantic");
+        std::vector<wolvrix::lib::grh::SemanticId> semanticIds;
+        for (int index = 0; index < 300; ++index)
+        {
+            semanticIds.push_back(tree.addNode(tree.root(),
+                wolvrix::lib::grh::SemanticNodeKind::Declaration, "s" + std::to_string(index)));
+        }
+        const std::unordered_set<wolvrix::lib::grh::SemanticId> expected(semanticIds.begin(), semanticIds.end());
+
+        const auto mask = makeValue(graph, "mask", 6);
+        const auto ext = makeValue(graph, "ext", 4);
+        graph.bindInputPort("mask", mask);
+        graph.bindInputPort("ext", ext);
+        const auto y = makeValue(graph, "y", 6);
+        const auto x = makeValue(graph, "x", 6);
+        const auto mid = makeValue(graph, "mid", 2);
+        const auto xorOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                 graph.internSymbol("xor_y_mask"));
+        graph.addOperand(xorOp, y);
+        graph.addOperand(xorOp, mask);
+        graph.addResult(xorOp, x);
+        makeSliceStatic(graph, x, mid, 1, 2, "slice_x_mid");
+        makeConcat(graph, "concat_y", {mid, ext}, y);
+        for (const auto op : graph.operations())
+        {
+            const std::size_t begin = (op.index - 1) * 100;
+            graph.setOpSemanticIds(op, std::span<const wolvrix::lib::grh::SemanticId>(
+                semanticIds.data() + begin, 100));
+        }
+
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+        PassDiagnostics diags;
+        const auto result = manager.run(design, diags);
+        if (!result.success || !result.changed || diags.hasError())
+        {
+            return fail("Expected semantic false-loop split to succeed");
+        }
+        bool foundFullUnion = false;
+        for (const auto op : graph.operations())
+        {
+            const auto ids = graph.opSemanticIds(op);
+            if (ids.empty()) return fail("Loop-split operation lost all SemanticIds");
+            for (const auto id : ids)
+                if (!expected.contains(id)) return fail("Loop-split operation acquired an unrelated SemanticId");
+            if (ids.size() == semanticIds.size())
+            {
+                if (std::unordered_set<wolvrix::lib::grh::SemanticId>(ids.begin(), ids.end()) != expected)
+                    return fail("Loop-split operation has an incomplete 300-ID union");
+                foundFullUnion = true;
+            }
+        }
+        if (!foundFullUnion) return fail("Loop-split operation did not inherit the 300-ID union");
+        return 0;
+    }
+
     int test_graph_selection()
     {
         wolvrix::lib::grh::Design source;
@@ -1599,6 +1659,7 @@ int main()
     if (int rc = test_instance_boundary(false); rc != 0) return rc;
     if (int rc = test_instance_boundary(true); rc != 0) return rc;
     if (int rc = test_instance_boundary_keeps_local_loop(); rc != 0) return rc;
+    if (int rc = test_semantic_loop_split(); rc != 0) return rc;
     if (int rc = test_false_loop_fixed(true); rc != 0) return rc;
     if (int rc = test_false_loop_fixed(); rc != 0)
     {

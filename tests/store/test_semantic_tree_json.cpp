@@ -32,17 +32,32 @@ grh::Design fixture() {
 
     auto& top = design.createGraph("top");
     auto& topTree = top.getOrCreateSemanticTree("unit", "circuit", "top");
-    const auto first = top.appendSemanticTree(child, topTree.root());
-    const auto second = top.appendSemanticTree(child, topTree.root());
+    const auto first = top.appendSemanticTree(child, topTree.root(), "first");
+    const auto second = top.appendSemanticTree(child, topTree.root(), "second");
     const auto firstLeaf = first + element - 1;
     const auto secondLeaf = second + element - 1;
+    require(topTree.path(firstLeaf) == std::vector<std::string>{"top", "first", "n", "bits", "[3]"} &&
+            topTree.path(secondLeaf) == std::vector<std::string>{"top", "second", "n", "bits", "[3]"},
+            "instance root replacement corrupted semantic paths");
     const auto value = top.createTemporaryValue(8, false);
-    const std::vector<grh::SemanticId> valueSources{firstLeaf, secondLeaf, firstLeaf};
+    std::vector<grh::SemanticId> valueSources;
+    for (int index = 0; index < 64; ++index)
+        valueSources.push_back(index % 2 ? secondLeaf : firstLeaf);
     top.setValueSemanticIds(value, valueSources);
     const auto op = top.createTemporaryOperation(grh::OperationKind::kNot);
     top.addResult(op, value);
-    const std::vector<grh::SemanticId> opSources{first + declaration - 1, second + declaration - 1};
+    const auto firstDeclaration = first + declaration - 1;
+    const auto secondDeclaration = second + declaration - 1;
+    std::vector<grh::SemanticId> opSources;
+    for (int index = 0; index < 64; ++index)
+        opSources.push_back(index % 2 ? secondDeclaration : firstDeclaration);
     top.setOpSemanticIds(op, opSources);
+    const auto sharedValue = top.createTemporaryValue(8, false);
+    const auto sharedOp = top.createTemporaryOperation(grh::OperationKind::kNot);
+    top.addResult(sharedOp, sharedValue);
+    top.setOpSemanticIds(sharedOp, opSources);
+    require(top.payloadStats().semanticIds == 128 && top.payloadStats().semanticLists == 2,
+            "multi-ID lists were not shared before JSON storage");
 
     auto& plain = design.createGraph("plain");
     plain.createTemporaryValue(1, false);
@@ -93,6 +108,9 @@ void compareDesign(const grh::Design& expected, const grh::Design& actual) {
         const auto b = after.opSemanticIds(after.operations()[i]);
         require(std::equal(a.begin(), a.end(), b.begin(), b.end()), "operation SemanticId list changed");
     }
+    require(after.payloadStats().semanticIds == before.payloadStats().semanticIds &&
+            after.payloadStats().semanticLists == before.payloadStats().semanticLists,
+            "JSON load changed shared SemanticId storage");
     require(!actual.findGraph("plain")->semanticTree(), "plain graph acquired a SemanticTree");
 }
 
@@ -151,8 +169,8 @@ int main() {
         expectReject(replaceOnce(json, "\"parent\": 2", "\"parent\": 99"), "invalid parent");
         expectReject(replaceOnce(json, "\"kind\": \"declaration\"", "\"kind\": \"instance\""), "instance node");
         expectReject(replaceOnce(json, "\"index\": 3", "\"index\": -1"), "negative element index");
-        expectReject(replaceOnce(json, "\"semanticIds\": [5, 10, 5]", "\"semanticIds\": [999999]"),
-                     "unknown SemanticId");
+        expectReject(replaceOnce(json, "\"semanticIds\": [5, 10, 5, 10, 5, 10, 5, 10",
+                                 "\"semanticIds\": [999999"), "unknown SemanticId");
         expectReject(R"json({
           "formatVersion":4,
           "graphs":[{

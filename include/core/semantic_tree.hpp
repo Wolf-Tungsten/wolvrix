@@ -48,9 +48,10 @@ public:
                        std::string_view name, int64_t index = -1);
     SemanticId addFieldPath(SemanticId parent, std::span<const std::string> fields);
 
-    // Copy the complete source tree, including its Module root. The returned
-    // ID is the copied root; every source ID moves by returnedId - 1.
-    SemanticId appendTree(const SemanticTree& source, SemanticId parent);
+    // Copy the complete source tree, replacing its Module root name with the
+    // instance name. Every source ID moves by returnedId - 1.
+    SemanticId appendTree(const SemanticTree& source, SemanticId parent,
+                          std::string_view rootName);
 
     std::vector<std::string> path(SemanticId id) const;
 

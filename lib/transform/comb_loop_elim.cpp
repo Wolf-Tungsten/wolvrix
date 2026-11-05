@@ -2680,6 +2680,8 @@ namespace wolvrix::lib::transform
             // Loop-split synthesis inherits the union of every loop op's
             // origins (def-site semantics; see kOriginModulesKey).
             std::vector<std::string> loopOrigins;
+            std::vector<wolvrix::lib::grh::SemanticId> loopSemantics;
+            std::unordered_set<wolvrix::lib::grh::SemanticId> loopSemanticSet;
             for (const OperationId loopOp : loop.loopOps)
             {
                 if (!loopOp.valid())
@@ -2690,12 +2692,23 @@ namespace wolvrix::lib::transform
                 {
                     appendOriginModules(loopOrigins, *origins);
                 }
+                for (const auto semantic : graph.opSemanticIds(loopOp))
+                {
+                    if (loopSemanticSet.insert(semantic).second)
+                    {
+                        loopSemantics.push_back(semantic);
+                    }
+                }
             }
             auto stampOrigins = [&](OperationId opId)
             {
                 if (!loopOrigins.empty())
                 {
                     graph.setAttr(opId, kOriginModulesKey, loopOrigins);
+                }
+                if (!loopSemantics.empty())
+                {
+                    graph.setOpSemanticIds(opId, loopSemantics);
                 }
             };
 

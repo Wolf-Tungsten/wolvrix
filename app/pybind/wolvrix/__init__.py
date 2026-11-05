@@ -292,6 +292,8 @@ class Session:
         output: str,
         mode: str = "pretty-compact",
         top: list[str] | None = None,
+        emit_def_users: bool = False,
+        emit_source_locations: bool = False,
     ) -> list[dict]:
         self._ensure_open()
         success, diagnostics = _native.session_store_json(
@@ -300,6 +302,8 @@ class Session:
             output=output,
             mode=mode,
             top=top or [],
+            emit_def_users=bool(emit_def_users),
+            emit_source_locations=bool(emit_source_locations),
         )
         return self._complete_action(
             "store_json",
@@ -362,6 +366,11 @@ class Session:
         """Read the graph's serializable metadata, without copying its entities."""
         self._ensure_open()
         return _native.session_graph_metadata(self._capsule, design=design, top=top)
+
+    def semantic_stats(self, *, design: str) -> dict:
+        """Count SemanticTree nodes and value/operation SemanticId associations."""
+        self._ensure_open()
+        return _native.session_semantic_stats(self._capsule, design=design)
 
     def emit_grhsim_cpu_st_cpp(
         self,

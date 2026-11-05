@@ -636,3 +636,23 @@ operand 的顺序同时填写 users 和 operandUseIndices。失败退出也须�
 
 **任何修改或 compact 后，都应重新取得借用的 span 和属性视图。** 需要跨修改持有内容时先复制。
 图级 metadata 保留原有接口，不属于每个 operation 的属性池。
+
+## 9. 自包含 SemanticTree
+
+每个 Graph 可持有一棵 `std::optional<SemanticTree>`，不引用其他 Graph 的来源树。树内节点保存
+`parent/kind/nameOffset/nameSize/index`；所有名称字符集中在同一个 `vector<char>`，节点集中在
+`vector<SemanticNode>`。SemanticNode 不含 `std::string` 或指针，因此默认树拷贝就是节点数组和字符区的深拷贝。
+
+SemanticId 是当前树的 uint32_t 本地节点下标，根为 1，0 无效。value/op 的 `semantics_` 行只保存
+`TopologyPools::semantics` 整数数组中的 Range；一个实体可以关联多个来源，设置列表时保留顺序和重复项，
+合并接口按既有规则去重。compact 重排实体行时同步移动 Range，不改变 SemanticId 本身。
+
+flatten 调用 `appendTree` 复制完整来源树，包括来源 Module 根。若复制后的源根为 R，则来源 ID x
+变为 `R+x-1`；源根的 parent 指向目标父节点，其余 parent 和 nameOffset 按各自基址平移。
+两条 flatten 路径都按同一公式重映射 value/op 来源。节点和名称数组按需几何扩容，不能每次
+精确 reserve 到本次追加后的长度，否则连续复制会反复搬迁已有整棵树。树中没有 Instance 节点、scope 或外部定义树引用；
+来源路径表达定义模块及字段关系，实例名仍由电路 symbol 表达。
+
+`semanticTree()` 返回当前 Graph 内树的借用指针，clone 得到独立深拷贝。JSON v4 直接保存这棵树的
+sourceUnit/circuit/nodes 和逐行 semanticIds，不序列化字符偏移、Range 或任何指针，详见
+[GRH JSON 规范](grh-json-spec.md)。

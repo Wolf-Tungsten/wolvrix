@@ -1881,11 +1881,14 @@ int main()
             return fail("Generate group not preserved in compact round-trip");
         }
 
-        // JSON written before the field existed omits it; it must still load.
+        // generateGroups is optional in v4.
         const std::string legacyJson = R"({
+  "formatVersion": 4,
   "graphs": [
     {
       "symbol": "legacy",
+      "dialects": {"grh": 2},
+      "metadata": {},
       "declaredSymbols": [],
       "vals": [],
       "ports": {
@@ -1977,9 +1980,12 @@ int main()
         }
 
         const std::string nestedArrayJson = R"({
+  "formatVersion": 4,
   "graphs": [
     {
       "symbol": "illegal_nested_array",
+      "dialects": {"grh": 2},
+      "metadata": {},
       "declaredSymbols": [],
       "vals": [],
       "ports": {
@@ -1989,13 +1995,14 @@ int main()
       },
       "ops": [
         {
+          "id": 1,
           "sym": "bad",
           "kind": "kAdd",
           "in": [],
           "out": [],
           "attrs": {
             "illegal": {
-              "k": "int[]",
+              "t": "int[]",
               "vs": [
                 1,
                 [2, 3]
@@ -2017,9 +2024,12 @@ int main()
         }
 
         const std::string objectAttributeJson = R"({
+  "formatVersion": 4,
   "graphs": [
     {
       "symbol": "illegal_object_attr",
+      "dialects": {"grh": 2},
+      "metadata": {},
       "declaredSymbols": [],
       "vals": [],
       "ports": {
@@ -2029,13 +2039,14 @@ int main()
       },
       "ops": [
         {
+          "id": 1,
           "sym": "bad_obj",
           "kind": "kAdd",
           "in": [],
           "out": [],
           "attrs": {
             "illegal": {
-              "k": "string",
+              "t": "string",
               "v": {
                 "unexpected": "object"
               }
@@ -2602,8 +2613,9 @@ int main()
             StoreJson temporaryStore;
             StoreOptions temporaryOptions;
             temporaryOptions.jsonMode = JsonPrintMode::PrettyCompact;
+            temporaryOptions.emitDefUsers = true;
             const auto temporaryJson = temporaryStore.storeToString(temporaryDesign, temporaryOptions);
-            if (!temporaryJson || temporaryJson->find("\"formatVersion\": 3") == std::string::npos ||
+            if (!temporaryJson || temporaryJson->find("\"formatVersion\": 4") == std::string::npos ||
                 temporaryJson->find("\"tmp\"") != std::string::npos ||
                 temporaryJson->find("tmp_val_") != std::string::npos ||
                 temporaryJson->find("tmp_op_") != std::string::npos)

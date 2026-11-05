@@ -891,23 +891,23 @@ namespace wolvrix::lib::load
             {
                 return AttributeKind::Double;
             }
-            if (text == "string" || text == "str")
+            if (text == "string")
             {
                 return AttributeKind::String;
             }
-            if (text == "bool_array" || text == "bool[]")
+            if (text == "bool[]")
             {
                 return AttributeKind::BoolArray;
             }
-            if (text == "int_array" || text == "int[]")
+            if (text == "int[]")
             {
                 return AttributeKind::IntArray;
             }
-            if (text == "double_array" || text == "double[]")
+            if (text == "double[]")
             {
                 return AttributeKind::DoubleArray;
             }
-            if (text == "string_array" || text == "string[]")
+            if (text == "string[]")
             {
                 return AttributeKind::StringArray;
             }
@@ -917,35 +917,11 @@ namespace wolvrix::lib::load
         AttributeValue parseAttributeValue(const JsonValue &jsonAttr)
         {
             const auto &object = jsonAttr.asObject("attribute");
-            auto kindIt = object.find("t");
-            if (kindIt == object.end())
-            {
-                kindIt = object.find("k");
-            }
-            if (kindIt == object.end())
-            {
-                kindIt = object.find("kind");
-            }
-            if (kindIt == object.end())
-            {
-                throw std::runtime_error("Attribute object missing kind");
-            }
-            const char *kindContext = kindIt->first == "t"   ? "attribute.t"
-                                     : kindIt->first == "k" ? "attribute.k"
-                                                            : "attribute.kind";
-            AttributeKind kind = parseAttributeKind(kindIt->second.asString(kindContext));
-
-            auto valueIt = object.find("v");
-            if (valueIt == object.end())
-            {
-                valueIt = object.find("value");
-            }
-
-            auto valuesIt = object.find("vs");
-            if (valuesIt == object.end())
-            {
-                valuesIt = object.find("values");
-            }
+            const auto kindIt = object.find("t");
+            if (kindIt == object.end()) throw std::runtime_error("Attribute object missing t");
+            const AttributeKind kind = parseAttributeKind(kindIt->second.asString("attribute.t"));
+            const auto valueIt = object.find("v");
+            const auto valuesIt = object.find("vs");
 
             auto validateAndReturn = [](AttributeValue attr) -> AttributeValue
             {
@@ -1096,6 +1072,73 @@ namespace wolvrix::lib::load
             return info;
         }
 
+        void parseSemanticTree(Graph &graph, const JsonValue &json)
+        {
+            if (graph.semanticTree()) throw std::runtime_error("Graph SemanticTree is already initialized");
+            const auto &object = json.asObject("graph.semanticTree");
+            const auto sourceUnit = object.find("sourceUnit");
+            const auto circuit = object.find("circuit");
+            const auto nodes = object.find("nodes");
+            if (sourceUnit == object.end() || circuit == object.end() || nodes == object.end())
+                throw std::runtime_error("SemanticTree missing sourceUnit/circuit/nodes");
+            const auto &nodeArray = nodes->second.asArray("semanticTree.nodes");
+            if (nodeArray.size() == 0) throw std::runtime_error("SemanticTree has no root node");
+            std::size_t id = 0;
+            for (const auto &entry : nodeArray)
+            {
+                ++id;
+                const auto &node = entry.asObject("semanticTree.nodes[]");
+                const auto parent = node.find("parent");
+                const auto kind = node.find("kind");
+                const auto name = node.find("name");
+                if (parent == node.end() || kind == node.end() || name == node.end())
+                    throw std::runtime_error("SemanticTree node missing parent/kind/name");
+                const int64_t parentId = parent->second.asInt("semanticTree.node.parent");
+                const auto nodeKind = wolvrix::lib::grh::parseSemanticNodeKind(
+                    kind->second.asString("semanticTree.node.kind"));
+                if (!nodeKind) throw std::runtime_error("Unknown SemanticTree node kind");
+                const auto &nodeName = name->second.asString("semanticTree.node.name");
+                const auto indexField = node.find("index");
+                int64_t nodeIndex = -1;
+                if (*nodeKind == wolvrix::lib::grh::SemanticNodeKind::Element)
+                {
+                    if (indexField == node.end()) throw std::runtime_error("SemanticTree element missing index");
+                    nodeIndex = indexField->second.asInt("semanticTree.node.index");
+                }
+                else if (indexField != node.end())
+                {
+                    throw std::runtime_error("SemanticTree non-element must not have index");
+                }
+                if (id == 1)
+                {
+                    if (parentId != 0 || *nodeKind != wolvrix::lib::grh::SemanticNodeKind::Module)
+                        throw std::runtime_error("SemanticTree root must be a parentless module");
+                    graph.getOrCreateSemanticTree(sourceUnit->second.asString("semanticTree.sourceUnit"),
+                                                  circuit->second.asString("semanticTree.circuit"), nodeName);
+                    continue;
+                }
+                if (parentId <= 0 || static_cast<uint64_t>(parentId) >= id)
+                    throw std::runtime_error("SemanticTree parent must precede its child");
+                graph.semanticTree()->addNode(static_cast<wolvrix::lib::grh::SemanticId>(parentId),
+                                              *nodeKind, nodeName, nodeIndex);
+            }
+        }
+
+        std::vector<wolvrix::lib::grh::SemanticId> parseSemanticIds(const JsonValue &json)
+        {
+            const auto &array = json.asArray("semanticIds");
+            std::vector<wolvrix::lib::grh::SemanticId> ids;
+            ids.reserve(array.size());
+            for (const auto &entry : array)
+            {
+                const int64_t id = entry.asInt("semanticIds[]");
+                if (id <= 0 || static_cast<uint64_t>(id) > std::numeric_limits<wolvrix::lib::grh::SemanticId>::max())
+                    throw std::runtime_error("SemanticId is outside the positive uint32 range");
+                ids.push_back(static_cast<wolvrix::lib::grh::SemanticId>(id));
+            }
+            return ids;
+        }
+
     } // namespace
 
     template<typename Parse>
@@ -1123,6 +1166,9 @@ namespace wolvrix::lib::load
             logJsonTiming("load_json.parse", toMillis(parseEnd - parseStart), details.str());
         }
         const auto &rootObj = root.asObject("design");
+        const auto formatVersion = rootObj.find("formatVersion");
+        if (formatVersion == rootObj.end() || formatVersion->second.asInt("design.formatVersion") != 4)
+            throw std::runtime_error("Unsupported GRH JSON; expected formatVersion 4; regenerate the checkpoint");
 
         Design design;
         auto graphsIt = rootObj.find("graphs");
@@ -1155,16 +1201,8 @@ namespace wolvrix::lib::load
                 graphStart = TimingClock::now();
             }
             const auto &graphObj = graphValue.asObject("graph");
-            bool versioned = false;
-            int64_t formatVersion = 0;
-            if (const auto version = graphObj.find("formatVersion"); version != graphObj.end())
-            {
-                formatVersion = version->second.asInt("graph.formatVersion");
-                if (formatVersion != 2 && formatVersion != 3)
-                    throw std::runtime_error("Unsupported GRH formatVersion; regenerate from SV");
-                versioned = true;
-            }
-            const bool localIds = formatVersion == 3;
+            if (graphObj.find("formatVersion") != graphObj.end())
+                throw std::runtime_error("Graph formatVersion is not part of GRH JSON v4");
             std::unordered_map<std::string, uint32_t> dialects;
             if (const auto declared = graphObj.find("dialects"); declared != graphObj.end())
             {
@@ -1176,8 +1214,8 @@ namespace wolvrix::lib::load
                     dialects.emplace(name, *supported);
                 }
             }
-            if (versioned && !dialects.contains("grh"))
-                throw std::runtime_error("Versioned GRH requires its dialect version");
+            if (!dialects.contains("grh"))
+                throw std::runtime_error("GRH JSON v4 requires its dialect version");
             auto symbolIt = graphObj.find("symbol");
             if (symbolIt == graphObj.end())
             {
@@ -1189,6 +1227,8 @@ namespace wolvrix::lib::load
                 throw std::runtime_error("Graph JSON symbol is empty");
             }
             Graph &graph = design.createGraph(graphSymbol);
+            if (const auto tree = graphObj.find("semanticTree"); tree != graphObj.end())
+                parseSemanticTree(graph, tree->second);
             if (const auto metadata = graphObj.find("metadata"); metadata != graphObj.end())
                 for (const auto& [key, entry] : metadata->second.asObject("graph.metadata"))
                     graph.setMetadata(key, parseAttributeValue(entry));
@@ -1307,17 +1347,9 @@ namespace wolvrix::lib::load
             std::unordered_set<uint32_t> declaredInputs;
             std::unordered_set<uint32_t> declaredOutputs;
             std::unordered_set<uint32_t> declaredInouts;
-            // v2 references use display names for temporary entities. Keep
-            // those names in a graph-local relocation table instead of
-            // interning them into the semantic SymbolTable; v3 uses the
-            // separate integer tables below.
-            std::unordered_map<std::string, ValueId> valueRefs;
-            std::unordered_map<std::string, OperationId> operationRefs;
             std::unordered_map<uint32_t, ValueId> valueIds;
             std::unordered_map<uint32_t, OperationId> operationIds;
             std::unordered_map<OperationId, uint32_t, wolvrix::lib::grh::OperationIdHash> operationLocalIds;
-            valueRefs.reserve(valuesArray.size() * 2 + 16);
-            operationRefs.reserve(opReserve * 2 + 16);
             valueIds.reserve(valuesArray.size() * 2 + 1);
             operationIds.reserve(opReserve * 2 + 1);
             operationLocalIds.reserve(opReserve * 2 + 1);
@@ -1327,42 +1359,18 @@ namespace wolvrix::lib::load
                     throw std::runtime_error(std::string(context) + ": expected positive 32-bit ID");
                 return static_cast<uint32_t>(id);
             };
-            const auto findValueRef = [&](std::string_view name) {
-                if (const auto it = valueRefs.find(std::string(name)); it != valueRefs.end()) return it->second;
-                return graph.findValue(name);
-            };
             const auto parseValueRef = [&](const JsonValue &entry, std::string_view context) -> ValueId {
-                if (localIds)
-                {
-                    const uint32_t id = parseLocalId(entry, context);
-                    const auto it = valueIds.find(id);
-                    if (it == valueIds.end())
-                        throw std::runtime_error(std::string(context) + ": unknown value ID " + std::to_string(id));
-                    return it->second;
-                }
-                const std::string &name = entry.asString(context);
-                if (name.empty())
-                    throw std::runtime_error(std::string(context) + ": empty value reference");
-                const auto value = findValueRef(name);
-                if (!value.valid())
-                    throw std::runtime_error("Unknown value reference: " + name);
-                return value;
+                const uint32_t id = parseLocalId(entry, context);
+                const auto it = valueIds.find(id);
+                if (it == valueIds.end())
+                    throw std::runtime_error(std::string(context) + ": unknown value ID " + std::to_string(id));
+                return it->second;
             };
             const auto parseOperationRef = [&](const JsonValue &entry, std::string_view context) -> OperationId {
-                if (localIds)
-                {
-                    const uint32_t id = parseLocalId(entry, context);
-                    const auto it = operationIds.find(id);
-                    if (it == operationIds.end())
-                        throw std::runtime_error(std::string(context) + ": unknown operation ID " + std::to_string(id));
-                    return it->second;
-                }
-                const std::string &name = entry.asString(context);
-                if (name.empty())
-                    throw std::runtime_error(std::string(context) + ": empty operation reference");
-                const auto it = operationRefs.find(name);
-                if (it == operationRefs.end())
-                    throw std::runtime_error("Unknown operation reference: " + name);
+                const uint32_t id = parseLocalId(entry, context);
+                const auto it = operationIds.find(id);
+                if (it == operationIds.end())
+                    throw std::runtime_error(std::string(context) + ": unknown operation ID " + std::to_string(id));
                 return it->second;
             };
 
@@ -1390,13 +1398,13 @@ namespace wolvrix::lib::load
                 const auto signIt = valueObj.find("sgn");
                 const auto inIt = valueObj.find("in");
                 const auto outIt = valueObj.find("out");
-                if ((localIds ? idIt == valueObj.end() : symIt == valueObj.end()) || widthIt == valueObj.end() ||
-                    signIt == valueObj.end() || inIt == valueObj.end() || outIt == valueObj.end())
+                if (idIt == valueObj.end() || widthIt == valueObj.end() || signIt == valueObj.end() ||
+                    inIt == valueObj.end() || outIt == valueObj.end())
                 {
                     throw std::runtime_error("Value entry missing required fields");
                 }
-                if (localIds && valueObj.find("tmp") != valueObj.end())
-                    throw std::runtime_error("formatVersion 3 value must not contain tmp marker");
+                if (valueObj.find("tmp") != valueObj.end())
+                    throw std::runtime_error("GRH JSON v4 value must not contain tmp marker");
 
                 std::string symbol;
                 if (symIt != valueObj.end())
@@ -1404,10 +1412,6 @@ namespace wolvrix::lib::load
                     symbol = symIt->second.asString("value.sym");
                     if (symbol.empty())
                         throw std::runtime_error("Value symbol is empty");
-                }
-                else if (!localIds)
-                {
-                    throw std::runtime_error("Value entry missing symbol");
                 }
                 int64_t width = widthIt->second.asInt("value.w");
                 if (width < std::numeric_limits<int32_t>::min() || width > std::numeric_limits<int32_t>::max())
@@ -1420,7 +1424,7 @@ namespace wolvrix::lib::load
                     if (!parsed) throw std::runtime_error("Unknown value domain");
                     domain = *parsed;
                 }
-                else if (versioned) throw std::runtime_error("Versioned GRH value is missing domain");
+                else throw std::runtime_error("GRH JSON v4 value is missing domain");
                 wolvrix::lib::grh::ValueType valueType = wolvrix::lib::grh::ValueType::Logic;
                 if (auto typeIt = valueObj.find("type"); typeIt != valueObj.end())
                 {
@@ -1439,11 +1443,7 @@ namespace wolvrix::lib::load
                 {
                     valueSymbolStart = TimingClock::now();
                 }
-                const bool temporary = localIds ? symIt == valueObj.end() : [&] {
-                    if (const auto tmpIt = valueObj.find("tmp"); tmpIt != valueObj.end())
-                        return tmpIt->second.asBool("value.tmp");
-                    return false;
-                }();
+                const bool temporary = symIt == valueObj.end();
                 SymbolId valueSym = temporary ? SymbolId::invalid() : graph.internSymbol(symbol);
                 if (timingEnabled)
                 {
@@ -1469,16 +1469,9 @@ namespace wolvrix::lib::load
                 }
                 ValueId valueId = graph.createTemporaryValue(valueSym, static_cast<int32_t>(width), isSigned,
                                                               valueType, valueShape, domain);
-                if (localIds)
-                {
-                    const uint32_t localId = parseLocalId(idIt->second, "value.id");
-                    if (!valueIds.emplace(localId, valueId).second)
-                        throw std::runtime_error("Duplicate value ID: " + std::to_string(localId));
-                }
-                else if (!valueRefs.emplace(symbol, valueId).second)
-                {
-                    throw std::runtime_error("Duplicate value display name: " + symbol);
-                }
+                const uint32_t localId = parseLocalId(idIt->second, "value.id");
+                if (!valueIds.emplace(localId, valueId).second)
+                    throw std::runtime_error("Duplicate value ID: " + std::to_string(localId));
                 if (timingEnabled)
                 {
                     const auto now = TimingClock::now();
@@ -1531,6 +1524,11 @@ namespace wolvrix::lib::load
                         valuesLocMs += toMillis(now - valueLocStart);
                         ++valuesLocCount;
                     }
+                }
+                if (const auto semantics = valueObj.find("semanticIds"); semantics != valueObj.end())
+                {
+                    const auto ids = parseSemanticIds(semantics->second);
+                    graph.setValueSemanticIds(valueId, ids);
                 }
                 ++valuesCount;
                 if (progressStep > 0 && (valuesCount % progressStep) == 0)
@@ -1845,16 +1843,14 @@ namespace wolvrix::lib::load
                     }
 
                     const auto* descriptor = wolvrix::lib::grh::findOpDescriptor(*kind);
-                    if (descriptor->dialect != "grh" &&
-                        (!versioned || !dialects.contains(std::string(descriptor->dialect))))
+                    if (descriptor->dialect != "grh" && !dialects.contains(std::string(descriptor->dialect)))
                         throw std::runtime_error("Dialect operation requires an explicit format/dialect version");
 
                     auto symIt = opObj.find("sym");
                     const auto idIt = opObj.find("id");
-                    if ((localIds ? idIt == opObj.end() : symIt == opObj.end()))
-                        throw std::runtime_error("Operation entry missing required identity field");
-                    if (localIds && opObj.find("tmp") != opObj.end())
-                        throw std::runtime_error("formatVersion 3 operation must not contain tmp marker");
+                    if (idIt == opObj.end()) throw std::runtime_error("Operation entry missing id");
+                    if (opObj.find("tmp") != opObj.end())
+                        throw std::runtime_error("GRH JSON v4 operation must not contain tmp marker");
 
                     std::string opSymbol;
                     if (symIt != opObj.end())
@@ -1868,11 +1864,7 @@ namespace wolvrix::lib::load
                     {
                         opSymbolStart = TimingClock::now();
                     }
-                    const bool temporary = localIds ? symIt == opObj.end() : [&] {
-                        if (const auto tmpIt = opObj.find("tmp"); tmpIt != opObj.end())
-                            return tmpIt->second.asBool("operation.tmp");
-                        return false;
-                    }();
+                    const bool temporary = symIt == opObj.end();
                     SymbolId opSym = temporary ? SymbolId::invalid() : graph.internSymbol(opSymbol);
                     if (timingEnabled)
                     {
@@ -1890,17 +1882,10 @@ namespace wolvrix::lib::load
                     }
                     OperationId opId = temporary ? graph.createTemporaryOperation(*kind) :
                         graph.createOperation(*kind, opSym);
-                    if (localIds)
-                    {
-                        const uint32_t localId = parseLocalId(idIt->second, "operation.id");
-                        if (!operationIds.emplace(localId, opId).second)
-                            throw std::runtime_error("Duplicate operation ID: " + std::to_string(localId));
-                        operationLocalIds.emplace(opId, localId);
-                    }
-                    else if (!operationRefs.emplace(opSymbol, opId).second)
-                    {
-                        throw std::runtime_error("Duplicate operation display name: " + opSymbol);
-                    }
+                    const uint32_t localId = parseLocalId(idIt->second, "operation.id");
+                    if (!operationIds.emplace(localId, opId).second)
+                        throw std::runtime_error("Duplicate operation ID: " + std::to_string(localId));
+                    operationLocalIds.emplace(opId, localId);
                     if (timingEnabled)
                     {
                         const auto now = TimingClock::now();
@@ -1961,6 +1946,12 @@ namespace wolvrix::lib::load
                         opsOutputsMs += toMillis(now - opOutputsStart);
                     }
 
+                    if (const auto semantics = opObj.find("semanticIds"); semantics != opObj.end())
+                    {
+                        const auto ids = parseSemanticIds(semantics->second);
+                        graph.setOpSemanticIds(opId, ids);
+                    }
+
                     if (auto attrsIt = opObj.find("attrs"); attrsIt != opObj.end())
                     {
                         TimingClock::time_point opAttrsStart;
@@ -2012,11 +2003,8 @@ namespace wolvrix::lib::load
                 }
             }
 
-            // v3 keeps def/use lists as redundant, checkable topology facts.
-            // The operation edge arrays above are authoritative for rebuilding
-            // the graph; reject stale or cross-namespace references instead of
-            // silently accepting a malformed checkpoint.
-            if (localIds)
+            // v4 keeps def/use lists as redundant, checkable topology facts.
+            // Operation edges are authoritative for rebuilding the graph.
             {
                 for (const auto &valueEntry : valuesArray)
                 {
@@ -2028,20 +2016,17 @@ namespace wolvrix::lib::load
                     const ValueId valueId = valueIt->second;
                     const auto defIt = valueObj.find("def");
                     const OperationId actualDef = graph.valueDef(valueId);
-                    if (defIt == valueObj.end())
-                    {
-                        if (actualDef.valid())
-                            throw std::runtime_error("Value is missing its defining operation ID");
-                    }
-                    else
+                    if (defIt != valueObj.end())
                     {
                         const OperationId encodedDef = parseOperationRef(defIt->second, "value.def");
                         if (encodedDef != actualDef)
                             throw std::runtime_error("Value defining operation ID does not match operation edges");
                     }
 
+                    const auto usersIt = valueObj.find("users");
+                    if (usersIt == valueObj.end()) continue;
                     std::vector<std::pair<uint32_t, std::size_t>> encodedUsers;
-                    if (const auto usersIt = valueObj.find("users"); usersIt != valueObj.end())
+                    if (usersIt != valueObj.end())
                     {
                         for (const auto &userEntry : usersIt->second.asArray("value.users"))
                         {

@@ -60,6 +60,44 @@ namespace wolvrix::app::pybind
         return Py_BuildValue("{s:s,s:N}", "symbol", graph->symbol().c_str(), "metadata", metadata);
     }
 
+    PyObject *py_session_semantic_stats(PyObject *, PyObject *args, PyObject *kwargs) {
+        PyObject *sessionObj = nullptr;
+        const char *designKey = nullptr;
+        static const char *kwlist[] = {"session", "design", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os", const_cast<char **>(kwlist),
+                                        &sessionObj, &designKey)) return nullptr;
+        SessionHandle *session = getSessionHandle(sessionObj);
+        if (!session) return nullptr;
+        auto *design = sessionDesign(*session, designKey);
+        if (!design) { PyErr_Format(PyExc_KeyError, "design key not found: %s", designKey); return nullptr; }
+        uint64_t trees = 0, nodes = 0, nameBytes = 0, valueRows = 0, operationRows = 0, semanticIds = 0;
+        for (const auto &[symbol, graph] : design->graphs()) {
+            (void)symbol;
+            if (const auto *tree = graph->semanticTree()) {
+                ++trees;
+                nodes += tree->size();
+                nameBytes += tree->nameBytes();
+            }
+            for (const auto value : graph->values()) {
+                const auto ids = graph->valueSemanticIds(value);
+                valueRows += !ids.empty();
+                semanticIds += ids.size();
+            }
+            for (const auto op : graph->operations()) {
+                const auto ids = graph->opSemanticIds(op);
+                operationRows += !ids.empty();
+                semanticIds += ids.size();
+            }
+        }
+        return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K}",
+                             "trees", static_cast<unsigned long long>(trees),
+                             "nodes", static_cast<unsigned long long>(nodes),
+                             "name_bytes", static_cast<unsigned long long>(nameBytes),
+                             "value_rows", static_cast<unsigned long long>(valueRows),
+                             "operation_rows", static_cast<unsigned long long>(operationRows),
+                             "semantic_ids", static_cast<unsigned long long>(semanticIds));
+    }
+
     PyObject *py_session_store_json(PyObject * /*self*/, PyObject *args, PyObject *kwargs)
     {
         PyObject *sessionObj = nullptr;
@@ -67,9 +105,13 @@ namespace wolvrix::app::pybind
         const char *output = nullptr;
         const char *modeText = "pretty-compact";
         PyObject *topListObj = Py_None;
-        static const char *kwlist[] = {"session", "design", "output", "mode", "top", nullptr};
-        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|sO", const_cast<char **>(kwlist),
-                                         &sessionObj, &designKey, &output, &modeText, &topListObj))
+        int emitDefUsers = 0;
+        int emitSourceLocations = 0;
+        static const char *kwlist[] = {"session", "design", "output", "mode", "top",
+                                       "emit_def_users", "emit_source_locations", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|sOpp", const_cast<char **>(kwlist),
+                                         &sessionObj, &designKey, &output, &modeText, &topListObj,
+                                         &emitDefUsers, &emitSourceLocations))
         {
             return nullptr;
         }
@@ -113,6 +155,8 @@ namespace wolvrix::app::pybind
         wolvrix::lib::store::StoreJson store(&diagnostics);
         wolvrix::lib::store::StoreOptions options;
         options.jsonMode = mode;
+        options.emitDefUsers = emitDefUsers != 0;
+        options.emitSourceLocations = emitSourceLocations != 0;
         options.topOverrides = std::move(topNames);
         options.outputFilename = filename;
         if (!outPath.parent_path().empty())

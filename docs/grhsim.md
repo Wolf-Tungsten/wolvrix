@@ -59,16 +59,16 @@ with wolvrix.Session() as session:
 An earlier checkpoint resumes the remaining stages through the shared flow.
 `make reemit_grhsim` is the supported playground entry for this operation.
 
-Every completed stage uses [GRH JSON](grh/grh-json-spec.md), with per-graph
-`formatVersion=3` and dialect versions `grh:2`, `grhsim:1` and, when used,
+Every completed stage uses [GRH JSON](grh/grh-json-spec.md), with design-root
+`formatVersion=4` and dialect versions `grh:2`, `grhsim:1` and, when used,
 `grhsim.cpu:1`. Types, InitSpec, declaration/generate metadata, owner paths and
 stage/configuration attributes survive store/load. Resolved schedules and
 emitter storage/chunk plans are not serialized. Load/clone creates a new
 instance; mutations, freeze and rename invalidate resolved schedules. Rebuild
 SinkSchedule in the same session before emission. Missing or stale schedules,
 unknown stages/dialects and retired independent-IR JSON are rejected.
-Version 2 checkpoints with string references remain readable and are upgraded
-to version 3 on the next store; graph-local IDs are structural references only.
+Older checkpoints are not readable; regenerate them from source. Graph-local IDs
+and SemanticTree node IDs are structural references only within the current Graph.
 
 The removed Python APIs are `lower_grhsim`, `run_grhsim_pass`,
 `run_grhsim_pipeline`, `load_grhsim`, `store_grhsim` and

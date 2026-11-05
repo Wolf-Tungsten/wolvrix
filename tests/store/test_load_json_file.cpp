@@ -32,6 +32,8 @@ std::string stored(const grh::Design &design, store::JsonPrintMode mode = store:
     store::StoreJson writer;
     store::StoreOptions options;
     options.jsonMode = mode;
+    options.emitDefUsers = true;
+    options.emitSourceLocations = true;
     const auto text = writer.storeToString(design, options);
     require(text.has_value(), "failed to serialize fixture");
     return *text;
@@ -135,31 +137,33 @@ int main() {
         }
 
         const std::string reordered = R"json({
+          "formatVersion":4,
           "tops":["g"], "aliases":{"alias":"g"}, "declaredSymbols":["design"],
           "graphs":[{
-            "ops":[{"out":["out"],"in":["input"],"attrs":{
-              "text":{"value":"\u00e9\n\\\"","kind":"str"},
-              "items":{"values":[1,2,3],"k":"int_array"}},"sym":"assign","kind":"kAssign"}],
-            "ports":{"out":[{"val":"out","name":"out"}],"in":[{"val":"input","name":"input"}]},
-            "metadata":{"opaque":{"values":["a","b"],"kind":"string_array"}},
+            "ops":[{"id":22,"out":[12],"in":[11],"attrs":{
+              "text":{"t":"string","v":"\u00e9\n\\\""},
+              "items":{"t":"int[]","vs":[1,2,3]}},"sym":"assign","kind":"kAssign"}],
+            "ports":{"out":[{"val":12,"name":"out"}],"in":[{"val":11,"name":"input"}],"inout":[]},
+            "dialects":{"grh":2},
+            "metadata":{"opaque":{"t":"string[]","vs":["a","b"]}},
             "generateGroups":[{"symbols":["assign","out"],"name":"grp","scope":"scope"}],
-            "vals":[{"out":false,"in":true,"sgn":false,"w":8,"sym":"input"},
-                    {"out":true,"in":false,"sgn":false,"w":8,"sym":"out"}],
+            "vals":[{"id":11,"out":false,"in":true,"inout":false,"domain":"4state","type":"logic","sgn":false,"w":8,"sym":"input",
+                      "users":[{"op":22,"idx":0}]},
+                    {"id":12,"out":true,"in":false,"inout":false,"domain":"4state","type":"logic","sgn":false,"w":8,"sym":"out",
+                      "def":22,"users":[]}],
             "declaredSymbols":["decl"],"symbol":"g","symbol":"ignored duplicate"
           }]
         })json";
-        checkBoth(directory / "reordered-legacy.json", reordered);
+        checkBoth(directory / "reordered-v4.json", reordered);
         checkRejected(directory / "trailing.json", reordered + "garbage");
         checkRejected(directory / "truncated.json", reordered.substr(0, reordered.size() - 4));
         checkRejected(directory / "invalid-escape.json", "{\"graphs\":[],\"declaredSymbols\":[],\"unknown\":[\"\\q\"]}");
         checkRejected(directory / "invalid-number.json", "{\"graphs\":[],\"declaredSymbols\":[],\"unknown\":[1e99999]}");
-        checkRejected(directory / "unknown-value.json", R"json({"graphs":[{
-            "symbol":"g","declaredSymbols":[],"vals":[],
-            "ops":[{"sym":"bad","kind":"kAssign","in":["missing"],"out":[]}]
+        checkRejected(directory / "unknown-value.json", R"json({"formatVersion":4,"graphs":[{
+            "symbol":"g","dialects":{"grh":2},"metadata":{},"declaredSymbols":[],"vals":[],
+            "ops":[{"id":1,"kind":"kAssign","in":[99],"out":[]}]
           }],"declaredSymbols":[]})json");
-        checkRejected(directory / "version.json", R"json({"graphs":[{
-            "symbol":"g","formatVersion":999,"declaredSymbols":[],"vals":[]
-          }],"declaredSymbols":[]})json");
+        checkRejected(directory / "version.json", R"json({"formatVersion":999,"graphs":[],"declaredSymbols":[]})json");
         bool missingRejected = false;
         try { auto result = load::LoadJson().loadFile(directory / "missing.json"); }
         catch (const std::exception &) { missingRejected = true; }

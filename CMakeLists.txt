@@ -517,6 +517,11 @@ target_compile_definitions(store-json
 
 register_test_exe(store-json)
 
+add_executable(store-semantic-tree-json tests/store/test_semantic_tree_json.cpp)
+target_link_libraries(store-semantic-tree-json PRIVATE wolvrix-lib)
+target_compile_definitions(store-semantic-tree-json PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}")
+register_test_exe(store-semantic-tree-json)
+
 add_executable(load-json-file tests/store/test_load_json_file.cpp)
 target_link_libraries(load-json-file PRIVATE wolvrix-lib)
 target_compile_definitions(load-json-file PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}")

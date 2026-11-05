@@ -43,6 +43,8 @@ namespace wolvrix::lib::store
         std::optional<std::string> outputFilename;
         JsonPrintMode jsonMode = JsonPrintMode::PrettyCompact;
         std::vector<std::string> topOverrides;
+        bool emitDefUsers = false;
+        bool emitSourceLocations = false;
     };
 
     struct StoreResult

@@ -1276,12 +1276,11 @@ public:
     void markLocalCyclesChecked() noexcept { localCycleProof_ = mutationEpoch_; }
     [[nodiscard]] const GraphStore& payloadStore() const noexcept { return *store_; }
 
-    SemanticTree* semanticTree() noexcept { return semanticTree_.get(); }
-    const SemanticTree* semanticTree() const noexcept { return semanticTree_.get(); }
+    SemanticTree* semanticTree() noexcept { return semanticTree_ ? &*semanticTree_ : nullptr; }
+    const SemanticTree* semanticTree() const noexcept { return semanticTree_ ? &*semanticTree_ : nullptr; }
     SemanticTree& getOrCreateSemanticTree(std::string sourceUnit, std::string circuit,
                                           std::string module);
-    SemanticId appendSemanticInstance(const Graph& source, SemanticId parent,
-                                      std::string_view instanceName);
+    SemanticId appendSemanticTree(const Graph& source, SemanticId parent);
 
     std::span<const OperationId> operations() const;
     std::span<const ValueId> values() const;
@@ -1442,11 +1441,11 @@ public:
     std::size_t remapValueBlockSemantics(const Graph& source,
                                          std::span<const ValueId> sourceValues,
                                          std::span<const ValueId> targetValues,
-                                         SemanticId scope);
+                                         SemanticId copiedRoot);
     std::size_t remapOperationBlockSemantics(const Graph& source,
                                              std::span<const OperationId> sourceOps,
                                              std::span<const OperationId> targetOps,
-                                             SemanticId scope);
+                                             SemanticId copiedRoot);
     // Offsets have ops.size()+1 entries, begin at zero, and terminate at the
     // corresponding flat edge count. Results acquire their definitions now;
     // reverse uses must be rebuilt before querying or mutating imported edges.
@@ -1487,7 +1486,8 @@ public:
     void clearOpSymbol(OperationId op);
     void clearValueSymbol(ValueId value);
 
-    void writeJson(slang::JsonWriter& writer) const;
+    void writeJson(slang::JsonWriter& writer, bool emitDefUsers = false,
+                   bool emitSourceLocations = false) const;
 
 private:
     friend class Design;
@@ -1514,7 +1514,7 @@ private:
     std::vector<AttrKV> metadata_;
     GraphSymbolTable symbols_;
     std::shared_ptr<GraphStore> store_;
-    std::shared_ptr<SemanticTree> semanticTree_;
+    std::optional<SemanticTree> semanticTree_;
     bool compacted_ = true;
     uint64_t srcLocEpoch_ = 0;
     uint64_t mutationEpoch_ = 0;

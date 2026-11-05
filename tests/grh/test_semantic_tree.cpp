@@ -3,6 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace wolvrix::lib::grh;
@@ -22,6 +23,8 @@ void requirePath(const SemanticTree& tree, SemanticId id,
 
 int main() {
     try {
+        static_assert(std::is_trivially_copyable_v<SemanticNode>);
+        static_assert(sizeof(SemanticId) == sizeof(uint32_t));
         Design design;
         auto& child = design.createGraph("child");
         auto& childTree = child.getOrCreateSemanticTree("unit", "circuit", "child");
@@ -37,14 +40,16 @@ int main() {
 
         auto& top = design.createGraph("top");
         auto& topTree = top.getOrCreateSemanticTree("unit", "circuit", "top");
-        const auto core0 = top.appendSemanticInstance(child, topTree.root(), "core0");
-        const auto core1 = top.appendSemanticInstance(child, topTree.root(), "core1");
-        const auto core0Leaf = qualifiedSemantic(core0, leaf);
-        const auto core1Leaf = qualifiedSemantic(core1, leaf);
+        const auto core0 = top.appendSemanticTree(child, topTree.root());
+        const auto core1 = top.appendSemanticTree(child, topTree.root());
+        const auto core0Leaf = core0 + leaf - 1;
+        const auto core1Leaf = core1 + leaf - 1;
         require(core0 != core1 && core0Leaf != core1Leaf,
-                "instances share a fully-qualified semantic leaf");
-        requirePath(topTree, core0Leaf, {"top", "core0", "child", "n", "bits", "data"});
-        requirePath(topTree, core1Leaf, {"top", "core1", "child", "n", "bits", "data"});
+                "copied trees share a semantic leaf");
+        require(topTree.size() == 1 + childTree.size() * 2,
+                "appendTree did not deep-copy every source node");
+        requirePath(topTree, core0Leaf, {"top", "child", "n", "bits", "data"});
+        requirePath(topTree, core1Leaf, {"top", "child", "n", "bits", "data"});
 
         const auto topValue = top.createTemporaryValue(8, false);
         const auto topOp = top.createTemporaryOperation(OperationKind::kNot);
@@ -65,8 +70,15 @@ int main() {
                 top.valueSemanticIds(replacement)[0] == core0Leaf,
                 "replaceResult lost the previous result source");
 
+        auto& outer = design.createGraph("outer");
+        auto& outerTree = outer.getOrCreateSemanticTree("unit", "circuit", "outer");
+        const auto copiedTop = outer.appendSemanticTree(top, outerTree.root());
+        const auto outerLeaf = copiedTop + core0Leaf - 1;
+        requirePath(outerTree, outerLeaf, {"outer", "top", "child", "n", "bits", "data"});
+        require(outerTree.size() == 1 + topTree.size(), "second copy did not copy the complete tree");
+
         require(design.deleteGraph("child"), "failed to delete source graph");
-        requirePath(topTree, top.opSemanticIds(topOp)[1], {"top", "core0", "child", "n", "bits", "data"});
+        requirePath(topTree, top.opSemanticIds(topOp)[1], {"top", "child", "n", "bits", "data"});
         top.compact();
         const auto compactedOp = top.operations().front();
         const auto compactedValue = top.values().front();
@@ -78,11 +90,12 @@ int main() {
         auto& clone = design.cloneGraph("top", "clone");
         require(clone.semanticTree() && clone.semanticTree()->size() == topTree.size(),
                 "clone lost SemanticTree nodes");
+        require(clone.semanticTree() != top.semanticTree(), "clone shares its SemanticTree");
         require(clone.opSemanticIds(clone.operations().front()).size() == 2 &&
                 clone.valueSemanticIds(clone.values().front())[0] == core0Leaf,
                 "clone lost semantic associations");
         requirePath(*clone.semanticTree(), clone.valueSemanticIds(clone.values().front())[0],
-                    {"top", "core0", "child", "n", "bits", "data"});
+                    {"top", "child", "n", "bits", "data"});
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "[grh-semantic-tree] " << error.what() << '\n';

@@ -47,6 +47,9 @@ namespace wolvrix::lib::transform
             std::size_t qualificationOutputBytes = 0;
             std::size_t pendingAttributes = 0;
             std::size_t generateGroups = 0;
+            std::size_t semanticNodesCopied = 0;
+            std::size_t semanticNameBytesCopied = 0;
+            std::chrono::nanoseconds semanticCopy{};
             std::chrono::nanoseconds freeze{};
             std::chrono::nanoseconds capacity{};
             std::chrono::nanoseconds topStamp{};
@@ -1526,7 +1529,7 @@ namespace wolvrix::lib::transform
                 wolvrix::lib::grh::SemanticId parent;
                 ~SemanticParentGuard() { state.currentSemanticParent = parent; }
             } semanticParentGuard{state, state.currentSemanticParent};
-            wolvrix::lib::grh::SemanticId semanticScopeId = 0;
+            wolvrix::lib::grh::SemanticId copiedSemanticRoot = 0;
             if (source.semanticTree())
             {
                 if (!target.semanticTree())
@@ -1536,10 +1539,15 @@ namespace wolvrix::lib::transform
                     state.stack.erase(&source);
                     return false;
                 }
-                const std::string_view component = state.nodeInstancePath.empty() ?
-                    std::string_view(prefix) : std::string_view(state.nodeInstancePath.back());
-                semanticScopeId = target.appendSemanticInstance(source, state.currentSemanticParent, component);
-                if (semanticScopeId) state.currentSemanticParent = wolvrix::lib::grh::semanticInstance(semanticScopeId);
+                const auto semanticStarted = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
+                copiedSemanticRoot = target.appendSemanticTree(source, state.currentSemanticParent);
+                if (state.profile)
+                {
+                    state.metrics.semanticCopy += FlattenClock::now() - semanticStarted;
+                    state.metrics.semanticNodesCopied += source.semanticTree()->size();
+                    state.metrics.semanticNameBytesCopied += source.semanticTree()->nameBytes();
+                }
+                if (copiedSemanticRoot) state.currentSemanticParent = copiedSemanticRoot;
             }
             const auto plannedInstance = valueMap.plannedInstance;
             const auto enterEvent = state.plan.consume(GlobalInlinePlan::EventKind::EnterValues, plannedInstance);
@@ -1561,8 +1569,11 @@ namespace wolvrix::lib::transform
                 targetIds.clear();
                 for (const auto sourceId : sourceIds)
                 {
-                    const auto targetId = wolvrix::lib::grh::qualifiedSemantic(semanticScopeId, sourceId);
-                    if (!targetId) throw std::invalid_argument("Flatten SemanticId relocation produced zero");
+                    if (!copiedSemanticRoot || !source.semanticTree()->contains(sourceId))
+                        throw std::invalid_argument("Flatten encountered an invalid source SemanticId");
+                    const auto targetId = copiedSemanticRoot + sourceId - 1;
+                    if (!target.semanticTree()->contains(targetId))
+                        throw std::invalid_argument("Flatten SemanticId relocation left the copied tree");
                     if (std::find(targetIds.begin(), targetIds.end(), targetId) == targetIds.end())
                         targetIds.push_back(targetId);
                 }
@@ -1709,7 +1720,7 @@ namespace wolvrix::lib::transform
             const bool retainColumns = state.plan.enabled && state.plan.definitionUses.at(&source) == 1;
             target.appendValueBlock(source, sourceValues, valueSymbols, newValues, srcLocImport,
                 state.plan.enabled ? 1 : state.numThreads, retainColumns);
-            target.remapValueBlockSemantics(source, sourceValues, newValues, semanticScopeId);
+            target.remapValueBlockSemantics(source, sourceValues, newValues, copiedSemanticRoot);
             if (state.plan.enabled)
             {
                 auto &event = state.plan.events[enterEvent];
@@ -1859,7 +1870,7 @@ namespace wolvrix::lib::transform
                     target.appendOperationBlock(source, run.operations, runSymbols, runOutput, srcLocImport,
                         state.plan.enabled ? 1 : state.numThreads, retainColumns);
                     state.metrics.annotatedOperations += target.remapOperationBlockSemantics(
-                        source, run.operations, runOutput, semanticScopeId);
+                        source, run.operations, runOutput, copiedSemanticRoot);
                     if (state.plan.enabled)
                     {
                         auto &event = state.plan.events[runEvent];
@@ -2278,6 +2289,9 @@ namespace wolvrix::lib::transform
                  " qualification-output-bytes=" + std::to_string(metrics.qualificationOutputBytes) +
                  " pending-attrs=" + std::to_string(metrics.pendingAttributes) +
                  " generate-groups=" + std::to_string(metrics.generateGroups) +
+                 " semantic-nodes-copied=" + std::to_string(metrics.semanticNodesCopied) +
+                 " semantic-name-bytes-copied=" + std::to_string(metrics.semanticNameBytesCopied) +
+                 " semantic-copy-ms=" + std::to_string(millis(metrics.semanticCopy)) +
                  " freeze-ms=" + std::to_string(millis(metrics.freeze)) +
                  " capacity-ms=" + std::to_string(millis(metrics.capacity)) +
                  " top-stamp-ms=" + std::to_string(millis(metrics.topStamp)) +

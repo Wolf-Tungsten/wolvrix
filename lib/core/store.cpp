@@ -730,6 +730,7 @@ namespace wolvrix::lib::store
 
         std::string serializeWithJsonWriter(const wolvrix::lib::grh::Design &design,
                                             std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
+                                            const StoreOptions &options,
                                             bool pretty)
         {
             auto collectAliases = [&](const wolvrix::lib::grh::Design &source)
@@ -750,6 +751,8 @@ namespace wolvrix::lib::store
             slang::JsonWriter writer;
             writer.setPrettyPrint(pretty);
             writer.startObject();
+            writer.writeProperty("formatVersion");
+            writer.writeValue(int64_t{4});
 
             const bool timingEnabled = jsonTimingEnabled();
             writer.writeProperty("graphs");
@@ -761,7 +764,7 @@ namespace wolvrix::lib::store
                 {
                     graphStart = TimingClock::now();
                 }
-                graph->writeJson(writer);
+                graph->writeJson(writer, options.emitDefUsers, options.emitSourceLocations);
                 if (timingEnabled)
                 {
                     const auto graphEnd = TimingClock::now();
@@ -1185,11 +1188,27 @@ namespace wolvrix::lib::store
             out.push_back('}');
         }
 
+        void writeSemanticIdsInline(JsonOutput &out,
+                                    std::span<const wolvrix::lib::grh::SemanticId> ids,
+                                    JsonPrintMode mode)
+        {
+            out.push_back('[');
+            bool first = true;
+            for (const auto id : ids)
+            {
+                if (!first) out.append(commaToken(mode));
+                out.append(std::to_string(id));
+                first = false;
+            }
+            out.push_back(']');
+        }
+
         void writeValueInline(JsonOutput &out,
                               const wolvrix::lib::grh::Graph &graph,
                               const GraphLocalIds &ids,
                               wolvrix::lib::grh::ValueId value,
-                              JsonPrintMode mode)
+                              JsonPrintMode mode,
+                              const StoreOptions &options)
         {
             writeInlineObject(out, mode, [&](auto &&prop)
                               {
@@ -1232,14 +1251,22 @@ namespace wolvrix::lib::store
                                                out.push_back(']');
                                            });
                                   }
-                                  if (graph.valueDef(value))
+                                  if (options.emitDefUsers && graph.valueDef(value))
                                   {
                                       prop("def", [&]
                                            { out.append(std::to_string(ids.operation(graph.valueDef(value)))); });
                                   }
-                                  prop("users", [&]
-                                       { writeUsersInline(out, graph, ids, graph.valueUsers(value), mode); });
-                                  if (graph.valueSrcLoc(value))
+                                  if (options.emitDefUsers)
+                                  {
+                                      prop("users", [&]
+                                           { writeUsersInline(out, graph, ids, graph.valueUsers(value), mode); });
+                                  }
+                                  if (!graph.valueSemanticIds(value).empty())
+                                  {
+                                      prop("semanticIds", [&]
+                                           { writeSemanticIdsInline(out, graph.valueSemanticIds(value), mode); });
+                                  }
+                                  if (options.emitSourceLocations && graph.valueSrcLoc(value))
                                   {
                                       prop("loc", [&]
                                            { writeDebugInline(out, mode, graph.valueSrcLoc(value)); });
@@ -1266,7 +1293,8 @@ namespace wolvrix::lib::store
                                   const wolvrix::lib::grh::Graph &graph,
                                   const GraphLocalIds &ids,
                                   wolvrix::lib::grh::OperationId op,
-                                  JsonPrintMode mode)
+                                  JsonPrintMode mode,
+                                  const StoreOptions &options)
         {
             writeInlineObject(out, mode, [&](auto &&prop)
                               {
@@ -1310,12 +1338,17 @@ namespace wolvrix::lib::store
                                            }
                                            out.push_back(']');
                                        });
+                                  if (!graph.opSemanticIds(op).empty())
+                                  {
+                                      prop("semanticIds", [&]
+                                           { writeSemanticIdsInline(out, graph.opSemanticIds(op), mode); });
+                                  }
                                   if (!graph.opAttrRange(op).empty())
                                   {
                                       prop("attrs", [&]
                                            { writeAttrsInline(out, graph.opAttrRange(op), mode); });
                                   }
-                                  if (graph.opSrcLoc(op))
+                                  if (options.emitSourceLocations && graph.opSrcLoc(op))
                                   {
                                       prop("loc", [&]
                                            { writeDebugInline(out, mode, graph.opSrcLoc(op)); });
@@ -1472,9 +1505,48 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
+        void writeSemanticTreePrettyCompact(JsonOutput &out,
+                                            const wolvrix::lib::grh::SemanticTree &tree,
+                                            int indent)
+        {
+            out.push_back('{');
+            appendNewlineAndIndent(out, indent + 1);
+            appendQuotedString(out, "sourceUnit");
+            out.append(": ");
+            appendQuotedString(out, tree.sourceUnit());
+            out.push_back(',');
+            appendNewlineAndIndent(out, indent + 1);
+            appendQuotedString(out, "circuit");
+            out.append(": ");
+            appendQuotedString(out, tree.circuit());
+            out.push_back(',');
+            appendNewlineAndIndent(out, indent + 1);
+            appendQuotedString(out, "nodes");
+            out.append(": [");
+            for (wolvrix::lib::grh::SemanticId id = 1; id <= tree.size(); ++id)
+            {
+                if (id != 1) out.push_back(',');
+                appendNewlineAndIndent(out, indent + 2);
+                writeInlineObject(out, JsonPrintMode::PrettyCompact, [&](auto &&prop)
+                {
+                    const auto &node = tree.node(id);
+                    prop("parent", [&] { out.append(std::to_string(node.parent)); });
+                    prop("kind", [&] { appendQuotedString(out, wolvrix::lib::grh::toString(node.kind)); });
+                    prop("name", [&] { appendQuotedString(out, tree.name(id)); });
+                    if (node.kind == wolvrix::lib::grh::SemanticNodeKind::Element)
+                        prop("index", [&] { out.append(std::to_string(node.index)); });
+                });
+            }
+            if (tree.size() != 0) appendNewlineAndIndent(out, indent + 1);
+            out.push_back(']');
+            appendNewlineAndIndent(out, indent);
+            out.push_back('}');
+        }
+
         void writeGraphPrettyCompact(JsonOutput &out,
                                      const wolvrix::lib::grh::Graph &graph,
                                      int baseIndent,
+                                     const StoreOptions &options,
                                      GraphWriteStats *stats,
                                      bool timingEnabled,
                                      std::size_t progressStep)
@@ -1501,9 +1573,6 @@ namespace wolvrix::lib::store
             out.push_back(',');
 
             appendNewlineAndIndent(out, indent);
-            appendQuotedString(out, "formatVersion");
-            out.append(": 3,");
-            appendNewlineAndIndent(out, indent);
             appendQuotedString(out, "dialects");
             out.append(": {");
             bool firstDialect = true;
@@ -1516,6 +1585,14 @@ namespace wolvrix::lib::store
                 firstDialect = false;
             }
             out.append("},");
+            if (graph.semanticTree())
+            {
+                appendNewlineAndIndent(out, indent);
+                appendQuotedString(out, "semanticTree");
+                out.append(": ");
+                writeSemanticTreePrettyCompact(out, *graph.semanticTree(), indent);
+                out.push_back(',');
+            }
             appendNewlineAndIndent(out, indent);
             appendQuotedString(out, "metadata");
             out.append(": ");
@@ -1579,7 +1656,7 @@ namespace wolvrix::lib::store
                         out.push_back(',');
                     }
                     appendNewlineAndIndent(out, indent + 1);
-                    writeValueInline(out, graph, ids, valueId, JsonPrintMode::PrettyCompact);
+                    writeValueInline(out, graph, ids, valueId, JsonPrintMode::PrettyCompact, options);
                     first = false;
                     ++valueIndex;
                     if (useTiming && progressStep > 0 && (valueIndex % progressStep) == 0)
@@ -1667,7 +1744,7 @@ namespace wolvrix::lib::store
                         out.push_back(',');
                     }
                     appendNewlineAndIndent(out, indent + 1);
-                    writeOperationInline(out, graph, ids, opId, JsonPrintMode::PrettyCompact);
+                    writeOperationInline(out, graph, ids, opId, JsonPrintMode::PrettyCompact, options);
                     first = false;
                     ++opIndex;
                     if (useTiming && progressStep > 0 && (opIndex % progressStep) == 0)
@@ -1732,12 +1809,17 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
-        void serializePrettyCompact(JsonOutput &out, const wolvrix::lib::grh::Design &design, std::span<const wolvrix::lib::grh::Graph *const> topGraphs)
+        void serializePrettyCompact(JsonOutput &out, const wolvrix::lib::grh::Design &design,
+                                    std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
+                                    const StoreOptions &options)
         {
             int indent = 0;
 
             out.push_back('{');
             indent = 1;
+            appendNewlineAndIndent(out, indent);
+            appendQuotedString(out, "formatVersion");
+            out.append(": 4,");
             appendNewlineAndIndent(out, indent);
 
             appendQuotedString(out, "graphs");
@@ -1763,7 +1845,7 @@ namespace wolvrix::lib::store
                     appendNewlineAndIndent(out, indent + 1);
                     GraphWriteStats stats{};
                     GraphWriteStats *statsPtr = timingEnabled ? &stats : nullptr;
-                    writeGraphPrettyCompact(out, *graph, indent + 1, statsPtr, timingEnabled, progressStep);
+                    writeGraphPrettyCompact(out, *graph, indent + 1, options, statsPtr, timingEnabled, progressStep);
                     if (timingEnabled)
                     {
                         const auto graphEnd = TimingClock::now();
@@ -1875,20 +1957,20 @@ namespace wolvrix::lib::store
 
         std::string serializeDesignJson(const wolvrix::lib::grh::Design &design,
                                          std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
-                                         JsonPrintMode mode)
+                                         const StoreOptions &options)
         {
-            switch (mode)
+            switch (options.jsonMode)
             {
             case JsonPrintMode::Compact:
-                return serializeWithJsonWriter(design, topGraphs, /* pretty */ false);
+                return serializeWithJsonWriter(design, topGraphs, options, /* pretty */ false);
             case JsonPrintMode::Pretty:
-                return serializeWithJsonWriter(design, topGraphs, /* pretty */ true);
+                return serializeWithJsonWriter(design, topGraphs, options, /* pretty */ true);
             case JsonPrintMode::PrettyCompact:
             default:
             {
                 std::string text;
                 JsonOutput out(text);
-                serializePrettyCompact(out, design, topGraphs);
+                serializePrettyCompact(out, design, topGraphs, options);
                 return text;
             }
             }
@@ -2037,7 +2119,7 @@ namespace wolvrix::lib::store
 
         try
         {
-            return serializeDesignJson(design, topGraphs, options.jsonMode);
+            return serializeDesignJson(design, topGraphs, options);
         }
         catch (const std::exception &ex)
         {
@@ -2080,7 +2162,7 @@ namespace wolvrix::lib::store
             if (streaming)
             {
                 JsonOutput out(*stream);
-                serializePrettyCompact(out, design, topGraphs);
+                serializePrettyCompact(out, design, topGraphs, options);
                 out.finish();
                 bytes = out.size();
             }
@@ -2088,7 +2170,7 @@ namespace wolvrix::lib::store
             {
                 // slang::JsonWriter owns its complete output; retain its
                 // existing Compact/Pretty formatting and string path.
-                const std::string jsonText = serializeDesignJson(design, topGraphs, options.jsonMode);
+                const std::string jsonText = serializeDesignJson(design, topGraphs, options);
                 bytes = jsonText.size();
                 if (timingEnabled)
                 {

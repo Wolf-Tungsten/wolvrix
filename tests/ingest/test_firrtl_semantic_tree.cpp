@@ -1,4 +1,6 @@
 #include "firrtl_test_fixture.hpp"
+#include "core/load.hpp"
+#include "core/store.hpp"
 #include "transform/hier_flatten.hpp"
 
 #include <fstream>
@@ -25,6 +27,17 @@ std::size_t countOperations(const grh::Graph& graph, const std::vector<std::stri
     });
 }
 
+grh::Design roundtrip(const grh::Design& design) {
+    wolvrix::lib::store::StoreOptions options;
+    options.jsonMode = wolvrix::lib::store::JsonPrintMode::PrettyCompact;
+    const auto json = wolvrix::lib::store::StoreJson().storeToString(design, options);
+    require(json.has_value(), "failed to store SemanticTree checkpoint");
+    auto restored = wolvrix::lib::load::LoadJson().load(*json);
+    const auto second = wolvrix::lib::store::StoreJson().storeToString(restored, options);
+    require(second && *second == *json, "SemanticTree checkpoint is not byte-stable");
+    return restored;
+}
+
 void checkFlattened(grh::Design& design, bool globalPlan) {
     tx::HierFlattenOptions options;
     options.useGlobalPlan = globalPlan;
@@ -33,21 +46,17 @@ void checkFlattened(grh::Design& design, bool globalPlan) {
     require(design.graphs().size() == 1, "flatten did not delete the source definition");
     const auto& top = *design.findGraph("top");
     require(top.semanticTree(), "flatten lost SemanticTree");
-    require(countValues(top, {"top", "c0", "child", "n"}) == 1,
-            "first instance lost its node result");
-    require(countValues(top, {"top", "c1", "child", "n"}) == 1,
-            "second instance lost its node result");
-    require(countOperations(top, {"top", "c0", "child", "n"}) >= 1 &&
-            countOperations(top, {"top", "c1", "child", "n"}) >= 1,
-            "flatten did not remap operation sources independently per instance");
+    require(countValues(top, {"top", "child", "n"}) == 2,
+            "deep-copied instances did not retain independent node results");
+    require(countOperations(top, {"top", "child", "n"}) >= 2,
+            "flatten did not remap operation sources independently per copy");
     require(countValues(top, {"top", "a0"}) == 1 && countValues(top, {"top", "a1"}) == 1,
             "top input sources disappeared");
-    require(countValues(top, {"top", "c0", "child", "a"}) == 1 &&
-            countValues(top, {"top", "c1", "child", "a"}) == 1,
+    require(countValues(top, {"top", "child", "a"}) == 2,
             "child input sources disappeared from their boundary values");
     const bool mergedPortSources = std::any_of(top.values().begin(), top.values().end(), [&](grh::ValueId value) {
         const auto ids = top.valueSemanticIds(value);
-        return ids.size() > 1 && hasPath(top, ids, {"top", "c0", "child", "a"});
+        return ids.size() > 1 && hasPath(top, ids, {"top", "child", "a"});
     });
     require(mergedPortSources, "port aliases did not retain multiple direct source associations");
     require(countValues(top, {"top", "w", "bits", "data"}) == 1,
@@ -58,6 +67,11 @@ void checkFlattened(grh::Design& design, bool globalPlan) {
                     "flatten emitted a legacy source attribute");
         }
     }
+    auto restored = roundtrip(design);
+    const auto& restoredTop = *restored.findGraph("top");
+    require(countValues(restoredTop, {"top", "child", "n"}) == 2 &&
+            countOperations(restoredTop, {"top", "child", "n"}) >= 2,
+            "JSON roundtrip lost flattened SemanticId associations");
 }
 
 } // namespace
@@ -98,6 +112,12 @@ circuit top :
         const auto childInput = child.findValue("a");
         require(childInput.valid() && hasPath(child, child.valueSemanticIds(childInput), {"child", "a"}),
                 "lowering did not retain the child input source");
+        auto ingested = roundtrip(base);
+        const auto& restoredChild = *ingested.findGraph("child");
+        const auto restoredInput = restoredChild.findValue("a");
+        require(restoredInput.valid() && hasPath(restoredChild, restoredChild.valueSemanticIds(restoredInput),
+                                                 {"child", "a"}),
+                "JSON roundtrip lost ingest SemanticId associations");
         auto legacy = base.clone();
         checkFlattened(legacy, false);
         auto global = base.clone();

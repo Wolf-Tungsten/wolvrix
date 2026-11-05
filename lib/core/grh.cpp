@@ -643,7 +643,7 @@ namespace wolvrix::lib::grh
         if (!sourceValues.empty()) clone.reserveValueCapacity(sourceValues.size());
         if (!sourceOperations.empty()) clone.reserveOperationCapacity(sourceOperations.size());
         for (const AttrKV& entry : source.metadata()) clone.setMetadata(entry.key, entry.value);
-        if (source.semanticTree_) clone.semanticTree_ = std::make_shared<SemanticTree>(*source.semanticTree_);
+        if (source.semanticTree_) clone.semanticTree_ = source.semanticTree_;
 
         std::vector<SymbolId> symbolMap(source.symbols_.textById_.size());
         const auto mapSymbol = [&](SymbolId symbol) {
@@ -3323,24 +3323,21 @@ namespace wolvrix::lib::grh
     {
         if (semanticTree_) {
             if (semanticTree_->sourceUnit() != sourceUnit || semanticTree_->circuit() != circuit ||
-                semanticTree_->node(semanticTree_->root()).name != module)
+                semanticTree_->name(semanticTree_->root()) != module)
                 throw std::invalid_argument("Graph SemanticTree identity mismatch");
             return *semanticTree_;
         }
-        auto tree = std::make_shared<SemanticTree>(std::move(sourceUnit), std::move(circuit),
-                                                   std::move(module));
         mutableStore();
-        semanticTree_ = std::move(tree);
+        semanticTree_.emplace(std::move(sourceUnit), std::move(circuit), std::move(module));
         return *semanticTree_;
     }
 
-    SemanticId Graph::appendSemanticInstance(const Graph& source, SemanticId parent,
-                                             std::string_view instanceName)
+    SemanticId Graph::appendSemanticTree(const Graph& source, SemanticId parent)
     {
         if (!source.semanticTree_ || this == &source) return 0;
         if (!semanticTree_) throw std::invalid_argument("target Graph has no SemanticTree");
         mutableStore();
-        return semanticScope(semanticTree_->appendInstance(*source.semanticTree_, parent, instanceName));
+        return semanticTree_->appendTree(*source.semanticTree_, parent);
     }
 
     std::span<const SemanticId> Graph::valueSemanticIds(ValueId value) const
@@ -3434,7 +3431,7 @@ namespace wolvrix::lib::grh
     std::size_t Graph::remapValueBlockSemantics(const Graph& source,
                                                 std::span<const ValueId> sourceValues,
                                                 std::span<const ValueId> targetValues,
-                                                SemanticId scope)
+                                                SemanticId copiedRoot)
     {
         if (sourceValues.size() != targetValues.size())
             throw std::invalid_argument("semantic value block column lengths differ");
@@ -3444,10 +3441,11 @@ namespace wolvrix::lib::grh
             annotated += !ids.empty();
             total += ids.size();
             for (const SemanticId id : ids)
-                if (!id || semanticInstance(id))
-                    throw std::invalid_argument("value SemanticId is not definition-local");
+                if (!source.semanticTree_ || !source.semanticTree_->contains(id))
+                    throw std::invalid_argument("invalid source value SemanticId");
         }
         if (!total) return 0;
+        if (!copiedRoot || !semanticTree_) throw std::invalid_argument("missing copied SemanticTree root");
         GraphStore& builder = mutableStore();
         auto& payload = builder.topology_->semantics;
         if (total > std::numeric_limits<uint32_t>::max() - payload.size())
@@ -3457,7 +3455,8 @@ namespace wolvrix::lib::grh
             const auto ids = source.valueSemanticIds(sourceValues[i]);
             const std::size_t offset = payload.size();
             for (const SemanticId id : ids) {
-                const SemanticId mapped = qualifiedSemantic(scope, id);
+                const SemanticId mapped = copiedRoot + id - 1;
+                if (!semanticTree_->contains(mapped)) throw std::invalid_argument("invalid copied value SemanticId");
                 if (std::find(payload.begin() + offset, payload.end(), mapped) == payload.end())
                     payload.push_back(mapped);
             }
@@ -3470,7 +3469,7 @@ namespace wolvrix::lib::grh
     std::size_t Graph::remapOperationBlockSemantics(const Graph& source,
                                                     std::span<const OperationId> sourceOps,
                                                     std::span<const OperationId> targetOps,
-                                                    SemanticId scope)
+                                                    SemanticId copiedRoot)
     {
         if (sourceOps.size() != targetOps.size())
             throw std::invalid_argument("semantic operation block column lengths differ");
@@ -3480,10 +3479,11 @@ namespace wolvrix::lib::grh
             annotated += !ids.empty();
             total += ids.size();
             for (const SemanticId id : ids)
-                if (!id || semanticInstance(id))
-                    throw std::invalid_argument("operation SemanticId is not definition-local");
+                if (!source.semanticTree_ || !source.semanticTree_->contains(id))
+                    throw std::invalid_argument("invalid source operation SemanticId");
         }
         if (!total) return 0;
+        if (!copiedRoot || !semanticTree_) throw std::invalid_argument("missing copied SemanticTree root");
         GraphStore& builder = mutableStore();
         auto& payload = builder.topology_->semantics;
         if (total > std::numeric_limits<uint32_t>::max() - payload.size())
@@ -3493,7 +3493,8 @@ namespace wolvrix::lib::grh
             const auto ids = source.opSemanticIds(sourceOps[i]);
             const std::size_t offset = payload.size();
             for (const SemanticId id : ids) {
-                const SemanticId mapped = qualifiedSemantic(scope, id);
+                const SemanticId mapped = copiedRoot + id - 1;
+                if (!semanticTree_->contains(mapped)) throw std::invalid_argument("invalid copied operation SemanticId");
                 if (std::find(payload.begin() + offset, payload.end(), mapped) == payload.end())
                     payload.push_back(mapped);
             }
@@ -5374,7 +5375,7 @@ namespace wolvrix::lib::grh
         builder.clearValueSymbol(value);
     }
 
-    void Graph::writeJson(slang::JsonWriter &writer) const
+    void Graph::writeJson(slang::JsonWriter &writer, bool emitDefUsers, bool emitSourceLocations) const
     {
         auto requireSymbolText = [&](SymbolId sym, std::string_view context) -> std::string_view
         {
@@ -5433,8 +5434,6 @@ namespace wolvrix::lib::grh
         }
         writer.writeValue(symbol_);
 
-        writer.writeProperty("formatVersion");
-        writer.writeValue(int64_t{3});
         writer.writeProperty("dialects");
         writer.startObject();
         for (const auto& [dialect, version] : requiredDialects(*this))
@@ -5443,6 +5442,36 @@ namespace wolvrix::lib::grh
             writer.writeValue(static_cast<int64_t>(version));
         }
         writer.endObject();
+        if (semanticTree_)
+        {
+            writer.writeProperty("semanticTree");
+            writer.startObject();
+            writer.writeProperty("sourceUnit");
+            writer.writeValue(semanticTree_->sourceUnit());
+            writer.writeProperty("circuit");
+            writer.writeValue(semanticTree_->circuit());
+            writer.writeProperty("nodes");
+            writer.startArray();
+            for (SemanticId id = 1; id <= semanticTree_->size(); ++id)
+            {
+                const auto& node = semanticTree_->node(id);
+                writer.startObject();
+                writer.writeProperty("parent");
+                writer.writeValue(static_cast<int64_t>(node.parent));
+                writer.writeProperty("kind");
+                writer.writeValue(toString(node.kind));
+                writer.writeProperty("name");
+                writer.writeValue(semanticTree_->name(id));
+                if (node.kind == SemanticNodeKind::Element)
+                {
+                    writer.writeProperty("index");
+                    writer.writeValue(static_cast<int64_t>(node.index));
+                }
+                writer.endObject();
+            }
+            writer.endArray();
+            writer.endObject();
+        }
         writer.writeProperty("metadata");
         writer.startObject();
         for (const AttrKV& entry : metadata_)
@@ -5522,32 +5551,42 @@ namespace wolvrix::lib::grh
                 }
                 writer.endArray();
             }
-            if (value.definingOp().valid())
+            if (emitDefUsers && value.definingOp().valid())
             {
                 Operation defOp = getOperation(value.definingOp());
                 writer.writeProperty("def");
                 writer.writeValue(static_cast<int64_t>(operationLocalId(defOp.id())));
             }
 
-            writer.writeProperty("users");
-            writer.startArray();
-            std::vector<ValueUser> orderedUsers(value.users().begin(), value.users().end());
-            std::sort(orderedUsers.begin(), orderedUsers.end(), [&](const ValueUser &left, const ValueUser &right) {
-                if (operationLocalId(left.operation) != operationLocalId(right.operation))
-                    return operationLocalId(left.operation) < operationLocalId(right.operation);
-                return left.operandIndex < right.operandIndex;
-            });
-            for (const auto &user : orderedUsers)
+            if (emitDefUsers)
             {
-                writer.startObject();
-                writer.writeProperty("op");
-                writer.writeValue(static_cast<int64_t>(operationLocalId(user.operation)));
-                writer.writeProperty("idx");
-                writer.writeValue(static_cast<int64_t>(user.operandIndex));
-                writer.endObject();
+                writer.writeProperty("users");
+                writer.startArray();
+                std::vector<ValueUser> orderedUsers(value.users().begin(), value.users().end());
+                std::sort(orderedUsers.begin(), orderedUsers.end(), [&](const ValueUser &left, const ValueUser &right) {
+                    if (operationLocalId(left.operation) != operationLocalId(right.operation))
+                        return operationLocalId(left.operation) < operationLocalId(right.operation);
+                    return left.operandIndex < right.operandIndex;
+                });
+                for (const auto &user : orderedUsers)
+                {
+                    writer.startObject();
+                    writer.writeProperty("op");
+                    writer.writeValue(static_cast<int64_t>(operationLocalId(user.operation)));
+                    writer.writeProperty("idx");
+                    writer.writeValue(static_cast<int64_t>(user.operandIndex));
+                    writer.endObject();
+                }
+                writer.endArray();
             }
-            writer.endArray();
-            writeSrcLoc(writer, value.srcLoc());
+            if (!valueSemanticIds(valueId).empty())
+            {
+                writer.writeProperty("semanticIds");
+                writer.startArray();
+                for (const auto id : valueSemanticIds(valueId)) writer.writeValue(static_cast<int64_t>(id));
+                writer.endArray();
+            }
+            if (emitSourceLocations) writeSrcLoc(writer, value.srcLoc());
             writer.endObject();
         }
         writer.endArray();
@@ -5632,6 +5671,14 @@ namespace wolvrix::lib::grh
             }
             writer.endArray();
 
+            if (!opSemanticIds(opId).empty())
+            {
+                writer.writeProperty("semanticIds");
+                writer.startArray();
+                for (const auto id : opSemanticIds(opId)) writer.writeValue(static_cast<int64_t>(id));
+                writer.endArray();
+            }
+
             if (!op.attrs().empty())
             {
                 writer.writeProperty("attrs");
@@ -5646,7 +5693,7 @@ namespace wolvrix::lib::grh
                 writer.endObject();
             }
 
-            writeSrcLoc(writer, op.srcLoc());
+            if (emitSourceLocations) writeSrcLoc(writer, op.srcLoc());
             writer.endObject();
         }
         writer.endArray();

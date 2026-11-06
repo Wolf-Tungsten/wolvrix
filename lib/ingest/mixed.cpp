@@ -4,7 +4,6 @@
 #include "ingest/sv.hpp"
 #include "firrtl/annotations.hpp"
 #include "firrtl/semantic.hpp"
-#include "transform/comb_loop_elim.hpp"
 #include "transform/verify.hpp"
 
 #include <algorithm>
@@ -1205,35 +1204,6 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
     transform::PassManagerOptions managerOptions;
     managerOptions.graphThreads = std::max(std::size_t{1}, threads);
     transform::PassManager manager(managerOptions);
-    const bool pendingCycles = std::any_of(design.graphs().begin(), design.graphs().end(), [](const auto& entry) {
-        return entry.second->metadata("firrtl.pendingCombLoopCheck").has_value();
-    });
-    // FIRRTL lowerers stamp a mutation-epoch proof when their local cycle
-    // analysis completed. Imported SV graphs and graphs changed by a linker
-    // pass have no such proof even when no pending metadata was produced.
-    // Keep the old pending gate for metadata cleanup, but schedule the same
-    // local checker whenever any graph lacks a valid proof. This preserves
-    // the fast path for proven FIRRTL graphs while preventing unproved mixed
-    // designs from silently skipping cycle verification.
-    const bool cycleCheckRequired = pendingCycles || std::any_of(
-        design.graphs().begin(), design.graphs().end(), [](const auto& entry) {
-            return !entry.second->localCyclesChecked();
-        });
-    std::shared_ptr<const std::unordered_set<std::string>> selection;
-    if (cycleCheckRequired) {
-        transform::CombLoopElimOptions options;
-        options.failOnTrueLoop = true;
-        // Check module-local array dependencies here. Instance input/output
-        // dependencies become precise after the ordinary hier-flatten pass.
-        options.treatInstancesAsBoundary = true;
-        auto mutableSelection = std::make_shared<std::unordered_set<std::string>>();
-        for (const auto& [name, graph] : design.graphs())
-            if (graph->metadata("firrtl.pendingCombLoopCheck") || !graph->localCyclesChecked())
-                mutableSelection->insert(name);
-        selection = std::move(mutableSelection);
-        options.graphSelection = selection;
-        manager.addPass(std::make_unique<transform::CombLoopElimPass>(options));
-    }
     manager.addPass(std::make_unique<transform::GrhVerifyPass>());
     transform::PassDiagnostics verification;
     StageTimer verifyPassesTimer("firrtl_linked_verify_passes");
@@ -1251,27 +1221,6 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
         if (entry.sourcePosition) position = SourcePosition{{}, entry.sourcePosition->file, entry.sourcePosition->line, entry.sourcePosition->column, {}, {}};
         diagnostics.push_back({entry.kind == diag::DiagnosticKind::Error ? IngestSeverity::Error : IngestSeverity::Warning,
             entry.message, entry.context, entry.passName, entry.originSymbol, std::move(position)});
-    }
-    if (pendingCycles && !success) {
-        const auto message = std::find_if(verification.messages().begin(), verification.messages().end(), [](const auto& entry) {
-            return entry.passName == "comb-loop-elim";
-        });
-        std::optional<SourcePosition> position;
-        if (message != verification.messages().end() && message->sourcePosition) {
-            const auto& source = *message->sourcePosition;
-            position = SourcePosition{{}, source.file, source.line, source.column, {}, {}};
-        }
-        diagnostics.push_back({IngestSeverity::Error, "combinational cycle in FIRRTL connections remains after range analysis", {}, "ingest-link", {}, std::move(position)});
-    }
-    if (success) {
-        // A successful local checker establishes a proof for exactly the
-        // graphs it inspected. The mutation epoch on Graph invalidates this
-        // marker automatically if a later pass changes topology or types.
-        if (cycleCheckRequired)
-            for (const auto& name : *selection)
-                if (auto* graph = design.findGraph(name)) graph->markLocalCyclesChecked();
-        if (pendingCycles)
-            for (const auto& entry : design.graphs()) entry.second->eraseMetadata("firrtl.pendingCombLoopCheck");
     }
     return success;
 }

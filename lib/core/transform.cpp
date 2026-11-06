@@ -1745,6 +1745,19 @@ namespace wolvrix::lib::transform
                 {
                     options.outputKey = std::string(arg.substr(std::string_view("-output-key=").size()));
                 }
+                else if (arg == "-fragment-map-path")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-fragment-map-path expects a value";
+                        return nullptr;
+                    }
+                    options.fragmentMapPath = std::string(args[++i]);
+                }
+                else if (arg.starts_with("-fragment-map-path="))
+                {
+                    options.fragmentMapPath = std::string(arg.substr(std::string_view("-fragment-map-path=").size()));
+                }
                 else
                 {
                     error = "unknown comb-loop-elim option";

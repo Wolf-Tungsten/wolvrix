@@ -2,6 +2,8 @@
 #include "ingest/ingest.hpp"
 #include "ingest/sv.hpp"
 #include "core/store.hpp"
+#include "transform/comb_loop_elim.hpp"
+#include "transform/hier_flatten.hpp"
 
 #include "slang/text/SourceManager.h"
 
@@ -215,24 +217,44 @@ int main() {
 
     parallel.sources.front().path = "firrtl/comb/parallel_diagnostics.fir";
     parallel.firrtl.lowerThreads = 1;
-    const auto serialWarnings = readFirrtl(parallel);
+    auto serialWarnings = readFirrtl(parallel);
     if (!serialWarnings.success() || !serialWarnings.design ||
         serialWarnings.design->graphOrder() != std::vector<std::string>{"z_loop", "a_loop", "top"})
         return fail("parallel diagnostic fixture did not publish graphs in dependency order");
-    std::size_t loopWarnings = 0;
-    for (const auto& diagnostic : serialWarnings.diagnostics)
-        if (diagnostic.passName == "comb-loop-elim" &&
-            diagnostic.message.find("resolved false loops") != std::string::npos)
-            ++loopWarnings;
-    if (loopWarnings != 2)
-        return fail("parallel diagnostic fixture did not resolve both module-local false loops");
+    namespace tx = wolvrix::lib::transform;
+    const auto runPostFlatten = [](wolvrix::lib::grh::Design& design, tx::PassDiagnostics& diagnostics) {
+        tx::PassManager manager;
+        manager.addPass(std::make_unique<tx::HierFlattenPass>());
+        tx::CombLoopElimOptions options;
+        options.failOnTrueLoop = true;
+        manager.addPass(std::make_unique<tx::CombLoopElimPass>(options));
+        return manager.run(design, diagnostics);
+    };
+    tx::PassDiagnostics serialDiagnostics;
+    const auto serialResult = runPostFlatten(*serialWarnings.design, serialDiagnostics);
+    if (!serialResult.success)
+        return fail("serial post-flatten analysis rejected the false-loop fixture");
+    bool resolved = false;
+    bool fixedBoth = false;
+    for (const auto& diagnostic : serialDiagnostics.messages()) {
+        if (diagnostic.passName != "comb-loop-elim") continue;
+        resolved |= diagnostic.message.find("resolved false loops") != std::string::npos;
+        fixedBoth |= diagnostic.message.find("false-fixed=2") != std::string::npos;
+    }
+    if (!resolved || !fixedBoth)
+        return fail("post-flatten analysis did not resolve both module-local false loops");
     const auto warningJson = store.storeToString(*serialWarnings.design);
     if (!warningJson) return fail("parallel diagnostic fixture could not serialize its design");
     for (const std::size_t threads : {2, 4, 2, 4}) {
         parallel.firrtl.lowerThreads = threads;
         auto concurrent = readFirrtl(parallel);
-        if (!concurrent.success() || !concurrent.design ||
-            concurrent.design->graphOrder() != serialWarnings.design->graphOrder() ||
+        if (!concurrent.success() || !concurrent.design)
+            return fail("parallel FIRRTL publication failed");
+        tx::PassDiagnostics concurrentDiagnostics;
+        const auto concurrentResult = runPostFlatten(*concurrent.design, concurrentDiagnostics);
+        if (!concurrentResult.success)
+            return fail("parallel post-flatten analysis rejected the false-loop fixture");
+        if (concurrent.design->graphOrder() != serialWarnings.design->graphOrder() ||
             store.storeToString(*concurrent.design) != warningJson ||
             !sameDiagnostics(serialWarnings, concurrent))
             return fail("parallel FIRRTL graph publication changed verification diagnostic order");

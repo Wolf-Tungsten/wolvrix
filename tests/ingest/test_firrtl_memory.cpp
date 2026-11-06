@@ -5,6 +5,13 @@
 namespace {
 using namespace firrtl_test;
 std::vector<std::string> models;
+void requireNoAddressCompare(const grh::Design& design, const std::string& name) {
+    const auto graph = design.findGraph("top");
+    for (const auto op : graph->operations()) {
+        require(graph->opKind(op) != grh::OperationKind::kLt,
+                name + " emitted a redundant memory address comparison");
+    }
+}
 void aggregateAndClocks(const std::string& name) {
     auto result = read(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "memory" / (name + ".fir"));
     require(result.success(), diagnostics(result));
@@ -63,6 +70,7 @@ void matrix(int readLatency, int writeLatency, const std::string& policy, bool i
     require(result.success(), diagnostics(result));
     run(*result.design, std::make_unique<tx::GrhVerifyPass>()); valid(*result.design);
     auto restored = roundTrip(*result.design); valid(restored);
+    requireNoAddressCompare(restored, name);
     grhsim_test::Oracle oracle(*restored.findGraph("top"));
     const auto check = [&](const firrtl_memory_test::Values& inputs, const firrtl_memory_test::Values& expected) {
         const auto observation = oracle.eval(inputs);

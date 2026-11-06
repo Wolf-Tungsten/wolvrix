@@ -408,8 +408,8 @@ circuit top :
     connect y, w
 )FIR";
     auto result = read(path); require(result.success(), diagnostics(result));
-    require(!result.design->findGraph("top")->metadata("firrtl.pendingCombLoopCheck"),
-        "local array dependencies were not resolved before publication");
+    require(result.design->findGraph("top")->metadata("firrtl.pendingCombLoopCheck").has_value(),
+        "local array dependency deferral was lost before post-flatten analysis");
     ingest::IngestRequest request;
     request.sources = {{ingest::SourceLanguage::Firrtl, path, "fixture"}};
     request.tops = {"top"};

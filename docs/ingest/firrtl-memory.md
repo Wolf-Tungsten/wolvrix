@@ -51,10 +51,11 @@ kRegisterWriteArrayMaskPort [writeEnable, addr, data, bitMask, clock]
 
 `regSymbol` identifies the state. Write operands, in order, are effective
 enable, row index, one complete row of data, a row-width bit mask, and the event
-clock. `eventEdge=["posedge"]` describes that clock. Enable includes address
-bounds; a complete row write has eight mask bits set. Reader output is gated
-by access and bounds. State attrs `firrtl.memory` and `firrtl.readUnderWrite`
-retain provenance. Latency uses ordinary registers tagged
+clock. `eventEdge=["posedge"]` describes that clock. Enable does not include a
+duplicate frontend address-bounds comparison; indexed access bounds are handled
+by the subsequent state read/write path. A complete row write has eight mask
+bits set. Reader output is gated by access. State attrs `firrtl.memory` and
+`firrtl.readUnderWrite` retain provenance. Latency uses ordinary registers tagged
 `firrtl.memoryPipeline`; no backend memory opcode is added.
 
 ## Timing and undefined behavior
@@ -75,8 +76,9 @@ the winner. No clock-history or collision-token state is synthesized for
 write-write conflicts.
 Independent clocks use the same old/new composition as the shared-clock case;
 there is no extra edge-history collision tracker. Out-of-bounds writes and zero
-masks do nothing. For explicit old/new memories, disabled/OOB reads use
-`FirrtlInvalidPolicy`. Undefined memories leave these reads ungated, so the
+masks do nothing. For explicit old/new memories, disabled reads use
+`FirrtlInvalidPolicy`; OOB reads use the state access path's safe result without
+an additional frontend comparison. Undefined memories leave these reads ungated, so the
 backend's safe array-read result is the selected don't-care value. Unknown remains
 FourState GRH X where invalid policy applies; Zero is an explicit deterministic
 policy. `FirrtlInitPolicy` independently controls memory and pipeline startup.

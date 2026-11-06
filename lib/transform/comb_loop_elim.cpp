@@ -8,12 +8,17 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -86,6 +91,16 @@ namespace wolvrix::lib::transform
         {
             int64_t low = 0;
             int64_t high = -1;
+        };
+
+        struct FragmentRecord
+        {
+            std::string graphName;
+            ValueId sourceValue = ValueId::invalid();
+            OperationId sourceOperation = OperationId::invalid();
+            std::vector<wolvrix::lib::grh::SemanticId> sourceSemantics;
+            ValueId fragmentValue = ValueId::invalid();
+            BitRange range;
         };
 
         struct RangeNode
@@ -2536,8 +2551,46 @@ namespace wolvrix::lib::transform
                             std::size_t &valuesSplit,
                             std::size_t &opsRewritten,
                             bool &hitFragmentCap,
+                            std::vector<FragmentRecord> &fragmentRecords,
                             const std::function<void(const Operation &, std::string)> &onError)
         {
+            struct ValueOrigin
+            {
+                OperationId sourceOperation = OperationId::invalid();
+                std::vector<wolvrix::lib::grh::SemanticId> semantics;
+                std::vector<std::string> origins;
+            };
+            std::unordered_map<ValueId, ValueOrigin, ValueIdHash> loopValueOrigins;
+            auto computeValueOrigin = [&](ValueId valueId) {
+                ValueOrigin origin;
+                const auto semantics = graph.valueSemanticIds(valueId);
+                origin.semantics.assign(semantics.begin(), semantics.end());
+                origin.sourceOperation = graph.valueDef(valueId);
+                if (origin.sourceOperation.valid())
+                {
+                    if (origin.semantics.empty())
+                    {
+                        const auto opSemantics = graph.opSemanticIds(origin.sourceOperation);
+                        origin.semantics.assign(opSemantics.begin(), opSemantics.end());
+                    }
+                    if (const auto origins = getOriginModules(graph, origin.sourceOperation))
+                    {
+                        origin.origins = *origins;
+                    }
+                }
+                return origin;
+            };
+            loopValueOrigins.reserve(loop.loopValues.size());
+            for (ValueId valueId : loop.loopValues)
+            {
+                loopValueOrigins.emplace(valueId, computeValueOrigin(valueId));
+            }
+            auto getValueOrigin = [&](ValueId valueId) {
+                const auto it = loopValueOrigins.find(valueId);
+                return it == loopValueOrigins.end() ? computeValueOrigin(valueId) : it->second;
+            };
+            OperationId currentSourceOp = OperationId::invalid();
+
             std::vector<MappingEdge> edges;
             if (!collectCopyEdges(graph, loop.loopOps, edges))
             {
@@ -2608,6 +2661,7 @@ namespace wolvrix::lib::transform
 
             std::unordered_map<RangeNode, ValueId, RangeNodeHash> fragmentMap;
             fragmentMap.reserve(loop.loopValues.size() * 2);
+            std::vector<FragmentRecord> loopFragmentRecords;
 
             valuesSplit = 0;
             for (ValueId valueId : loop.loopValues)
@@ -2618,6 +2672,7 @@ namespace wolvrix::lib::transform
                     return false;
                 }
                 const Value baseValue = graph.getValue(valueId);
+                const ValueOrigin baseOrigin = getValueOrigin(valueId);
                 if (segIt->second.size() > 1)
                 {
                     ++valuesSplit;
@@ -2648,7 +2703,10 @@ namespace wolvrix::lib::transform
                                                  baseValue.isSigned(),
                                                  baseValue.type());
                     }
+                    graph.setValueSemanticIds(frag, baseOrigin.semantics);
                     fragmentMap.emplace(RangeNode{valueId, range}, frag);
+                    loopFragmentRecords.push_back(FragmentRecord{graph.symbol(), valueId,
+                        baseOrigin.sourceOperation, baseOrigin.semantics, frag, range});
                 }
             }
 
@@ -2677,38 +2735,43 @@ namespace wolvrix::lib::transform
             std::unordered_set<ValueId, ValueIdHash> definedFragments;
             opsRewritten = 0;
 
-            // Loop-split synthesis inherits the union of every loop op's
-            // origins (def-site semantics; see kOriginModulesKey).
-            std::vector<std::string> loopOrigins;
-            std::vector<wolvrix::lib::grh::SemanticId> loopSemantics;
-            std::unordered_set<wolvrix::lib::grh::SemanticId> loopSemanticSet;
-            for (const OperationId loopOp : loop.loopOps)
+            auto stampOrigins = [&](OperationId opId, OperationId sourceOp)
             {
-                if (!loopOp.valid())
+                const auto semantics = graph.opSemanticIds(sourceOp);
+                const std::vector<wolvrix::lib::grh::SemanticId> copied(
+                    semantics.begin(), semantics.end());
+                graph.setOpSemanticIds(opId, copied);
+                if (const auto origins = getOriginModules(graph, sourceOp))
                 {
-                    continue;
+                    graph.setAttr(opId, kOriginModulesKey, *origins);
                 }
-                if (const auto origins = getOriginModules(graph, loopOp))
+            };
+            auto stampViewOrigins = [&](OperationId opId, ValueId sourceValue, ValueId viewValue)
+            {
+                ValueOrigin origin = getValueOrigin(sourceValue);
+                if ((origin.semantics.empty() || origin.origins.empty()) && currentSourceOp.valid())
                 {
-                    appendOriginModules(loopOrigins, *origins);
-                }
-                for (const auto semantic : graph.opSemanticIds(loopOp))
-                {
-                    if (loopSemanticSet.insert(semantic).second)
+                    if (origin.semantics.empty())
                     {
-                        loopSemantics.push_back(semantic);
+                        const auto semantics = graph.opSemanticIds(currentSourceOp);
+                        origin.semantics.assign(semantics.begin(), semantics.end());
+                    }
+                    if (origin.origins.empty())
+                    {
+                        if (const auto origins = getOriginModules(graph, currentSourceOp))
+                        {
+                            origin.origins = *origins;
+                        }
                     }
                 }
-            }
-            auto stampOrigins = [&](OperationId opId)
-            {
-                if (!loopOrigins.empty())
+                graph.setOpSemanticIds(opId, origin.semantics);
+                if (viewValue.valid())
                 {
-                    graph.setAttr(opId, kOriginModulesKey, loopOrigins);
+                    graph.setValueSemanticIds(viewValue, origin.semantics);
                 }
-                if (!loopSemantics.empty())
+                if (!origin.origins.empty())
                 {
-                    graph.setOpSemanticIds(opId, loopSemantics);
+                    graph.setAttr(opId, kOriginModulesKey, origin.origins);
                 }
             };
 
@@ -2755,7 +2818,7 @@ namespace wolvrix::lib::transform
                                                              graph.getValue(valueId).isSigned(),
                                                              graph.getValue(valueId).type());
                             graph.addResult(sliceOp, frag);
-                            stampOrigins(sliceOp);
+                            stampViewOrigins(sliceOp, valueId, frag);
                             fragmentMap.emplace(RangeNode{valueId, range}, frag);
                             return frag;
                         }
@@ -2789,7 +2852,7 @@ namespace wolvrix::lib::transform
                                                  graph.getValue(valueId).isSigned(),
                                                  graph.getValue(valueId).type());
                 graph.addResult(sliceOp, frag);
-                stampOrigins(sliceOp);
+                stampViewOrigins(sliceOp, valueId, frag);
                 fragmentMap.emplace(RangeNode{valueId, range}, frag);
                 return frag;
             };
@@ -2844,7 +2907,7 @@ namespace wolvrix::lib::transform
                 ValueId fullView = graph.createValue(value.width(), value.isSigned(), value.type(),
                                                      value.shape());
                 graph.addResult(concatOp, fullView);
-                stampOrigins(concatOp);
+                stampViewOrigins(concatOp, valueId, fullView);
                 fullViewCache.emplace(valueId, fullView);
                 return fullView;
             };
@@ -2916,7 +2979,8 @@ namespace wolvrix::lib::transform
             auto createOp = [&](OperationKind kind,
                                 const std::vector<ValueId> &operands,
                                 ValueId result,
-                                const std::optional<SrcLoc> &srcLoc) -> bool
+                                const std::optional<SrcLoc> &srcLoc,
+                                OperationId sourceOp) -> bool
             {
                 try
                 {
@@ -2926,7 +2990,7 @@ namespace wolvrix::lib::transform
                         graph.addOperand(opId, operand);
                     }
                     graph.addResult(opId, result);
-                    stampOrigins(opId);
+                    stampOrigins(opId, sourceOp);
                     if (srcLoc)
                     {
                         graph.setOpSrcLoc(opId, *srcLoc);
@@ -2951,6 +3015,7 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
+                currentSourceOp = opId;
                 const Operation op = graph.getOperation(opId);
                 const auto &operands = op.operands();
                 const auto &results = op.results();
@@ -3671,7 +3736,7 @@ namespace wolvrix::lib::transform
                     OperationId newOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign);
                     graph.addOperand(newOp, pair.first);
                     graph.addResult(newOp, pair.second);
-                    stampOrigins(newOp);
+                    stampOrigins(newOp, opId);
                     if (op.srcLoc())
                     {
                         graph.setOpSrcLoc(newOp, *op.srcLoc());
@@ -3737,7 +3802,7 @@ namespace wolvrix::lib::transform
                         graph.addOperand(newOp, operand);
                     }
                     graph.addResult(newOp, seg.result);
-                    stampOrigins(newOp);
+                    stampOrigins(newOp, opId);
                     if (op.srcLoc())
                     {
                         graph.setOpSrcLoc(newOp, *op.srcLoc());
@@ -3749,6 +3814,7 @@ namespace wolvrix::lib::transform
             for (const auto &entry : customOps)
             {
                 const OperationId opId = entry.first;
+                currentSourceOp = opId;
                 const auto &custom = entry.second;
                 if (isCompareOp(custom.kind) || custom.kind == OperationKind::kSliceArray ||
                     isMonolithicLoopOp(custom.kind))
@@ -3785,7 +3851,7 @@ namespace wolvrix::lib::transform
                 auto emitNewBinary = [&](OperationKind kind, ValueId lhs, ValueId rhs) -> std::optional<ValueId>
                 {
                     ValueId out = graph.createValue(1, false, resultValue.type());
-                    if (!createOp(kind, std::vector<ValueId>{lhs, rhs}, out, custom.srcLoc))
+                    if (!createOp(kind, std::vector<ValueId>{lhs, rhs}, out, custom.srcLoc, opId))
                     {
                         return std::nullopt;
                     }
@@ -3871,18 +3937,19 @@ namespace wolvrix::lib::transform
                     }
                     else if (segBits.size() == 1)
                     {
-                        if (!createOp(OperationKind::kAssign, std::vector<ValueId>{segBits.front()}, *dstFrag, custom.srcLoc))
+                        if (!createOp(OperationKind::kAssign, std::vector<ValueId>{segBits.front()}, *dstFrag, custom.srcLoc, opId))
                         {
                             return false;
                         }
                     }
-                    else if (!createOp(OperationKind::kConcat, segBits, *dstFrag, custom.srcLoc))
+                    else if (!createOp(OperationKind::kConcat, segBits, *dstFrag, custom.srcLoc, opId))
                     {
                         return false;
                     }
                 }
             }
 
+            currentSourceOp = OperationId::invalid();
             std::unordered_map<ValueId, ValueId, ValueIdHash> viewMap;
             viewMap.reserve(loop.loopValues.size());
             for (ValueId valueId : loop.loopValues)
@@ -3931,7 +3998,7 @@ namespace wolvrix::lib::transform
                     viewValue = graph.createValue(value.width(), value.isSigned(), value.type(),
                                                   value.shape());
                     graph.addResult(concatOp, viewValue);
-                    stampOrigins(concatOp);
+                    stampViewOrigins(concatOp, valueId, viewValue);
                 }
                 viewMap.emplace(valueId, viewValue);
             }
@@ -4014,6 +4081,12 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            if (valuesSplit > 0)
+            {
+                fragmentRecords.insert(fragmentRecords.end(),
+                    std::make_move_iterator(loopFragmentRecords.begin()),
+                    std::make_move_iterator(loopFragmentRecords.end()));
+            }
             return valuesSplit > 0;
         }
 
@@ -4022,8 +4095,124 @@ namespace wolvrix::lib::transform
     namespace {
         struct GraphLoopResult {
             std::size_t loops = 0, trueLoops = 0, falseLoops = 0, fixed = 0, dynamic = 0, capped = 0;
+            std::vector<FragmentRecord> fragments;
             std::vector<CombLoopReport> reports;
         };
+
+        std::string jsonEscape(std::string_view text)
+        {
+            std::string out;
+            out.reserve(text.size() + 8);
+            for (const unsigned char ch : text)
+            {
+                switch (ch)
+                {
+                case '\\': out.append("\\\\"); break;
+                case '"': out.append("\\\""); break;
+                case '\b': out.append("\\b"); break;
+                case '\f': out.append("\\f"); break;
+                case '\n': out.append("\\n"); break;
+                case '\r': out.append("\\r"); break;
+                case '\t': out.append("\\t"); break;
+                default:
+                    if (ch < 0x20)
+                    {
+                        static constexpr char kHex[] = "0123456789abcdef";
+                        out.append("\\u00");
+                        out.push_back(kHex[(ch >> 4) & 0xf]);
+                        out.push_back(kHex[ch & 0xf]);
+                    }
+                    else
+                    {
+                        out.push_back(static_cast<char>(ch));
+                    }
+                }
+            }
+            return out;
+        }
+
+        void writeFragmentMap(const std::string &path,
+                              wolvrix::lib::grh::Design &design,
+                              std::vector<FragmentRecord> records)
+        {
+            std::unordered_map<ValueId, uint32_t, ValueIdHash> serializedValues;
+            std::unordered_map<OperationId, uint32_t, OperationIdHash> serializedOperations;
+            for (const auto &entry : design.graphs())
+            {
+                uint32_t valueId = 1;
+                for (const auto value : entry.second->values())
+                {
+                    serializedValues.emplace(value, valueId++);
+                }
+                uint32_t operationId = 1;
+                for (const auto op : entry.second->operations())
+                {
+                    serializedOperations.emplace(op, operationId++);
+                }
+            }
+            std::sort(records.begin(), records.end(), [](const auto &lhs, const auto &rhs) {
+                return std::tie(lhs.graphName, lhs.sourceValue.index, lhs.range.low,
+                                lhs.range.high, lhs.fragmentValue.index) <
+                       std::tie(rhs.graphName, rhs.sourceValue.index, rhs.range.low,
+                                rhs.range.high, rhs.fragmentValue.index);
+            });
+            try
+            {
+                const std::filesystem::path outputPath(path);
+                if (outputPath.has_parent_path())
+                {
+                    std::filesystem::create_directories(outputPath.parent_path());
+                }
+                std::ofstream out(outputPath);
+                if (!out)
+                {
+                    throw std::runtime_error("failed to open " + path);
+                }
+                out << "{\n  \"formatVersion\": 1,\n  \"fragments\": [\n";
+                for (std::size_t index = 0; index < records.size(); ++index)
+                {
+                    const auto &record = records[index];
+                    out << "    {\"graph\": \"" << jsonEscape(record.graphName)
+                        << "\", \"sourceValue\": " << serializedValues.at(record.sourceValue)
+                        << ", \"sourceOperation\": ";
+                    if (record.sourceOperation.valid())
+                    {
+                        out << serializedOperations.at(record.sourceOperation);
+                    }
+                    else
+                    {
+                        out << "null";
+                    }
+                    out << ", \"sourceSemanticIds\": [";
+                    for (std::size_t semantic = 0; semantic < record.sourceSemantics.size(); ++semantic)
+                    {
+                        if (semantic != 0)
+                        {
+                            out << ", ";
+                        }
+                        out << record.sourceSemantics[semantic];
+                    }
+                    out << "], \"fragmentValue\": " << serializedValues.at(record.fragmentValue)
+                        << ", \"lo\": " << record.range.low << ", \"hi\": " << record.range.high << "}";
+                    if (index + 1 != records.size())
+                    {
+                        out << ",";
+                    }
+                    out << "\n";
+                }
+                out << "  ]\n}\n";
+                out.flush();
+                if (!out)
+                {
+                    throw std::runtime_error("failed to write " + path);
+                }
+            }
+            catch (const std::exception &ex)
+            {
+                throw std::runtime_error("comb-loop-elim fragment map export failed: " +
+                                         std::string(ex.what()));
+            }
+        }
     }
 
     CombLoopElimPass::CombLoopElimPass()
@@ -4050,6 +4239,7 @@ namespace wolvrix::lib::transform
         std::size_t totalFalseLoopsFixed = 0;
         std::size_t totalDynArrayLoops = 0;
         std::size_t totalFragCapped = 0;
+        std::vector<FragmentRecord> fragmentRecords;
         std::vector<CombLoopReport> sessionReports;
 
         for (Graph* selected : graphs())
@@ -4360,7 +4550,7 @@ namespace wolvrix::lib::transform
                         bool hitFragmentCap = false;
                         std::optional<SrcLoc> loopLoc = findLoopSrcLoc(graph, loop.loopValues, loop.loopOps);
                         if (splitFalseLoop(graph, loop, options_, loopValuesSplit, loopOpsRewritten,
-                                           hitFragmentCap, onError))
+                                           hitFragmentCap, fragmentRecords, onError))
                         {
                             changedThisIter = true;
                             totalValuesSplit += loopValuesSplit;
@@ -4500,7 +4690,8 @@ namespace wolvrix::lib::transform
         }
 
         result.graphData = GraphLoopResult{totalLoopsDetected, totalTrueLoops, totalFalseLoops,
-            totalFalseLoopsFixed, totalDynArrayLoops, totalFragCapped, std::move(sessionReports)};
+            totalFalseLoopsFixed, totalDynArrayLoops, totalFragCapped,
+            std::move(fragmentRecords), std::move(sessionReports)};
         if (!graphKernel()) finishGraphKernels(std::span<const PassResult>(&result, 1));
         return result;
     }
@@ -4509,6 +4700,7 @@ namespace wolvrix::lib::transform
     {
         std::size_t totalLoopsDetected = 0, totalTrueLoops = 0, totalFalseLoops = 0,
             totalFalseLoopsFixed = 0, totalDynArrayLoops = 0, totalFragCapped = 0;
+        std::vector<FragmentRecord> fragmentRecords;
         std::vector<CombLoopReport> sessionReports;
         for (const auto& result : results) {
             const auto* graph = std::any_cast<GraphLoopResult>(&result.graphData);
@@ -4519,6 +4711,7 @@ namespace wolvrix::lib::transform
             totalFalseLoopsFixed += graph->fixed;
             totalDynArrayLoops += graph->dynamic;
             totalFragCapped += graph->capped;
+            fragmentRecords.insert(fragmentRecords.end(), graph->fragments.begin(), graph->fragments.end());
             sessionReports.insert(sessionReports.end(), graph->reports.begin(), graph->reports.end());
         }
         std::string summary = "comb-loop-elim summary";
@@ -4540,6 +4733,10 @@ namespace wolvrix::lib::transform
         }
         logInfo(std::move(summary));
 
+        if (!options_.fragmentMapPath.empty())
+        {
+            writeFragmentMap(options_.fragmentMapPath, design(), std::move(fragmentRecords));
+        }
         if (!options_.outputKey.empty())
         {
             setSessionValue(options_.outputKey, std::move(sessionReports), "comb-loop.reports");

@@ -174,11 +174,13 @@ conditions of blocks not containing the destination declaration control its
 connects. Local wires therefore need complete coverage under these interleaving
 conditions. Dynamic writes need a complete default or sufficient static
 coverage; no value is silently supplied for a missing driver. Combinational
-cycles are rejected before publishing the design. Whole-array cycles involving
-partial element dependencies are checked by the shared range analysis before
-publication. For example `m[0][1] = a < b; m[1][0] = not(m[0][1])` has no element
-cycle; range analysis removes the apparent whole-array cycle while preserving
-the public array shape. A mutual dependency between both elements is rejected.
+cycle analysis is deferred until after `hier-flatten`, with the deferral retained
+in `firrtl.pendingCombLoopCheck`. Whole-array cycles involving partial element
+dependencies are checked by the shared range analysis there. For example
+`m[0][1] = a < b; m[1][0] = not(m[0][1])` has no element cycle; range analysis
+removes the apparent whole-array cycle while preserving the public array shape.
+A mutual dependency between both elements is rejected by `comb-loop-elim` with
+`fail_on_true_loop=True` before simulation conversion.
 
 ## Logic domain and node metadata
 

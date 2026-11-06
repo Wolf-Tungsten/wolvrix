@@ -753,6 +753,8 @@ target_link_libraries(transform-comb-loop-elim
     PRIVATE
         wolvrix-lib
 )
+target_compile_definitions(transform-comb-loop-elim PRIVATE
+    WOLF_SV_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}")
 
 register_test_exe(transform-comb-loop-elim)
 

@@ -60,6 +60,8 @@ namespace wolvrix::lib::transform
 
         // Optional session key used to store loop reports for later inspection.
         std::string outputKey;
+        // Optional JSON export of original values to their rewritten fragments.
+        std::string fragmentMapPath;
         // Optional immutable coordinator selection. A null set checks all
         // graphs; an empty set checks none. This is never serialized.
         std::shared_ptr<const std::unordered_set<std::string>> graphSelection;

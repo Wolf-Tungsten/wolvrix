@@ -817,9 +817,6 @@ void Lowerer::memories() {
                     lowered.writeEnable = both(guard(port.guard, port.range), op(OperationKind::kReduceOr, bit, {lowered.writeMask}, port.range), port.range);
                     if (port.read && port.write) lowered.readEnable = both(lowered.readEnable, op(OperationKind::kNot, bit, {writeModes.at(port.name)}, port.range), port.range);
                 }
-                const auto bounds = inBounds(lowered.address, memory.depth, port.range);
-                lowered.readEnable = both(lowered.readEnable, bounds, port.range);
-                lowered.writeEnable = both(lowered.writeEnable, bounds, port.range);
                 if (port.write) {
                     lowered.writeEnable = both(lowered.writeEnable, op(OperationKind::kReduceOr, bit, {lowered.writeMask}, port.range), port.range);
                     lowered.writeAddress = lowered.address;

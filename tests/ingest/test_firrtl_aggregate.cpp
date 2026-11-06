@@ -1,5 +1,7 @@
 #include "firrtl_test_fixture.hpp"
+#include "transform/comb_loop_elim.hpp"
 #include "transform/const_fold.hpp"
+#include "transform/hier_flatten.hpp"
 #include "slang/numeric/SVInt.h"
 
 namespace {
@@ -7,6 +9,17 @@ using namespace firrtl_test;
 void shape(const grh::Graph& graph, std::string_view name, int width, std::vector<int64_t> expected) {
     const auto value = graph.findValue(name); require(bool(value), "missing flattened leaf: "+std::string(name));
     require(graph.valueWidth(value)==width && std::vector<int64_t>(graph.valueShape(value).begin(),graph.valueShape(value).end())==expected, "wrong aggregate geometry: "+std::string(name));
+}
+void requireCycleRejectedAfterFlatten(ingest::IngestResult& result, std::string_view message) {
+    require(result.success(), diagnostics(result));
+    tx::PassManager manager;
+    manager.addPass(std::make_unique<tx::HierFlattenPass>());
+    tx::CombLoopElimOptions options;
+    options.failOnTrueLoop = true;
+    manager.addPass(std::make_unique<tx::CombLoopElimPass>(options));
+    tx::PassDiagnostics diagnostics;
+    const auto outcome = manager.run(*result.design, diagnostics);
+    require(!outcome.success, std::string(message));
 }
 void rectangularMixedIndexBounds() {
     // FIRRTL's final suffix is the outer dimension: this is two rows of three.
@@ -266,7 +279,8 @@ void elementDependencies() {
     auto restored = roundTrip(*result.design);
     const auto& graph = *restored.findGraph("top");
     shape(graph, "y", 4, {2, 2});
-    require(!graph.metadata("firrtl.pendingCombLoopCheck"), "range cycle check was deferred past publication");
+    require(graph.metadata("firrtl.pendingCombLoopCheck").has_value(),
+            "post-flatten cycle-analysis deferral was lost before publication");
     Oracle oracle(graph);
     for (unsigned a = 0; a < 16; ++a) for (unsigned b = 0; b < 16; ++b)
         require(oracle.output("y", {{"a", a}, {"b", b}}) == (a < b ? 2 : 4),
@@ -276,7 +290,7 @@ void elementDependencies() {
     connect y[0], not(y[1])
     connect y[1], not(y[0])
 )FIR");
-    require(!cycle.success() && !cycle.design && diagnostics(cycle).find("combinational cycle") != std::string::npos,
+    requireCycleRejectedAfterFlatten(cycle,
         "range analysis accepted a real array element cycle");
 }
 void conditionalElementDependencies() {
@@ -356,7 +370,7 @@ void conditionalElementDependencies() {
     connect y[1], UInt<1>(0)
     when y[0] : connect y[0], UInt<1>(0)
 )FIR");
-    require(!cycle.success() && !cycle.design && diagnostics(cycle).find("combinational cycle") != std::string::npos,
+    requireCycleRejectedAfterFlatten(cycle,
         "conditional partial connect hid a real dependency on its own destination");
 }
 }

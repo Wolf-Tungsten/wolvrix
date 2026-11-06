@@ -197,12 +197,11 @@ Inventory imports without a source node policy remain a no-op. Per-operation
 node attributes and the generated simulator's operations are unchanged.
 
 FIRRTL array element connections can form apparent cycles at whole-value
-granularity. Before publication, range analysis resolves these module-local
-dependencies and rejects real local cycles. During this check, instances are
-boundaries: treating every child input as a dependency of every child output
-would falsely reject ready/enqueue handshakes. The simulation flow runs
-`hier-flatten` followed by `comb-loop-elim` to check the actual cross-module
-dependencies before conversion.
+granularity. Publication preserves `firrtl.pendingCombLoopCheck` and the graph
+for the post-flatten analysis instead of rejecting them during ingest. The
+simulation flow runs `hier-flatten` followed by `comb-loop-elim` with
+`fail_on_true_loop=True`, so range analysis resolves false loops and rejects
+real cycles after all cross-module dependencies are visible.
 
 ## Node annotations and bounded bringup
 

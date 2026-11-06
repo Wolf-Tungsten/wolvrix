@@ -400,6 +400,24 @@ In practice this means:
 - `simplify` has much less cleanup work afterward
 - later passes such as `activity-schedule` start from a much smaller graph
 
+## Fragment Provenance And Mapping
+
+Split values and synthesized ops retain their precise source associations rather
+than the union of the whole SCC:
+
+- a fragment value inherits the original value's SemanticIds, falling back to
+  its original defining op when the value had no direct annotation;
+- ops cloned from a loop op inherit that op's SemanticIds and `originModules`;
+- helper slices and reassembled concat views inherit the viewed value's
+  association, with the current source op as the fallback for anonymous values.
+
+`-fragment-map-path=PATH` exports a deterministic JSON array under
+`fragments`. Each record contains `graph`, `sourceValue`, `sourceOperation`,
+`sourceSemanticIds`, `fragmentValue`, `lo`, and `hi`. Ranges are inclusive bit
+ranges of the original value. Entity IDs use the same graph-enumeration numbering
+as StoreJson at pass completion; regenerate the map after subsequent graph
+mutations. The export is optional; precise source retention is always enabled.
+
 ## Session Output
 
 Optional output:
@@ -422,9 +440,11 @@ This is mainly for later inspection or debugging. The primary output of the pass
 | `-fix-dynamic-array-loops` / `-no-fix-dynamic-array-loops` | true | attempt whole-fragment repair of loops containing a dynamic-index `kSliceArray`; off reports them as undecidable |
 | `-max-fragments-per-value` | `4096` | fragment cap per value while splitting; `0` means unlimited; capped loops are left intact |
 | `-output-key` | empty | session key for an explicit loop report |
+| `-fragment-map-path` | empty | export original-value to fragment mappings as JSON |
 
 The Python bindings expose the same knobs as `enable_array_fragmentation`,
-`fix_dynamic_array_loops`, and `max_fragments_per_value` named arguments.
+`fix_dynamic_array_loops`, `max_fragments_per_value`, and `fragment_map_path`
+named arguments.
 
 ## Diagnostic Raise-Level Interaction
 

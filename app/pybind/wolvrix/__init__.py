@@ -582,6 +582,9 @@ def _compile_comb_loop_elim_kwargs(named: dict[str, Any]) -> list[str]:
     output_key = _pop_named(local, "out_comb_loop_report", None)
     if output_key is not None:
         out.extend(["-output-key", str(output_key)])
+    fragment_map_path = _pop_named(local, "fragment_map_path", None)
+    if fragment_map_path is not None:
+        out.extend(["-fragment-map-path", str(fragment_map_path)])
     _ensure_no_extra_named("comb-loop-elim", local)
     return out
 

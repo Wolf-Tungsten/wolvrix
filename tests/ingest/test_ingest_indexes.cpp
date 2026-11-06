@@ -2,6 +2,8 @@
 #include "../../lib/ingest/firrtl/annotations.hpp"
 #include "../../lib/ingest/firrtl/semantic.hpp"
 #include "../../lib/ingest/mixed.hpp"
+#include "transform/comb_loop_elim.hpp"
+#include "transform/hier_flatten.hpp"
 
 #include <chrono>
 
@@ -88,7 +90,7 @@ void linkedPorts(std::size_t count, BadPort bad = BadPort::None) {
     }
 }
 
-void unprovedLocalCycleIsChecked() {
+void localCycleIsCheckedAfterFlatten() {
     grh::Design design;
     auto& graph = design.createGraph("cycle");
     design.markAsTop("cycle");
@@ -98,13 +100,21 @@ void unprovedLocalCycleIsChecked() {
     graph.addResult(op, value);
     require(!graph.localCyclesChecked(), "cycle fixture unexpectedly carried a proof");
 
-    std::vector<ingest::IngestDiagnostic> diagnostics;
-    require(!ingest::verifyLinkedDesign(design, diagnostics),
-        "unproved local combinational cycle was skipped by linked verification");
-    require(std::any_of(diagnostics.begin(), diagnostics.end(), [](const auto& diagnostic) {
+    std::vector<ingest::IngestDiagnostic> linkedDiagnostics;
+    require(ingest::verifyLinkedDesign(design, linkedDiagnostics),
+        "structural linked verification rejected the graph before post-flatten cycle analysis");
+    tx::PassManager manager;
+    manager.addPass(std::make_unique<tx::HierFlattenPass>());
+    tx::CombLoopElimOptions options;
+    options.failOnTrueLoop = true;
+    manager.addPass(std::make_unique<tx::CombLoopElimPass>(options));
+    tx::PassDiagnostics diagnostics;
+    const auto result = manager.run(design, diagnostics);
+    require(!result.success, "post-flatten analysis accepted a real combinational cycle");
+    require(std::any_of(diagnostics.messages().begin(), diagnostics.messages().end(), [](const auto& diagnostic) {
         return diagnostic.passName == "comb-loop-elim" &&
             diagnostic.message.find("comb loop detected") != std::string::npos;
-    }), "unproved local cycle did not publish comb-loop diagnostic");
+    }), "post-flatten cycle did not publish comb-loop diagnostic");
 }
 
 void moduleAnnotations(std::size_t modules, std::size_t perModule) {
@@ -149,7 +159,7 @@ int main(int argc, char** argv) {
         } else {
             semanticPorts(256); linkedPorts(256);
             linkedPorts(4, BadPort::Unknown); linkedPorts(4, BadPort::Duplicate); linkedPorts(4, BadPort::Type);
-            unprovedLocalCycleIsChecked();
+            localCycleIsCheckedAfterFlatten();
             moduleAnnotations(16, 8);
         }
         return 0;

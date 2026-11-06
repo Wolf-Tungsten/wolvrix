@@ -236,10 +236,10 @@ shape 的子数组类型）。
 的打包 logic 值（packed fill，来自整宽聚合写），此时按行主序逐行切片，线性行号为 `i`
 的元素取 `%data[i*elementWidth +: elementWidth]`。
 
-**同一状态的多个写 op（`write`/`writeMask`/`writeArray`/`writeArrayMask`/`fill` 的任意组合）按 op 声明顺序应用：
-同轮同时激活时按声明顺序依次生效，后声明的写覆盖先声明的写**（与 GRH stage-03 §3.4 的
-同 regSymbol 写端口优先级规则同构；转换层 1:1 保序生成）。**同 state 写 op 的相对顺序
-是 IR 语义的一部分，pass 不得重排**（verifier 断言兜底）。跨事件的写口同样适用该规则，
+**同一状态的多个写 op（`write`/`writeMask`/`writeArray`/`writeArrayMask`/`fill` 的任意组合）按显式
+`writerOrder` 升序应用：同轮同时激活时按该数值依次生效，同地址重叠位由较大值覆盖**
+（与 GRH 写端口优先级规则同构）。同组 `writerOrder` 必须唯一且为非负 int64；
+ops 数组位置和 pass 遍历顺序不参与优先级判定（verifier 断言兜底）。跨事件写口同样适用该规则，
 不再有任何"同顺序域"限制。
 
 > 演进说明（stage-06）：旧 op 族 `regWrite`/`memRead`/`memWrite`/`memFill`/`memAssign`/
@@ -247,7 +247,7 @@ shape 的子数组类型）。
 > `memRead`→`readArray`，`memWrite`→`writeArray`，`memFill`→`fill`，`memAssign`→数组
 > 整体 `write`）。旧约束"同一 array 状态的任意两个写 op 不能在同一次 `G` 应用中写入同一
 > bit，需要有序覆盖的多写口必须收进单个 `memWriteSeq`（operand 顺序表达覆盖关系）"随之
-> 删除——有序覆盖现在由声明顺序语义表达，`memWriteSeq` 的"全部写口须同事件"限制也不复
+> 删除——有序覆盖现在由显式 `writerOrder` 表达，`memWriteSeq` 的"全部写口须同事件"限制也不复
 > 存在。
 
 ## 6. Event 与边沿标注
@@ -477,8 +477,9 @@ core.dpi.call
 
 GRH port 的目标 symbol 转换为目标 StateId，operands 保持原顺序（数组端口的多索引操作数
 原样保留，线性化推迟到后端 mapping——转换契约是逐 op 承接、不在转换时引入新计算），
-`eventEdge` 转换为 `event_edges`。**同一 regSymbol 的多个写端口各成一个 op、按声明顺序
-保序生成**——声明顺序即写优先级语义（见第 5 节），转换层不丢失也不重建排序信息。GRH
+`eventEdge` 转换为 `event_edges`。**同一 regSymbol 的多个写端口各成一个 op，并直接保留显式
+`writerOrder`**（见第 5 节）；转换不得从 ops 数组位置推断或重建优先级。旧图缺少该属性时的兼容补值
+仅属迁移行为，不是新图规范。GRH
 DPI import 的并行属性数组规范化为一个 `DpiSignature`，DPI call 的
 `targetImportSymbol` 解析为对应 `F` 表项的 FuncId；这两步只改变引用和元数据的表示，不改变
 调用粒度。
@@ -528,8 +529,8 @@ Core 模型必须满足：
   `%mask` 是宽等于目标状态总位宽的标量 logic，`writeArrayMask` 的 `%mask` 是宽等于
   `%data` 总位宽的标量 logic；
 - `fill` 的 `%data` 为元素宽度的标量，或目标状态总位宽的打包值（packed fill，见第 5 节）；
-- 同一状态的多个写 op 的相对顺序即覆盖优先级（声明顺序语义，见第 5 节），转换与 pass
-  不得重排；
+- 同一状态的写 op 必须带唯一非负 `writerOrder`，按数值升序应用，较大值覆盖同地址重叠位；
+  不得以 ops 数组位置替代或补充优先级（见第 5 节）；
 - system function 有且只有一个 result，system task 的条件、参数和 event 分段合法；
 - `F` 表项的 FuncId 唯一、`signature` 完整，DPI call 的目标、operands 和 results 与 signature
   的方向、顺序和类型一致；

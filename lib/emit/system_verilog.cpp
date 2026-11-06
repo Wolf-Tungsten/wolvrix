@@ -3669,7 +3669,42 @@ namespace wolvrix::lib::emit
                 };
                 recurse(indent, 0, "", "");
             };
-            for (const auto opId : graph->operations())
+            const auto sourceOperations = graph->operations();
+            std::map<std::string, std::vector<wolvrix::lib::grh::OperationId>> writers;
+            for (const auto opId : sourceOperations)
+            {
+                const auto kind = graph->opKind(opId);
+                if (!wolvrix::lib::grh::isRegisterWritePortKind(kind) &&
+                    kind != wolvrix::lib::grh::OperationKind::kLatchWritePort) continue;
+                const auto op = graph->getOperation(opId);
+                const auto target = getAttribute<std::string>(*graph, op,
+                    kind == wolvrix::lib::grh::OperationKind::kLatchWritePort ? "latchSymbol" : "regSymbol");
+                if (target) writers[*target].push_back(opId);
+            }
+            for (auto &[target, group] : writers)
+                std::sort(group.begin(), group.end(), [&](const auto lhs, const auto rhs) {
+                    const auto left = getAttribute<int64_t>(*graph, graph->getOperation(lhs), "writerOrder").value_or(0);
+                    const auto right = getAttribute<int64_t>(*graph, graph->getOperation(rhs), "writerOrder").value_or(0);
+                    return left != right ? left < right : lhs.index < rhs.index;
+                });
+            std::unordered_map<std::string, std::size_t> nextWriters;
+            std::vector<wolvrix::lib::grh::OperationId> emissionOperations;
+            emissionOperations.reserve(sourceOperations.size());
+            for (const auto opId : sourceOperations)
+            {
+                const auto kind = graph->opKind(opId);
+                if (!wolvrix::lib::grh::isRegisterWritePortKind(kind) &&
+                    kind != wolvrix::lib::grh::OperationKind::kLatchWritePort)
+                {
+                    emissionOperations.push_back(opId);
+                    continue;
+                }
+                const auto target = getAttribute<std::string>(*graph, graph->getOperation(opId),
+                    kind == wolvrix::lib::grh::OperationKind::kLatchWritePort ? "latchSymbol" : "regSymbol");
+                if (!target) continue;
+                emissionOperations.push_back(writers[*target][nextWriters[*target]++]);
+            }
+            for (const auto opId : emissionOperations)
             {
                 const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
                 const auto &operands = op.operands();
@@ -6372,6 +6407,21 @@ namespace wolvrix::lib::emit
                     out << "  " << decl << '\n';
                 }
             }
+
+            std::map<std::string, std::size_t> crossEventWriters;
+            std::map<std::string, std::unordered_set<const SeqBlock *>> writerBlocks;
+            for (const auto &block : seqBlocks)
+                for (const auto &stmt : block.stmts)
+                {
+                    if (!stmt.op.valid() || !wolvrix::lib::grh::isRegisterWritePortKind(graph->opKind(stmt.op))) continue;
+                    const auto target = getAttribute<std::string>(*graph, graph->getOperation(stmt.op), "regSymbol");
+                    if (!target) continue;
+                    ++crossEventWriters[*target];
+                    writerBlocks[*target].insert(&block);
+                }
+            for (const auto &[target, blocks] : writerBlocks)
+                if (blocks.size() > 1 && crossEventWriters[target] > 1)
+                    reportWarning("writerOrder cannot order writes to state '" + target + "' across event blocks", target);
 
             if (!portBindingStmts.empty())
             {

@@ -66,26 +66,22 @@ address/data/mask/enable L-1 edges before committing. Read behavior is:
 | --- | --- |
 | old | Read/gate data at request time, then delay by read latency. |
 | new | Delay address/enable by read latency, then read current storage. |
-| undefined | Delay read data and track overlapping active writes to the same address. A collision returns the selected invalid value. |
+| undefined | Delay only the address, then read current storage; emit a warning. This selects new-value collision behavior and leaves disabled/OOB results ungated for two-state simulation. |
 
-Combinational reads select stored values and are excluded from synchronous
-collision tracking. Independent-clock synchronous reads track overlap for all
-policies. Pending tokens retain collisions across write-clock edges until
-completion; completed history holds until the next read result. Clock history
-and collision registers start at zero because they represent simulator history,
-not uninitialized user data (`firrtl.memoryClockHistory/memoryCollision`).
-
-Concurrent effective writers to one address produce undefined written data;
-there is no textual last-writer guarantee. Held enables on other clocks do not
-constitute edges. A collision poisons each writer's whole enabled mask, even
-when their masks are disjoint; unmasked storage bits remain unchanged. Simple
-node/wire clock aliases are canonicalized before deciding whether clocks are
-shared. Out-of-bounds writes and zero masks do nothing. Disabled/OOB
-reads use `FirrtlInvalidPolicy`. Unknown remains FourState GRH X; Zero is an
-explicit deterministic policy. `FirrtlInitPolicy` independently controls memory
-and pipeline startup. Both policies persist in graph metadata. The existing
-`grh-to-grhsim` pass performs later explicit TwoState projection. No random
-initialization is invented.
+Every writer has a nonnegative `writerOrder` that is unique within its target
+state. Concurrent effective writers apply in ascending numeric order, so the
+larger value wins overlapping bits. Graph/ops declaration order never selects
+the winner. No clock-history or collision-token state is synthesized for
+write-write conflicts.
+Independent clocks use the same old/new composition as the shared-clock case;
+there is no extra edge-history collision tracker. Out-of-bounds writes and zero
+masks do nothing. For explicit old/new memories, disabled/OOB reads use
+`FirrtlInvalidPolicy`. Undefined memories leave these reads ungated, so the
+backend's safe array-read result is the selected don't-care value. Unknown remains
+FourState GRH X where invalid policy applies; Zero is an explicit deterministic
+policy. `FirrtlInitPolicy` independently controls memory and pipeline startup.
+Both policies persist in graph metadata. The existing `grh-to-grhsim` pass
+performs later explicit TwoState projection. No random initialization is invented.
 
 ## Validation
 

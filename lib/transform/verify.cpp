@@ -12,6 +12,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wolvrix::lib::transform
@@ -297,6 +299,7 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            std::unordered_map<std::string, std::unordered_set<int64_t>> usedWriterOrders;
             for (const OperationId opId : graph->operations())
             {
                 const OperationView op{*graph, opId};
@@ -304,6 +307,23 @@ namespace wolvrix::lib::transform
                 {
                     error(*graph, op, "grh.verify: " + problem);
                     continue;
+                }
+                const bool latchWriter = op.kind() == OperationKind::kLatchWritePort || op.kind() == grhsim::kLatchWrite;
+                if (latchWriter || wolvrix::lib::grh::isRegisterWritePortKind(op.kind()) || grhsim::isWriter(op.kind()))
+                {
+                    const auto order = attrAs<int64_t>(op, "writerOrder");
+                    if (!order)
+                    {
+                        error(*graph, op, "grh.verify: write port requires writerOrder");
+                    }
+                    else
+                    {
+                        if (*order < 0) error(*graph, op, "grh.verify: writerOrder must be nonnegative");
+                        const std::string symbol = attrAs<std::string>(op, latchWriter ? "latchSymbol" : "regSymbol")
+                            .value_or(std::string());
+                        if (!usedWriterOrders[symbol].insert(*order).second)
+                            error(*graph, op, "grh.verify: duplicate writerOrder for state '" + symbol + "'");
+                    }
                 }
                 if (findOpDescriptor(op.kind())->dialect != "grh") continue;
                 switch (op.kind())

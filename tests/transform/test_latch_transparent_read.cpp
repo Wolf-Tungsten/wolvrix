@@ -44,6 +44,7 @@ int testBasicLatchTransparentRead()
     graph.addOperand(writePort, en);      // updateCond
     graph.addOperand(writePort, d);       // nextValue
     graph.setAttr(writePort, "latchSymbol", std::string("data_latch"));
+    graph.assignWriterOrder(writePort, "data_latch");
     
     // Create latch read port
     SymbolId readSym = graph.internSymbol("data_latch_read");
@@ -126,6 +127,7 @@ int testLatchWithMask()
     graph.addOperand(writePort, d);       // nextValue
     graph.addOperand(writePort, mask);    // mask
     graph.setAttr(writePort, "latchSymbol", std::string("data_latch"));
+    graph.assignWriterOrder(writePort, "data_latch");
     
     // Create latch read port
     SymbolId readSym = graph.internSymbol("data_latch_read");
@@ -189,6 +191,7 @@ int testMultipleWritePorts()
     graph.addOperand(writePort1, en1);
     graph.addOperand(writePort1, d1);
     graph.setAttr(writePort1, "latchSymbol", std::string("data_latch"));
+    graph.assignWriterOrder(writePort1, "data_latch");
     
     // Create second write port (should cause error)
     SymbolId writeSym2 = graph.internSymbol("data_latch_write2");
@@ -196,6 +199,7 @@ int testMultipleWritePorts()
     graph.addOperand(writePort2, en2);
     graph.addOperand(writePort2, d2);
     graph.setAttr(writePort2, "latchSymbol", std::string("data_latch"));
+    graph.assignWriterOrder(writePort2, "data_latch");
     
     // Create read port
     SymbolId readSym = graph.internSymbol("data_latch_read");
@@ -291,6 +295,7 @@ int testMultipleReadPorts()
     graph.addOperand(writePort, en);
     graph.addOperand(writePort, d);
     graph.setAttr(writePort, "latchSymbol", std::string("data_latch"));
+    graph.assignWriterOrder(writePort, "data_latch");
     
     // Create multiple read ports
     SymbolId readSym1 = graph.internSymbol("data_latch_read1");

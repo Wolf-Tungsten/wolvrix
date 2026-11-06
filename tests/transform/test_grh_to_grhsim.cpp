@@ -150,8 +150,9 @@ void testCompleteConversion()
             graph.addOperand(writers[i], reset);
             graph.setAttr(writers[i], "eventEdge", std::vector<std::string>{"posedge", "negedge"});
         }
-        graph.setAttr(writers[i], i == 5 ? "latchSymbol" : "regSymbol",
-                      std::string(i == 5 ? "latch" : i >= 2 ? "memory" : "q"));
+        const std::string target(i == 5 ? "latch" : i >= 2 ? "memory" : "q");
+        graph.setAttr(writers[i], i == 5 ? "latchSymbol" : "regSymbol", target);
+        graph.assignWriterOrder(writers[i], target);
         graph.setAttr(writers[i], "originModules", std::vector<std::string>{"top$registers"});
     }
     const auto taskCondition = constant(graph, logic(32), "32'h2");
@@ -216,7 +217,8 @@ void testCompleteConversion()
     {
         require(graph.opKind(writers[i]) == expected[i] && count(graph, expected[i]) == 1,
                 "writer was omitted, copied or converted to the wrong op");
-        require(sim::attribute<int64_t>(graph, writers[i], "writerOrder") == int64_t(i), "writer priority changed");
+        const std::array expectedOrders{int64_t{0}, int64_t{1}, int64_t{0}, int64_t{1}, int64_t{2}, int64_t{0}};
+        require(sim::attribute<int64_t>(graph, writers[i], "writerOrder") == expectedOrders[i], "writer priority changed");
         require(!graph.getOperation(writers[i]).attr("eventEdge"), "writer retained raw events");
         if (i != 5) require(sim::isFire(graph, graph.opOperands(writers[i])[0]), "writer did not get an explicit fire");
     }
@@ -351,6 +353,27 @@ void testFailuresAndFactory()
     graph.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
     const auto stamp = transform::DesignStamp::capture(graph);
     require(!convert(design) && stamp.matches(graph), "malformed event was partly converted");
+    for (const int64_t order : {int64_t{0}, int64_t{-1}})
+    {
+        grh::Design invalid;
+        auto& invalidGraph = invalid.createGraph("bad_priority");
+        invalid.markAsTop("bad_priority");
+        const auto clk = input(invalidGraph, "clk", logic(1));
+        const auto one = constant(invalidGraph, logic(1), "1'h1");
+        const auto data = input(invalidGraph, "data", logic(8));
+        state(invalidGraph, "q", logic(8));
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto writer = operation(invalidGraph, OperationKind::kRegisterWritePort,
+                "writer" + std::to_string(i), {one, data, clk});
+            invalidGraph.setAttr(writer, "regSymbol", std::string("q"));
+            invalidGraph.setAttr(writer, "eventEdge", std::vector<std::string>{"posedge"});
+            invalidGraph.setAttr(writer, "writerOrder", order);
+        }
+        const auto invalidStamp = transform::DesignStamp::capture(invalidGraph);
+        require(!convert(invalid) && invalidStamp.matches(invalidGraph),
+                "duplicate or negative writerOrder was accepted or partly converted");
+    }
     std::string error;
     const std::array<std::string_view, 2> args{"-top=bad_event", "-logic-domain=4state"};
     require(transform::makePass("grh-to-grhsim", args, error) != nullptr, "factory registration missing");

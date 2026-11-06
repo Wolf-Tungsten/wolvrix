@@ -942,10 +942,8 @@ namespace wolvrix::lib::transform
             const ActivityOpData &opData,
             const std::vector<uint32_t> &positions)
         {
-            // stage-03: the ordered memory-write priority machinery is gone
-            // (same-register write ports form one implicit group ordered by
-            // declaration order, which the backends already honor), so every
-            // sink is its own atomic unit here.
+            // Writer groups are ordered by explicit writerOrder in the backend;
+            // activity scheduling keeps every sink as its own atomic unit.
             (void)graph;
             (void)opData;
             std::vector<std::vector<uint32_t>> units;

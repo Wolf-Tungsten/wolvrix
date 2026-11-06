@@ -11,6 +11,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -882,6 +883,15 @@ namespace wolvrix::lib::transform
                 }
                 for (auto &[sym, ops] : groups)
                 {
+                    const auto order = [&](const OperationId id) {
+                        const auto attr = findAttr(graph_, id, "writerOrder");
+                        const auto priority = attr ? attr->get<int64_t>() : std::nullopt;
+                        if (!priority || *priority < 0) throw std::invalid_argument("Writer requires nonnegative writerOrder");
+                        return *priority;
+                    };
+                    std::sort(ops.begin(), ops.end(), [&](const auto lhs, const auto rhs) {
+                        return order(lhs) < order(rhs);
+                    });
                     foldOneWriteGroup(sym, ops);
                 }
                 if (std::getenv("WOLVRIX_MUXFOLD_DEBUG") != nullptr)
@@ -1354,9 +1364,10 @@ namespace wolvrix::lib::transform
                     graph_.addOperand(fill, ref.tailConstVal);
                     makeEvents(fill);
                     graph_.setAttr(fill, "regSymbol", regSym);
+                    graph_.assignWriterOrder(fill, regSym);
                 }
-                // Dynamic ports: innermost chain level first (declaration order
-                // = priority; the outermost mux level wins collisions).
+                // Dynamic ports use ascending writerOrder from the innermost
+                // mux level outward.
                 for (std::size_t i = portCount; i-- > 0;)
                 {
                     const WriteLevel &level = ref.levels[i];
@@ -1384,6 +1395,7 @@ namespace wolvrix::lib::transform
                     graph_.addOperand(write, level.data);
                     makeEvents(write);
                     graph_.setAttr(write, "regSymbol", regSym);
+                    graph_.assignWriterOrder(write, regSym);
                 }
                 // Highest priority: uniform const (reset) fill.
                 if (constCount != 0)
@@ -1394,6 +1406,7 @@ namespace wolvrix::lib::transform
                     graph_.addOperand(fill, resetData);
                     makeEvents(fill);
                     graph_.setAttr(fill, "regSymbol", regSym);
+                    graph_.assignWriterOrder(fill, regSym);
                 }
                 ++writeGroupsFolded_;
             }
@@ -1401,7 +1414,7 @@ namespace wolvrix::lib::transform
             // Guarded assignments produced by register-write-normalize. Unlike
             // pattern W, one entry may have several mutually exclusive writes,
             // and reset / whole writes form barriers rather than rejecting the
-            // entire register. Keep the full declaration order at each barrier.
+            // entire register. Keep the explicit writerOrder at each barrier.
             struct GuardedPort
             {
                 OperationId source;
@@ -1694,8 +1707,17 @@ namespace wolvrix::lib::transform
                     if (const auto symbol = attr ? attr->get<std::string>() : std::nullopt)
                         groups[std::string(*symbol)].push_back(id);
                 }
-                for (const auto &[symbol, writes] : groups)
+                for (auto &[symbol, writes] : groups)
                 {
+                    const auto order = [&](const OperationId id) {
+                        const auto attr = findAttr(graph_, id, "writerOrder");
+                        const auto priority = attr ? attr->get<int64_t>() : std::nullopt;
+                        if (!priority || *priority < 0) throw std::invalid_argument("Writer requires nonnegative writerOrder");
+                        return *priority;
+                    };
+                    std::sort(writes.begin(), writes.end(), [&](const auto lhs, const auto rhs) {
+                        return order(lhs) < order(rhs);
+                    });
                     const auto *reg = findRegister(symbol);
                     if (!reg) continue;
                     std::vector<GuardedPort> replacement;
@@ -1738,7 +1760,9 @@ namespace wolvrix::lib::transform
                         std::vector<ValueId> args(source.operands().begin(), source.operands().end());
                         if (port.pointer.valid())
                         { args[0] = port.enable; args[1] = port.pointer; args[2] = port.data; }
-                        write_detail::copyWrite(graph_, source, args);
+                        const auto rewritten = write_detail::copyWrite(graph_, source, args);
+                        graph_.eraseAttr(rewritten, "writerOrder");
+                        graph_.assignWriterOrder(rewritten, symbol);
                     }
                     for (auto id : writes) { erased_.insert(id); graph_.eraseOp(id); }
                     ++writeGroupsFolded_;

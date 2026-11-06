@@ -30,9 +30,10 @@ the semantics before Event partitions exist.
 | `grhsim.latchWrite` | enable, data, mask | none |
 
 Clocked writes reference the original register through `regSymbol`; latch
-writes use `latchSymbol`. Every writer has nonnegative `writerOrder`, preserving
-the original overlapping-write precedence. Equal explicit priorities retain
-declaration order, including across rename/freeze. Enable is one scalar Logic bit.
+writes use `latchSymbol`. Every writer has a unique nonnegative `writerOrder`
+within its target state group. Writers apply in ascending numeric order and a
+larger value wins overlapping bits; declaration/traversal order is not a tie-breaker.
+Enable is one scalar Logic bit.
 Fire is an edge-detect result, a legal OR/assign of such results, or a simplified
 zero pulse; a raw clock or constant-one clocked write is invalid.
 

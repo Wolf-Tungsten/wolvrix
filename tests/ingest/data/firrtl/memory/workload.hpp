@@ -13,7 +13,7 @@ namespace firrtl_memory_test {
 using Values = std::map<std::string, uint64_t>;
 struct Request {
     uint64_t address = 0, data = 0;
-    bool enabled = false, poisoned = false;
+    bool enabled = false;
 };
 template<class Check> void chirrtlTrace(Check check) {
     std::array<uint64_t, 3> memory{};
@@ -53,17 +53,6 @@ template<class Check> void independentTrace(int readLatency, int writeLatency, c
         const uint64_t data = (random >> 16) & 255;
         Request read{raddr, raddr < memory.size() ? memory[raddr] : 0, ren && raddr < memory.size()};
         Request write{waddr, data, wen && mask && waddr < memory.size()};
-        if (readEdge || writeEdge) {
-            const auto overlap = [&](Request& pending) {
-                if (!pending.enabled) return;
-                if (writeEdge) pending.poisoned |= write.enabled && write.address == pending.address;
-                for (const auto& active : writes) pending.poisoned |= active.enabled && active.address == pending.address;
-            };
-            // Independent clocks make any overlapping read undefined for all
-            // three read-under-write settings, not only "undefined".
-            for (auto& pending : reads) overlap(pending);
-            if (readEdge) overlap(read);
-        }
         if (writeEdge) {
             const auto committed = writes.empty() ? write : writes.front();
             if (!writes.empty()) { writes.pop_front(); writes.push_back(write); }
@@ -73,7 +62,8 @@ template<class Check> void independentTrace(int readLatency, int writeLatency, c
             completed = reads.empty() ? read : reads.front();
             if (!reads.empty()) { reads.pop_front(); reads.push_back(read); }
         }
-        const uint64_t expected = completed.enabled && !completed.poisoned ?
+        const uint64_t expected = policy == "undefined" ?
+            (completed.address < memory.size() ? memory[completed.address] : 0) : completed.enabled ?
             (policy == "new" ? memory[completed.address] : completed.data) : 0;
         rclk = nextRead; wclk = nextWrite;
         Values inputs{{"rclk", rclk}, {"wclk", wclk}, {"ren", ren}, {"wen", wen}, {"mask", mask},
@@ -92,8 +82,8 @@ template<class Check> void multiClockTrace(Check check) {
         const uint64_t a0 = (random >> 14) & 3, a1 = (random >> 16) & 3, r = (random >> 18) & 3;
         const bool w0 = !c0 && n0 && (random & 1) && a0 < 3, w1 = !c1 && n1 && (random & 2) && a1 < 3;
         const uint64_t d0 = (random >> 20) & 255, d1 = (random >> 12) & 255;
-        if (w0) memory[a0] = w1 && a0 == a1 ? 0 : d0;
-        if (w1) memory[a1] = w0 && a0 == a1 ? 0 : d1;
+        if (w0) memory[a0] = d0;
+        if (w1) memory[a1] = d1;
         c0 = n0; c1 = n1;
         check(Values{{"c0", c0}, {"c1", c1}, {"a0", a0}, {"a1", a1}, {"d0", d0}, {"d1", d1}, {"e0", random & 1}, {"e1", (random >> 1) & 1}, {"readAddr", r}}, Values{{"y", r < 3 ? memory[r] : 0}});
     }
@@ -121,7 +111,7 @@ template<class Check> void bundleRdwrTrace(Check check) {
         const bool wa = cycle % 3 == 0, wb = cycle % 5 == 0;
         const auto expected = [&] {
             const uint64_t qa = addr < 3 ? a[addr] : 0, qb = addr < 3 ? b[addr] : 0;
-            return Values{{"pa", wa || wb ? 0 : qa}, {"pb", wa || wb ? 0 : qb}, {"qa", qa}, {"qb", qb}};
+            return Values{{"pa", qa}, {"pb", qb}, {"qa", qa}, {"qb", qb}};
         };
         check(Values{{"clk", 0}, {"addr", addr}, {"wa", wa}, {"wb", wb}, {"a", av}, {"b", bv}}, expected());
         if (addr < 3) { if (wa) a[addr] = av; if (wb) b[addr] = bv; }
@@ -143,25 +133,17 @@ template<class Check> void standardTrace(int readLatency, int writeLatency, cons
         check(inputs, Values{});
         Request write{waddr, data, wen && mask && waddr < memory.size()};
         Request read{raddr, raddr < memory.size() ? memory[raddr] : 0, ren && raddr < memory.size()};
-        // A synchronous request overlaps every pending write, including a new
-        // write initiated on the same edge. Disabled masks do not write.
-        const auto collision = [&](Request& request) {
-            if (policy != "undefined" || !request.enabled) return;
-            request.poisoned |= write.enabled && write.address == request.address;
-            for (const auto& pending : writes) request.poisoned |= pending.enabled && pending.address == request.address;
-        };
-        if (readLatency) {
-            collision(read);
-            for (auto& pending : reads) collision(pending);
-        }
         const auto committed = writes.empty() ? write : writes.front();
         if (!writes.empty()) { writes.pop_front(); writes.push_back(write); }
         if (committed.enabled) memory[committed.address] = committed.data;
         Request completed = read;
         if (!reads.empty()) { completed = reads.front(); reads.pop_front(); reads.push_back(read); }
         uint64_t expected = 0;
-        if (!readLatency) expected = ren && raddr < memory.size() ? memory[raddr] : 0;
-        else if (completed.enabled && !completed.poisoned) expected = policy == "new" ? memory[completed.address] : completed.data;
+        if (policy == "undefined") {
+            const auto& request = readLatency ? completed : read;
+            expected = request.address < memory.size() ? memory[request.address] : 0;
+        } else if (!readLatency) expected = ren && raddr < memory.size() ? memory[raddr] : 0;
+        else if (completed.enabled) expected = policy == "new" ? memory[completed.address] : completed.data;
         check(Values{{"clk", 1}}, Values{{"y", expected}});
         check(Values{{"clk", 1}}, Values{{"y", expected}}); // repeated eval cannot duplicate a write
     }

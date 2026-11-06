@@ -113,7 +113,9 @@ struct Fixture {
         const auto op = graph.createOperation(kind);
         for (const auto value : args) graph.addOperand(op, value);
         const bool latch = kind == OperationKind::kLatchWritePort;
-        graph.setAttr(op, latch ? "latchSymbol" : "regSymbol", std::string(graph.symbolText(graph.operationSymbol(state))));
+        const std::string symbol(graph.symbolText(graph.operationSymbol(state)));
+        graph.setAttr(op, latch ? "latchSymbol" : "regSymbol", symbol);
+        graph.assignWriterOrder(op, symbol);
         if (!latch) graph.setAttr(op, "eventEdge", std::move(edges));
         return op;
     }

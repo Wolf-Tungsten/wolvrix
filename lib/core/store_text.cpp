@@ -263,7 +263,7 @@ void schedule(std::ostream& out, const grh::Graph& graph, const transform::Sessi
     runs("general-runs (sample small next / large payload)", plan->generalRuns);
     runs("large-commit-runs (commit previously sampled payload)", plan->largeCommitRuns);
     out << "    # writerOrder is the explicit priority; target-write-rank counts that state's writers in schedule order.\n";
-    out << "    # Runs preserve writer order; a group may occur in several runs. Equal writerOrder retains declaration order.\n";
+    out << "    # Runs preserve ascending writerOrder; a group may occur in several runs. Per-state writerOrder values are unique.\n";
 }
 
 void graphText(std::ostream& out, const grh::Graph& graph, const transform::SessionStore* session) {

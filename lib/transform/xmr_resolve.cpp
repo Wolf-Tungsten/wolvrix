@@ -974,6 +974,7 @@ namespace wolvrix::lib::transform
                         leafGraph->addOperand(writeOp, value);
                     }
                     leafGraph->setAttr(writeOp, "regSymbol", leafName);
+                    leafGraph->assignWriterOrder(writeOp, leafName);
                     leafGraph->setAttr(writeOp, "eventEdge", *eventEdgesOpt);
                     result.changed = true;
                     return true;
@@ -989,6 +990,7 @@ namespace wolvrix::lib::transform
                         leafGraph->addOperand(writeOp, value);
                     }
                     leafGraph->setAttr(writeOp, "latchSymbol", leafName);
+                    leafGraph->assignWriterOrder(writeOp, leafName);
                     result.changed = true;
                     return true;
                 }
@@ -1001,6 +1003,7 @@ namespace wolvrix::lib::transform
                     leafGraph->addOperand(writeOp, value);
                 }
                 leafGraph->setAttr(writeOp, "regSymbol", leafName);
+                leafGraph->assignWriterOrder(writeOp, leafName);
                 leafGraph->setAttr(writeOp, "eventEdge", *eventEdgesOpt);
                 result.changed = true;
                 return true;

@@ -103,8 +103,10 @@ public:
             std::vector<grh::OperationId> writers;
             for (const auto op : graph_.operations())
                 if (grh::isRegisterWritePortKind(graph_.opKind(op)) || graph_.opKind(op) == OperationKind::kLatchWritePort || sim::isWriter(graph_.opKind(op))) writers.push_back(op);
-            std::stable_sort(writers.begin(), writers.end(), [&](auto a, auto b) {
-                return sim::attribute<int64_t>(graph_, a, "writerOrder").value_or(a.index) < sim::attribute<int64_t>(graph_, b, "writerOrder").value_or(b.index);
+            std::sort(writers.begin(), writers.end(), [&](auto a, auto b) {
+                const auto left = sim::attribute<int64_t>(graph_, a, "writerOrder").value();
+                const auto right = sim::attribute<int64_t>(graph_, b, "writerOrder").value();
+                return left != right ? left < right : a.index < b.index;
             });
             for (const auto op : writers) write(op, next);
             // Every detector samples history once, even when all consumers are disabled.
@@ -209,7 +211,11 @@ private:
                 writers.insert(writers.end(), run.orderedWriters.begin(), run.orderedWriters.end());
             } else {
                 for (const auto op : graph_.operations()) if (sim::isWriter(graph_.opKind(op))) writers.push_back(op);
-                std::stable_sort(writers.begin(), writers.end(), [&](auto a, auto b) { return sim::attribute<int64_t>(graph_, a, "writerOrder").value() < sim::attribute<int64_t>(graph_, b, "writerOrder").value(); });
+                std::sort(writers.begin(), writers.end(), [&](auto a, auto b) {
+                    const auto left = sim::attribute<int64_t>(graph_, a, "writerOrder").value();
+                    const auto right = sim::attribute<int64_t>(graph_, b, "writerOrder").value();
+                    return left != right ? left < right : a.index < b.index;
+                });
             }
             for (const auto op : writers) for (const auto input : graph_.opOperands(op)) value(input); // General snapshots.
             for (const auto op : writers) {

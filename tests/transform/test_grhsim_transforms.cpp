@@ -71,7 +71,9 @@ struct Builder {
                            std::vector<std::string> edges = {"posedge"}) {
         const auto op = graph.createOperation(kind);
         for (const auto arg : args) graph.addOperand(op, arg);
-        graph.setAttr(op, kind == OperationKind::kLatchWritePort ? "latchSymbol" : "regSymbol", std::string(graph.getOperation(target).symbolText()));
+        const std::string symbol(graph.getOperation(target).symbolText());
+        graph.setAttr(op, kind == OperationKind::kLatchWritePort ? "latchSymbol" : "regSymbol", symbol);
+        graph.assignWriterOrder(op, symbol);
         if (kind != OperationKind::kLatchWritePort) graph.setAttr(op, "eventEdge", std::move(edges));
         return op;
     }

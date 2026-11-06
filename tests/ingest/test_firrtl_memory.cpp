@@ -152,8 +152,21 @@ circuit top :
     request.sources.push_back({ingest::SourceLanguage::Firrtl, path, "fixture"});
     request.firrtl.initPolicy = ingest::FirrtlInitPolicy::Zero;
     auto result = ingest::readSources(request); require(result.success(), diagnostics(result));
+    require(diagnostics(result).find("read-under-write=undefined") != std::string::npos,
+            "undefined read-under-write did not emit a warning");
     auto restored = roundTrip(*result.design); valid(restored);
-    grhsim_test::Oracle oracle(*restored.findGraph("top"), {}, nullptr, true);
+    const auto& graph = *restored.findGraph("top");
+    std::size_t addressPipelines = 0;
+    for (const auto op : graph.operations()) {
+        for (const auto attr : graph.opAttrRange(op)) {
+            if (attr.key() != "firrtl.memoryPipeline") continue;
+            ++addressPipelines;
+            require(grh::stateLogicalType(graph, op).width == 1,
+                    "undefined read created non-address pipeline state");
+        }
+    }
+    require(addressPipelines == 2, "undefined two-stage read must only delay the address");
+    grhsim_test::Oracle oracle(graph, {}, nullptr, true);
     const auto cycle = [&](uint64_t ren, uint64_t wen, uint64_t data) {
         oracle.eval({{"clk", 0}, {"ren", ren}, {"wen", wen}, {"addr", 1}, {"data", data}});
         return slang::SVInt::fromString(oracle.eval({{"clk", 1}}).outputs.at("y"));
@@ -162,11 +175,11 @@ circuit top :
     cycle(1, 0, 0);
     require(cycle(1, 0, 0).as<uint64_t>() == 91, "defined read did not survive FourState GRH");
     cycle(1, 0, 0);
-    require(cycle(1, 1, 37).hasUnknown(), "undefined collision was silently converted to zero");
-    require(cycle(1, 0, 0).hasUnknown(), "colliding initiating read lost unknown history");
-    require(cycle(1, 0, 0).as<uint64_t>() == 37, "collision poison leaked into later reads");
+    require(cycle(1, 1, 37).as<uint64_t>() == 37, "undefined read-under-write must use new-value collision behavior");
+    require(cycle(1, 0, 0).as<uint64_t>() == 37, "address-delayed read did not observe the committed write");
+    require(cycle(1, 0, 0).as<uint64_t>() == 37, "later read changed the committed value");
     cycle(0, 0, 0);
-    require(cycle(0, 0, 0).hasUnknown(), "disabled read must use selected invalid policy");
+    require(cycle(0, 0, 0).as<uint64_t>() == 37, "undefined disabled read must remain ungated");
 }
 void depthOne() {
     auto result = text("memory-depth-one", R"FIR(    input clk : Clock

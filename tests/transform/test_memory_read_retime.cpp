@@ -102,6 +102,7 @@ namespace
         const OperationId regWrite = graph.createOperation(OperationKind::kRegisterWritePort,
                                                            graph.internSymbol("addr_q_write"));
         graph.setAttr(regWrite, "regSymbol", std::string("addr_q"));
+        graph.assignWriterOrder(regWrite, "addr_q");
         graph.setAttr(regWrite, "eventEdge", std::vector<std::string>{"posedge"});
         graph.addOperand(regWrite, en);
         graph.addOperand(regWrite, addrD);
@@ -133,6 +134,7 @@ namespace
             const OperationId memWrite = graph.createOperation(OperationKind::kRegisterWriteArrayMaskPort,
                                                                graph.internSymbol("mem0_write"));
             graph.setAttr(memWrite, "regSymbol", std::string("mem0"));
+            graph.assignWriterOrder(memWrite, "mem0");
             graph.setAttr(memWrite, "eventEdge", std::vector<std::string>{"posedge"});
             graph.addOperand(memWrite, wen);
             graph.addOperand(memWrite, waddr);
@@ -152,6 +154,7 @@ namespace
                 const OperationId memWrite2 = graph.createOperation(OperationKind::kRegisterWriteArrayMaskPort,
                                                                     graph.internSymbol("mem0_write_2"));
                 graph.setAttr(memWrite2, "regSymbol", std::string("mem0"));
+                graph.assignWriterOrder(memWrite2, "mem0");
                 graph.setAttr(memWrite2, "eventEdge", std::vector<std::string>{"posedge"});
                 graph.addOperand(memWrite2, wen2);
                 graph.addOperand(memWrite2, waddr2);

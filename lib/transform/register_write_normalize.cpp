@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -216,13 +217,19 @@ namespace wolvrix::lib::transform
             }
             BooleanBuilder booleans(graph);
             std::size_t normalized = 0, removedHolds = 0;
-            for (const auto &[groupKey, writes] : groups)
+            for (auto &[groupKey, writes] : groups)
             {
                 const auto &attrName = groupKey.first;
                 const auto &symbol = groupKey.second;
-                // Plan against the complete original write group before erasing
-                // anything. Recreate the whole group to preserve declaration
-                // priority relative to every unchanged writer.
+                const auto order = [&](const OperationId id) {
+                    const auto attr = findAttr(graph, id, "writerOrder");
+                    const auto priority = attr ? attr->get<int64_t>() : std::nullopt;
+                    if (!priority || *priority < 0) throw std::invalid_argument("Writer requires nonnegative writerOrder");
+                    return *priority;
+                };
+                std::sort(writes.begin(), writes.end(), [&](const auto lhs, const auto rhs) {
+                    return order(lhs) < order(rhs);
+                });
                 std::map<uint32_t, Plan> plans;
                 std::unordered_map<ValueId, bool, grh::ValueIdHash> readDependencies;
                 std::map<uint64_t, std::vector<std::size_t>> byRow;

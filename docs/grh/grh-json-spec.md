@@ -108,26 +108,31 @@ C++ `StoreOptions.emitDefUsers`、`emitSourceLocations` 和 Python `store_json` 
   - `out`: 为空
   - `attrs.regSymbol`: string
   - `attrs.eventEdge`: string[]
+  - `attrs.writerOrder`: int64，非负且同 regSymbol 写组内唯一
 - `kRegisterWriteMaskPort`
   - `in`: `[updateCond, nextValue, mask, event0, event1, ...]`
   - `out`: 为空
   - `attrs.regSymbol`: string
   - `attrs.eventEdge`: string[]
+  - `attrs.writerOrder`: int64，非负且同 regSymbol 写组内唯一
 - `kRegisterWriteArrayPort`
   - `in`: `[updateCond, i0..ik-1, data, event0, event1, ...]`（1 ≤ k ≤ rank；k<rank 时 data 为子数组）
   - `out`: 为空
   - `attrs.regSymbol`: string
   - `attrs.eventEdge`: string[]
+  - `attrs.writerOrder`: int64，非负且同 regSymbol 写组内唯一
 - `kRegisterWriteArrayMaskPort`
   - `in`: `[updateCond, i0..ik-1, data, mask, event0, event1, ...]`
   - `out`: 为空
   - `attrs.regSymbol`: string
   - `attrs.eventEdge`: string[]
+  - `attrs.writerOrder`: int64，非负且同 regSymbol 写组内唯一
 - `kRegisterFillPort`
   - `in`: `[updateCond, data, event0, event1, ...]`（data 为元素宽，广播写满全部元素）
   - `out`: 为空
   - `attrs.regSymbol`: string
   - `attrs.eventEdge`: string[]
+  - `attrs.writerOrder`: int64，非负且同 regSymbol 写组内唯一
 - `kLatch`
   - `in`: 为空
   - `out`: 为空
@@ -141,6 +146,7 @@ C++ `StoreOptions.emitDefUsers`、`emitSourceLocations` 和 Python `store_json` 
   - `in`: `[updateCond, nextValue, mask]`
   - `out`: 为空
   - `attrs.latchSymbol`: string
+  - `attrs.writerOrder`: int64，非负且同 latchSymbol 写组内唯一
 
 ## XMR 操作
 - `kXMRRead`
@@ -167,11 +173,11 @@ JSON 中若仍保留该 op，表示流程未完成。
 
 ## 排序与布局约定
 - Graph 列表按名称排序；`vals`、`ops` 保留创建顺序；端口数组顺序来自 Graph 端口列表（`compact()` / `freeze()` 会按端口名排序）；operation 的 `attrs` 按 key 文本排序，图级 metadata 保持插入顺序。
-- **op 顺序是语义的一部分**：同一 kRegister 的全部写端口（kRegisterWritePort /
-  kRegisterWriteMaskPort / kRegisterWriteArrayPort / kRegisterWriteArrayMaskPort /
-  kRegisterFillPort）构成唯一写组，同时激活时按 op 声明顺序依次应用、后声明者覆盖
-  （见 grh-ir.md §6.4）。`ops` 数组有序，因此该顺序在 JSON 中免费持久化；
-  任何 pass 不得重排同 regSymbol 写端口的相对顺序。
+- `ops` 数组仅保留创建顺序，**不承载写口优先级语义**。同一 regSymbol 的全部写端口
+  （kRegisterWritePort / kRegisterWriteMaskPort / kRegisterWriteArrayPort /
+  kRegisterWriteArrayMaskPort / kRegisterFillPort）必须带唯一非负 `writerOrder`，
+  按数值升序应用，同地址重叠位由较大值覆盖（见 grh-ir.md §6.4）。latch 写组使用 latchSymbol 的同一规则。
+  pass 不得依赖数组位置改写优先级；旧图的 declaration-order fallback 仅属迁移兼容行为。
 - `Compact` 模式无多余空格与换行；`PrettyCompact` 模式下 `vals`、`ports.in/out`、`ops` 数组的元素均单行展示；`Pretty` 模式每个字段独立换行。
 
 ## 兼容性

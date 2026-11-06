@@ -1012,6 +1012,8 @@ res[0] = <latchSymbol>
 
 **attrs**:
 - `latchSymbol` (string): 指向目标 kLatch 的 symbol
+- `writerOrder` (int64): 非负写优先级，同一 latchSymbol 写组内唯一；按数值升序应用，
+  同地址重叠位由较大值覆盖，不读取 ops 数组位置作为优先级
 
 **语义**:
 
@@ -1117,7 +1119,7 @@ end
 | kRegisterReadPort | 无 | 全数组 value（shape 继承声明） |
 | kRegisterReadArrayPort | `[i0, ..., ik-1]`，1 ≤ k ≤ rank | k==rank → 元素标量；k<rank → 子数组 value（shape=剩余维） |
 
-写端口（均带 1-bit `updateCond` 与事件尾；attrs 均为 `regSymbol` + `eventEdge`）：
+写端口（均带 1-bit `updateCond` 与事件尾；attrs 均为 `regSymbol` + `eventEdge` + `writerOrder`）：
 
 | op | operands | 语义 |
 |----|----------|------|
@@ -1140,13 +1142,15 @@ end
   `eventEdge` 数量反推（声明的 rank 无法唯一确定部分索引数）。写端口的 `eventEdge`
   必须非空——没有边沿事件的"写"应建模为组合逻辑。
 - mask 语义唯一：**位掩码**（mask[i]=1 时写入第 i 位）。不提供元素粒度掩码。
-- **写端口优先级**：组 = 同 regSymbol 的全部写端口（含 kRegisterFillPort），
-  不要求相同事件/边沿。同轮同时激活时按**op 声明顺序**依次应用，后声明者覆盖同地址
-  先写者。**同 regSymbol 写端口 op 的相对顺序是 IR 语义的一部分——pass 不得重排**
-  （JSON ops 数组有序，持久化免费；grh.verify 校验端口与声明同图兜底）。
-  SV emitter 在同 always 块内按声明顺序排列（天然后写覆盖先写）；跨事件写端口的顺序
-  无法被 SV 表达，emitter 报 warning 并按事件分块、块内按声明顺序输出（best-effort，
-  语义以 grhsim 后端为准）。
+- **写端口优先级由显式 `writerOrder` 决定**：组 = 同 regSymbol 的全部写端口（含 kRegisterFillPort），
+  不要求相同事件/边沿。`writerOrder` 是非负 int64，同组内必须唯一，但不要求连续或与创建顺序相关。
+  同轮同时激活时按 `writerOrder` 数值**升序**依次应用；同地址重叠位由数值较大者覆盖。
+  ops 数组位置、图遍历顺序、Symbol 文本、创建时间和 pass 执行顺序均不参与优先级判定。
+  pass 必须保留该属性；新建写口必须按源语义显式赋值，不能靠插入位置隐式决定优先级。
+- `writerOrder` 与 `eventEdge` 独立：前者只规定同组写口的应用顺序，后者只规定事件触发方式。
+  例如 ops 数组按 B、A 排列，A 的 `writerOrder=10`、B 的 `writerOrder=20`，仍先应用 A 再应用 B。
+  缺少 `writerOrder` 或同组值重复均为非法新图；旧图的 declaration-order fallback 仅属迁移兼容行为，
+  不是新图的语义。SV emitter 按该数值顺序输出；无法保持顺序的跨事件形式必须报告 warning。
 
 ### kRegisterReadPort
 

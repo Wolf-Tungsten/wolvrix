@@ -249,6 +249,7 @@ namespace wolvrix::lib::transform
             const OperationId op = graph.createOperation(OperationKind::kRegisterWritePort, opSym);
             graph.setAttr(op, "regSymbol", std::string(regSymbol));
             graph.setAttr(op, "eventEdge", eventEdges);
+            graph.assignWriterOrder(op, regSymbol);
             graph.addOperand(op, updateCond);
             graph.addOperand(op, nextValue);
             for (const ValueId event : events)

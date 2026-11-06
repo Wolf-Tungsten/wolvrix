@@ -293,6 +293,7 @@ int main()
         graph.addOperand(writeRow, row);
         graph.addOperand(writeRow, clk);
         graph.setAttr(writeRow, "regSymbol", std::string("reg_arr"));
+        graph.assignWriterOrder(writeRow, "reg_arr");
         graph.setAttr(writeRow, "eventEdge", std::vector<std::string>{"posedge"});
 
         ValueId mask8 = graph.createValue(graph.internSymbol("mask8"), 8, false);
@@ -305,6 +306,7 @@ int main()
         graph.addOperand(writeElem, mask8);
         graph.addOperand(writeElem, clk);
         graph.setAttr(writeElem, "regSymbol", std::string("reg_arr"));
+        graph.assignWriterOrder(writeElem, "reg_arr");
         graph.setAttr(writeElem, "eventEdge", std::vector<std::string>{"posedge"});
 
         OperationId fill = graph.createOperation(OperationKind::kRegisterFillPort,
@@ -313,6 +315,7 @@ int main()
         graph.addOperand(fill, elem);
         graph.addOperand(fill, clk);
         graph.setAttr(fill, "regSymbol", std::string("reg_arr"));
+        graph.assignWriterOrder(fill, "reg_arr");
         graph.setAttr(fill, "eventEdge", std::vector<std::string>{"posedge"});
 
         ValueId mask128 = graph.createValue(graph.internSymbol("mask128"), 128, false);
@@ -323,6 +326,7 @@ int main()
         graph.addOperand(writeMask, mask128);
         graph.addOperand(writeMask, clk);
         graph.setAttr(writeMask, "regSymbol", std::string("reg_arr"));
+        graph.assignWriterOrder(writeMask, "reg_arr");
         graph.setAttr(writeMask, "eventEdge", std::vector<std::string>{"posedge"});
 
         OperationId writeWhole = graph.createOperation(OperationKind::kRegisterWritePort,
@@ -331,6 +335,7 @@ int main()
         graph.addOperand(writeWhole, whole);
         graph.addOperand(writeWhole, clk);
         graph.setAttr(writeWhole, "regSymbol", std::string("reg_arr"));
+        graph.assignWriterOrder(writeWhole, "reg_arr");
         graph.setAttr(writeWhole, "eventEdge", std::vector<std::string>{"posedge"});
         if (!runVerify(design))
         {
@@ -375,6 +380,7 @@ int main()
         graph.addOperand(write, data);
         graph.addOperand(write, clk);
         graph.setAttr(write, "regSymbol", std::string("reg_arr"));
+        graph.assignWriterOrder(write, "reg_arr");
         graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
         if (runVerify(design))
         {
@@ -396,6 +402,7 @@ int main()
         graph.addOperand(write, data);
         graph.addOperand(write, clk);
         graph.setAttr(write, "regSymbol", std::string("reg0"));
+        graph.assignWriterOrder(write, "reg0");
         graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
         if (runVerify(design))
         {
@@ -415,6 +422,7 @@ int main()
         graph.addOperand(write, en);
         graph.addOperand(write, data);
         graph.setAttr(write, "regSymbol", std::string("reg0"));
+        graph.assignWriterOrder(write, "reg0");
         if (runVerify(design))
         {
             return fail("kRegisterWritePort without eventEdge passed verification");
@@ -452,6 +460,7 @@ int main()
         graph.addOperand(write, data);
         graph.addOperand(write, clk);
         graph.setAttr(write, "regSymbol", std::string("reg0"));
+        graph.assignWriterOrder(write, "reg0");
         graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
         if (runVerify(design))
         {
@@ -459,7 +468,37 @@ int main()
         }
     }
 
-    // Case 14: replicate width is determined by the operand and rep attr.
+    // Case 14: every state write must have a unique nonnegative writerOrder.
+    {
+        Design design;
+        Graph &graph = design.createGraph("writer_order");
+        addRegister(graph, "reg0", 8);
+        ValueId clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+        ValueId en = graph.createValue(graph.internSymbol("en"), 1, false);
+        ValueId data = graph.createValue(graph.internSymbol("data"), 8, false);
+        OperationId writes[2];
+        for (int i = 0; i < 2; ++i)
+        {
+            writes[i] = graph.createOperation(OperationKind::kRegisterWritePort,
+                                              graph.internSymbol("write" + std::to_string(i)));
+            graph.addOperand(writes[i], en);
+            graph.addOperand(writes[i], data);
+            graph.addOperand(writes[i], clk);
+            graph.setAttr(writes[i], "regSymbol", std::string("reg0"));
+            graph.setAttr(writes[i], "eventEdge", std::vector<std::string>{"posedge"});
+        }
+        if (runVerify(design)) return fail("write port without writerOrder passed verification");
+        graph.assignWriterOrder(writes[0], "reg0");
+        graph.assignWriterOrder(writes[1], "reg0");
+        graph.setAttr(writes[1], "writerOrder", int64_t{0});
+        if (runVerify(design)) return fail("duplicate writerOrder passed verification");
+        graph.setAttr(writes[1], "writerOrder", int64_t{1});
+        if (!runVerify(design)) return fail("unique writerOrder was rejected");
+        graph.setAttr(writes[1], "writerOrder", int64_t{-1});
+        if (runVerify(design)) return fail("negative writerOrder passed verification");
+    }
+
+    // Case 15: replicate width is determined by the operand and rep attr.
     for (const int32_t resultWidth : {9, 1})
     {
         Design design;

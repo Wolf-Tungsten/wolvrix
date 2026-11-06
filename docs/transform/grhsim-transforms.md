@@ -232,12 +232,12 @@ IDs and necessary nonsink leaf prerequisites. General prerequisites include
 transitive data and effect-order dependencies; large commit runs consume the
 snapshots already sampled in General.
 
-Writer order is preserved across clock groups: A(clock0), B(clock1), C(clock0)
-may require the clock0 group to recur. Groups may not mix clocks, priority ranks
-or hoisted/local guard policies. The schedule holds no duplicate writer operands,
-Output history plan, nonsink execution graph, physical layout or chunks.
-Equal explicit writerOrder values keep declaration order; symbol spelling does
-not decide the winning write, and rename/freeze preserve this tie order.
+Explicit `writerOrder` values are preserved across clock groups: A(clock0),
+B(clock1), C(clock0) may require the clock0 group to recur. Groups may not mix
+clocks, priority ranks or hoisted/local guard policies. The schedule holds no
+duplicate writer operands, Output history plan, nonsink execution graph,
+physical layout or chunks. `writerOrder` must be unique within each target state
+write group; ops order, symbol spelling and rename/freeze never decide the winning write.
 
 Keep the same externally owned session through pass and emit. Consumers call
 `requireSinkSchedule(session, graph)`, which verifies slot type, instance/top/

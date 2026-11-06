@@ -1322,6 +1322,7 @@ public:
     OperationId createOperation(OperationKind kind, SymbolId symbol);
     OperationId createOperation(OperationKind kind);
     OperationId createTemporaryOperation(OperationKind kind);
+    void assignWriterOrder(OperationId op, std::string_view symbol);
 
     // Stable, generated names for diagnostics and serialization.  A valid
     // symbol returns its text; an invalid symbol gets a deterministic name
@@ -1532,6 +1533,8 @@ private:
     std::unordered_set<uint32_t> declaredSymbolSet_;
     std::vector<GenerateGroup> generateGroups_;
     std::unordered_map<uint32_t, std::vector<std::size_t>> generateGroupsBySymbol_;
+    std::unordered_map<std::string, int64_t> nextWriterOrders_;
+    bool writerOrdersInitialized_ = false;
     uint32_t nextInternalOpSym_ = 0;
     uint32_t nextInternalValSym_ = 0;
 };

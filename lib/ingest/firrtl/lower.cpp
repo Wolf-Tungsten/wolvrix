@@ -126,7 +126,6 @@ private:
     std::unordered_map<std::string_view, Driver*> rootDrivers_;
     std::unordered_map<std::string_view, grh::SemanticId> semanticDeclarations_;
     std::map<int, ValueId> guards_;
-    std::unordered_map<ValueId, ValueId, grh::ValueIdHash> clockPulses_;
     grh::SemanticId currentSemantic_ = 0;
     class SemanticScope {
     public:
@@ -175,7 +174,6 @@ private:
     void memories();
     bool memorySource(const LeafKey& key) const;
     ValueId pipeline(ValueId data, ValueId clock, int64_t stages, Range range);
-    ValueId clockPulse(ValueId clock, Range range);
     void effects();
     void instances();
 };
@@ -517,6 +515,7 @@ void Lowerer::stateWrite(const Driver& driver, const Declaration::Register& stat
         graph_.addOperand(writer, expression(*state.reset)); edges.push_back("posedge");
     }
     graph_.setAttr(writer, "regSymbol", driver.regSymbol); graph_.setAttr(writer, "eventEdge", edges);
+    graph_.assignWriterOrder(writer, driver.regSymbol);
     graph_.setOpSrcLocView(writer, location(range));
     setOpSemantic(writer, driver.semantic);
 }
@@ -686,32 +685,12 @@ ValueId Lowerer::pipeline(ValueId data, ValueId clock, int64_t stages, Range ran
         const auto write = graph_.createTemporaryOperation(OperationKind::kRegisterWritePort);
         for (const auto value : {number(1, 1, range), data, clock}) graph_.addOperand(write, value);
         graph_.setAttr(write, "regSymbol", symbol); graph_.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        graph_.assignWriterOrder(write, symbol);
         graph_.setOpSrcLocView(write, location(range));
         setOpSemantic(write);
         data = op(OperationKind::kRegisterReadPort, type, {}, range); graph_.setAttr(graph_.valueDef(data), "regSymbol", symbol);
     }
     return data;
-}
-ValueId Lowerer::clockPulse(ValueId clock, Range range) {
-    if (const auto found = clockPulses_.find(clock); found != clockPulses_.end()) return found->second;
-    SemanticScope scope(currentSemantic_, generatedSemantic("clockPulse_" + std::to_string(clockPulses_.size())));
-    const LogicalType bit{grh::ValueType::Logic, 1, false};
-    const auto state = graph_.createOperation(OperationKind::kRegister);
-    const std::string symbol(graph_.getOperation(state).symbolText());
-    grh::setStateLogicalType(graph_, state, bit);
-    grh::InitStep init; init.value = "1'b0"; grh::setStateInitSpec(graph_, state, {init});
-    graph_.setAttr(state, "firrtl.memoryClockHistory", true);
-    setOpSemantic(state);
-    const auto previous = op(OperationKind::kRegisterReadPort, bit, {}, range);
-    graph_.setAttr(graph_.valueDef(previous), "regSymbol", symbol);
-    const auto writer = graph_.createTemporaryOperation(OperationKind::kRegisterWritePort);
-    for (const auto value : {number(1, 1, range), clock, clock}) graph_.addOperand(writer, value);
-    graph_.setAttr(writer, "regSymbol", symbol);
-    graph_.setAttr(writer, "eventEdge", std::vector<std::string>{"both"});
-    graph_.setOpSrcLocView(writer, location(range));
-    setOpSemantic(writer);
-    const auto pulse = op(OperationKind::kAnd, bit, {clock, op(OperationKind::kNot, bit, {previous}, range)}, range);
-    clockPulses_.emplace(clock, pulse); return pulse;
 }
 void Lowerer::memories() {
     const LogicalType bit{grh::ValueType::Logic, 1, false};
@@ -732,6 +711,13 @@ void Lowerer::memories() {
         return clock;
     };
     for (const auto& [name, memory] : semantics_.memories) {
+        if (memory.readUnderWrite == "undefined") {
+            std::vector<std::string> warnings;
+            if (const auto existing = graph_.metadata("firrtl.readUnderWriteWarnings"))
+                warnings = std::get<std::vector<std::string>>(*existing);
+            warnings.push_back("memory '" + name + "' read-under-write=undefined uses new-value collision behavior and ungated disabled/OOB reads for two-state simulation");
+            graph_.setMetadata("firrtl.readUnderWriteWarnings", warnings);
+        }
         std::map<std::string, ValueId> writeModes;
         if (!memory.standard) for (const auto& port : memory.ports) if (port.read && port.write) {
             std::vector<grh::SemanticId> semantics;
@@ -755,8 +741,6 @@ void Lowerer::memories() {
             const MemoryPort* source; grh::SemanticId semantic = 0;
             ValueId address, clock, readEnable, writeEnable;
             ValueId writeAddress, writeData, writeMask;
-            ValueId initiatingEnable;
-            std::vector<std::pair<ValueId, ValueId>> pendingWrites;
         };
         for (const auto& leaf : semantics_.leavesCached(memory.data)) {
             const auto type = logical(leaf); if (!type.width) continue;
@@ -838,12 +822,10 @@ void Lowerer::memories() {
                 lowered.writeEnable = both(lowered.writeEnable, bounds, port.range);
                 if (port.write) {
                     lowered.writeEnable = both(lowered.writeEnable, op(OperationKind::kReduceOr, bit, {lowered.writeMask}, port.range), port.range);
-                    lowered.initiatingEnable = lowered.writeEnable;
                     lowered.writeAddress = lowered.address;
                     for (int64_t i = 1; i < memory.writeLatency; ++i) {
                         lowered.writeAddress = pipeline(lowered.writeAddress, lowered.clock, 1, port.range);
                         lowered.writeEnable = pipeline(lowered.writeEnable, lowered.clock, 1, port.range);
-                        lowered.pendingWrites.emplace_back(lowered.writeAddress, lowered.writeEnable);
                     }
                     lowered.writeData = pipeline(lowered.writeData, lowered.clock, memory.writeLatency - 1, port.range);
                     lowered.writeMask = pipeline(lowered.writeMask, lowered.clock, memory.writeLatency - 1, port.range);
@@ -852,17 +834,10 @@ void Lowerer::memories() {
             }
             for (const auto& port : ports) if (port.source->write) {
                 SemanticScope scope(currentSemantic_, port.semantic);
-                auto data = port.writeData;
-                for (const auto& other : ports) if (&other != &port && other.source->write) {
-                    const auto same = op(OperationKind::kEq, bit, {port.writeAddress, other.writeAddress}, port.source->range);
-                    const auto active = both(other.writeEnable, clockPulse(other.clock, port.source->range), port.source->range);
-                    const auto conflict = both(active, same, port.source->range);
-                    // FIRRTL independent writers have undefined collisions, never last-connect priority.
-                    data = op(OperationKind::kMux, type, {conflict, invalid(type, port.source->range), data}, port.source->range);
-                }
                 const auto writer = graph_.createTemporaryOperation(OperationKind::kRegisterWriteArrayMaskPort);
-                for (const auto value : {port.writeEnable, port.writeAddress, data, port.writeMask, port.clock}) graph_.addOperand(writer, value);
+                for (const auto value : {port.writeEnable, port.writeAddress, port.writeData, port.writeMask, port.clock}) graph_.addOperand(writer, value);
                 graph_.setAttr(writer, "regSymbol", symbol); graph_.setAttr(writer, "eventEdge", std::vector<std::string>{"posedge"});
+                graph_.assignWriterOrder(writer, symbol);
                 graph_.setOpSrcLocView(writer, location(port.source->range));
                 setOpSemantic(writer);
             }
@@ -870,62 +845,17 @@ void Lowerer::memories() {
                 SemanticScope scope(currentSemantic_, port.semantic);
                 ValueId data;
                 if (port.source->read) {
-                    ValueId poison;
-                    if (memory.readLatency) {
-                        // Pending read tokens retain collision history even when a
-                        // different clock writes between two read clock edges.
-                        const auto readPulse = clockPulse(port.clock, port.source->range);
-                        auto tokenAddress = port.address, tokenEnable = port.readEnable;
-                        auto priorPoison = number(0, 1, port.source->range);
-                        std::vector<ValueId> clocks{port.clock};
-                        for (const auto& writer : ports) if (writer.source->write && std::find(clocks.begin(), clocks.end(), writer.clock) == clocks.end()) clocks.push_back(writer.clock);
-                        for (int64_t stage = 0; stage < memory.readLatency; ++stage) {
-                            const auto range = port.source->range;
-                            const auto savedAddress = pipeline(tokenAddress, port.clock, 1, range);
-                            const auto savedEnable = pipeline(tokenEnable, port.clock, 1, range);
-                            const auto state = graph_.createOperation(OperationKind::kRegister);
-                            const std::string poisonSymbol(graph_.getOperation(state).symbolText());
-                            grh::setStateLogicalType(graph_, state, bit);
-                            grh::InitStep init; init.value = "1'b0"; grh::setStateInitSpec(graph_, state, {init});
-                            graph_.setAttr(state, "firrtl.memoryCollision", true);
-                            setOpSemantic(state);
-                            poison = op(OperationKind::kRegisterReadPort, bit, {}, range);
-                            graph_.setAttr(graph_.valueDef(poison), "regSymbol", poisonSymbol);
-                            const auto selectedAddress = op(OperationKind::kMux, graph_.valueLogicalType(tokenAddress), {readPulse, tokenAddress, savedAddress}, range);
-                            const auto selectedEnable = op(OperationKind::kMux, bit, {readPulse, tokenEnable, savedEnable}, range);
-                            auto next = op(OperationKind::kMux, bit, {readPulse, priorPoison, poison}, range);
-                            for (const auto& writer : ports) if (writer.source->write && (memory.readUnderWrite == "undefined" || writer.clock != port.clock)) {
-                                const auto collide = [&](ValueId address, ValueId enable) {
-                                    const auto same = op(OperationKind::kEq, bit, {selectedAddress, address}, range);
-                                    const auto collision = both(selectedEnable, both(enable, same, range), range);
-                                    next = op(OperationKind::kOr, bit, {next, collision}, range);
-                                };
-                                // A write with latency one commits on its initiating
-                                // edge; longer writes also occupy pending stages.
-                                collide(writer.address, both(writer.initiatingEnable, clockPulse(writer.clock, range), range));
-                                for (const auto& pending : writer.pendingWrites) collide(pending.first, pending.second);
-                            }
-                            const auto update = graph_.createTemporaryOperation(OperationKind::kRegisterWritePort);
-                            // Completed tokens remain stable until the next result.
-                            graph_.addOperand(update, stage + 1 == memory.readLatency ? readPulse : number(1, 1, range));
-                            graph_.addOperand(update, next);
-                            for (const auto clock : clocks) graph_.addOperand(update, clock);
-                            graph_.setAttr(update, "regSymbol", poisonSymbol);
-                            graph_.setAttr(update, "eventEdge", std::vector<std::string>(clocks.size(), "posedge"));
-                            setOpSemantic(update);
-                            priorPoison = poison; tokenAddress = savedAddress; tokenEnable = savedEnable;
-                        }
-                    }
                     auto address = port.address, enable = port.readEnable;
-                    if (memory.readUnderWrite == "new") {
+                    const bool delayAddress = memory.readUnderWrite != "old";
+                    const bool gateRead = memory.readUnderWrite != "undefined";
+                    if (delayAddress) {
                         address = pipeline(address, port.clock, memory.readLatency, port.source->range);
-                        enable = pipeline(enable, port.clock, memory.readLatency, port.source->range);
+                        if (gateRead) enable = pipeline(enable, port.clock, memory.readLatency, port.source->range);
                     }
                     data = op(OperationKind::kRegisterReadArrayPort, type, {address}, port.source->range);
                     graph_.setAttr(graph_.valueDef(data), "regSymbol", symbol);
-                    data = op(OperationKind::kMux, type, {enable, data, invalid(type, port.source->range)}, port.source->range);
-                    if (memory.readUnderWrite != "new") data = pipeline(data, port.clock, memory.readLatency, port.source->range);
-                    if (poison) data = op(OperationKind::kMux, type, {poison, invalid(type, port.source->range), data}, port.source->range);
+                    if (gateRead) data = op(OperationKind::kMux, type, {enable, data, invalid(type, port.source->range)}, port.source->range);
+                    if (!delayAddress) data = pipeline(data, port.clock, memory.readLatency, port.source->range);
                 } else data = invalid(type, port.source->range);
                 std::vector<std::string> fields;
                 std::string target = port.source->name;

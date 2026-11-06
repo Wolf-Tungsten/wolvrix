@@ -311,6 +311,7 @@ PassResult GrhToGrhsimPass::run()
         }
         EventInitialValue initial(*graph, states, domain);
         std::vector<OpConversion> conversions;
+        std::unordered_map<std::string, std::unordered_set<int64_t>> usedWriterOrders;
         int64_t writerOrder = 0;
         for (const auto op : operations)
         {
@@ -387,9 +388,23 @@ PassResult GrhToGrhsimPass::run()
                 throw std::invalid_argument("Latch writer requires a scalar Logic enable");
             if (isWriter(*kind))
             {
-                conversion.writerOrder = attribute<int64_t>(*graph, op, "writerOrder").value_or(writerOrder);
-                if (conversion.writerOrder < 0) throw std::invalid_argument("Negative writerOrder");
-                ++writerOrder;
+                const auto target = attribute<std::string>(*graph, op,
+                    *kind == kLatchWrite ? "latchSymbol" : "regSymbol").value();
+                auto& used = usedWriterOrders[target];
+                if (const auto explicitOrder = attribute<int64_t>(*graph, op, "writerOrder"))
+                {
+                    if (*explicitOrder < 0) throw std::invalid_argument("Negative writerOrder");
+                    if (!used.insert(*explicitOrder).second)
+                        throw std::invalid_argument("Duplicate writerOrder for state '" + target + "'");
+                    conversion.writerOrder = *explicitOrder;
+                }
+                else
+                {
+                    while (used.contains(writerOrder)) ++writerOrder;
+                    conversion.writerOrder = writerOrder;
+                    used.insert(writerOrder);
+                    ++writerOrder;
+                }
             }
             conversions.push_back(std::move(conversion));
         }

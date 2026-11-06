@@ -148,6 +148,7 @@ namespace
         graph.addOperand(op, data);
         graph.addOperand(op, clock);
         graph.setAttr(op, "regSymbol", regSym);
+        graph.assignWriterOrder(op, regSym);
         graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
     }
 
@@ -164,6 +165,7 @@ namespace
         if (masked) graph.addOperand(op, mask);
         graph.addOperand(op, clock);
         graph.setAttr(op, "regSymbol", regSym);
+        graph.assignWriterOrder(op, regSym);
         graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
         return op;
     }
@@ -178,6 +180,7 @@ namespace
         graph.addOperand(op, data);
         graph.addOperand(op, mask);
         graph.setAttr(op, "latchSymbol", latchSym);
+        graph.assignWriterOrder(op, latchSym);
         return op;
     }
 
@@ -194,6 +197,7 @@ namespace
         graph.addOperand(op, mask);
         graph.addOperand(op, clock);
         graph.setAttr(op, "regSymbol", regSym);
+        graph.assignWriterOrder(op, regSym);
         graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
         return op;
     }
@@ -379,7 +383,7 @@ namespace
             return fail("write-decoder: expected 2 write ports + 1 fill, got " +
                         std::to_string(writePorts) + "/" + std::to_string(fills));
         }
-        // declaration order = priority: port0 (innermost), port1, reset fill last
+        // Explicit priorities: port0 (innermost), port1, reset fill last.
         if (order.size() != 3 || order[0] != "write" || order[1] != "write" ||
             order[2] != "fill")
         {
@@ -472,7 +476,7 @@ namespace
     }
 
     // Small independent two-state evaluator: every write samples the same
-    // pre-event state and declaration order resolves write collisions.
+    // pre-event state and writerOrder resolves write collisions.
     using Inputs = std::map<uint32_t, uint64_t>;
     std::vector<uint64_t> evaluateWrites(grh::Graph &graph, const Inputs &inputs,
                                         const std::vector<uint64_t> &old)
@@ -525,10 +529,16 @@ namespace
             return result;
         };
         auto next = old;
-        for (auto id : graph.operations())
+        std::vector<grh::OperationId> writers;
+        for (const auto id : graph.operations())
+            if (grh::isRegisterWritePortKind(graph.opKind(id))) writers.push_back(id);
+        std::sort(writers.begin(), writers.end(), [&](const auto lhs, const auto rhs) {
+            return std::get<int64_t>(*graph.getOperation(lhs).attr("writerOrder")) <
+                std::get<int64_t>(*graph.getOperation(rhs).attr("writerOrder"));
+        });
+        for (auto id : writers)
         {
             const auto op = graph.getOperation(id);
-            if (!grh::isRegisterWritePortKind(op.kind())) continue;
             const auto args = op.operands();
             if (!eval(args[0])) continue;
             if (op.kind() == grh::OperationKind::kRegisterWriteArrayPort)
@@ -572,6 +582,7 @@ namespace
         graph.addOperand(resetOp, makeConst(graph, "zeros", 32, "32'h0"));
         graph.addOperand(resetOp, clock);
         graph.setAttr(resetOp, "regSymbol", std::string("arr"));
+        graph.assignWriterOrder(resetOp, "arr");
         graph.setAttr(resetOp, "eventEdge", std::vector<std::string>{"posedge"});
         for (int row = 0; row < 4; ++row)
         {
@@ -671,27 +682,37 @@ namespace
 
     int testIdentityOverridesEarlierWrite()
     {
-        grh::Design design;
-        auto &graph = design.createGraph("identity_priority");
-        makeRegisterArray(graph, "arr", 8, 4);
-        const auto clock = makeInput(graph, "clk", 1);
-        const auto condition = makeInput(graph, "condition", 1);
-        const auto data = makeInput(graph, "data", 8);
-        const auto index = makeConst(graph, "idx", 2, "2'd0");
-        const auto one = makeConst(graph, "one", 1, "1'b1");
-        makeArrayWrite(graph, "first", "arr", one, index, data, clock);
-        const auto hold = makeReadElem(graph, "arr", "old", index, 8);
-        const auto selected = makeMux(graph, "last_data", 8, condition,
-                                      makeConst(graph, "last_value", 8, "8'd99"), hold);
-        makeArrayWrite(graph, "last", "arr", one, index, selected, clock);
-        PassManager manager;
-        manager.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
-        PassDiagnostics diags;
-        const auto res = manager.run(design, diags);
-        if (!res.success || res.changed) return fail("priority: identity overwrite must remain");
-        Inputs inputs{{clock.index, 1}, {condition.index, 0}, {data.index, 42}};
-        if (evaluateWrites(graph, inputs, {7, 8, 9, 10})[0] != 7)
-            return fail("priority: higher-priority self assignment exposed earlier data");
+        for (const bool reversed : {false, true})
+        {
+            grh::Design design;
+            auto &graph = design.createGraph("identity_priority");
+            makeRegisterArray(graph, "arr", 8, 4);
+            const auto clock = makeInput(graph, "clk", 1);
+            const auto condition = makeInput(graph, "condition", 1);
+            const auto data = makeInput(graph, "data", 8);
+            const auto index = makeConst(graph, "idx", 2, "2'd0");
+            const auto one = makeConst(graph, "one", 1, "1'b1");
+            makeArrayWrite(graph, "first", "arr", one, index, data, clock);
+            const auto hold = makeReadElem(graph, "arr", "old", index, 8);
+            const auto selected = makeMux(graph, "last_data", 8, condition,
+                                          makeConst(graph, "last_value", 8, "8'd99"), hold);
+            makeArrayWrite(graph, "last", "arr", one, index, selected, clock);
+            if (reversed)
+            {
+                graph.setAttr(graph.findOperation("first"), "writerOrder", int64_t{1});
+                graph.setAttr(graph.findOperation("last"), "writerOrder", int64_t{0});
+            }
+            PassManager manager;
+            manager.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
+            PassDiagnostics diags;
+            const auto res = manager.run(design, diags);
+            if (!res.success || res.changed != reversed)
+                return fail("priority: writerOrder did not control identity removal");
+            Inputs inputs{{clock.index, 1}, {condition.index, 0}, {data.index, 42}};
+            const auto expected = reversed ? 42 : 7;
+            if (evaluateWrites(graph, inputs, {7, 8, 9, 10})[0] != uint64_t(expected))
+                return fail("priority: writerOrder changed the winning data");
+        }
         return 0;
     }
 
@@ -1009,6 +1030,7 @@ namespace
                 graph.addOperand(whole, makeConst(graph, "nonuniform", 32, "32'h11223344"));
                 graph.addOperand(whole, clock);
                 graph.setAttr(whole, "regSymbol", std::string("arr"));
+                graph.assignWriterOrder(whole, "arr");
                 graph.setAttr(whole, "eventEdge", std::vector<std::string>{"posedge"});
             }
             for (int row = 0; row < 4; ++row)

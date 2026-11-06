@@ -3877,6 +3877,35 @@ namespace wolvrix::lib::grh
 
     std::span<const InoutPort> Graph::inoutPorts() const { return store_->inoutPorts_; }
 
+    void Graph::assignWriterOrder(OperationId op, std::string_view symbol)
+    {
+        if (opAttrRange(op).find("writerOrder")) return;
+        if (!writerOrdersInitialized_) {
+            for (const auto existing : operations()) {
+                if (existing == op || (!isRegisterWritePortKind(opKind(existing)) &&
+                    opKind(existing) != OperationKind::kLatchWritePort)) continue;
+                const auto attrs = opAttrRange(existing);
+                const auto order = attrs.find("writerOrder");
+                if (!order) continue;
+                const auto priority = order->value().get<int64_t>();
+                if (!priority) continue;
+                for (const auto key : {"regSymbol", "latchSymbol"}) {
+                    const auto target = attrs.find(key);
+                    if (!target) continue;
+                    const auto state = target->value().get<std::string>();
+                    if (!state) continue;
+                    if (*priority == std::numeric_limits<int64_t>::max())
+                        throw std::overflow_error("writerOrder exhausted for state '" + std::string(*state) + "'");
+                    auto& next = nextWriterOrders_[std::string(*state)];
+                    next = std::max(next, *priority + 1);
+                }
+            }
+            writerOrdersInitialized_ = true;
+        }
+        auto [it, inserted] = nextWriterOrders_.try_emplace(std::string(symbol), 0);
+        setAttr(op, "writerOrder", it->second++);
+    }
+
     ValueId Graph::createValue(SymbolId symbol, int32_t width, bool isSigned, ValueType type,
                                std::span<const int64_t> shape, LogicDomain domain)
     {

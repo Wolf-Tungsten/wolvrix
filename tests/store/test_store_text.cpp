@@ -81,14 +81,17 @@ void testReadableSnapshot() {
     graph.addOperand(task, enable); graph.addOperand(task, result);
     const auto writer = graph.createOperation(grh::OperationKind::kRegisterWritePort);
     graph.setAttr(writer, "regSymbol", std::string("core$alu$accumulator"));
+    graph.assignWriterOrder(writer, "core$alu$accumulator");
     graph.setAttr(writer, "eventEdge", std::vector<std::string>{"posedge"});
     graph.addOperand(writer, enable); graph.addOperand(writer, result); graph.addOperand(writer, clock);
     const auto peerWriter = graph.createOperation(grh::OperationKind::kRegisterWritePort);
     graph.setAttr(peerWriter, "regSymbol", std::string("core$alu$peer"));
+    graph.assignWriterOrder(peerWriter, "core$alu$peer");
     graph.setAttr(peerWriter, "eventEdge", std::vector<std::string>{"posedge"});
     graph.addOperand(peerWriter, enable); graph.addOperand(peerWriter, result); graph.addOperand(peerWriter, clock);
     const auto fill = graph.createOperation(grh::OperationKind::kRegisterFillPort);
     graph.setAttr(fill, "regSymbol", std::string("core$memory$words"));
+    graph.assignWriterOrder(fill, "core$memory$words");
     graph.setAttr(fill, "eventEdge", std::vector<std::string>{"posedge"});
     graph.addOperand(fill, enable); graph.addOperand(fill, data); graph.addOperand(fill, clock);
     graph.bindOutputPort("accumulator", current);

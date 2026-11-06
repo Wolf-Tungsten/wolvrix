@@ -21271,6 +21271,7 @@ private:
             }
             graph_.setAttr(op, "eventEdge", std::move(edges));
             graph_.setAttr(op, "regSymbol", std::string(memSymbol));
+            graph_.assignWriterOrder(op, memSymbol);
         }
     }
 
@@ -26044,6 +26045,7 @@ private:
                 }
                 graph_.setAttr(op, "eventEdge", std::move(edges));
                 graph_.setAttr(op, "regSymbol", std::string(regName));
+                graph_.assignWriterOrder(op, regName);
                 continue;
             }
 
@@ -26060,6 +26062,7 @@ private:
             graph_.addOperand(op, nextValue);
             graph_.addOperand(op, maskValue);
             graph_.setAttr(op, "latchSymbol", std::string(latchName));
+            graph_.assignWriterOrder(op, latchName);
         }
     }
 

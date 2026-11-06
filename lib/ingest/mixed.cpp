@@ -864,6 +864,10 @@ std::string Transaction::ensureFirrtl(const std::string& name) {
             auto& graph = *design_.findGraph(name);
             const bool cyclesChecked = graph.localCyclesChecked();
 
+            if (const auto warnings = graph.metadata("firrtl.readUnderWriteWarnings")) {
+                for (const auto& message : std::get<std::vector<std::string>>(*warnings))
+                    result_.diagnostics.push_back({IngestSeverity::Warning, message, name, "ingest-firrtl", name, {}});
+            }
             for (const auto& position : covers)
                 result_.diagnostics.push_back({IngestSeverity::Warning, "FIRRTL cover uses a simulation hit trace; no formal coverage model is generated",
                     name, "ingest-firrtl", name, position});

@@ -1,3 +1,5 @@
+#include "core/behavior_state_group.hpp"
+#include "core/behavior_compute_group.hpp"
 #include "emit/system_verilog.hpp"
 
 #include <algorithm>
@@ -2064,6 +2066,7 @@ namespace wolvrix::lib::emit
                 case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
                 case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
                 case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+                case wolvrix::lib::grh::OperationKind::kBehaviorStateGroup:
                     return true;
                 default:
                     return false;
@@ -5365,6 +5368,31 @@ namespace wolvrix::lib::emit
                         appendIndented(stmt, 2, "end");
                     }
                     addSequentialStmt(*seqKey, stmt.str(), opId);
+                    break;
+                }
+                case wolvrix::lib::grh::OperationKind::kBehaviorStateGroup:
+                {
+                    try {
+                        wolvrix::lib::grh::validateBehaviorOwnership(*graph);
+                        const auto layout = wolvrix::lib::grh::behaviorStateLayout(*graph, op);
+                        auto memory = resolveMemorySymbol(op);
+                        auto event = buildEventKey(op, operands.size()-1);
+                        if (!memory || !event) { reportError("invalid behavior memory/event", opContext); break; }
+                        std::ostringstream stmt;
+                        appendIndented(stmt,2,"if ("+valueExprSeq(operands[0])+") begin");
+                        appendIndented(stmt,3,"if ("+valueExprSeq(operands[1])+") begin");
+                        for (size_t row=0;row<layout.initial.size();++row)
+                            appendIndented(stmt,4,*memory+"["+std::to_string(row)+"] <= "+std::to_string(layout.width)+"'d"+layout.initial[row]+";");
+                        appendIndented(stmt,3,"end else begin");
+                        for (size_t i=0;i<layout.updateArrays.size();++i) {
+                            auto a=layout.updateArrays[i];
+                            appendIndented(stmt,4,"if ("+valueExprSeq(operands[2+3*i])+") "+*memory+
+                                "["+std::to_string(layout.offsets[a])+" + ("+valueExprSeq(operands[3+3*i])+" & "+
+                                std::to_string(layout.rows[a]-1)+")] <= "+valueExprSeq(operands[4+3*i])+";");
+                        }
+                        appendIndented(stmt,3,"end"); appendIndented(stmt,2,"end");
+                        addSequentialStmt(*event,stmt.str(),opId);
+                    } catch(const std::exception& e) {reportError(e.what(),opContext);}
                     break;
                 }
                 case wolvrix::lib::grh::OperationKind::kMemoryFillPort:

@@ -141,6 +141,7 @@ namespace wolvrix::lib::transform
             case OperationKind::kLatchWritePort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
+            case OperationKind::kBehaviorStateGroup:
                 return true;
             default:
                 return false;
@@ -193,6 +194,7 @@ namespace wolvrix::lib::transform
             case OperationKind::kMemoryReadPort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
+            case OperationKind::kBehaviorStateGroup:
                 return &memInfos;
             default:
                 return nullptr;
@@ -220,6 +222,7 @@ namespace wolvrix::lib::transform
             case OperationKind::kMemoryReadPort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
+            case OperationKind::kBehaviorStateGroup:
                 return getAttrString(op, "memSymbol");
             default:
                 return std::nullopt;
@@ -479,7 +482,8 @@ namespace wolvrix::lib::transform
                 case OperationKind::kRegisterWritePort:
                 case OperationKind::kLatchWritePort:
                 case OperationKind::kMemoryWritePort:
-                case OperationKind::kMemoryFillPort: {
+                case OperationKind::kMemoryFillPort:
+                case OperationKind::kBehaviorStateGroup: {
                     auto sym = getStorageSymbol(op);
                     auto *map = storageMapForKind(info.kind, regInfos, latchInfos, memInfos);
                     if (sym && map)

@@ -84,7 +84,9 @@ enum class OperationKind {
     kCountTrailingZeros,
     kCountOnes,
     kGrayDecode,
-    kDecodeTable
+    kDecodeTable,
+    kBehaviorStateGroup,
+    kBehaviorComputeGroup
 };
 
 std::string_view toString(OperationKind kind) noexcept;

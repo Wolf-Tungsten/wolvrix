@@ -8265,8 +8265,24 @@ private:
                 }
                 return shifted;
             }
-            ExprNodeId lhs = lowerExpression(binary->left());
-            ExprNodeId rhs = lowerExpression(binary->right());
+            // A comparison/logical result does not size its operands. In
+            // particular a one-bit declaration initializer must not truncate
+            // a shift or arithmetic operand before comparing it.
+            using Op = wolvrix::lib::grh::OperationKind;
+            const bool selfDeterminedOperands =
+                *opKind == Op::kEq || *opKind == Op::kNe ||
+                *opKind == Op::kCaseEq || *opKind == Op::kCaseNe ||
+                *opKind == Op::kWildcardEq || *opKind == Op::kWildcardNe ||
+                *opKind == Op::kLt || *opKind == Op::kLe ||
+                *opKind == Op::kGt || *opKind == Op::kGe ||
+                *opKind == Op::kLogicAnd || *opKind == Op::kLogicOr;
+            ExprNodeId lhs = kInvalidPlanIndex;
+            ExprNodeId rhs = kInvalidPlanIndex;
+            {
+                WidthContextScope widthScope(*this, selfDeterminedOperands ? 0 : widthContext);
+                lhs = lowerExpression(binary->left());
+                rhs = lowerExpression(binary->right());
+            }
             if (lhs == kInvalidPlanIndex || rhs == kInvalidPlanIndex)
             {
                 return kInvalidPlanIndex;
@@ -8302,13 +8318,13 @@ private:
                 {
                     if (*opKind == wolvrix::lib::grh::OperationKind::kMul)
                     {
-                        const int64_t combined =
-                            static_cast<int64_t>(lhsWidth) + static_cast<int64_t>(rhsWidth);
-                        const int64_t maxValue =
-                            static_cast<int64_t>(std::numeric_limits<int32_t>::max());
-                        targetWidth = combined > maxValue
-                                          ? std::numeric_limits<int32_t>::max()
-                                          : static_cast<int32_t>(combined);
+                        // SV multiplication has the resolved expression width,
+                        // not the sum of operand widths. In a concatenation it
+                        // is self-determined; firtool already widens operands
+                        // when the full Chisel product is required.
+                        applyExprWidthHint(node);
+                        targetWidth = node.widthHint > 0 ? node.widthHint
+                                                        : std::max(lhsWidth, rhsWidth);
                     }
                     else
                     {

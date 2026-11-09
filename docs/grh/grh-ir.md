@@ -1259,6 +1259,100 @@ end
 
 若两个地址相同，后执行的 high port 覆盖 low port；若地址不同，两次写入都保留。
 
+### kBehaviorStateGroup（实验性，版本 1）
+
+单时钟、同步复位、observer-only 的有序数组更新组。它是 commit sink，
+不是组合操作，也不调用有状态 DPI。默认 RTL 导入不产生此节点。
+
+**operands**（N 次更新，总计 `3 + 3*N`）：
+
+- `oper[0]`：1-bit 整组使能；当前 Chisel importer 绑定常量 1。
+- `oper[1]`：1-bit 同步复位；仅在使能且时钟上升沿生效，优先于所有更新。
+- 第 i 次更新：`oper[2+3*i]` 为 1-bit valid，`oper[3+3*i]` 为局部数组索引，
+  `oper[4+3*i]` 为完整元素数据。
+- 最后一个 operand：1-bit 时钟，`eventEdge = ["posedge"]`。
+
+**results**：无。当前状态通过指向同一 backing storage 的普通 `kMemoryReadPort` 读取，
+不能把该组的提交结果当作同拍 next-state 输入。读索引与读结果的依赖仍显式存在于 GRH。
+
+**attrs**：
+
+- `memSymbol`：本组独占的 `kMemory`。该 memory 仅复用物理存储和 reader activation，
+  不允许有额外 `kMemoryWritePort/kMemoryFillPort` 或第二个组写入。
+- `behavior.version`：整数 1；`behavior.observerOnly`：布尔 true。
+- `behavior.names`、`behavior.rows`、`behavior.widths`：按数组顺序的名称、行数、元素位宽。
+  名称唯一，行数为 2 的幂，元素为 1–64 位 UInt，总行数不超过 65,536。
+- `behavior.initial`：按数组和行顺序展开的无符号十进制初始化字符串。
+- `behavior.updateArrays`：每次更新所属数组的序号；序列顺序就是写入优先级，越后优先级越高。
+
+backing memory 的 row 是各数组行数之和，width 是最大元素位宽。数组偏移为前面数组行数之和。
+索引宽度必须为 `max(1, ceil(log2(rows)))`；一行数组也有 1-bit 端口，地址按 `rows-1` 取掩码。
+数据宽度必须与目标数组一致；较窄数组读取时截断 backing word。
+
+例如两个 32 行数组 arch（64 位）和 rat（9 位），有序执行两次更新：
+
+```text
+memory: width=64, row=64
+operands: [1'b1, reset, valid0, index0, data64, valid1, index1, data9, clock]
+attrs:
+  memSymbol: "model_storage"
+  behavior.version: 1
+  behavior.observerOnly: true
+  behavior.names: ["arch", "rat"]
+  behavior.rows: [32, 32]
+  behavior.widths: [64, 9]
+  behavior.initial: [64 个初始化字符串，arch 在前、rat 在后]
+  behavior.updateArrays: [0, 1]
+  eventEdge: ["posedge"]
+read arch[i]: kMemoryReadPort(model_storage, i)
+read rat[i]:  kSliceStatic(kMemoryReadPort(model_storage, 32+i), 8, 0)
+```
+
+边沿前计算所有更新条件、索引和数据，随后有序写入。同一行先写新值再写回旧值时，
+最终状态不变，不重新激活其 reader。重复 eval 或高电平期间更改输入不产生第二次提交。
+GrhSIM 用未初始化的 pending/touched 数组与小位图暂存有效更新，只比较被触碰行的最终值；
+没有每周期复制整组旧状态。当前实现仍逐条检查 valid，不把最大更新数当作实际更新数。
+
+SystemVerilog emitter 将此节点展开为带同步复位的 `always @(posedge clock)` 和有序非阻塞赋值。
+普通 fallback 可重新导入为标准 GRH。分组模式的 ownership 检查允许组内/组间观察依赖及
+顶层检查输出。完整 DiffTest 可在 v2 manifest 中显式声明 `observer_domains`，用实际模块名、
+端口方向与位宽绑定 debug 模块；导入器为该域建立模块专用副本，并在状态声明、分组节点和
+checker sink 上附加字符串属性 `behavior.observerDomain`。共享但未绑定的功能实例不继承此属性。
+
+组的读取结果可以写入已绑定域的普通 register/memory，随后检查会继续遍历该存储的所有
+reader 和消费者；域内无返回值的 DPI/SystemTask 可以作为检查终点。未标记的状态写入、
+有返回值的 DPI、XMR write，以及经过 debug 状态再反馈功能状态的路径均被拒绝。
+reg-to-mem 合并要求所有源寄存器的域属性一致，并将该属性转移到新 memory。
+这些标记仅约束 observer 数据流，不改变普通状态的边沿提交和 DPI 调用时序。
+
+### kBehaviorComputeGroup（实验性，版本 1）
+
+无状态行为模型的纯组合计算组。它没有 clock、reset、register、memory 或副作用；流水
+寄存器、valid/fire、flush 和握手仍由外围普通 GRH 表示。默认 lowering 是 ordinary，只有
+通过带版本的 Chisel carrier 和 manifest 绑定后，Wolvrix 才生成该节点。
+
+**operands/results**：operands 按 manifest 的稳定输入端口顺序排列，results 按稳定输出端口
+顺序排列；每个值必须是已知正宽度的 Logic。当前四个模型各使用一个 packed 输入和一个输出：
+`int-mul` 为 133→64，`vec-int-mul` 为 238→72，`fp-mul`/`vec-fp-mul` 为 108→107。
+
+**attrs**：
+
+- `behavior.version`: 整数 1；`behavior.model`: `int-mul`、`vec-int-mul`、`fp-mul` 或 `vec-fp-mul`。
+- `behavior.observerOnly=false`、`behavior.stateful=false`。
+- `behavior.inputWidths`、`behavior.outputWidths`: 与 operand/result 的宽度和顺序逐项相同。
+- `behavior.bindingHash`: carrier 模块、端口方向/位宽和模型 ID 的 SHA-256 绑定摘要。
+
+`pipelineLatency` 和 `pipelineEnable` 只存在于模型 manifest，描述外围流水契约，不由该节点
+保存状态。导入器先验证 carrier 版本、模块名、端口、位宽和语义摘要，再把 carrier 图替换成
+`kBehaviorComputeGroup`；任何绑定缺失或不匹配都报错，不能静默生成空黑盒。节点保持完整输入
+到输出依赖，供 DCE、activity scheduler 和变化检测使用。
+
+GrhSIM 对已验证的模型分派精确 C++ helper：标量整数使用有符号高/低半和 MULW 截断，向量
+整数按 SEW lane 隔离并保留加宽、MAC、vxrm/vxsat，高层浮点模型使用整数有效数乘积，不提前
+舍入。carrier 本身仍有合法 SystemVerilog 算术实现，普通 `--behavior-compute-lowering ordinary`
+路径也保留完整硬件/行为 fallback。该节点不能表达延迟、状态或隐式 DPI；需要这些语义时应使用
+普通寄存器/存储器或 `kBehaviorStateGroup`。
+
 ## 6.6 层次结构
 
 用于建模模块实例化和跨层次引用。

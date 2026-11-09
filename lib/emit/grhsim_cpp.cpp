@@ -1,3 +1,5 @@
+#include "core/behavior_state_group.hpp"
+#include "core/behavior_compute_group.hpp"
 #include "core/decode_table.hpp"
 #include "emit/grhsim_cpp.hpp"
 #include "grhsim_compiler_compat.hpp"
@@ -3916,6 +3918,9 @@ namespace wolvrix::lib::emit
             case OperationKind::kMemoryWritePort:
                 eventStart = 4;
                 break;
+            case OperationKind::kBehaviorStateGroup:
+                eventStart = operands.size() - 1;
+                break;
             case OperationKind::kMemoryFillPort:
                 eventStart = 2;
                 break;
@@ -4024,6 +4029,7 @@ namespace wolvrix::lib::emit
             case OperationKind::kLatchWritePort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
+            case OperationKind::kBehaviorStateGroup:
                 return true;
             default:
                 return false;
@@ -4599,6 +4605,20 @@ namespace wolvrix::lib::emit
             std::size_t waveformPrevStringIndex = 0;
         };
 
+        // Runtime-only description of a pure behavior carrier.  This is
+        // emitted only when the explicit runtime profile is requested; the
+        // ordinary simulator carries no counters or metadata for it.
+        struct BehaviorComputeProfileDecl
+        {
+            OperationId opId{};
+            ValueId result{};
+            std::string model;
+            std::string symbol;
+            std::size_t inputWords = 0;
+            std::size_t outputWords = 0;
+            int32_t resultWidth = 0;
+        };
+
         // A word is eligible for producer-side dirty tracking only when its
         // complete dependency tree is rooted in persistent scalar state (and
         // constants/pure aliases).  The bit is assigned per emitted model,
@@ -4664,6 +4684,11 @@ namespace wolvrix::lib::emit
             std::unordered_map<std::string, std::size_t> memoryRowReaderActivationBySymbol;
             std::vector<MemoryRowReaderActivationDecl> memoryRowReaderActivations;
             std::unordered_map<OperationId, WriteDecl, OperationIdHash> writeByOp;
+            std::vector<BehaviorComputeProfileDecl> behaviorComputeProfiles;
+            std::unordered_map<OperationId, std::size_t, OperationIdHash>
+                behaviorComputeProfileIndexByOp;
+            std::unordered_map<ValueId, std::size_t, ValueIdHash>
+                behaviorComputeProfileIndexByResult;
             std::unordered_map<std::string, StateShadowDecl> stateShadowBySymbol;
             std::unordered_map<OperationId, EventSampleDecl, OperationIdHash> eventSamplesByOp;
             std::unordered_map<ValueId, std::string, ValueIdHash> eventEdgeFieldByValue;
@@ -5193,6 +5218,7 @@ namespace wolvrix::lib::emit
             case OperationKind::kLatchWritePort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
+            case OperationKind::kBehaviorStateGroup:
                 return RuntimeProfileOpClass::Sink;
             case OperationKind::kRegister:
             case OperationKind::kMemory:
@@ -7697,6 +7723,7 @@ namespace wolvrix::lib::emit
             case OperationKind::kMemoryReadPort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
+            case OperationKind::kBehaviorStateGroup:
                 emitTargetAttr("mem", "memSymbol");
                 break;
             default:
@@ -7716,6 +7743,7 @@ namespace wolvrix::lib::emit
             case OperationKind::kLatchWritePort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
+            case OperationKind::kBehaviorStateGroup:
             case OperationKind::kDpicCall:
             case OperationKind::kSystemTask:
                 return true;
@@ -8994,6 +9022,7 @@ namespace wolvrix::lib::emit
             case OperationKind::kCountOnes:
             case OperationKind::kDecodeTable:
             case OperationKind::kGrayDecode:
+            case OperationKind::kBehaviorComputeGroup:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceXor:
             case OperationKind::kReduceNor:
@@ -12875,6 +12904,9 @@ namespace wolvrix::lib::emit
             model.directInvertedBoolStateValues.clear();
             model.memoryRowReaderActivationBySymbol.clear();
             model.memoryRowReaderActivations.clear();
+            model.behaviorComputeProfiles.clear();
+            model.behaviorComputeProfileIndexByOp.clear();
+            model.behaviorComputeProfileIndexByResult.clear();
             model.stateLogicScalarSlotCounts = {};
             model.stateLogicWideSlotCountsByWords.clear();
             model.packedArrayLaneViewByValue.clear();
@@ -13290,6 +13322,36 @@ namespace wolvrix::lib::emit
                         error="invalid kDecodeTable: "+std::string(e.what());return false;
                     }
                 }
+                if (op.kind() == OperationKind::kBehaviorComputeGroup) {
+                    try {
+                        (void)grh::behaviorComputeContract(graph, op);
+                        // Keep a stable emit-time row for each carrier.  The
+                        // row is only materialized in profile builds; normal
+                        // models carry no counter or metadata for it.
+                        if (op.results().size() == 1u) {
+                            BehaviorComputeProfileDecl profile;
+                            profile.opId = opId;
+                            profile.result = op.results().front();
+                            profile.model = getAttribute<std::string>(op, "behavior.model").value_or(std::string());
+                            profile.symbol = std::string(op.symbolText());
+                            profile.resultWidth = graph.valueWidth(profile.result);
+                            const auto contract = grh::behaviorComputeContract(graph, op);
+                            for (const int64_t width : contract.inputWidths) {
+                                if (width > 0) {
+                                    profile.inputWords += logicWordCount(static_cast<int32_t>(width));
+                                }
+                            }
+                            profile.outputWords = logicWordCount(graph.valueWidth(profile.result));
+                            const std::size_t index = model.behaviorComputeProfiles.size();
+                            model.behaviorComputeProfiles.push_back(std::move(profile));
+                            model.behaviorComputeProfileIndexByOp.emplace(opId, index);
+                            model.behaviorComputeProfileIndexByResult.emplace(op.results().front(), index);
+                        }
+                    } catch (const std::exception &e) {
+                        error = "invalid kBehaviorComputeGroup: " + std::string(e.what());
+                        return false;
+                    }
+                }
                 if (op.kind() == OperationKind::kCountTrailingZeros ||
                     op.kind() == OperationKind::kCountOnes ||
                     op.kind() == OperationKind::kGrayDecode)
@@ -13347,7 +13409,8 @@ namespace wolvrix::lib::emit
                 if (op.kind() == OperationKind::kRegisterWritePort ||
                     op.kind() == OperationKind::kLatchWritePort ||
                     op.kind() == OperationKind::kMemoryWritePort ||
-                    op.kind() == OperationKind::kMemoryFillPort)
+                    op.kind() == OperationKind::kMemoryFillPort ||
+                    op.kind() == OperationKind::kBehaviorStateGroup)
                 {
                     WriteDecl write;
                     write.opId = opId;
@@ -13390,7 +13453,15 @@ namespace wolvrix::lib::emit
                                     " target is not a memory: " + write.symbol;
                             return false;
                         }
-                        if (write.isMemoryFill)
+                        if (op.kind() == OperationKind::kBehaviorStateGroup)
+                        {
+                            try {
+                                const auto layout = grh::behaviorStateLayout(graph, op);
+                                if (layout.width != state.width || layout.totalRows != state.rowCount)
+                                    throw std::runtime_error("behavior backing storage shape mismatch");
+                            } catch (const std::exception& e) { error=e.what(); return false; }
+                        }
+                        else if (write.isMemoryFill)
                         {
                             if (!validateMemoryFillPort(graph, op, state, error))
                             {
@@ -13401,7 +13472,7 @@ namespace wolvrix::lib::emit
                         {
                             return false;
                         }
-                        if (!write.isMemoryFill)
+                        if (!write.isMemoryFill && op.kind() != OperationKind::kBehaviorStateGroup)
                         {
                             const auto operands = op.operands();
                             const ValueId addrValue = operands[1];
@@ -13462,6 +13533,14 @@ namespace wolvrix::lib::emit
                 }
             }
 
+            for (const auto& write : model.writes) {
+                if (graph.opKind(write.opId) == OperationKind::kBehaviorStateGroup &&
+                    model.stateWriteCountBySymbol.at(write.symbol) != 1) {
+                    error = "behavior group backing memory has another writer: " + write.symbol;
+                    return false;
+                }
+            }
+
             auto registerEventSamples = [&](OperationId opId, const Operation &op) {
                 EventOperandInfo info = collectEventOperands(op);
                 if (info.values.empty())
@@ -13505,6 +13584,7 @@ namespace wolvrix::lib::emit
                 case OperationKind::kLatchWritePort:
                 case OperationKind::kMemoryWritePort:
                 case OperationKind::kMemoryFillPort:
+                case OperationKind::kBehaviorStateGroup:
                 case OperationKind::kSystemTask:
                 case OperationKind::kDpicCall:
                     registerEventSamples(opId, op);
@@ -17211,6 +17291,7 @@ template<class Index>
             case OperationKind::kCountOnes:
             case OperationKind::kDecodeTable:
             case OperationKind::kGrayDecode:
+            case OperationKind::kBehaviorComputeGroup:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceNor:
             case OperationKind::kReduceXor:
@@ -17787,6 +17868,9 @@ template<class Index>
             const int32_t resultWidth = graph.valueWidth(resultValue);
             const bool materialized = isMaterializedValue(model, resultValue);
             const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue, activationContext);
+            const auto behaviorProfileIt = model.emitRuntimeProfile
+                ? model.behaviorComputeProfileIndexByResult.find(resultValue)
+                : model.behaviorComputeProfileIndexByResult.end();
             if (!materialized)
             {
                 emitValueAssignmentComment(stream, graph, model, resultValue, "        ");
@@ -17826,6 +17910,11 @@ template<class Index>
                         // original direct fanout, without adding deferred groups.
                         stream << "            const bool grhsim_wide_changed = "
                                << assignWordsInlineExpr(lhs, "next_words", resultWidth) << ";\n";
+                        if (behaviorProfileIt != model.behaviorComputeProfileIndexByResult.end())
+                        {
+                            stream << "            if (runtime_profile_enabled_ && grhsim_wide_changed) { ++behavior_compute_output_changed_["
+                                   << behaviorProfileIt->second << "u]; }\n";
+                        }
                         emitConditionalActivationStatements(stream,
                                                             "supernode_active_curr_",
                                                             "active_count_",
@@ -17840,12 +17929,22 @@ template<class Index>
                     else
                     {
                         stream << "            if (" << assignWordsInlineExpr(lhs, "next_words", resultWidth) << ") {\n";
+                        if (behaviorProfileIt != model.behaviorComputeProfileIndexByResult.end())
+                        {
+                            stream << "                if (runtime_profile_enabled_) { ++behavior_compute_output_changed_["
+                                   << behaviorProfileIt->second << "u]; }\n";
+                        }
                         emitChangedValuePropagation(stream, model, resultValue, "                ", activationContext);
                         stream << "            }\n";
                     }
                 }
                 else
                 {
+                    if (behaviorProfileIt != model.behaviorComputeProfileIndexByResult.end())
+                    {
+                        stream << "            if (runtime_profile_enabled_ && (" << lhs << " != next_words)) { ++behavior_compute_output_changed_["
+                               << behaviorProfileIt->second << "u]; }\n";
+                    }
                     stream << "            " << lhs << " = next_words;\n";
                 }
             }
@@ -17853,6 +17952,11 @@ template<class Index>
             {
                 stream << "            const auto next_value = static_cast<" << cppTypeForValue(graph, resultValue)
                        << ">(grhsim_trunc_u64(next_words[0], " << resultWidth << "));\n";
+                if (behaviorProfileIt != model.behaviorComputeProfileIndexByResult.end())
+                {
+                    stream << "            if (runtime_profile_enabled_ && (" << lhs << " != next_value)) { ++behavior_compute_output_changed_["
+                           << behaviorProfileIt->second << "u]; }\n";
+                }
                 if (needChangeDetect)
                 {
                     emitScalarChangedValueAssign(
@@ -17971,9 +18075,17 @@ template<class Index>
 
             const bool needChangeDetect =
                 !suppressChangePropagation && valueNeedsTrackedChange(model, resultValue, activationContext);
+            const auto behaviorProfileIt = model.emitRuntimeProfile
+                ? model.behaviorComputeProfileIndexByResult.find(resultValue)
+                : model.behaviorComputeProfileIndexByResult.end();
             emitValueAssignmentComment(stream, graph, model, resultValue, "        ");
             stream << "        {\n";
             stream << "            const " << cppType << " next_value = " << initializerExpr << ";\n";
+            if (behaviorProfileIt != model.behaviorComputeProfileIndexByResult.end())
+            {
+                stream << "            if (runtime_profile_enabled_ && (" << lhs << " != next_value)) { ++behavior_compute_output_changed_["
+                       << behaviorProfileIt->second << "u]; }\n";
+            }
             if (needChangeDetect)
             {
                 emitScalarChangedValueAssign(
@@ -20140,6 +20252,41 @@ template<class Index>
             {
                 operandExprs.push_back(resolvedScheduleValueExpr(model, operand, context));
             }
+            if (model.emitRuntimeProfile && op.kind() == OperationKind::kBehaviorComputeGroup)
+            {
+                if (const auto profileIt = model.behaviorComputeProfileIndexByOp.find(op.id());
+                    profileIt != model.behaviorComputeProfileIndexByOp.end())
+                {
+                    const std::size_t profileIndex = profileIt->second;
+                    std::string inputActivityExpr = "true";
+                    std::vector<std::string> edgeTerms;
+                    for (const ValueId operand : operands)
+                    {
+                        if (const auto edgeIt = model.eventEdgeFieldByValue.find(operand);
+                            edgeIt != model.eventEdgeFieldByValue.end())
+                        {
+                            edgeTerms.push_back("(" + edgeIt->second + " != grhsim_event_edge_kind::none)");
+                        }
+                    }
+                    if (!edgeTerms.empty())
+                    {
+                        inputActivityExpr = edgeTerms.front();
+                        for (std::size_t edgeIndex = 1; edgeIndex < edgeTerms.size(); ++edgeIndex)
+                        {
+                            inputActivityExpr += " || " + edgeTerms[edgeIndex];
+                        }
+                    }
+                    const auto &profile = model.behaviorComputeProfiles[profileIndex];
+                    stream << "        if (runtime_profile_enabled_) {\n";
+                    stream << "            ++behavior_compute_calls_[" << profileIndex << "u];\n";
+                    stream << "            if (" << inputActivityExpr << ") {\n";
+                    stream << "                ++behavior_compute_input_active_[" << profileIndex << "u];\n";
+                    stream << "            }\n";
+                    stream << "            behavior_compute_word_iterations_[" << profileIndex << "u] += UINT64_C("
+                           << profile.inputWords << ");\n";
+                    stream << "        }\n";
+                }
+            }
             const auto expr = eventWordLogicExprForOp(graph, model, op, resultValue, operandExprs);
             if (!expr)
             {
@@ -20361,6 +20508,24 @@ template<class Index>
             case OperationKind::kGrayDecode:
                 return "grhsim_gray_decode_words(" + operandExprs[0] + ", " +
                        std::to_string(graph.valueWidth(operands[0])) + ")";
+            case OperationKind::kBehaviorComputeGroup:
+            {
+                const auto model = getAttribute<std::string>(op, "behavior.model").value_or(std::string());
+                const char *helper = model == "int-mul" ? "grhsim_behavior_int_mul_words" :
+                                     model == "fp-mul" ? "grhsim_behavior_fp_mul_words" :
+                                     model == "vec-int-mul" ? "grhsim_behavior_vec_int_mul_words" :
+                                     model == "vec-fp-mul" ? "grhsim_behavior_vec_fp_mul_words" :
+                                     model == "int-alu" ? "grhsim_behavior_int_alu_words" :
+                                     model == "int-bku" ? "grhsim_behavior_int_bku_words" :
+                                     (model == "vec-int-alu-lane" || model == "vec-int-alu-whole") ? "grhsim_behavior_vec_int_alu_words" :
+                                     (model == "vec-int-pu-lane" || model == "vec-int-pu-whole") ? "grhsim_behavior_vec_int_pu_words" :
+                                     (model == "vec-int-mac-lane" || model == "vec-int-mac-whole") ? "grhsim_behavior_vec_int_mul_words" : nullptr;
+                if (helper == nullptr) return std::nullopt;
+                return eventLogicExprFromWordsExpr(
+                    graph, resultValue,
+                    std::string(helper) + "<" + std::to_string(logicWordCount(resultWidth)) + ">(" +
+                        operandExprs[0] + ", " + std::to_string(graph.valueWidth(operands[0])) + ")");
+            }
             case OperationKind::kReduceOr:
                 return logicBoolExpr(unaryWordsBoolExpr(operandWords(0, graph.valueWidth(operands[0])),
                                                         graph.valueWidth(operands[0]),
@@ -20587,6 +20752,7 @@ template<class Index>
             case OperationKind::kCountOnes:
                 case OperationKind::kDecodeTable:
             case OperationKind::kGrayDecode:
+            case OperationKind::kBehaviorComputeGroup:
                 case OperationKind::kReduceOr:
                 case OperationKind::kReduceNor:
                 case OperationKind::kReduceXor:
@@ -21154,6 +21320,7 @@ template<class Index>
             case OperationKind::kCountOnes:
                     case OperationKind::kDecodeTable:
             case OperationKind::kGrayDecode:
+            case OperationKind::kBehaviorComputeGroup:
                     case OperationKind::kReduceOr:
                     case OperationKind::kReduceNor:
                     case OperationKind::kReduceXor:
@@ -21569,6 +21736,10 @@ template<class Index>
             case OperationKind::kGrayDecode:
                 return ScalarLogicExpr{"grhsim_gray_decode_u64(" + operands[0] + ", " +
                     std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
+            case OperationKind::kBehaviorComputeGroup:
+                // Compute carriers use packed inputs wider than one scalar word;
+                // they are emitted through the word helper path below.
+                return ScalarLogicExpr{"UINT64_C(0)", true};
             case OperationKind::kReduceOr:
                 return ScalarLogicExpr{"grhsim_reduce_or_u64(" + operands[0] + ", " + std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
             case OperationKind::kReduceNor:
@@ -22017,6 +22188,7 @@ template<class Index>
             case OperationKind::kLatchWritePort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
+            case OperationKind::kBehaviorStateGroup:
                 return true;
             default:
                 return false;
@@ -22584,6 +22756,7 @@ template<class Index>
             case OperationKind::kCountOnes:
             case OperationKind::kDecodeTable:
             case OperationKind::kGrayDecode:
+            case OperationKind::kBehaviorComputeGroup:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceXor:
             case OperationKind::kReduceNor:
@@ -24387,6 +24560,46 @@ template<class Index>
                 }
                 return condition;
             };
+            if (op.kind() == OperationKind::kBehaviorStateGroup) {
+                const auto layout = grh::behaviorStateLayout(graph, op);
+                const auto stateRef = resolvedStateRefExpr(state, context);
+                stream << indent << "{\n";
+                stream << innerIndent << "std::array<" << logicCppType(state.width) << ", " << state.rowCount << "> pending;\n";
+                stream << innerIndent << "std::array<std::uint32_t, " << state.rowCount << "> touched;\n";
+                stream << innerIndent << "std::array<std::uint64_t, " << (state.rowCount+63)/64 << "> seen{};\n";
+                stream << innerIndent << "std::size_t count = 0;\n";
+                stream << innerIndent << "auto put = [&](std::size_t row, std::uint64_t value) {\n";
+                stream << innerIndent << "    auto mask = UINT64_C(1) << (row % 64);\n";
+                stream << innerIndent << "    if (!(seen[row/64] & mask)) { seen[row/64] |= mask; touched[count++] = row; }\n";
+                stream << innerIndent << "    pending[row] = static_cast<" << logicCppType(state.width) << ">(value);\n";
+                stream << innerIndent << "};\n";
+                emitPerfCounterIncrement(stream, model, innerIndent, "behaviorGroupCommits");
+                stream << innerIndent << "if (" << resolvedScheduleValueExpr(model, operands[1], context) << ") {\n";
+                stream << innerIndent << "    static constexpr std::uint64_t initial[] = {";
+                for (const auto& value:layout.initial) stream << "UINT64_C(" << value << "),";
+                stream << "};\n";
+                stream << innerIndent << "    for (std::size_t row=0; row<" << state.rowCount << "; ++row) put(row,initial[row]);\n";
+                stream << innerIndent << "} else {\n";
+                for (size_t i=0;i<layout.updateArrays.size();++i) {
+                    auto a=layout.updateArrays[i];
+                    stream << innerIndent << "    if (" << resolvedScheduleValueExpr(model, operands[2+3*i], context) << ") {\n";
+                    stream << innerIndent << "        put(" << layout.offsets[a] << "u + (static_cast<std::size_t>("
+                        << resolvedScheduleValueExpr(model, operands[3+3*i], context) << ") & " << layout.rows[a]-1
+                        << "u), static_cast<std::uint64_t>(" << resolvedScheduleValueExpr(model, operands[4+3*i], context) << "));\n";
+                    emitPerfCounterIncrement(stream, model, innerIndent+"        ", "behaviorEnabledUpdates");
+                    stream << innerIndent << "    }\n";
+                }
+                stream << innerIndent << "}\n";
+                stream << innerIndent << "for (std::size_t i=0; i<count; ++i) {\n";
+                stream << innerIndent << "    const auto row = touched[i];\n";
+                emitPerfCounterIncrement(stream, model, innerIndent+"    ", "behaviorTouchedRows");
+                stream << innerIndent << "    if (" << stateRef << "[row] != pending[row]) {\n";
+                stream << innerIndent << "        " << stateRef << "[row] = pending[row];\n";
+                emitPerfCounterIncrement(stream, model, innerIndent+"        ", "touchedWriteCount");
+                emitReaderActivations(innerIndent+"        ", "row");
+                stream << innerIndent << "    }\n" << innerIndent << "}\n" << indent << "}\n";
+                return std::nullopt;
+            }
             stream << indent << "{\n";
             if (write.kind == StateDecl::Kind::Memory)
             {
@@ -26692,6 +26905,7 @@ template<class Index>
                         {
                             break;
                         }
+                        emitPerfCounterIncrement(stream, model, "            ", "scheduledMemoryReads");
                         auto memSymbol = getAttribute<std::string>(op, "memSymbol");
                         if (!memSymbol)
                         {
@@ -26877,6 +27091,7 @@ template<class Index>
             case OperationKind::kCountOnes:
                     case OperationKind::kDecodeTable:
             case OperationKind::kGrayDecode:
+            case OperationKind::kBehaviorComputeGroup:
                     case OperationKind::kReduceOr:
                     case OperationKind::kReduceNor:
                     case OperationKind::kReduceXor:
@@ -27980,6 +28195,11 @@ template<class Index>
                 const auto &write = model.writeByOp.at(op.id());
                 const auto &state = model.stateBySymbol.at(write.symbol);
                 const auto operands = op.operands();
+                if (op.kind() == OperationKind::kBehaviorStateGroup) {
+                    enabled["behavior_group_updates_upper"] += (operands.size()-3)/3;
+                    body.unmodeledWork = "behavior group: use diagnostic counters for enabled/touched rows";
+                    continue;
+                }
                 const bool memory = write.kind == StateDecl::Kind::Memory;
                 const bool wide = isWideLogicWidth(state.width);
                 const uint64_t words = logicWordCount(state.width);
@@ -28449,6 +28669,9 @@ template<class Index>
                                 case OperationKind::kGrayDecode:
                                     addShape("wide.helper.gray_decode_word_iterations", operandWords);
                                     break;
+                                case OperationKind::kBehaviorComputeGroup:
+                                    addShape("wide.helper.behavior_compute_word_iterations", operandWords);
+                                    break;
                                 case OperationKind::kReduceAnd:
                                 case OperationKind::kReduceNand:
                                 case OperationKind::kReduceOr:
@@ -28814,7 +29037,7 @@ template<class Index>
                     entry.enable = op.operands()[0];
                     entry.enableProof = nonzero(entry.enable);
                     entry.dataWidth = static_cast<uint32_t>(model.stateBySymbol.at(write.symbol).width);
-                    if (write.isMemoryFill)
+                    if (write.isMemoryFill || op.kind() == OperationKind::kBehaviorStateGroup)
                     {
                         entry.maskNonzeroProof = GrhSimExecutionPlan::Predicate::True;
                     }
@@ -28888,6 +29111,9 @@ template<class Index>
         }
 
         const auto &graph = *topGraphs.front();
+        try { grh::validateBehaviorOwnership(graph); }
+        catch (const std::exception& e) { reportError(e.what()); result.success=false; return result; }
+
         const std::string sessionPrefix = resolveSessionPathPrefix(graph, options) + ".activity_schedule.";
         const auto *supernodeToOps =
             getSessionValue<ActivityScheduleSupernodeToOps>(options, sessionPrefix + "supernode_to_ops");
@@ -32675,6 +32901,547 @@ inline std::array<std::uint64_t, N> grhsim_mul_words(const std::array<std::uint6
     return out;
 }
 
+template <typename Words>
+inline std::uint64_t grhsim_behavior_get_bits(const Words &value, std::size_t start, std::size_t width)
+{
+    if (width == 0) return UINT64_C(0);
+    const std::size_t word = start / 64u;
+    const std::size_t shift = start & 63u;
+    std::uint64_t result = word < std::tuple_size_v<Words> ? value[word] >> shift : UINT64_C(0);
+    if (shift != 0 && word + 1u < std::tuple_size_v<Words>) result |= value[word + 1u] << (64u - shift);
+    return grhsim_trunc_u64(result, width);
+}
+
+inline std::uint64_t grhsim_behavior_sext(std::uint64_t value, unsigned width)
+{
+    return static_cast<std::uint64_t>(grhsim_sign_extend_i64(value, width));
+}
+
+inline std::uint64_t grhsim_behavior_rotl(std::uint64_t value, unsigned shift)
+{
+    shift &= 63u;
+    return shift == 0 ? value : (value << shift) | (value >> (64u - shift));
+}
+
+inline std::uint32_t grhsim_behavior_rotl32(std::uint32_t value, unsigned shift)
+{
+    shift &= 31u;
+    return shift == 0 ? value : static_cast<std::uint32_t>((value << shift) | (value >> (32u - shift)));
+}
+
+inline std::uint32_t grhsim_behavior_rotr32(std::uint32_t value, unsigned shift)
+{
+    shift &= 31u;
+    return shift == 0 ? value : static_cast<std::uint32_t>((value >> shift) | (value << (32u - shift)));
+}
+
+inline std::uint64_t grhsim_behavior_rotr(std::uint64_t value, unsigned shift)
+{
+    shift &= 63u;
+    return shift == 0 ? value : (value >> shift) | (value << (64u - shift));
+}
+
+inline std::uint64_t grhsim_behavior_reverse_byte(std::uint64_t value)
+{
+    std::uint64_t result = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        const std::uint64_t byte = (value >> (i * 8u)) & UINT64_C(0xff);
+        std::uint64_t reversed = 0;
+        for (unsigned bit = 0; bit < 8; ++bit) reversed |= ((byte >> bit) & 1u) << (7u - bit);
+        result |= reversed << (i * 8u);
+    }
+    return result;
+}
+
+inline std::uint64_t grhsim_behavior_orcb(std::uint64_t value)
+{
+    std::uint64_t result = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        if (((value >> (i * 8u)) & UINT64_C(0xff)) != 0) result |= UINT64_C(0xff) << (i * 8u);
+    }
+    return result;
+}
+
+inline std::uint64_t grhsim_behavior_int_alu_u64(std::uint64_t a, std::uint64_t b,
+                                                  std::uint64_t op, std::uint64_t pc)
+{
+    const unsigned sh = static_cast<unsigned>(b & 63u);
+    const unsigned shw = static_cast<unsigned>(b & 31u);
+    const auto a32 = static_cast<std::uint32_t>(a);
+    const auto b32 = static_cast<std::uint32_t>(b);
+    // FuOpType carries the ALU opcode in its low seven bits.  The carrier
+    // exposes the wider control bundle so that it can share the real
+    // XiangShan interface; upper bits are unrelated control fields and must
+    // not select the default operation here.
+    switch (op & 0x7fu) {
+    case 0: return static_cast<std::uint64_t>(a32) << sh;
+    case 1: return a << sh;
+    case 2: return a & ~(UINT64_C(1) << sh);
+    case 3: return a | (UINT64_C(1) << sh);
+    case 4: return a ^ (UINT64_C(1) << sh);
+    case 5: return a >> sh;
+    case 6: return (a >> sh) & 1u;
+    case 7: return static_cast<std::uint64_t>(static_cast<std::int64_t>(a) >> sh);
+    case 9: return grhsim_behavior_rotl(a, sh);
+    case 11: return grhsim_behavior_rotr(a, sh);
+    case 16: return grhsim_behavior_sext(static_cast<std::uint32_t>(a32 + b32), 32);
+    case 17: return grhsim_behavior_sext(static_cast<std::uint32_t>((a & 1u) + b32), 32);
+    case 18: return grhsim_behavior_sext(static_cast<std::uint32_t>(a32 - b32), 32);
+    case 19: {
+        const std::int64_t lo = grhsim_sign_extend_i64(b & UINT64_C(0xfff), 12);
+        const std::uint64_t hi = b & UINT64_C(0xfffffffffffff000);
+        return grhsim_behavior_sext(static_cast<std::uint32_t>(lo + static_cast<std::int64_t>(hi)), 32);
+    }
+    case 20: return (a32 + b32) & 1u;
+    case 21: return (a32 + b32) & UINT64_C(0xff);
+    case 22: return (a32 + b32) & UINT64_C(0xffff);
+    case 23: return grhsim_behavior_sext((a32 + b32) & UINT64_C(0xffff), 16);
+    case 24: return grhsim_behavior_sext(static_cast<std::uint32_t>(a32 << shw), 32);
+    case 25: return grhsim_behavior_sext(static_cast<std::uint32_t>(a32 >> shw), 32);
+    case 26: return grhsim_behavior_sext(static_cast<std::uint32_t>(static_cast<std::int32_t>(a32) >> shw), 32);
+    case 28: return grhsim_behavior_sext(grhsim_behavior_rotl32(a32, shw), 32);
+    case 29: return grhsim_behavior_sext(grhsim_behavior_rotr32(a32, shw), 32);
+    case 32: return static_cast<std::uint64_t>(a32) + b;
+    case 33: return (a & 1u) + b;
+    case 34: return a + b;
+    case 35: return static_cast<std::uint64_t>(grhsim_sign_extend_i64(b & UINT64_C(0xfff), 12)) + (b & UINT64_C(0xfffffffffffff000));
+    case 36: return (a >> 29u) + b;
+    case 37: return (a >> 30u) + b;
+    case 38: return (a >> 31u) + b;
+    case 39: return (a >> 32u) + b;
+    case 40: return (static_cast<std::uint64_t>(a32) << 1u) + b;
+    case 41: return (a << 1u) + b;
+    case 42: return (static_cast<std::uint64_t>(a32) << 2u) + b;
+    case 43: return (a << 2u) + b;
+    case 44: return (static_cast<std::uint64_t>(a32) << 3u) + b;
+    case 45: return (a << 3u) + b;
+    case 47: return (a << 4u) + b;
+    case 48: return a - b;
+    case 49: return a < b;
+    case 50: return static_cast<std::int64_t>(a) < static_cast<std::int64_t>(b);
+    case 52: return a < b ? b : a;
+    case 53: return a < b ? a : b;
+    case 54: return static_cast<std::int64_t>(a) < static_cast<std::int64_t>(b) ? b : a;
+    case 55: return static_cast<std::int64_t>(a) < static_cast<std::int64_t>(b) ? a : b;
+    case 64: return a & b;
+    case 65: return a & ~b;
+    case 66: return a | b;
+    case 67: return a | ~b;
+    case 68: return a ^ b;
+    case 69: return ~(a ^ b);
+    case 70: return grhsim_behavior_orcb(a);
+    case 72: return grhsim_behavior_sext(a, 8);
+    case 73: return ((b & UINT64_C(0xff)) << 8u) | (a & UINT64_C(0xff));
+    case 74: return grhsim_behavior_sext(a, 16);
+    case 75: return grhsim_behavior_sext(((b & UINT64_C(0xffff)) << 16u) | (a & UINT64_C(0xffff)), 32);
+    case 80: return grhsim_behavior_reverse_byte(a);
+    case 81: return __builtin_bswap64(a);
+    case 82: return ((b & UINT64_C(0xffffffff)) << 32u) | (a & UINT64_C(0xffffffff));
+    case 83: return (a & UINT64_C(0xffffffffffffff00)) | b;
+    case 88: return (a & UINT64_C(0xffffffff)) << 1u;
+    case 89: return (a & UINT64_C(0xffffffff)) << 2u;
+    case 90: return (a & UINT64_C(0xffffffff)) << 3u;
+    case 91: return (a >> 8u) & UINT64_C(0xff);
+    case 96: return (a & b) & UINT64_C(0x1);
+    case 97: return (a & b) & UINT64_C(0xffff);
+    case 98: return (a | b) & UINT64_C(0x1);
+    case 99: return (a | b) & UINT64_C(0xffff);
+    case 100: return (a ^ b) & UINT64_C(0x1);
+    case 101: return (a ^ b) & UINT64_C(0xffff);
+    case 102: return grhsim_behavior_orcb(a) & UINT64_C(0x1);
+    case 103: return grhsim_behavior_orcb(a) & UINT64_C(0xffff);
+    case 116: return (b == 0) ? 0 : a;
+    case 118: return (b != 0) ? 0 : a;
+    case 120: case 121: case 122: return pc + b;
+    default: return 0;
+    }
+}
+
+template <std::size_t N, typename Words>
+inline std::array<std::uint64_t, N> grhsim_behavior_int_alu_words(const Words &value, std::size_t width)
+{
+    const auto a = grhsim_behavior_get_bits(value, 0, 64);
+    const auto b = grhsim_behavior_get_bits(value, 64, 64);
+    const auto op = grhsim_behavior_get_bits(value, 128, 9);
+    const auto pc = width >= 201 ? grhsim_behavior_get_bits(value, 137, 64) : 0;
+    return grhsim_from_u128_words<N>(grhsim_behavior_int_alu_u64(a, b, op, pc), 64);
+}
+
+inline unsigned __int128 grhsim_behavior_clmul_u128(std::uint64_t a, std::uint64_t b)
+{
+    unsigned __int128 result = 0;
+    for (unsigned i = 0; i < 64; ++i) if ((a >> i) & 1u) result ^= static_cast<unsigned __int128>(b) << i;
+    return result;
+}
+
+inline std::uint64_t grhsim_behavior_xperm(std::uint64_t table, std::uint64_t index, unsigned width)
+{
+    const unsigned count = 64u / width;
+    const std::uint64_t mask = (UINT64_C(1) << width) - 1u;
+    std::uint64_t result = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        const unsigned selected = static_cast<unsigned>((index >> (i * width)) & mask);
+        if (selected < count) result |= ((table >> (selected * width)) & mask) << (i * width);
+    }
+    return result;
+}
+
+template <std::size_t N, typename Words>
+inline std::array<std::uint64_t, N> grhsim_behavior_int_bku_words(const Words &value, std::size_t)
+{
+    const auto a = grhsim_behavior_get_bits(value, 0, 64);
+    const auto b = grhsim_behavior_get_bits(value, 64, 64);
+    const auto op = grhsim_behavior_get_bits(value, 128, 6);
+    std::uint64_t result = 0;
+    switch (op) {
+    case 8: result = a ? std::countl_zero(a) : 64; break;
+    case 9: { const auto x = static_cast<std::uint32_t>(a); result = x ? std::countl_zero(x) : 32; break; }
+    case 10: result = a ? std::countr_zero(a) : 64; break;
+    case 11: { const auto x = static_cast<std::uint32_t>(a); result = x ? std::countr_zero(x) : 32; break; }
+    case 12: result = std::popcount(a); break;
+    case 13: result = std::popcount(static_cast<std::uint32_t>(a)); break;
+    case 0: result = static_cast<std::uint64_t>(grhsim_behavior_clmul_u128(a, b)); break;
+    case 1: result = static_cast<std::uint64_t>(grhsim_behavior_clmul_u128(a, b) >> 64u); break;
+    case 2: result = static_cast<std::uint64_t>(grhsim_behavior_clmul_u128(a, b) >> 63u); break;
+    case 4: result = grhsim_behavior_xperm(a, b, 4); break;
+    case 5: {
+        for (unsigned i = 0; i < 8; ++i) {
+            // XPERM.B rejects the whole byte when any of its upper five
+            // bits are set; only values 0..7 select a table byte.
+            const auto idx = static_cast<unsigned>((b >> (i * 8u)) & 0xffu);
+            if (idx < 8) result |= ((a >> (idx * 8u)) & 0xffu) << (i * 8u);
+        }
+        break;
+    }
+    default: result = 0; break;
+    }
+    return grhsim_from_u128_words<N>(result, 64);
+}
+
+template <std::size_t N, typename Words>
+inline std::array<std::uint64_t, N> grhsim_behavior_vec_int_alu_words(const Words &value, std::size_t)
+{
+    // VIAluFix lane carrier layout is authenticated by the manifest.  The
+    // first version of the host path covers the non-stateful add/sub/logic
+    // lane operations; mask/tail and saturation metadata stay explicit in the
+    // carrier result and are zero for these operations.
+    const auto opcode = grhsim_behavior_get_bits(value, 282, 6);
+    const auto vs2 = grhsim_behavior_get_bits(value, 202, 64);
+    const auto vs1 = grhsim_behavior_get_bits(value, 138, 64);
+    const auto sel8 = grhsim_behavior_get_bits(value, 281, 1) != 0;
+    const auto sel16 = grhsim_behavior_get_bits(value, 280, 1) != 0;
+    const auto sel32 = grhsim_behavior_get_bits(value, 279, 1) != 0;
+    const auto isSigned = grhsim_behavior_get_bits(value, 274, 1) != 0;
+    const unsigned bits = sel8 ? 8u : sel16 ? 16u : sel32 ? 32u : 64u;
+    const std::uint64_t mask = grhsim_mask(bits);
+    std::uint64_t vd = 0;
+    std::uint8_t addCarryCmpMask = 0;
+    std::uint8_t laneEqual = 0;
+    for (unsigned lane = 0; lane < 64u / bits; ++lane) {
+        const auto a = (vs2 >> (lane * bits)) & mask;
+        const auto b = (vs1 >> (lane * bits)) & mask;
+        if (a == b) laneEqual |= static_cast<std::uint8_t>(1u << lane);
+        std::uint64_t r = 0;
+        switch (opcode) {
+        case 0: r = a + b; break;       // vadd
+        case 16: r = a - b; break;      // vsub
+        case 32: r = ~(a ^ b); break;   // vxnor
+        case 33: r = a & b; break;      // vand
+        case 34: r = ~(a & b); break;   // vnand
+        case 35: r = a & ~b; break;     // vandn
+        case 36: r = a ^ b; break;      // vxor
+        case 37: r = a | b; break;      // vor
+        case 38: r = ~(a | b); break;   // vnor
+        case 39: r = a | ~b; break;     // vorn
+        default: r = 0; break;
+        }
+        vd |= (r & mask) << (lane * bits);
+    }
+    // Vialu's vnor opcode also drives the compare-result sideband from the
+    // shared adder.  Preserve that visible lane mask even though the data
+    // result itself comes from the misc path.
+    if (opcode == 37u || opcode == 38u) {
+        // The shared adder decodes vor/vnor with the equality compare
+        // sideband as well: vor selects eqResult and vnor selects its
+        // complement.  The data path itself remains in VIAluMisc.
+        const std::uint8_t cmp = opcode == 37u
+            ? laneEqual : static_cast<std::uint8_t>(~laneEqual);
+        if (bits == 8u) addCarryCmpMask = cmp;
+        else if (bits == 16u) addCarryCmpMask = static_cast<std::uint8_t>(
+            ((cmp >> 1u) & 1u) | (((cmp >> 3u) & 1u) << 1u) |
+            (((cmp >> 5u) & 1u) << 2u) | (((cmp >> 7u) & 1u) << 3u));
+        else if (bits == 32u) addCarryCmpMask = static_cast<std::uint8_t>(
+            ((cmp >> 3u) & 1u) | (((cmp >> 7u) & 1u) << 1u));
+        else addCarryCmpMask = static_cast<std::uint8_t>((cmp >> 7u) & 1u);
+    }
+    // VIAluMisc always computes the narrow sideband, even when the selected
+    // opcode uses the ordinary (non-narrow) result.  Keep that observable
+    // output equal to the RTL carrier so grouped lowering is a true
+    // replacement rather than an output-shape approximation.
+    std::uint32_t narrowVd = 0;
+    if (bits < 64u) {
+        const unsigned wideBits = bits * 2u;
+        const unsigned wideLanes = 64u / wideBits;
+        const std::uint64_t wideMask = grhsim_mask(wideBits);
+        for (unsigned lane = 0; lane < wideLanes; ++lane) {
+            const unsigned offset = lane * wideBits;
+            const std::uint64_t wideA = (vs2 >> offset) & wideMask;
+            const std::uint64_t wideB = (vs1 >> offset) & wideMask;
+            const unsigned shift = static_cast<unsigned>(wideB & (wideBits - 1u));
+            std::uint64_t shifted = wideA >> shift;
+            if (isSigned && ((wideA >> (wideBits - 1u)) & 1u) != 0 && shift != 0) {
+                const std::uint64_t signMask = ~wideMask;
+                shifted |= signMask;
+            }
+            narrowVd |= static_cast<std::uint32_t>(shifted & mask) << (lane * bits);
+        }
+    }
+    const unsigned __int128 packed = static_cast<unsigned __int128>(vd) |
+        (static_cast<unsigned __int128>(narrowVd) << 64u) |
+        (static_cast<unsigned __int128>(addCarryCmpMask) << 96u);
+    return grhsim_from_u128_words<N>(packed, 112);
+}
+
+template <std::size_t N, typename Words>
+inline std::array<std::uint64_t, N> grhsim_behavior_vec_int_pu_words(const Words &value, std::size_t)
+{
+    // VIFuInput is packed by Chisel from low to high fields as follows:
+    // mask[0:127], vs1[128:255], vs2[256:383], old_vd[384:511],
+    // vdType[512:515], uopIdx[526:531], vl[539:546], vm[552], opcode[553:558].
+    // The carrier output is VIFuOutput.asUInt: vd occupies bits [1:128] and
+    // vxsat is bit 0.  This helper mirrors the single-uop mask/scalar subset
+    // implemented in VIPUComputeCarrier; multi-uop reductions stay on VIAlu.
+    auto get128 = [&](std::size_t start) -> unsigned __int128 {
+        const std::uint64_t lo = grhsim_behavior_get_bits(value, start, 64);
+        const std::uint64_t hi = grhsim_behavior_get_bits(value, start + 64u, 64);
+        return static_cast<unsigned __int128>(lo) |
+               (static_cast<unsigned __int128>(hi) << 64u);
+    };
+    const unsigned opcode = static_cast<unsigned>(grhsim_behavior_get_bits(value, 553, 6));
+    const unsigned vdType = static_cast<unsigned>(grhsim_behavior_get_bits(value, 512, 2));
+    const unsigned uopIdx = static_cast<unsigned>(grhsim_behavior_get_bits(value, 526, 6));
+    const unsigned vl = static_cast<unsigned>(grhsim_behavior_get_bits(value, 539, 8));
+    const bool vm = grhsim_behavior_get_bits(value, 552, 1) != 0;
+    const unsigned __int128 vs2 = get128(256);
+    const unsigned __int128 mask = get128(0);
+    const unsigned __int128 all = ~static_cast<unsigned __int128>(0);
+    unsigned __int128 active = vs2 & (vm ? all : mask);
+    if (vl < 128u) {
+        const unsigned __int128 vlMask = vl == 0u ? 0u :
+            (static_cast<unsigned __int128>(1) << vl) - 1u;
+        active &= vlMask;
+    }
+
+    unsigned __int128 result = 0;
+    if (opcode == 0x2fu) { // vmv.x.s
+        const unsigned width = 8u << vdType;
+        const std::uint64_t element = grhsim_behavior_get_bits(value, 256, width);
+        const bool sign = ((element >> (width - 1u)) & 1u) != 0;
+        std::uint64_t extended = element;
+        if (sign && width < 64u) extended |= ~grhsim_mask(width);
+        result = extended;
+    } else if (opcode == 0x27u) { // vcpop.m
+        result = static_cast<std::uint64_t>(std::popcount(static_cast<std::uint64_t>(active)) +
+                                            std::popcount(static_cast<std::uint64_t>(active >> 64u)));
+    } else if (opcode == 0x28u) { // vfirst.m
+        std::uint64_t first = UINT64_MAX;
+        const std::uint64_t lo = static_cast<std::uint64_t>(active);
+        const std::uint64_t hi = static_cast<std::uint64_t>(active >> 64u);
+        if (lo != 0) first = static_cast<std::uint64_t>(std::countr_zero(lo));
+        else if (hi != 0) first = 64u + static_cast<std::uint64_t>(std::countr_zero(hi));
+        result = first;
+    } else if (opcode == 0x29u || opcode == 0x2au || opcode == 0x2bu) { // vmsbf/vmsif/vmsof
+        unsigned __int128 before = 0;
+        bool seen = false;
+        for (unsigned i = 0; i < 128u; ++i) {
+            const bool bit = ((active >> i) & 1u) != 0;
+            if (!seen) before |= static_cast<unsigned __int128>(1) << (127u - i);
+            if (bit) seen = true;
+        }
+        const unsigned __int128 vmsbf = before;
+        const unsigned __int128 vmsif = (vmsbf << 1u) | 1u;
+        const unsigned __int128 vmsof = (~vmsbf) & vmsif;
+        result = opcode == 0x29u ? vmsbf : (opcode == 0x2au ? vmsif : vmsof);
+    } else if (opcode == 0x2cu || opcode == 0x2du) { // viota.m / vid.v
+        const unsigned width = 8u << vdType;
+        const unsigned elems = 128u / width;
+        for (unsigned i = 0; i < elems; ++i) {
+            std::uint64_t element = 0;
+            if (opcode == 0x2du) {
+                element = static_cast<std::uint64_t>(i + (uopIdx << (6u - vdType)));
+            } else {
+                for (unsigned j = 0; j < i * width; ++j) {
+                    element += static_cast<unsigned>((active >> j) & 1u);
+                }
+            }
+            result |= (static_cast<unsigned __int128>(element & grhsim_mask(width)) << (i * width));
+        }
+    }
+    std::array<std::uint64_t, N> packed{};
+    const unsigned __int128 shifted = result << 1u;
+    if constexpr (N > 0) packed[0] = static_cast<std::uint64_t>(shifted);
+    if constexpr (N > 1) packed[1] = static_cast<std::uint64_t>(shifted >> 64u);
+    if constexpr (N > 2) packed[2] = static_cast<std::uint64_t>(result >> 127u);
+    grhsim_trunc_words(packed, 129);
+    return packed;
+}
+
+inline unsigned __int128 grhsim_behavior_product(std::uint64_t a, std::uint64_t b,
+                                                  std::size_t width, bool signedA, bool signedB)
+{
+    const std::uint64_t mask = grhsim_mask(width);
+    a &= mask; b &= mask;
+    const unsigned __int128 raw = static_cast<unsigned __int128>(a) * static_cast<unsigned __int128>(b);
+    const std::uint64_t low = static_cast<std::uint64_t>(raw) & mask;
+    std::uint64_t high = static_cast<std::uint64_t>(raw >> width) & mask;
+    if (signedA && width != 0 && ((a >> (width - 1u)) & 1u)) high = (high - b) & mask;
+    if (signedB && width != 0 && ((b >> (width - 1u)) & 1u)) high = (high - a) & mask;
+    return (static_cast<unsigned __int128>(high) << width) | low;
+}
+
+template <std::size_t N, typename Words>
+inline std::array<std::uint64_t, N> grhsim_behavior_int_mul_words(const Words &value, std::size_t width)
+{
+    const std::uint64_t a = grhsim_behavior_get_bits(value, 0, 64);
+    const std::uint64_t b = grhsim_behavior_get_bits(value, 64, 64);
+    const std::uint64_t op = grhsim_behavior_get_bits(value, 128, 5);
+    const bool signedA = !((op >> 1u) & 1u && (op & 1u));
+    const bool signedB = !((op >> 1u) & 1u);
+    const unsigned __int128 product = grhsim_behavior_product(a, b, 64, signedA, signedB);
+    std::uint64_t result = 0;
+    if ((op >> 2u) & 1u) {
+        result = grhsim_sign_extend_i64(static_cast<std::uint64_t>(product), 32);
+    } else if ((op & 3u) != 0) {
+        result = static_cast<std::uint64_t>(product >> 64u);
+    } else {
+        result = static_cast<std::uint64_t>(product);
+    }
+    return grhsim_from_u128_words<N>(static_cast<unsigned __int128>(result), 64);
+}
+
+template <std::size_t N, typename Words>
+inline std::array<std::uint64_t, N> grhsim_behavior_fp_mul_words(const Words &value, std::size_t width)
+{
+    const std::uint64_t a = grhsim_behavior_get_bits(value, 0, 53);
+    const std::uint64_t b = grhsim_behavior_get_bits(value, 53, 53);
+    const bool fp64 = grhsim_behavior_get_bits(value, 106, 1) != 0;
+    const bool fp32 = grhsim_behavior_get_bits(value, 107, 1) != 0;
+    const unsigned __int128 wide = static_cast<unsigned __int128>(a) * static_cast<unsigned __int128>(b);
+    const unsigned __int128 single0 = static_cast<unsigned __int128>(a & ((UINT64_C(1) << 24u) - 1u)) *
+                                      static_cast<unsigned __int128>(b & ((UINT64_C(1) << 24u) - 1u));
+    const unsigned __int128 half0 = static_cast<unsigned __int128>(a & ((UINT64_C(1) << 11u) - 1u)) *
+                                    static_cast<unsigned __int128>(b & ((UINT64_C(1) << 11u) - 1u));
+    unsigned __int128 result = wide;
+    if (!fp64 && fp32) result = single0;
+    if (!fp64 && !fp32) result = half0;
+    return grhsim_from_u128_words<N>(result, 107);
+}
+
+template <std::size_t N, typename Words>
+inline std::array<std::uint64_t, N> grhsim_behavior_vec_fp_mul_words(const Words &value, std::size_t width)
+{
+    const std::uint64_t a = grhsim_behavior_get_bits(value, 0, 53);
+    const std::uint64_t b = grhsim_behavior_get_bits(value, 53, 53);
+    const bool fp64 = grhsim_behavior_get_bits(value, 106, 1) != 0;
+    const bool fp32 = grhsim_behavior_get_bits(value, 107, 1) != 0;
+    const auto mul = [](std::uint64_t x, std::uint64_t y, std::size_t bits) -> unsigned __int128 {
+        const std::uint64_t mask = bits == 64 ? ~UINT64_C(0) : ((UINT64_C(1) << bits) - 1u);
+        return static_cast<unsigned __int128>(x & mask) * static_cast<unsigned __int128>(y & mask);
+    };
+    const unsigned __int128 wide = mul(a, b, 53);
+    const unsigned __int128 p24 = mul(a >> 29u, b >> 29u, 24);
+    const unsigned __int128 p11a = mul(a >> 42u, b >> 42u, 11);
+    const unsigned __int128 p11b = mul(a >> 29u, b >> 29u, 11);
+    const unsigned __int128 p11c = mul(a >> 13u, b >> 13u, 11);
+    const unsigned __int128 p11d = mul(a, b, 11);
+    unsigned __int128 result = wide;
+    if (!fp64 && fp32) result = (p24 << 58u) | mul(a, b, 24);
+    if (!fp64 && !fp32) result = (p11a << 84u) | (p11b << 58u) | (p11c << 26u) | p11d;
+    return grhsim_from_u128_words<N>(result, 107);
+}
+
+template <typename Words>
+inline std::uint64_t grhsim_behavior_vec_int_mul_get(const Words &value, std::size_t start, std::size_t width)
+{
+    return grhsim_behavior_get_bits(value, start, width);
+}
+
+template <std::size_t N, typename Words>
+inline std::array<std::uint64_t, N> grhsim_behavior_vec_int_mul_words(const Words &value, std::size_t width)
+{
+    const std::uint64_t vs2 = grhsim_behavior_vec_int_mul_get(value, 69, 64);
+    const std::uint64_t vs1 = grhsim_behavior_vec_int_mul_get(value, 133, 64);
+    const std::uint64_t oldVd = grhsim_behavior_vec_int_mul_get(value, 5, 64);
+    const std::uint64_t src0 = grhsim_behavior_vec_int_mul_get(value, 205, 4);
+    const std::uint64_t src1 = grhsim_behavior_vec_int_mul_get(value, 201, 4);
+    const std::uint64_t vdType = grhsim_behavior_vec_int_mul_get(value, 197, 4);
+    const std::uint64_t uop = grhsim_behavior_vec_int_mul_get(value, 211, 6);
+    const std::uint64_t vxrm = grhsim_behavior_vec_int_mul_get(value, 209, 2);
+    const bool highHalf = grhsim_behavior_vec_int_mul_get(value, 4, 1);
+    const bool isMacc = grhsim_behavior_vec_int_mul_get(value, 3, 1);
+    const bool isSub = grhsim_behavior_vec_int_mul_get(value, 2, 1);
+    const bool widen = grhsim_behavior_vec_int_mul_get(value, 1, 1);
+    const bool isFixP = grhsim_behavior_vec_int_mul_get(value, 0, 1);
+    const unsigned format = static_cast<unsigned>(src0 & 3u);
+    std::uint64_t vd = 0, sat = 0;
+    for (unsigned sewIndex = 0; sewIndex < 4; ++sewIndex) {
+        const unsigned bits = 8u << sewIndex;
+        const unsigned lanes = 64u / bits;
+        const unsigned halfLanes = lanes / 2u;
+        std::uint64_t narrow = 0, wide = 0, satBits = 0;
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+            const std::uint64_t a = (vs2 >> (lane * bits)) & grhsim_mask(bits);
+            const std::uint64_t b = (vs1 >> (lane * bits)) & grhsim_mask(bits);
+            const bool signedA = ((src0 >> 2u) & 1u) != 0;
+            const bool signedB = ((src1 >> 2u) & 1u) != 0;
+            const unsigned __int128 product = grhsim_behavior_product(a, b, bits, signedA, signedB);
+            const std::uint64_t oldNarrow = (oldVd >> (lane * bits)) & grhsim_mask(bits);
+            const unsigned oldIndex = bits == 64u ? 0u : lane % halfLanes;
+            const unsigned __int128 oldWide = bits == 64u
+                ? static_cast<unsigned __int128>(oldNarrow)
+                : static_cast<unsigned __int128>((oldVd >> (oldIndex * 2u * bits)) & grhsim_mask(2u * bits));
+            const unsigned __int128 old = widen ? oldWide : static_cast<unsigned __int128>(oldNarrow);
+            const unsigned __int128 fullMask = bits == 64u
+                ? ~static_cast<unsigned __int128>(0)
+                : ((static_cast<unsigned __int128>(1) << (2u * bits)) - 1u);
+            const unsigned __int128 accumulated = (isSub ? old - product : old + product) & fullMask;
+            const unsigned __int128 normal = isMacc ? accumulated : product;
+            const unsigned __int128 selected = isMacc ? accumulated : product;
+            const unsigned shift = bits - 1u;
+            const bool guard = shift ? ((product >> (shift - 1u)) & 1u) != 0 : false;
+            const bool sticky = shift > 1u ? (product & ((static_cast<unsigned __int128>(1) << (shift - 1u)) - 1u)) != 0 : false;
+            const bool lsb = ((product >> shift) & 1u) != 0;
+            const bool increment = vxrm == 0 ? guard : vxrm == 1 ? (guard && (sticky || lsb)) : vxrm == 2 ? false : (!lsb && (guard || sticky));
+            const bool saturated = ((product >> (2u * bits - 2u)) & 3u) == 1u;
+            const unsigned __int128 rounded = ((product >> (bits - 1u)) + static_cast<unsigned>(increment)) & ((static_cast<unsigned __int128>(1) << bits) - 1u);
+            const unsigned __int128 fixed = saturated
+                ? ((static_cast<unsigned __int128>(1) << (bits - 1u)) - 1u)
+                : rounded;
+            const unsigned __int128 out = isFixP
+                ? fixed
+                : (highHalf ? ((selected >> bits) & ((static_cast<unsigned __int128>(1) << bits) - 1u))
+                            : (selected & ((static_cast<unsigned __int128>(1) << bits) - 1u)));
+            narrow |= static_cast<std::uint64_t>(out) << (lane * bits);
+            if (bits < 64u) {
+                const unsigned selectedBase = (uop & 1u) ? halfLanes : 0u;
+                if (lane >= selectedBase && lane < selectedBase + halfLanes) {
+                    const unsigned index = lane - selectedBase;
+                    wide |= static_cast<std::uint64_t>(normal & ((static_cast<unsigned __int128>(1) << (2u * bits)) - 1u)) << (index * 2u * bits);
+                }
+            } else {
+                // The Chisel width-64 case aliases the narrow result.  There
+                // is no second half to select, so preserve highHalf/fixed
+                // handling through `out` rather than exposing `normal`.
+                wide = narrow;
+            }
+            if (isFixP && saturated) satBits |= grhsim_mask(bits / 8u) << (lane * bits / 8u);
+        }
+        const std::uint64_t selectedVd = widen ? wide : narrow;
+        if (sewIndex == format) { vd = selectedVd; sat = satBits; }
+    }
+    return grhsim_from_u128_words<N>((static_cast<unsigned __int128>(sat) << 64u) | vd, 72);
+}
+
 template <std::size_t N>
 inline std::array<std::uint64_t, N> grhsim_negate_words(const std::array<std::uint64_t, N> &value, std::size_t width)
 {
@@ -33845,6 +34612,11 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "        std::uint64_t commitBatchExecCount = UINT64_C(0);\n";
                 *stream << "        std::uint64_t touchedStateShadowCount = UINT64_C(0);\n";
                 *stream << "        std::uint64_t touchedWriteCount = UINT64_C(0);\n";
+                *stream << "        std::uint64_t behaviorGroupCommits = UINT64_C(0);\n";
+                *stream << "        std::uint64_t behaviorEnabledUpdates = UINT64_C(0);\n";
+                *stream << "        std::uint64_t behaviorTouchedRows = UINT64_C(0);\n";
+                *stream << "        std::uint64_t scheduledMemoryReads = UINT64_C(0);\n";
+
                 *stream << "        std::uint64_t eventFastPathCount = UINT64_C(0);\n";
                 *stream << "        std::uint64_t eventStateChangedCount = UINT64_C(0);\n";
                 *stream << "        std::uint64_t eventSparseSettleCount = UINT64_C(0);\n";
@@ -34260,6 +35032,12 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             {
                 *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_compute_{};\n";
                 *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_commit_{};\n";
+                *stream << "    static constexpr std::size_t kBehaviorComputeProfileCount = "
+                        << model.behaviorComputeProfiles.size() << ";\n";
+                *stream << "    std::array<std::uint64_t, kBehaviorComputeProfileCount> behavior_compute_calls_{};\n";
+                *stream << "    std::array<std::uint64_t, kBehaviorComputeProfileCount> behavior_compute_input_active_{};\n";
+                *stream << "    std::array<std::uint64_t, kBehaviorComputeProfileCount> behavior_compute_output_changed_{};\n";
+                *stream << "    std::array<std::uint64_t, kBehaviorComputeProfileCount> behavior_compute_word_iterations_{};\n";
             }
             if (model.deferredActivationCofireProbe)
             {
@@ -35186,6 +35964,44 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    std::printf(\"[GRHSIM_RUNTIME_PROFILE] supernode_fire_tsv=%s rows=%zu\\n\",\n";
                 *stream << "                path,\n";
                 *stream << "                kRows.size());\n";
+
+                *stream << "    const char *behaviorEnvPath = std::getenv(\"WOLVRIX_GRHSIM_BEHAVIOR_COMPUTE_TSV\");\n";
+                *stream << "    const char *behaviorPath = (behaviorEnvPath != nullptr && behaviorEnvPath[0] != '\\0')\n";
+                *stream << "        ? behaviorEnvPath\n";
+                *stream << "        : \"" << escapeCppString((outDir / "grhsim_behavior_compute.tsv").string()) << "\";\n";
+                *stream << "    const std::filesystem::path behaviorOutputPath(behaviorPath);\n";
+                *stream << "    if (behaviorOutputPath.has_parent_path()) {\n";
+                *stream << "        std::error_code behaviorEc;\n";
+                *stream << "        std::filesystem::create_directories(behaviorOutputPath.parent_path(), behaviorEc);\n";
+                *stream << "        if (behaviorEc) {\n";
+                *stream << "            std::fprintf(stderr, \"[GRHSIM_RUNTIME_PROFILE] failed to create behavior TSV directory %s: %s\\n\",\n";
+                *stream << "                         behaviorOutputPath.parent_path().string().c_str(), behaviorEc.message().c_str());\n";
+                *stream << "        }\n";
+                *stream << "    }\n";
+                *stream << "    std::FILE *behaviorFp = std::fopen(behaviorPath, \"w\");\n";
+                *stream << "    if (behaviorFp == nullptr) {\n";
+                *stream << "        std::fprintf(stderr, \"[GRHSIM_RUNTIME_PROFILE] failed to open behavior TSV %s\\n\", behaviorPath);\n";
+                *stream << "    } else {\n";
+                *stream << "        std::fprintf(behaviorFp, \"index\\tmodel\\tsymbol\\tresult_width\\tinput_words\\toutput_words\\thelper_calls\\tinput_active\\toutput_changed\\toutput_unchanged\\tword_iterations\\n\");\n";
+                for (std::size_t profileIndex = 0; profileIndex < model.behaviorComputeProfiles.size(); ++profileIndex)
+                {
+                    const auto &profile = model.behaviorComputeProfiles[profileIndex];
+                    *stream << "        { const auto calls = behavior_compute_calls_[" << profileIndex << "u];\n";
+                    *stream << "          const auto changed = behavior_compute_output_changed_[" << profileIndex << "u];\n";
+                    *stream << "          std::fprintf(behaviorFp, \"%zu\\t%s\\t%s\\t%d\\t%zu\\t%zu\\t%llu\\t%llu\\t%llu\\t%llu\\t%llu\\n\",\n";
+                    *stream << "                       " << profileIndex << "u, \"" << escapeCppString(profile.model) << "\", \""
+                            << escapeCppString(profile.symbol) << "\", " << profile.resultWidth << ", "
+                            << profile.inputWords << "u, " << profile.outputWords << "u,\n";
+                    *stream << "                       static_cast<unsigned long long>(calls),\n";
+                    *stream << "                       static_cast<unsigned long long>(behavior_compute_input_active_[" << profileIndex << "u]),\n";
+                    *stream << "                       static_cast<unsigned long long>(changed),\n";
+                    *stream << "                       static_cast<unsigned long long>(calls >= changed ? calls - changed : 0),\n";
+                    *stream << "                       static_cast<unsigned long long>(behavior_compute_word_iterations_[" << profileIndex << "u])); }\n";
+                }
+                *stream << "        std::fclose(behaviorFp);\n";
+                *stream << "        std::printf(\"[GRHSIM_RUNTIME_PROFILE] behavior_compute_tsv=%s rows=%zu\\n\", behaviorPath, "
+                        << model.behaviorComputeProfiles.size() << "u);\n";
+                *stream << "    }\n";
             }
             if (model.deferredActivationCofireProbe)
             {
@@ -37355,6 +38171,10 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 {
                     *stream << "    runtime_profile_fire_compute_.fill(UINT64_C(0));\n";
                     *stream << "    runtime_profile_fire_commit_.fill(UINT64_C(0));\n";
+                    *stream << "    behavior_compute_calls_.fill(UINT64_C(0));\n";
+                    *stream << "    behavior_compute_input_active_.fill(UINT64_C(0));\n";
+                    *stream << "    behavior_compute_output_changed_.fill(UINT64_C(0));\n";
+                    *stream << "    behavior_compute_word_iterations_.fill(UINT64_C(0));\n";
                 }
                 if (model.deferredActivationCofireProbe)
                 {

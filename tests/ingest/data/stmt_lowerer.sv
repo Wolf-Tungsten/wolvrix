@@ -552,3 +552,39 @@ module stmt_lowerer_procedural_local(
         y <= next;
     end
 endmodule
+
+module stmt_lowerer_mul_widths (
+  input logic [52:0] a, b,
+  output logic [106:0] packed_product, self_determined,
+  output logic [127:0] contextual
+);
+  always_comb begin
+    packed_product = {1'b0, {53'b0, a} * {53'b0, b}};
+    self_determined = {54'b0, a * b};
+    contextual = a * b;
+  end
+endmodule
+
+module stmt_lowerer_boolean_operand_widths (
+  input logic [5:0] index,
+  input logic [63:0] onehot,
+  output logic [11:0] predicates,
+  output wire declaration_bad
+);
+  wire bad = (64'h1 << index) != onehot;
+  assign declaration_bad = bad;
+  always_comb begin
+    predicates[0] = (64'h1 << index) == onehot;
+    predicates[1] = (64'h1 << index) != onehot;
+    predicates[2] = (64'h1 << index) === onehot;
+    predicates[3] = (64'h1 << index) !== onehot;
+    predicates[4] = (64'h1 << index) ==? onehot;
+    predicates[5] = (64'h1 << index) !=? onehot;
+    predicates[6] = (64'h1 << index) < onehot;
+    predicates[7] = (64'h1 << index) <= onehot;
+    predicates[8] = (64'h1 << index) > onehot;
+    predicates[9] = (64'h1 << index) >= onehot;
+    predicates[10] = (64'h1 << index) && onehot;
+    predicates[11] = (64'h1 << index) || onehot;
+  end
+endmodule

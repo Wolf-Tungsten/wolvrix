@@ -491,6 +491,56 @@ int testCaseInside(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testMultiplyWidths(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    if (!buildLoweringPlan(sourcePath, "stmt_lowerer_mul_widths", diagnostics, plan, lowering)) {
+        return fail("Failed to lower multiplication width fixture");
+    }
+    std::unordered_set<int32_t> widths;
+    for (const auto& node : lowering.values) {
+        if (node.op == wolvrix::lib::grh::OperationKind::kMul) {
+            widths.insert(node.widthHint);
+        }
+    }
+    if (diagnostics.hasError() || widths != std::unordered_set<int32_t>{53, 106, 128}) {
+        return fail("Multiplication must respect self-determined and contextual widths");
+    }
+    return 0;
+}
+
+int testBooleanOperandWidths(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    if (!buildLoweringPlan(sourcePath, "stmt_lowerer_boolean_operand_widths", diagnostics, plan, lowering)) {
+        return fail("Failed to lower boolean operand width fixture");
+    }
+    using Op = wolvrix::lib::grh::OperationKind;
+    std::unordered_set<Op> predicates;
+    for (const auto& node : lowering.values) {
+        switch (node.op) {
+        case Op::kEq: case Op::kNe: case Op::kCaseEq: case Op::kCaseNe:
+        case Op::kWildcardEq: case Op::kWildcardNe:
+        case Op::kLt: case Op::kLe: case Op::kGt: case Op::kGe:
+        case Op::kLogicAnd: case Op::kLogicOr:
+            predicates.insert(node.op);
+            for (auto operand : node.operands) {
+                if (lowering.values.at(operand).widthHint != 64) {
+                    return fail("Boolean result width leaked into an operand");
+                }
+            }
+            break;
+        default: break;
+        }
+    }
+    if (diagnostics.hasError() || predicates.size() != 12) {
+        return fail("Missing comparison/logical width cases");
+    }
+    return 0;
+}
+
 int testLhsSelect(const std::filesystem::path& sourcePath) {
     wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
     wolvrix::lib::ingest::ModulePlan plan;
@@ -1602,6 +1652,12 @@ int main() {
         return status;
     }
     if (int status = testDpiReturnLowering(sourcePath); status != 0) {
+        return status;
+    }
+    if (int status = testMultiplyWidths(sourcePath); status != 0) {
+        return status;
+    }
+    if (int status = testBooleanOperandWidths(sourcePath); status != 0) {
         return status;
     }
     return testProceduralLocalLowering(sourcePath);

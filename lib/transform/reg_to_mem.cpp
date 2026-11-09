@@ -4222,6 +4222,11 @@ namespace wolvrix::lib::transform
 
             const std::string memSymbol = makeUniqueMemoryName(graph, group.regSymbols);
             const Operation firstReg = graph.getOperation(candidate.regOps.front());
+            const auto observerDomain = getAttr<std::string>(firstReg, "behavior.observerDomain");
+            for (const auto reg : candidate.regOps) {
+                if (getAttr<std::string>(graph.getOperation(reg), "behavior.observerDomain") != observerDomain)
+                    return false; // Never merge an observer array with functional state.
+            }
             const bool isSigned = getAttr<bool>(firstReg, "isSigned").value_or(false);
             const std::size_t storageElementCount =
                 group.storageElementCount == 0 ? group.elementCount : group.storageElementCount;
@@ -4230,6 +4235,7 @@ namespace wolvrix::lib::transform
             graph.setAttr(memOp, "width", static_cast<int64_t>(group.elementWidth));
             graph.setAttr(memOp, "row", static_cast<int64_t>(storageElementCount));
             graph.setAttr(memOp, "isSigned", isSigned);
+            if (observerDomain) graph.setAttr(memOp, "behavior.observerDomain", *observerDomain);
             std::vector<std::string> initKinds;
             std::vector<std::string> initFiles;
             std::vector<std::string> initValues;

@@ -112,6 +112,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
             case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
             case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+            case wolvrix::lib::grh::OperationKind::kBehaviorStateGroup:
                 return true;
             default:
                 return false;
@@ -983,6 +984,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
                 eventStart = 4;
                 break;
+            case wolvrix::lib::grh::OperationKind::kBehaviorStateGroup:
             case wolvrix::lib::grh::OperationKind::kSystemTask:
             case wolvrix::lib::grh::OperationKind::kDpicCall:
                 eventStart = operands.size() >= edges.size() ? operands.size() - edges.size() : operands.size();
@@ -1201,6 +1203,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
             case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+            case wolvrix::lib::grh::OperationKind::kBehaviorStateGroup:
                 break;
             default:
                 return std::nullopt;
@@ -1753,6 +1756,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
             case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
             case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+            case wolvrix::lib::grh::OperationKind::kBehaviorStateGroup:
                 return ActivityOpClass::Sink;
             default:
                 break;
@@ -1975,6 +1979,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
             case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
             case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+            case wolvrix::lib::grh::OperationKind::kBehaviorStateGroup:
             case wolvrix::lib::grh::OperationKind::kSystemFunction:
             case wolvrix::lib::grh::OperationKind::kSystemTask:
             case wolvrix::lib::grh::OperationKind::kDpicCall:

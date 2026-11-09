@@ -53,15 +53,74 @@ Wolvrix 导入器把这个版本化 transport 转成同宽的 `kGrayDecode`，�
 Verilog、GRH 和 C++ lowering fixture，没有据此宣称香山整机 walltime 收益；完整整机
 测量须先找到实际使用点或加入明确的局部调用。
 
-## 行为模型 API：先复用 GRH 状态，再按实测增加专用 lowering
+## 行为模型 API 与实验性数组分组 lowering
 
 行为模型与纯组合 intrinsic 的目标不同。它允许在 Chisel elaboration 阶段用另一套代码
-描述 observer/debug 状态，但必须保留时钟、复位、更新条件和输出依赖。当前入口为：
+描述 observer/debug 状态或功能运算，但必须保留时钟、复位、更新条件和输出依赖。数组入口为：
 
 ```text
 --wolvrix-sim-models hardware
 --wolvrix-sim-models commit-rat
 ```
+
+### 乘法功能模型
+
+乘法使用独立显式选择，可单独开启或用逗号组合：
+
+```text
+--wolvrix-sim-models int-mul,vec-int-mul,fp-mul,vec-fp-mul
+```
+
+默认仍为 `hardware`。未知名称、重复名称及 `hardware` 与其他模式混用会报错。底层 YunSuan
+构造参数 `behavior: Boolean = false` 由 XiangShan wrapper 传入，YunSuan 不依赖 utility。
+
+| 选择 | 实际替换 | 流水契约 |
+|---|---|---|
+| `int-mul` | scalar.Mul 的 Booth/压缩树 | 两级寄存器，保留 MUL/MULH/MULHSU/MULHU/MULW 与 wrapper 的 MULW7 |
+| `vec-int-mul` | VIMac64b 的逐元素乘法、累加和结果处理 | 两级寄存器，覆盖 SEW8/16/32/64、高半、加宽、vsmul、vxrm/vxsat |
+| `fp-mul` | FloatFMA 的有效数乘法核心 | 原三拍整体流水，保留全部 FMA 后处理 |
+| `vec-fp-mul` | VectorFloatFMA 的独立 lane 有效数乘法 | 原三拍整体流水，沿用加宽选择和后处理 |
+
+行为源码使用直接整数乘法和 `MultiplyBehavior.pipeline(value, valid, stages)`。payload
+只在相应流水使能时写入且不增加复位；valid 继承原复位语义。外围 ROB/flush/ready、向量
+mask/tail/vstart 和旧目的数据合并不改。浮点使用精确 53×53、24×24、11×11 整数乘积，
+没有提前舍入，不使用宿主 float/double；对阶、融合累加、规格化、特殊值和 fflags 保留。
+
+这些功能模型采用现有 `kMul` 和普通状态，manifest 为 `observer_only=false`、
+`lowering=ordinary`，记录实际实例端口、乘积宽度、流水级数和使能/复位契约。
+它们不获得 observer 权限；commit-rat 的单核/DiffTest/同步复位限制仅约束 commit-rat。
+
+局部复现入口为 `scripts/multiply_behavior_study.py`、`multiply_behavior_check.py`、
+`multiply_wrapper_check.py`、`multiply_product_check.py` 和 `multiply_behavior_measure.py`。
+浮点参考使用独立构建的 RISC-V SoftFloat；参考库不进入模型运行时。
+局部及完整 S3 结果须分别报告，默认不因局部加速而自动开启。
+
+### `kBehaviorComputeGroup`：保留无状态计算边界
+
+对四类乘法模型可以额外指定：
+
+```text
+--wolvrix-behavior-compute-lowering ordinary|grouped
+```
+
+`ordinary` 保留 carrier 的普通 GRH 算术；`grouped` 先认证 `simulation_models.json` 中的
+carrier 模块、端口顺序、位宽和语义哈希，再把纯组合 carrier 转成一个
+`kBehaviorComputeGroup`。该节点不拥有寄存器、内存、时钟或复位，latency 只是 manifest 契约；
+原有流水寄存器、valid/fire、flush 和握手继续留在外围 GRH。它因此可以把宿主整数乘法/精确
+有效数 helper 的边界暴露给 scheduler，而不把流水时序隐藏在 DPI 或状态节点里。
+
+四类 carrier 的输入输出布局固定在模型 manifest；未知模型、重复 carrier、端口/宽度/hash
+错误都会在 lowering 或 emitter 阶段失败。`behavior_compute_group.py` 只替换完全匹配的
+carrier graph，未认证的设计不会静默退化。普通 Chisel/SystemVerilog carrier 仍是回退实现，
+默认硬件和 ordinary 路径不改变。
+
+局部研究使用 `scripts/multiply_behavior_study.py --compute-lowering ordinary|grouped`、
+`multiply_behavior_check.py` 和 `multiply_behavior_measure.py`。比较必须包含硬件、ordinary
+和 grouped 三个版本，并把输入准备、完整流水、输出读取和变化检测计入计时；单个 helper 的
+微基准不能作为整机收益证据。当前 grouped 仅在标量整数局部模型达到门槛后进入整机候选，
+其他模型即使功能正确也保持显式实验开关关闭。
+
+### 数组 observer 模型
 
 `hardware` 是默认模式。`commit-rat` 模式使用 utility 中的 `SimulationModels` API，模型
 作者可以声明 `input`、同步 `register`、小型 `memory`、`update` 和 `output`。这些调用
@@ -71,23 +130,109 @@ Verilog、GRH 和 C++ lowering fixture，没有据此宣称香山整机 walltime
 `array(name, rows, init)` 声明可索引数组，并用一次 `update(enable, index, value)` 描述
 单点更新；这保持模型源代码在数组抽象层，而不是要求作者手工展开每个寄存器。
 
+数组状态的底层 Vec 不暴露给模型作者。`read(index)` 与 `snapshot` 是观察副本，
+`update(enable,index,value)` 才修改内部状态；同拍后调用的有效更新覆盖先调用的更新，
+读取使用边沿前状态，reset 优先。`array(name,rows,row => init)` 支持 identity 初始化。
+
+真实 `commit-rat` adapter 消费原 ROB 微操作退休序列和物理写回。普通 lowering 在模块边界按
+架构索引合并最后写入；分组 lowering 直接保留原始更新顺序。两者都保留整数/FP/vector RAT
+与架构快照。延迟移到物理/RAT gather 之后，
+commit data 通过地址/数据分别对齐保持原 Preprocess 拍号。该实验路径仍保留完整 canonical
+DiffTest 和 NEMU；单核完整配置之外的输入能力不足会报错。
+
 第一版刻意不新增 `kBehaviorRegister` 或 `kBehaviorMemory`。现有 GRH 已经把
 `kRegister/kMemory` 纳入 source/sink 分类、commit phase、state-reader 激活、变化检测和
 scalar commit write 优化。增加同语义的 OperationKind 不会自动减少运行时工作；实际
-性能收益首先来自裁剪 DiffTest 字段和 Gateway/Preprocess 路径。
+性能候选来自改变 observer 状态、读写与 Gateway/Preprocess 的组织方式。完整 S3 实验保持
+canonical DiffTest 检查字段和 NEMU 功能，不通过关闭检查获得收益。
 
-如果普通 GRH 行为模型的状态更新仍是热点，后续应增加**分组级**的专用状态 lowering，
-而不是逐个复制 Register/Memory 类型。该 lowering 必须显式携带输入、状态、更新条件、
-commit 事件和输出依赖，使 scheduler 与 activity analysis 可见；C++ emitter 才能把一组
-observer commit 更新合并成一次 helper，并跳过不必要的 state shadow、event guard 和
-fixed-point 反馈。模型 manifest 会作为 lowering 的边界和校验输入，当前 Python GrhSIM
-驱动会把它复制到生成模型目录，但默认仍走普通 GRH 状态路径。
+可选的 `kBehaviorStateGroup` 已完成局部实验和完整 S3 功能验收。它把有序数组写入作为一个 commit sink，
+显式携带输入、状态、更新条件、时钟和复位；读取沿用普通 memory read dependencies。
+只比较每行最终写入值，净变化才激活 reader；不会为每条写入单独生成完整状态提交包装。
+本轮所有基线的 state shadow 已为零，因此不能把实测收益归因于消除 shadow。
 
 示例 fixture 为 `testcase/chisel-intrinsic/BehaviorModelStudy.scala`，脚本为
 `scripts/behavior_model_study.py`。它生成硬件版和 `commit-rat` 版相同端口的 RTL；行为
 版 manifest 声明 32 个架构寄存器、32 个 RAT 寄存器、commit/RAT 输入和两个状态输出。
 Wolvrix frontend 将行为版状态识别为普通 `kRegister`/`kRegisterWritePort`，没有引入
-专用 OperationKind。
+专用 OperationKind。这是早期普通状态 fixture，仍可作为 API 回退示例。
+
+新的数组实验保留作者侧的高层写法：
+
+```scala
+SimulationModels.withMode("commit-rat", Some(manifest), lowering = "grouped") {
+  // Elaborate the Module here. Its model body remains array-oriented:
+  // val arch = model.array("arch", 32, 0.U(64.W))
+  // arch.update(commit.valid, commit.dest, commit.data)
+  // val observed = arch.snapshot
+}
+```
+
+这里的 elaboration 选项让 API 记录数组和有序更新，并生成
+`WolvrixBehaviorStateGroup_v1_<ordinal>`。它在 Chisel 内部使用 `BlackBox with HasBlackBoxInline`
+作为传递容器，但带有完整可执行的 SV 实现；它不是空 stub，也没有运行时有状态 DPI。
+同一份数组描述同时生成 fallback RTL 和 `simulation_models.json` v2 binding。
+binding 包含精确模块名、clock/reset/update/read 端口方向与位宽、数组初始化、更新顺序和 SV SHA256。
+模型名、capability、检查字段和 SourceInfo 另行保留；`Data.toString` 仅作诊断，不用于绑定。
+
+Wolvrix 的选择独立于 elaboration：
+
+```text
+WOLVRIX_SIMULATION_MODELS_MANIFEST=<simulation_models.json>
+scripts/wolvrix_xs_grhsim.py <既有参数> --behavior-state-lowering ordinary
+scripts/wolvrix_xs_grhsim.py <既有参数> --behavior-state-lowering grouped
+```
+
+`ordinary` 为默认，完整 SV lower 到普通 GRH；`grouped` 在 flatten 之前核对 metadata、实际
+解析到的模块端口、canonical fallback 及读取的 RTL 源文内容，才替换对应模块 body。
+缺少 binding、未知版本、端口/位宽不符、源码与 manifest 不符都报错；不允许从未认证的
+pre-reg-to-mem/stats checkpoint 跳过导入。flatten 后每个实例获得独立存储。
+
+完整 XiangShan 的生成入口为：
+
+```text
+--wolvrix-sim-models commit-rat --wolvrix-behavior-state-lowering grouped
+```
+
+单线程实验脚本对应 `--sim-models commit-rat --behavior-state-lowering grouped`，默认仍为
+`hardware/ordinary`。当前完整 adapter 仅将 RAT 的 32/32/32/1 行数组、2,080 条潜在更新
+交给分组节点；物理 RF shadow、架构快照和延迟仍使用普通状态。manifest 可以同时包含
+显式 `ordinary` 与 `grouped` 模型，不能将缺少 binding 的分组模型静默回退。
+
+完整 DiffTest 下游由 `SimulationModels.observerModule` 显式声明。manifest 的
+`observer_domains` 绑定实际模块名及有类型端口；导入时为该域的子模块建立专用副本，
+共享的普通 DelayReg 等模块不会因此获得 observer 权限。ownership 检查允许分组结果
+经过域内 debug 状态到 void DPI/checker，并继续穿过状态的所有 reader 检查消费者。
+未标记的状态写入、带返回值的 DPI、XMR write 以及经过 debug delay 后再反馈到功能状态
+仍被拒绝。reg-to-mem 仅合并 observer 域一致的状态，并保留域标记。
+
+v1 限定单上升沿时钟、同步复位、完整元素写入、字面量初始化、1–64 位 UInt 和 2 的幂行数，
+总行数上限 65,536。多字元素、任意行数、mask write、异步复位及通用行为语言未实现。
+详细 IR 契约见 [GRH state group](../grh/grh-ir.md#kbehaviorstategroup实验性版本-1)。
+
+复现入口为根仓库的 `scripts/behavior_state_group_{study,check,validate,diagnostics,measure,report}.py`，
+fixture 为 `testcase/chisel-intrinsic/BehaviorStateGroupStudy.scala`。
+它使用完整生产 reg-to-mem/activity/emitter 配置，比较原硬件写法 H、同一 carrier 的普通路径 O
+和分组路径 G；诊断模型与计时模型分开。
+
+520 路潜在退休更新的 RAT 局部实验中，G 在稀疏/密集更新下分别比 O 快 24.10%/21.19%，
+比 H 快 16.56%/17.10%；小型双数组未获得相对 O 的收益。数据只支持继续验证大规模有序写入，
+不支持所有数组都启用分组。结果、完整范围与下一阶段条件见
+[TNO0438](../../../pdocs/grhsim_opt_thj/TNO0438_behavior_state_group_contract_20261105.md) 和
+[TNO0439](../../../pdocs/grhsim_opt_thj/TNO0439_behavior_state_group_local_performance_20261105.md)。
+真实香山 adapter 的分组路径已通过与硬件 S3 的 100,000 周期 NEMU/trace 比较，四份原始
+trace 哈希相同。实际参数的局部 adapter 普通/分组路径各通过 30,000 周期参考检查，覆盖
+FP/vector、重复写、flush、skip 和延迟。整机验证仅覆盖本次单核配置与 CoreMark，不能
+外推为所有向量指令或配置的证明。实现与功能记录见
+[TNO0440](../../../pdocs/grhsim_opt_thj/TNO0440_grouped_rat_s3_integration_20261105.md) 和
+[TNO0441](../../../pdocs/grhsim_opt_thj/TNO0441_grouped_rat_s3_functional_gate_20261105.md)；
+整机速度由独立的无 trace 配对测量判断，不能从局部加速或 GRH 数量推定。
+
+完整 S3 的 8 对 AB/BA 中，硬件 A 平均 101.086 秒，分组 adapter B 平均 101.257 秒；
+配对变化 +0.170705%，95% 区间 [-0.182087%, +0.461222%]，B 仅 2/8 更快。
+最终 GRH 操作数减少 4.63%，但调度节点与激活边略增；本轮未证明稳定整机加速，不追加 A/A。
+分组路径保持显式实验选项，默认 hardware/ordinary。统计、范围与审计见
+[TNO0442](../../../pdocs/grhsim_opt_thj/TNO0442_grouped_rat_s3_performance_20261105.md)。
 
 当前实验覆盖 `1,2,3,4,5,6,7,8,9,10,14,15,16,17,31,32,33,36,38,63,64,65,
 127,128,129,255,256,257,511,512,1024` 位的打包和分散 Bool 输入；实际 XiangShan

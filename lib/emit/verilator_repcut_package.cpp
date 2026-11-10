@@ -3315,6 +3315,22 @@ namespace wolvrix::lib::emit
         {
             drivers.emplace(port.value, DriverDesc{DriverDesc::Kind::Top, {}, port.name, {}});
         }
+        if (grhSim)
+        {
+            // RepCut preserves undriven RTL nets in its wrapper. Native
+            // two-state GrhSIM initializes their logic storage to zero;
+            // preserve that behavior across the package input boundary.
+            for (const auto value : topGraph.values())
+            {
+                if (!topGraph.valueDef(value).valid() && drivers.find(value) == drivers.end() &&
+                    topGraph.valueType(value) == wolvrix::lib::grh::ValueType::Logic &&
+                    topGraph.valueWidth(value) > 0)
+                {
+                    drivers.emplace(value, DriverDesc{DriverDesc::Kind::Const, {}, {},
+                        std::to_string(topGraph.valueWidth(value)) + "'h0"});
+                }
+            }
+        }
         for (const auto opId : topGraph.operations())
         {
             if (topGraph.opKind(opId) != wolvrix::lib::grh::OperationKind::kConstant)

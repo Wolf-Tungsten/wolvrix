@@ -221,6 +221,13 @@ namespace
             bank.bindOutputPort("q" + suffix, reg(bank, "reg" + suffix, width,
                                                  bankClock, reset, enable, data));
         }
+        for (const int32_t width : {1, 64, 130})
+        {
+            const auto suffix = std::to_string(width);
+            const auto data = input(bank, "undriven" + suffix, width);
+            bank.bindOutputPort("zero" + suffix, reg(bank, "zero_reg" + suffix, width,
+                                                      bankClock, reset, enable, data));
+        }
 
         Graph &top = design.createGraph("RepCutTop");
         const auto clock = input(top, "clock", 1);
@@ -278,6 +285,26 @@ namespace
             secondOutputs.push_back(second);
             bankInputs.push_back("data" + suffix);
             bankOutputs.push_back("q" + suffix);
+        }
+        for (const int32_t width : {1, 64, 130})
+        {
+            const auto suffix = std::to_string(width);
+            const auto undriven = value(top, "undriven" + suffix, width);
+            const auto alias = value(top, "undriven_alias" + suffix, width);
+            const auto assign = top.createOperation(OperationKind::kAssign,
+                                                      top.internSymbol("undriven_assign" + suffix));
+            top.addOperand(assign, undriven);
+            top.addResult(assign, alias);
+            const auto first = value(top, "firstZero" + suffix, width);
+            const auto second = value(top, "secondZero" + suffix, width);
+            top.bindOutputPort("firstZero" + suffix, first);
+            top.bindOutputPort("secondZero" + suffix, second);
+            firstInputs.push_back(undriven);
+            secondInputs.push_back(alias);
+            firstOutputs.push_back(first);
+            secondOutputs.push_back(second);
+            bankInputs.push_back("undriven" + suffix);
+            bankOutputs.push_back("zero" + suffix);
         }
         instance(top, "part_0", "RegisterBank",
                  firstInputs, firstOutputs, bankInputs, bankOutputs);
@@ -462,6 +489,10 @@ struct Wrapper {
         model.set_in32(in.in32);
         model.set_in64(in.in64);
         model.step();
+        if (model.get_firstZero1() || model.get_secondZero1() ||
+            model.get_firstZero64() || model.get_secondZero64() ||
+            model.get_firstZero130() != Wide130{} || model.get_secondZero130() != Wide130{})
+            throw std::runtime_error("undriven wrapper input was not zero");
         return {model.get_dpi_result(), model.get_first8(), model.get_first65(),
                 model.get_first130(), model.get_second8(), model.get_second65(),
                 model.get_second130(), model.get_first1025(), model.get_second1025(),
@@ -487,6 +518,9 @@ struct Facade {
         model.in32 = in.in32;
         model.in64 = in.in64;
         model.eval();
+        if (model.firstZero1 || model.secondZero1 || model.firstZero64 || model.secondZero64 ||
+            model.firstZero130 != Wide130{} || model.secondZero130 != Wide130{})
+            throw std::runtime_error("undriven facade input was not zero");
         return {model.dpi_result, model.first8, model.first65, model.first130,
                 model.second8, model.second65, model.second130, model.first1025, model.second1025,
                 {model.first1, model.first16, model.first32, model.first64},
@@ -937,6 +971,28 @@ int main()
 
     // Top names are public C++ API. Unsupported names must fail generation
     // explicitly, rather than produce an uncompilable facade or collisions.
+    {
+        Design invalid = buildDesign();
+        auto *top = invalid.findGraph("RepCutTop");
+        const auto data = input(*top, "unsupported_input", 8);
+        const auto one = constant(*top, "unsupported_one", 8, "8'd1");
+        const auto driven = binary(*top, "unsupported_wrapper_compute", 8, OperationKind::kAdd, data, one);
+        for (const auto op : top->operations())
+        {
+            if (top->opKind(op) == OperationKind::kInstance)
+            {
+                top->replaceOperand(op, 1, driven);
+                break;
+            }
+        }
+        EmitOptions invalidOptions = options;
+        invalidOptions.outputDir = (artifactRoot / "invalid_wrapper_compute").string();
+        EmitDiagnostics invalidDiagnostics;
+        EmitGrhSimRepCutPackage invalidEmitter(&invalidDiagnostics);
+        if (invalidEmitter.emit(invalid, invalidOptions).success ||
+            diagnosticsSummary(invalidDiagnostics).find("Unsupported top wrapper value") == std::string::npos)
+            return fail("a driven unsupported wrapper expression must not be replaced with zero");
+    }
     for (const bool collision : {false, true})
     {
         Design invalid = buildDesign();

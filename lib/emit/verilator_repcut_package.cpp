@@ -1768,6 +1768,10 @@ namespace wolvrix::lib::emit
             header << "  bool phase_worker_spin_infinite_{};\n";
             header << "  bool phase_host_spin_overridden_{};\n";
             header << "  bool phase_worker_spin_overridden_{};\n";
+            if (grhSim)
+            {
+                header << "  bool phase_pin_threads_{};\n";
+            }
             header << "  bool restore_host_affinity_{};\n";
             header << "  std::uint64_t step_count_{};\n";
             header << "  StepTimingStats step_timing_{};\n";
@@ -1843,7 +1847,10 @@ namespace wolvrix::lib::emit
                 commonSource << "};\n\n";
                 commonSource << "inline bool wolvi_repcut_code_hugepages_disabled() {\n";
                 commonSource << "  const char* value = std::getenv(\"WOLVI_GRHSIM_CODE_HUGEPAGE\");\n";
-                commonSource << "  if (value == nullptr || *value == '\\0') return false;\n";
+                // Code-page remapping is a measurement aid. Keep it opt-in so
+                // generated packages retain ordinary process/ELF semantics by
+                // default; the performance runner enables it explicitly.
+                commonSource << "  if (value == nullptr || *value == '\\0') return true;\n";
                 commonSource << "  return std::strcmp(value, \"0\") == 0 ||\n";
                 commonSource << "         std::strcmp(value, \"off\") == 0 ||\n";
                 commonSource << "         std::strcmp(value, \"false\") == 0 ||\n";
@@ -2037,6 +2044,17 @@ namespace wolvrix::lib::emit
             commonSource << "  return static_cast<std::size_t>(value);\n";
             commonSource << "}\n";
             commonSource << "\n";
+            if (grhSim)
+            {
+                commonSource << "inline bool wolvi_repcut_pin_threads_enabled() {\n";
+                commonSource << "  const char* value = std::getenv(\"WOLVI_REPCUT_PIN_THREADS\");\n";
+                commonSource << "  if (value == nullptr || *value == '\\0') return false;\n";
+                commonSource << "  return std::strcmp(value, \"1\") == 0 ||\n";
+                commonSource << "         std::strcmp(value, \"true\") == 0 ||\n";
+                commonSource << "         std::strcmp(value, \"yes\") == 0 ||\n";
+                commonSource << "         std::strcmp(value, \"on\") == 0;\n";
+                commonSource << "}\n\n";
+            }
             commonSource << "inline std::size_t wolvi_repcut_parse_bounded_unsigned(\n";
             commonSource << "    const char* text, std::size_t maximum, const char* errorMessage) {\n";
             commonSource << "  std::size_t value = 0;\n";
@@ -2114,7 +2132,14 @@ namespace wolvrix::lib::emit
             commonSource << "}\n\n";
             commonSource << "inline void wolvi_repcut_log_runtime_config(\n";
             commonSource << "    const WolviRepCutWaitConfig& config, const std::vector<int>& cpus,\n";
-            commonSource << "    std::size_t workerCount) {\n";
+            if (grhSim)
+            {
+                commonSource << "    std::size_t workerCount, bool pinThreads) {\n";
+            }
+            else
+            {
+                commonSource << "    std::size_t workerCount) {\n";
+            }
             commonSource << "  std::vector<std::size_t> identity(workerCount);\n";
             commonSource << "  for (std::size_t lane = 0; lane < workerCount; ++lane) identity[lane] = lane;\n";
             commonSource << "  const bool hostSpins = config.hostSpinInfinite || config.hostSpinUs != 0;\n";
@@ -2129,19 +2154,44 @@ namespace wolvrix::lib::emit
             commonSource << "      << \",\\\"background_workers\\\":\"\n";
             commonSource << "      << (config.hostParticipates ? workerCount - 1 : workerCount)\n";
             commonSource << "      << \",\\\"host_cpu\\\":\";\n";
-            commonSource << "  if (config.hostParticipates) out << cpus.at(config.hostLane); else out << \"null\";\n";
+            if (grhSim)
+            {
+                commonSource << "  if (config.hostParticipates && pinThreads) out << cpus.at(config.hostLane); else out << \"null\";\n";
+            }
+            else
+            {
+                commonSource << "  if (config.hostParticipates) out << cpus.at(config.hostLane); else out << \"null\";\n";
+            }
             commonSource << "  out << \",\\\"host_lane\\\":\";\n";
             commonSource << "  if (config.hostParticipates) out << config.hostLane; else out << \"null\";\n";
             commonSource << "  out << \",\\\"host_participates\\\":\" << (config.hostParticipates ? \"true\" : \"false\")\n";
             commonSource << "      << \",\\\"dispatch_kind\\\":\\\"\"\n";
             commonSource << "      << (config.workerSpinInfinite ? \"per-lane-atomic-spin\" : \"per-lane-cv\") << '\"'\n";
             commonSource << "      << \",\\\"worker_cpus\\\":\";\n";
-            commonSource << "  wolvi_repcut_json_array(out, cpus);\n";
+            if (grhSim)
+            {
+                commonSource << "  if (pinThreads) wolvi_repcut_json_array(out, cpus); else out << \"[]\";\n";
+            }
+            else
+            {
+                commonSource << "  wolvi_repcut_json_array(out, cpus);\n";
+            }
             commonSource << "  out << \",\\\"worker_to_part\\\":\";\n";
             commonSource << "  wolvi_repcut_json_array(out, identity);\n";
             commonSource << "  out << \",\\\"part_cpus\\\":\";\n";
-            commonSource << "  wolvi_repcut_json_array(out, cpus);\n";
+            if (grhSim)
+            {
+                commonSource << "  if (pinThreads) wolvi_repcut_json_array(out, cpus); else out << \"[]\";\n";
+            }
+            else
+            {
+                commonSource << "  wolvi_repcut_json_array(out, cpus);\n";
+            }
             commonSource << "  out << \",\\\"update_mode\\\":\\\"push\\\",\\\"wait_policy\\\":\\\"\" << waitPolicy << '\"'\n";
+            if (grhSim)
+            {
+                commonSource << "      << \",\\\"thread_pinning\\\":\\\"\" << (pinThreads ? \"enabled\" : \"disabled\") << '\"'\n";
+            }
             commonSource << "      << \",\\\"host_spin_us\\\":\" << config.hostSpinUs\n";
             commonSource << "      << \",\\\"host_spin_infinite\\\":\" << (config.hostSpinInfinite ? \"true\" : \"false\")\n";
             commonSource << "      << \",\\\"worker_spin_infinite\\\":\" << (config.workerSpinInfinite ? \"true\" : \"false\")\n";
@@ -2273,14 +2323,29 @@ namespace wolvrix::lib::emit
             commonSource << "  if (requestedWorkers != 0 && requestedWorkers > maxParallelFns && !waitConfig.hostParticipates) {\n";
             commonSource << "    wolvi_repcut_thread_config_error(\"XS_EMU_THREADS must not exceed largest phase task count\");\n";
             commonSource << "  }\n";
-            commonSource << "  phase_cpu_ids_ = wolvi_repcut_available_cpus();\n";
+            if (grhSim)
+            {
+                commonSource << "  phase_pin_threads_ = wolvi_repcut_pin_threads_enabled();\n";
+                commonSource << "  phase_cpu_ids_ = phase_pin_threads_ ? wolvi_repcut_available_cpus() : std::vector<int>{};\n";
+            }
+            else
+            {
+                commonSource << "  phase_cpu_ids_ = wolvi_repcut_available_cpus();\n";
+            }
             commonSource << "  const std::size_t availableCpuCount = phase_cpu_ids_.size();\n";
             commonSource << "  if (requestedWorkers < 2) {\n";
             commonSource << "    std::fprintf(stderr, \"[WOLVI][thread-config] requested=%zu effective=1 max_parallel=%zu available_cpus=%zu\\n\", requestedWorkers, maxParallelFns, availableCpuCount);\n";
             commonSource << "    phase_cpu_ids_.clear();\n";
             commonSource << "    return;\n";
             commonSource << "  }\n";
-            commonSource << "  if (requestedWorkers > availableCpuCount) {\n";
+            if (grhSim)
+            {
+                commonSource << "  if (phase_pin_threads_ && requestedWorkers > availableCpuCount) {\n";
+            }
+            else
+            {
+                commonSource << "  if (requestedWorkers > availableCpuCount) {\n";
+            }
             commonSource << "    wolvi_repcut_thread_config_error(\"XS_EMU_THREADS must not exceed available CPU count\");\n";
             commonSource << "  }\n";
             commonSource << "  phase_worker_count_ = requestedWorkers;\n";
@@ -2291,8 +2356,18 @@ namespace wolvrix::lib::emit
             commonSource << "  phase_worker_spin_infinite_ = waitConfig.workerSpinInfinite;\n";
             commonSource << "  phase_host_spin_overridden_ = waitConfig.hostSpinOverridden;\n";
             commonSource << "  phase_worker_spin_overridden_ = waitConfig.workerSpinOverridden;\n";
-            commonSource << "  original_host_cpu_ids_ = phase_cpu_ids_;\n";
-            commonSource << "  phase_cpu_ids_.resize(phase_worker_count_);\n";
+            if (grhSim)
+            {
+                commonSource << "  if (phase_pin_threads_) {\n";
+                commonSource << "    original_host_cpu_ids_ = phase_cpu_ids_;\n";
+                commonSource << "    phase_cpu_ids_.resize(phase_worker_count_);\n";
+                commonSource << "  }\n";
+            }
+            else
+            {
+                commonSource << "  original_host_cpu_ids_ = phase_cpu_ids_;\n";
+                commonSource << "  phase_cpu_ids_.resize(phase_worker_count_);\n";
+            }
             commonSource << "  std::fprintf(stderr, \"[WOLVI][thread-config] requested=%zu effective=%zu max_parallel=%zu available_cpus=%zu\\n\", requestedWorkers, phase_worker_count_, maxParallelFns, availableCpuCount);\n";
             commonSource << "  part_timing_worker_stats_.assign(phase_worker_count_, {});\n";
             commonSource << "  phase_workers_ = std::make_unique<PhaseWorker[]>(phase_worker_count_);\n";
@@ -2304,7 +2379,14 @@ namespace wolvrix::lib::emit
             commonSource << "      phase_workers_[workerIndex].thread = std::thread([this, workerIndex]() {\n";
             commonSource << "        auto& worker = phase_workers_[workerIndex];\n";
             commonSource << "        try {\n";
-            commonSource << "          if (!wolvi_repcut_pin_current_thread(phase_cpu_ids_.at(workerIndex))) {\n";
+            if (grhSim)
+            {
+                commonSource << "          if (phase_pin_threads_ && !wolvi_repcut_pin_current_thread(phase_cpu_ids_.at(workerIndex))) {\n";
+            }
+            else
+            {
+                commonSource << "          if (!wolvi_repcut_pin_current_thread(phase_cpu_ids_.at(workerIndex))) {\n";
+            }
             commonSource << "            throw std::runtime_error(\"failed to pin phase worker lane \" + std::to_string(workerIndex));\n";
             commonSource << "          }\n";
             commonSource << "        } catch (...) {\n";
@@ -2333,13 +2415,27 @@ namespace wolvrix::lib::emit
             commonSource << "        std::rethrow_exception(worker.error);\n";
             commonSource << "      }\n";
             commonSource << "    }\n";
-            commonSource << "    if (phase_host_participates_) {\n";
+            if (grhSim)
+            {
+                commonSource << "    if (phase_host_participates_ && phase_pin_threads_) {\n";
+            }
+            else
+            {
+                commonSource << "    if (phase_host_participates_) {\n";
+            }
             commonSource << "      if (!wolvi_repcut_pin_current_thread(phase_cpu_ids_.at(phase_host_lane_))) {\n";
             commonSource << "        throw std::runtime_error(\"failed to pin participating Host lane \" + std::to_string(phase_host_lane_));\n";
             commonSource << "      }\n";
             commonSource << "      restore_host_affinity_ = true;\n";
             commonSource << "    }\n";
-            commonSource << "    wolvi_repcut_log_runtime_config(waitConfig, phase_cpu_ids_, phase_worker_count_);\n";
+            if (grhSim)
+            {
+                commonSource << "    wolvi_repcut_log_runtime_config(waitConfig, phase_cpu_ids_, phase_worker_count_, phase_pin_threads_);\n";
+            }
+            else
+            {
+                commonSource << "    wolvi_repcut_log_runtime_config(waitConfig, phase_cpu_ids_, phase_worker_count_);\n";
+            }
             commonSource << "    phase_parallel_ = true;\n";
             commonSource << "  } catch (...) {\n";
             commonSource << "    shutdown_phase_workers_();\n";
@@ -2388,6 +2484,10 @@ namespace wolvrix::lib::emit
             commonSource << "  phase_worker_spin_infinite_ = false;\n";
             commonSource << "  phase_host_spin_overridden_ = false;\n";
             commonSource << "  phase_worker_spin_overridden_ = false;\n";
+            if (grhSim)
+            {
+                commonSource << "  phase_pin_threads_ = false;\n";
+            }
             commonSource << "}\n\n";
             commonSource << "void " + simClass + "::phase_worker_loop_(std::size_t workerIndex) {\n";
             commonSource << "  auto &worker = phase_workers_[workerIndex];\n";

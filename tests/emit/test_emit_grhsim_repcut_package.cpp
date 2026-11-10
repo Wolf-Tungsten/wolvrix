@@ -385,7 +385,7 @@ namespace
         }
         const auto runLog = caseRoot / "run.log";
         const auto run =
-            "timeout 30s env -u WOLVI_REPCUT_HOST_LANE -u WOLVI_REPCUT_HOST_SPIN_US "
+            "timeout 30s env -u WOLVI_REPCUT_PIN_THREADS -u WOLVI_REPCUT_HOST_LANE -u WOLVI_REPCUT_HOST_SPIN_US "
             "-u WOLVI_REPCUT_WORKER_SPIN_US -u WOLVI_REPCUT_TIMING_JSONL XS_EMU_THREADS=1 " +
             shellQuote(executable.string()) + " > " + shellQuote(runLog.string()) + " 2>&1";
         if (std::system(run.c_str()) != 0 ||
@@ -814,7 +814,7 @@ int main() {
             for (const unsigned threads : {1u, 2u})
             {
                 if (threads > availableCpuCount()) continue;
-                const auto run = "timeout 30s env -u WOLVI_REPCUT_TIMING_JSONL -u WOLVI_REPCUT_HOST_LANE "
+                const auto run = "timeout 30s env -u WOLVI_REPCUT_PIN_THREADS -u WOLVI_REPCUT_TIMING_JSONL -u WOLVI_REPCUT_HOST_LANE "
                     "-u WOLVI_REPCUT_HOST_SPIN_US -u WOLVI_REPCUT_WORKER_SPIN_US " +
                     std::string(threads == 2 ? "WOLVI_REPCUT_HOST_SPIN_US=0 WOLVI_REPCUT_WORKER_SPIN_US=0 " : "") +
                     "XS_EMU_THREADS=" +
@@ -1110,7 +1110,7 @@ int main()
                 const auto output = artifactRoot / (name + ".out");
                 const auto log = artifactRoot / (name + ".log");
                 const auto run =
-                    "timeout 30s env -u WOLVI_REPCUT_HOST_LANE -u WOLVI_REPCUT_HOST_SPIN_US "
+                    "timeout 30s env -u WOLVI_REPCUT_PIN_THREADS -u WOLVI_REPCUT_HOST_LANE -u WOLVI_REPCUT_HOST_SPIN_US "
                     "-u WOLVI_REPCUT_WORKER_SPIN_US -u WOLVI_REPCUT_TIMING_JSONL "
                     + std::string(useCv ? "WOLVI_REPCUT_HOST_SPIN_US=0 WOLVI_REPCUT_WORKER_SPIN_US=0 " : "")
                     + "XS_EMU_THREADS=" +
@@ -1145,6 +1145,11 @@ int main()
                 }
                 if (threads >= 2)
                 {
+                    if (runtimeLog.find("\"thread_pinning\":\"disabled\"") == std::string::npos ||
+                        runtimeLog.find("\"worker_cpus\":[]") == std::string::npos)
+                    {
+                        return fail(name + " enabled thread pinning without the explicit opt-in");
+                    }
                     const std::string expectedPolicy = threads == 3 && !useCv ? "all-spin"
                                                                               : "condition-variable";
                     if (runtimeLog.find("\"wait_policy\":\"" + expectedPolicy + "\"") == std::string::npos)
@@ -1157,7 +1162,7 @@ int main()
                     const auto alternateOutput = artifactRoot / (name + "_host0.out");
                     const auto alternateLog = artifactRoot / (name + "_host0.log");
                     const auto alternateRun =
-                        "timeout 30s env -u WOLVI_REPCUT_HOST_SPIN_US -u WOLVI_REPCUT_WORKER_SPIN_US "
+                        "timeout 30s env -u WOLVI_REPCUT_PIN_THREADS -u WOLVI_REPCUT_HOST_SPIN_US -u WOLVI_REPCUT_WORKER_SPIN_US "
                         "-u WOLVI_REPCUT_TIMING_JSONL WOLVI_REPCUT_HOST_LANE=0 XS_EMU_THREADS=3 "
                         + std::string(useCv ? "WOLVI_REPCUT_HOST_SPIN_US=0 WOLVI_REPCUT_WORKER_SPIN_US=0 " : "")
                         + shellQuote(executable.string()) + " " + api + " > "
@@ -1179,7 +1184,7 @@ int main()
                             const auto mixedName = name + "_mixed_" + std::to_string(mode);
                             const auto mixedOutput = artifactRoot / (mixedName + ".out");
                             const auto mixedLog = artifactRoot / (mixedName + ".log");
-                            const auto mixedRun = "timeout 30s env -u WOLVI_REPCUT_TIMING_JSONL "
+                            const auto mixedRun = "timeout 30s env -u WOLVI_REPCUT_PIN_THREADS -u WOLVI_REPCUT_TIMING_JSONL "
                                 "WOLVI_REPCUT_HOST_LANE=0 XS_EMU_THREADS=3 "
                                 + std::string(mixedEnvironments[mode]) + shellQuote(executable.string())
                                 + " " + api + " > " + shellQuote(mixedOutput.string())

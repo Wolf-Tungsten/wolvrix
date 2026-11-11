@@ -262,8 +262,8 @@ authentication. The reader additionally records SHA256 evidence.
 with identical counts/evals. It checks graph/source/site binding, complete
 executable coverage, row order, totals, end markers and uint64 bounds.
 It rejects truncated, stale or mismatched evidence. Use the project Make
-targets `test_grhsim_execution_counts`, `inspect_remove_grhsim_ir_execution`
-and `inspect_remove_grhsim_ir_rob_execution` to run these workflows.
+targets `test_grhsim_execution_counts` and `inspect_remove_grhsim_ir_execution`
+to run these workflows.
 
 Family/paired diagnostics optionally use these counts for native final-graph
 writer data cones. They count shared operations once in the union, exclude

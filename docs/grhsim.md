@@ -110,11 +110,10 @@ make run_xs_grhsim_emu XS_SIM_MAX_CYCLE=100000
 
 XS requires `preserve-aggregate=all`; the production build keeps
 `-O3 -march=native -fno-strict-aliasing`, 24 jobs for migration acceptance,
-and JSON roundtrip/schedule reconstruction. `measure_remove_grhsim_ir_resources`
-with target `build_remove_grhsim_ir_xs_from_sv` measures the complete original
-SV → linked emu interval against the 2100-second budget. A checkpoint-only
-re-emission is not that measurement. The 100k run is a cycle window with NEMU
-difftest, not full CoreMark completion.
+and JSON roundtrip/schedule reconstruction. `xs_grhsim_emu` covers the complete
+original SV → generated model → linked emu flow. Set `XS_GRHSIM_BUILD` to a
+fresh `ptmp/` directory to retain the generation and build artifacts. The
+100k run checks a cycle window with NEMU difftest.
 
 `check_remove_grhsim_ir` audits current sources, retired trees, actual CMake
 compile commands, core/binding symbols and optionally a generated model.

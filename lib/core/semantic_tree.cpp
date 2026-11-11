@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace wolvrix::lib::grh {
 
@@ -110,6 +111,102 @@ SemanticId SemanticTree::appendTree(const SemanticTree& source, SemanticId paren
         }
     }
     return copiedRoot;
+}
+
+std::unique_ptr<SemanticTree> SemanticTree::buildPruned(
+    std::span<const uint8_t> referenced, SemanticTreePruneResult& result) const {
+    result = {};
+    if (referenced.size() != nodes_.size())
+        throw std::invalid_argument("SemanticTree reference bitmap size mismatch");
+
+    std::vector<uint8_t> keep(referenced.begin(), referenced.end());
+    keep[0] = 0;
+    keep[root()] = 1;
+    for (SemanticId id = static_cast<SemanticId>(nodes_.size() - 1); id > root(); --id) {
+        if (keep[id]) keep[nodes_[id].parent] = 1;
+    }
+
+    struct SiblingKey {
+        SemanticId parent;
+        std::string_view name;
+        bool operator==(const SiblingKey&) const = default;
+    };
+    struct SiblingHash {
+        std::size_t operator()(const SiblingKey& key) const noexcept {
+            std::size_t hash = std::hash<SemanticId>{}(key.parent);
+            hash ^= std::hash<std::string_view>{}(key.name) + 0x9e3779b9u +
+                (hash << 6) + (hash >> 2);
+            return hash;
+        }
+    };
+    std::unordered_map<SiblingKey, SemanticId, SiblingHash> modules;
+    for (SemanticId id = root() + 1; id < nodes_.size(); ++id) {
+        if (nodes_[id].kind == SemanticNodeKind::Module)
+            modules.emplace(SiblingKey{nodes_[id].parent, name(id)}, id);
+    }
+    std::vector<std::pair<SemanticId, SemanticId>> instanceLinks;
+    instanceLinks.reserve(modules.size());
+    for (SemanticId id = root() + 1; id < nodes_.size(); ++id) {
+        const auto& item = nodes_[id];
+        if (item.kind != SemanticNodeKind::Declaration ||
+            nodes_[item.parent].kind != SemanticNodeKind::Module)
+            continue;
+        const auto module = modules.find(SiblingKey{item.parent, name(id)});
+        if (module != modules.end()) instanceLinks.emplace_back(module->second, id);
+    }
+    for (const auto& [module, declaration] : instanceLinks) {
+        if (keep[module] || keep[declaration]) {
+            keep[module] = 1;
+            keep[declaration] = 1;
+        }
+    }
+    for (SemanticId id = static_cast<SemanticId>(nodes_.size() - 1); id > root(); --id) {
+        if (keep[id]) keep[nodes_[id].parent] = 1;
+    }
+
+    std::size_t retainedNameBytes = 0;
+    for (SemanticId id = root(); id < nodes_.size(); ++id) {
+        if (!keep[id]) continue;
+        ++result.retainedNodes;
+        retainedNameBytes += nodes_[id].nameSize;
+        if (id != root() && !referenced[id]) ++result.retainedIndirectNodes;
+    }
+    result.removedNodes = size() - result.retainedNodes;
+    result.removedNameBytes = names_.size() - retainedNameBytes;
+    if (result.removedNodes == 0) return nullptr;
+
+    result.oldToNew.assign(nodes_.size(), 0);
+    auto compacted = std::make_unique<SemanticTree>(sourceUnit_, circuit_, std::string(name(root())));
+    auto& compactedNodes = compacted->nodes_;
+    auto& compactedNames = compacted->names_;
+    compactedNodes.clear();
+    compactedNodes.resize(1);
+    compactedNames.clear();
+    compactedNodes.reserve(result.retainedNodes + 1);
+    compactedNames.reserve(retainedNameBytes);
+    for (SemanticId id = root(); id < nodes_.size(); ++id) {
+        if (!keep[id]) continue;
+        const auto& source = nodes_[id];
+        SemanticNode target = source;
+        if (id == root()) {
+            target.parent = 0;
+        } else {
+            target.parent = result.oldToNew[source.parent];
+            if (target.parent == 0) throw std::logic_error("SemanticTree retained parent was removed");
+        }
+        if (source.nameOffset > names_.size() ||
+            source.nameSize > names_.size() - source.nameOffset)
+            throw std::logic_error("SemanticTree name range is invalid");
+        result.oldToNew[id] = static_cast<SemanticId>(compactedNodes.size());
+        target.nameOffset = static_cast<uint32_t>(compactedNames.size());
+        compactedNames.insert(compactedNames.end(), names_.begin() + source.nameOffset,
+                              names_.begin() + source.nameOffset + source.nameSize);
+        compactedNodes.push_back(target);
+    }
+    if (compactedNodes.size() != result.retainedNodes + 1 ||
+        compactedNames.size() != retainedNameBytes)
+        throw std::logic_error("SemanticTree compaction count mismatch");
+    return compacted;
 }
 
 std::vector<std::string> SemanticTree::path(SemanticId id) const {

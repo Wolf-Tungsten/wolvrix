@@ -1,6 +1,5 @@
 #include "ingest/firrtl.hpp"
 #include "ingest/node_attributes.hpp"
-#include "transform/grhsim/node-cse.hpp"
 #include "../lib/ingest/firrtl/semantic.hpp"
 #include "core/store.hpp"
 
@@ -16,9 +15,7 @@ namespace grh = wolvrix::lib::grh;
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 5 && argc != 9) throw std::invalid_argument("usage: inspect-firrtl-nodes INPUT MODULE off|gsim REPORT [off|prefer|auto legacy|bytes MAX_NODES CLONE]");
-        if (std::string_view(argv[3]) != "off" && std::string_view(argv[3]) != "gsim")
-            throw std::invalid_argument("node CSE mode must be off or gsim");
+        if (argc != 4 && argc != 8) throw std::invalid_argument("usage: inspect-firrtl-nodes INPUT MODULE REPORT [off|prefer|auto legacy|bytes MAX_NODES CLONE]");
         const auto started = std::chrono::steady_clock::now();
         tx::SessionStore session;
         auto indexed = fi::indexFile(argv[1], "frozen-xs");
@@ -49,7 +46,7 @@ int main(int argc, char** argv) {
         lower(lower, *index);
         design.markAsTop(argv[2]);
         auto& graph = *design.findGraph(argv[2]);
-        std::ofstream report(argv[4]);
+        std::ofstream report(argv[3]);
         if (!report) throw std::invalid_argument("cannot write report");
         const auto snapshot = [&](std::string_view stage) {
             in::node::recordRetention(graph);
@@ -79,37 +76,28 @@ int main(int argc, char** argv) {
         execute("hier-flatten");
         execute("simplify", {"-semantics=2state"});
         execute("grh-to-grhsim");
-        execute("grhsim-simplify");
-        execute("grhsim-pack-bit-registers");
-        execute("grhsim-simplify");
-        execute("grhsim-recover-masked-or");
-        execute("grhsim-simplify");
-        execute("grhsim-node-cse", {std::string_view(argv[3]) == "off" ? "-firrtl-node-cse=off" : "-firrtl-node-cse=gsim"});
-        const auto stats = graph.metadata("firrtl.nodeCseStats");
-        for (const auto& value : std::get<std::vector<std::string>>(*stats)) report << value << '\n';
-        if (argc == 9) {
+        if (argc == 8) {
             execute("grhsim-split-event-and-output");
             execute("grhsim-split-nonsink-and-sink");
             const auto split = wolvrix::lib::store::StoreJson{}.storeToString(design);
             if (!split) throw std::invalid_argument("split checkpoint store failed");
             report << "split-checkpoint-bytes=" << split->size() << '\n';
-            std::ofstream splitFile(std::string(argv[4]) + ".split.json");
+            std::ofstream splitFile(std::string(argv[3]) + ".split.json");
             splitFile << *split;
             if (!splitFile) throw std::invalid_argument("split checkpoint write failed");
-            const std::string hint = "-firrtl-nodes=" + std::string(argv[5]);
-            const std::string cost = "-cost-model=" + std::string(argv[6]);
-            const std::string capacity = "-max-supernode-nodes=" + std::string(argv[7]);
-            const std::string clone = "-clone-shared=" + std::string(argv[8]);
+            const std::string hint = "-firrtl-nodes=" + std::string(argv[4]);
+            const std::string cost = "-cost-model=" + std::string(argv[5]);
+            const std::string capacity = "-max-supernode-nodes=" + std::string(argv[6]);
+            const std::string clone = "-clone-shared=" + std::string(argv[7]);
             execute("grhsim-partition-nonsink", {hint, cost, capacity, clone});
             const auto census = graph.metadata("grhsim.nonsinkHintStats");
             for (const auto& value : std::get<std::vector<std::string>>(*census)) report << value << '\n';
             report << "partition-report-stage=nonsink-partitioned-before-simplify\n";
-            execute("grhsim-simplify");
             execute("grhsim-partition-sink");
             // Save the actual schedule/IR checkpoint for review and CPU reemit.
             const auto final = wolvrix::lib::store::StoreJson{}.storeToString(design);
             if (!final) throw std::invalid_argument("partition checkpoint store failed");
-            std::ofstream checkpoint(std::string(argv[4]) + ".json");
+            std::ofstream checkpoint(std::string(argv[3]) + ".json");
             checkpoint << *final;
             if (!checkpoint) throw std::invalid_argument("partition checkpoint write failed");
         }

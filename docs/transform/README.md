@@ -36,6 +36,7 @@ with wolvrix.Session() as sess:
 | [`instance-inline`](instance-inline.md) | inline a selected instance path | local expansion after partitioning |
 | [`latch-transparent-read`](latch-transparent-read.md) | model latch transparency | latch-heavy RTL |
 | [`slice-index-const`](slice-index-const.md) | convert constant dynamic slices to static slices | simplify slicing patterns |
+| [`split-static-array`](split-static-array.md) | scalarize statically indexed combinational and state arrays | before independent DCE |
 | [`multidriven-guard`](multidriven-guard.md) | detect multiple-driver conflicts | structural checking before flattening |
 | [`register-write-normalize`](register-write-normalize.md) | extract guarded writes and remove proven state hold paths | two-state register/latch access recovery before scheduling |
 | [`mux-tree-fold`](register-write-normalize.md#动态写恢复) | recover dynamic accesses from expanded array decoders | aggregate array read/write recovery |
@@ -44,14 +45,18 @@ with wolvrix.Session() as sess:
 | [`memory-init-check`](memory-init-check.md) | validate memory initialization consistency | memory checking |
 | [`repcut`](repcut.md) | partition one graph with RepCut | large-graph partitioning |
 | [`simplify`](simplify.md) | run standard IR simplifications | general cleanup and optimization |
-| [`grh-to-grhsim`](grhsim-transforms.md) | convert simulation writes/events/calls on the same GRH graph | flat, unpartitioned simulation form |
-| [`grhsim-simplify`](grhsim-transforms.md#grhsim-simplify) | simplify globally before partitioning, within each owner afterwards | preserve simulation effects and cloned computations |
-| [`grhsim-pack-bit-registers`](grhsim-transforms.md#packing-and-masked-or-recovery) | pack eligible bit states with shared fire controls | unpartitioned simulation optimization |
-| [`grhsim-recover-masked-or`](grhsim-transforms.md#packing-and-masked-or-recovery) | recover masked OR reductions | simulation computation optimization |
-| [`grhsim-split-event-and-output`](grhsim-transforms.md) | extract Event/Output closures and histories | first simulation owners |
-| [`grhsim-split-nonsink-and-sink`](grhsim-transforms.md) | classify General work and state writes by total size | NonSink, SmallSink and LargeSink |
-| [`grhsim-partition-nonsink`](grhsim-transforms.md#activity-partitioning) | form activity supernodes and leaves | activation granularity |
-| [`grhsim-partition-sink`](grhsim-transforms.md#sink-groups-and-sinkschedule) | preserve ordered writer runs and publish SinkSchedule | current CPU emission |
+| [`grhsim-dialect-translate`](grhsim-transforms.md) | convert simulation writes/events/calls on the same GRH graph | flat, unpartitioned simulation form; `grh-to-grhsim` is a compatibility alias |
+| [`expr-opt`](grhsim-transforms.md#expr-opt) | GSIM-compatible expression-tree cleanup | after external DCE, before conversion |
+| [`used-bits`](grhsim-transforms.md#used-bits) | backward used-bit analysis and width narrowing | after expression cleanup, before conversion |
+| [`split-nodes`](grhsim-transforms.md#split-nodes) | split independently used static bit ranges in scalar GRH expressions | after used-bit narrowing, before the second external DCE |
+| [`constant-analysis`](grhsim-transforms.md#constant-analysis) | propagate provably constant pure GRH expressions | after SplitNodes and an explicit DCE, before conversion |
+| [`alias-analysis`](grhsim-transforms.md#alias-analysis) | redirect identity scalar views to their source values | after constant propagation, before pattern detection |
+| [`pattern-detect`](grhsim-transforms.md#pattern-detect) | expose safe concat/equality patterns | after alias analysis, before common-expression sharing |
+| [`comm-expr`](grhsim-transforms.md#common-expr) | share repeated pure scalar expression trees | before the final explicit DCE and conversion; `common-expr` is a compatibility alias |
+| [`split-event-and-output`](grhsim-transforms.md) | extract Event/Output closures and histories | first simulation owners; `grhsim-split-event-and-output` is an alias |
+| [`split-nonsink-and-sink`](grhsim-transforms.md) | classify General work and state writes by total size | NonSink, SmallSink and LargeSink |
+| [`partition-nonsink`](grhsim-transforms.md#activity-partitioning) | form activity supernodes and leaves | activation granularity |
+| [`partition-sink`](grhsim-transforms.md#sink-groups-and-sinkschedule) | preserve ordered writer runs and publish SinkSchedule | current CPU emission |
 | [`stats`](stats.md) | collect design statistics | analysis and debugging |
 
 ## Internal Passes Used By `simplify`

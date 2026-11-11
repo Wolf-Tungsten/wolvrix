@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <memory>
 #include <set>
 #include <utility>
 
@@ -53,6 +54,11 @@ struct AccessPath {
     InlinePath<std::string_view, 4> fields;
     InlinePath<ExprId, 2> indices;
 };
+struct DriverPiece {
+    int64_t end = 0;
+    ValueId value;
+};
+using DriverPieces = std::map<int64_t, DriverPiece>;
 struct Driver {
     Leaf leaf;
     ValueId value;
@@ -60,6 +66,10 @@ struct Driver {
     Range range;
     // Disjoint half-open bit intervals, with a sentinel at total width.
     std::map<int64_t, int> coverage;
+    // Current packed provenance.  Static indexed writes replace pieces in
+    // this map, so a later field overwrite does not retain the old aggregate
+    // value merely as an operand of a historical kConcat.
+    std::unique_ptr<DriverPieces> pieces;
     std::string regSymbol;
     ValueId memoryMask;
     grh::SemanticId semantic = 0;
@@ -592,6 +602,51 @@ void Lowerer::connect(const Connection& connection) {
                 throw Error(connection.range, "probe has multiple definitions");
     }
     if (staticWrite) cover(driver, offset, offset + dataType.width, connection.guard);
+
+    auto flatType = fullType; flatType.shape.clear(); flatType.isSigned = false;
+    auto materializePieces = [&]() {
+        if (!driver.pieces) return;
+        std::vector<ValueId> parts;
+        parts.reserve(driver.pieces->size());
+        for (auto it = driver.pieces->rbegin(); it != driver.pieces->rend(); ++it)
+            parts.push_back(it->second.value);
+        const auto packed = parts.size() == 1 ? parts.front() : op(OperationKind::kConcat, flatType, parts, connection.range);
+        driver.current = view(packed, fullType, connection.range);
+    };
+    auto splitPiece = [&](int64_t position) {
+        if (position <= 0 || position >= fullType.width || !driver.pieces) return;
+        auto next = driver.pieces->upper_bound(position);
+        if (next == driver.pieces->begin()) return;
+        auto piece = std::prev(next);
+        if (position == piece->first || position >= piece->second.end) return;
+        const auto begin = piece->first;
+        const auto end = piece->second.end;
+        const auto value = piece->second.value;
+        const auto lower = slice(value, 0, position - begin, false, connection.range);
+        const auto upper = slice(value, position - begin, end - position, false, connection.range);
+        piece->second.end = position;
+        piece->second.value = lower;
+        driver.pieces->emplace(position, DriverPiece{end, upper});
+    };
+    auto ensurePieces = [&]() {
+        if (driver.pieces) return;
+        const auto base = driver.current ? view(driver.current, flatType, connection.range) : invalid(flatType, connection.range);
+        driver.pieces = std::make_unique<DriverPieces>();
+        driver.pieces->emplace(0, DriverPiece{fullType.width, base});
+    };
+    auto replacePieceRange = [&](ValueId value) {
+        ensurePieces();
+        splitPiece(offset); splitPiece(offset + dataType.width);
+        auto first = driver.pieces->lower_bound(offset);
+        auto last = driver.pieces->lower_bound(offset + dataType.width);
+        driver.pieces->erase(first, last);
+        driver.pieces->emplace(offset, DriverPiece{offset + dataType.width, value});
+        materializePieces();
+    };
+    if (!path.indices.empty() && !staticWrite && driver.pieces) {
+        materializePieces();
+        driver.pieces.reset();
+    }
     auto current = driver.current;
     if (!current) current = invalid(fullType, connection.range);
     auto enable = guard(connection.guard, connection.range);
@@ -601,22 +656,23 @@ void Lowerer::connect(const Connection& connection) {
     if (!path.indices.empty() && staticWrite) {
         // Guard only the written slice. An array-wide mux would introduce
         // false dependencies from the condition to untouched elements.
-        auto flatType = fullType; flatType.shape.clear(); flatType.isSigned = false;
         auto partType = dataType; partType.shape.clear(); partType.isSigned = false;
-        const auto prior = view(current, flatType, connection.range);
+        ensurePieces();
         auto part = view(data, partType, connection.range);
-        if (connection.guard != 1)
+        if (connection.guard != 1) {
+            // Keep the old arm local to the written range, without retaining a whole-array snapshot.
+            splitPiece(offset); splitPiece(offset + dataType.width);
+            const auto first = driver.pieces->lower_bound(offset);
+            auto last = driver.pieces->lower_bound(offset + dataType.width);
+            std::vector<ValueId> priorParts;
+            while (last != first) priorParts.push_back((--last)->second.value);
+            const auto prior = priorParts.size() == 1 ? view(priorParts.front(), partType, connection.range) :
+                op(OperationKind::kConcat, partType, priorParts, connection.range);
             part = op(OperationKind::kMux, partType,
-                {enable, part, slice(prior, offset, dataType.width, false, connection.range)}, connection.range);
-        std::vector<ValueId> pieces;
-        pieces.reserve(3);
-        const auto end = offset + dataType.width;
-        if (end < fullType.width) pieces.push_back(slice(prior, end, fullType.width - end, false, connection.range));
-        pieces.push_back(part);
-        if (offset) pieces.push_back(slice(prior, 0, offset, false, connection.range));
-        // Keep the packed accumulator between partial writes. Rebuilding the
-        // shaped array here would repeatedly unpack and repack every element.
-        data = pieces.size() == 1 ? pieces[0] : op(OperationKind::kConcat, flatType, pieces, connection.range);
+                {enable, part, prior}, connection.range);
+        }
+        replacePieceRange(part);
+        data = driver.current;
         if (trackMemoryMask)
             writeMask = constant(fullType, std::string(dataType.width, '1') + std::string(offset, '0'), connection.range);
     } else if (!path.indices.empty()) {
@@ -645,8 +701,12 @@ void Lowerer::connect(const Connection& connection) {
         const auto kept = op(OperationKind::kAnd, flatType, {view(current, flatType, connection.range), clear}, connection.range);
         data = view(op(OperationKind::kOr, flatType, {kept, payload}, connection.range), fullType, connection.range);
     }
-    driver.current = staticWrite && (connection.guard == 1 || !path.indices.empty()) ? data :
-        op(OperationKind::kMux, fullType, {enable, data, view(current, fullType, connection.range)}, connection.range);
+    if (!(staticWrite && !path.indices.empty())) {
+        driver.current = staticWrite && connection.guard == 1 ? data :
+            op(OperationKind::kMux, fullType, {enable, data, view(current, fullType, connection.range)}, connection.range);
+        driver.pieces = std::make_unique<DriverPieces>();
+        driver.pieces->emplace(0, DriverPiece{fullType.width, view(driver.current, flatType, connection.range)});
+    }
     if (trackMemoryMask) {
         auto mask = driver.memoryMask ? driver.memoryMask : number(0, fullType.width, connection.range);
         mask = view(mask, fullType, connection.range);
@@ -931,6 +991,10 @@ void Lowerer::effects() {
         graph_.setAttr(task, "procKind", std::string("always")); graph_.setAttr(task, "hasTiming", true);
         graph_.setAttr(task, "firrtl.effectKind", std::string(statement.kind == StmtKind::Cover ? "cover-hit" : verification ? "assert" : statement.kind == StmtKind::Stop ? "stop" : "printf"));
         graph_.setAttr(task, "firrtl.effectLabel", std::string(statement.name)); graph_.setOpSrcLocView(task, location(statement.range));
+        // Keep the originating FIRRTL statement line as a stable cross-tool
+        // identity. GSIM uses this same parser line for ASSERT_/PRINTF_/STOP_
+        // special-node names and its serialized lineno field.
+        graph_.setAttr(task, "firrtl.line", static_cast<int64_t>(statement.range.line));
         setOpSemantic(task);
     }
 }
@@ -977,6 +1041,9 @@ void Lowerer::instances() {
         const auto operation = graph_.createOperation(OperationKind::kInstance);
         graph_.setAttr(operation, "moduleName", instance.target);
         graph_.setAttr(operation, "instanceName", instance.name);
+        // External-module/instance boundaries retain the FIRRTL statement
+        // line so they can be matched to GSIM's boundary node lineno.
+        graph_.setAttr(operation, "firrtl.line", static_cast<int64_t>(instance.range.line));
         graph_.setOpSrcLocView(operation, location(instance.range));
         if (const auto found = semanticDeclarations_.find(instance.name); found != semanticDeclarations_.end())
             setOpSemantic(operation, found->second);

@@ -614,9 +614,8 @@ void deadInventory() {
         auto implementation = tx::makePass(name, {}, error);
         require(bool(implementation), error); return implementation;
     };
-    for (const auto name : {"dead-code-elim", "mux-tree-fold", "grhsim-simplify"}) {
+    for (const auto name : {"dead-code-elim", "mux-tree-fold"}) {
         auto candidate = original.clone();
-        if (std::string_view(name) == "grhsim-simplify") run(candidate, pass("grh-to-grhsim"));
         run(candidate, pass(name));
         auto& graph = *candidate.findGraph("top"); node::recordRetention(graph);
         const auto stats = std::get<std::vector<std::string>>(*graph.metadata("firrtl.nodeRetention"));

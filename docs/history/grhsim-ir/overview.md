@@ -283,10 +283,8 @@ DeclProvenanceSlice
   解析不到（如已脱离图的悬挂名字）的声明只留在 `declaredSymbols` 名单里，没有记录；
 - 折叠/合并/拆分某个被声明实体的 pass，在旧实体消失前用 `upsertDeclProvenance`
   重定向或重切 slice（alias/merged/多 slice）；不做语义改写的 pass 无需触碰。
-  `grhsim.simplify` 的全部子 pass 已按此维护（就地改写零维护、折叠重定向为
   alias、等价状态合并为 merged、窄化截断为部分覆盖，细则见
   [simplify pass 文档](passes/simplify.md)）；全图优化段（M5d-3）的
-  `grhsim.pack-bit-registers` 通过共享的
   provenance helper 把被合并成员的 slice 重定向为
   目标实体内的偏移位段（kind=merged，targetOffset 按 bit 线性偏移），细则见该
   pass 文档（`grhsim.reg-to-mem` 已于 2026-10-10 退役，见

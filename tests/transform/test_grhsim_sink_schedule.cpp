@@ -37,7 +37,7 @@ void testOrderedRunsAndSnapshots() {
     for (const auto& run : schedule.generalRuns) order.insert(order.end(), run.orderedWriters.begin(), run.orderedWriters.end());
     require(order == writers, "clock grouping reordered the original writers");
     require(!schedule.largeCommitRuns.empty(), "large commits omitted");
-    require(std::any_of(schedule.generalRuns.begin(), schedule.generalRuns.end(), [](const auto& run) { return !run.requiredNonsinkKeys.empty(); }), "sink nonsink dependencies omitted");
+    require(std::any_of(schedule.generalRuns.begin(), schedule.generalRuns.end(), [](const auto& run) { return !run.directNonsinkRoots.empty(); }), "sink nonsink dependencies omitted");
     require(std::any_of(schedule.sinkGroups.begin(), schedule.sinkGroups.end(), [](const auto& group) { return !group.guards.empty(); }), "shared enable guards not grouped");
     // Independent states at priority zero share clock0 but are interleaved by
     // clock1; the same group must recur instead of moving the third writer.
@@ -183,7 +183,7 @@ void testForgedGroupsAndEffectDependencies() {
     const auto samplePart = owner(graph, graph.valueDef(sample));
     Owner taskPart;
     for (const auto op : graph.operations()) if (graph.opKind(op) == sim::kSystemTask) taskPart = owner(graph, op);
-    const auto& dependencies = schedule.generalRuns.back().requiredNonsinkKeys;
+    const auto dependencies = sim::requiredNonsinkKeys(schedule, schedule.generalRuns.back());
     const auto taskPosition = std::find(dependencies.begin(), dependencies.end(), taskPart);
     const auto samplePosition = std::find(dependencies.begin(), dependencies.end(), samplePart);
     require(taskPosition != dependencies.end() && samplePosition != dependencies.end() && taskPosition < samplePosition,
@@ -202,7 +202,7 @@ void testForgedGroupsAndEffectDependencies() {
             "group mixing local and hoisted guards accepted");
 }
 
-void testEqualPriorityDeclarationOrder() {
+void testExplicitPriority() {
     Fixture fixture;
     const auto clock = fixture.input("clock"), enable = fixture.input("enable");
     const auto q = fixture.state("q", 8);
@@ -210,11 +210,16 @@ void testEqualPriorityDeclarationOrder() {
     const auto last = fixture.write(OperationKind::kRegisterWritePort, q, {enable, fixture.constant(8, "8'hee"), clock});
     fixture.graph.setOpSymbol(first, fixture.graph.internSymbol("z_first"));
     fixture.graph.setOpSymbol(last, fixture.graph.internSymbol("a_last"));
-    fixture.graph.setAttr(first, "writerOrder", int64_t{0}); fixture.graph.setAttr(last, "writerOrder", int64_t{0});
+    fixture.graph.setAttr(first, "writerOrder", int64_t{7}); fixture.graph.setAttr(last, "writerOrder", int64_t{3});
     fixture.convert(); const auto reference = fixture.design.clone(); fixture.split(); fixture.partition();
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, fixture.graph);
+    std::vector<grh::OperationId> ordered;
+    for (const auto& run : schedule.generalRuns)
+        ordered.insert(ordered.end(), run.orderedWriters.begin(), run.orderedWriters.end());
+    require(ordered == std::vector{last, first},
+            "writerOrder did not override graph declaration order");
     compare(reference, fixture.design, {"q"}, {{{"clock", 0}, {"enable", 1}}, {{"clock", 1}}, {{"clock", 0}}, {{"clock", 1}}},
-        "equal-priority", &schedule);
+        "explicit-priority", &schedule);
     const auto firstOwner = owner(fixture.graph, first), lastOwner = owner(fixture.graph, last);
     fixture.graph.setOpSymbol(first, fixture.graph.internSymbol("zz_renamed_first"));
     fixture.graph.setOpSymbol(last, fixture.graph.internSymbol("aa_renamed_last"));
@@ -222,7 +227,7 @@ void testEqualPriorityDeclarationOrder() {
     fixture.graph.freeze();
     run(fixture.design, "grhsim-partition-sink", fixture.session);
     const auto& rebuilt = sim::requireSinkSchedule(&fixture.session, fixture.graph);
-    compare(reference, fixture.design, {"q"}, {{{"clock", 0}, {"enable", 1}}, {{"clock", 1}}}, "equal-priority-freeze", &rebuilt);
+    compare(reference, fixture.design, {"q"}, {{{"clock", 0}, {"enable", 1}}, {{"clock", 1}}}, "explicit-priority-freeze", &rebuilt);
 }
 
 void testSharedSinkConeAfterSimplify() {
@@ -238,7 +243,6 @@ void testSharedSinkConeAfterSimplify() {
     const auto reference = fixture.design.clone();
     fixture.split();
     run(fixture.design, "grhsim-partition-nonsink", fixture.session);
-    run(fixture.design, "grhsim-simplify", fixture.session);
     require(fixture.graph.opOperands(first)[2] == fixture.graph.opOperands(second)[2],
             "fixture did not exercise CSE sharing within the broad sink region");
     run(fixture.design, "grhsim-partition-sink", fixture.session);
@@ -283,10 +287,73 @@ void testSharedRunDependencyClosure() {
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, fixture.graph);
     require(schedule.generalRuns.size() == 1 && schedule.generalRuns[0].orderedWriters.size() == 128,
             "Independent same-clock writers did not form one ordered run");
-    const auto& keys = schedule.generalRuns[0].requiredNonsinkKeys;
+    const auto keys = sim::requiredNonsinkKeys(schedule, schedule.generalRuns[0]);
     const std::set<Owner> unique(keys.begin(), keys.end());
     require(unique.size() == keys.size(), "Repeated writers duplicated run prerequisites");
     for (const auto& key : expected) require(unique.contains(key), "Shared run omitted a transitive leaf prerequisite");
+}
+
+void testInterleavedRunsShareDependencyDag() {
+    Fixture fixture;
+    const auto clock0 = fixture.input("clock0"), clock1 = fixture.input("clock1");
+    const auto enable = fixture.input("enable"), input = fixture.input("input", 8);
+    const auto one = fixture.constant(8, "8'd1");
+    auto data = input;
+    constexpr unsigned depth = 192, writers = 256;
+    for (unsigned i = 0; i < depth; ++i)
+        data = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, one});
+    fixture.task("display", {enable, data});
+    for (unsigned i = 0; i < writers; ++i) {
+        const auto state = fixture.state("state" + std::to_string(i), 8);
+        fixture.write(OperationKind::kRegisterWritePort, state, {enable, data, i & 1 ? clock1 : clock0});
+    }
+    fixture.convert(); fixture.split();
+    for (const auto op : fixture.graph.operations()) if (fixture.graph.opKind(op) == OperationKind::kAdd) {
+        const auto key = wolvrix::lib::ingest::node::key({"test", "top", "top", {},
+            std::string(fixture.graph.symbolText(fixture.graph.operationSymbol(op))), {}});
+        wolvrix::lib::ingest::node::write(fixture.graph, op, {{key}, {}, {key}});
+    }
+    wolvrix::lib::ingest::node::establishPolicy(fixture.graph);
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session,
+        {"-max-supernode-nodes=8", "-clone-shared=0", "-firrtl-nodes=prefer"});
+    std::set<Owner> expected;
+    for (const auto op : fixture.graph.operations()) {
+        const auto path = owner(fixture.graph, op);
+        if (path.size() == 4 && fixture.graph.opKind(op) == OperationKind::kAdd) expected.insert(path);
+    }
+    require(expected.size() == depth, "Interleaved fixture lost its shared ancestor chain");
+    run(fixture.design, "grhsim-partition-sink", fixture.session);
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session, fixture.graph);
+    require(schedule.generalRuns.size() == writers, "Interleaved clocks did not create repeated writer runs");
+    std::size_t roots = 0, expanded = 0;
+    for (const auto& sinkRun : schedule.generalRuns) {
+        roots += sinkRun.directNonsinkRoots.size();
+        const auto ordinals = sim::requiredNonsinkOrdinals(schedule, sinkRun);
+        require(std::is_sorted(ordinals.begin(), ordinals.end()) &&
+            std::adjacent_find(ordinals.begin(), ordinals.end()) == ordinals.end(),
+            "On-demand prerequisite closure lost topological order or uniqueness");
+        std::set<Owner> keys;
+        for (const auto ordinal : ordinals) keys.insert(schedule.nonsinkKeys.at(ordinal));
+        for (const auto& key : expected) require(keys.contains(key), "Interleaved run omitted a shared transitive prerequisite");
+        expanded += ordinals.size();
+    }
+    const auto stored = schedule.nonsinkKeys.size() + schedule.nonsinkPrerequisites.size() + roots;
+    require(expanded >= depth * writers && stored * 16 < expanded,
+            "Sink schedule retained per-run transitive closure storage");
+    require(schedule.nonsinkPrerequisiteOffsets.size() == schedule.nonsinkKeys.size() + 1,
+            "Shared prerequisite CSR omitted a row");
+    auto forged = schedule;
+    forged.generalRuns.front().directNonsinkRoots.clear();
+    require(!sim::verifySinkSchedule(fixture.graph, forged).empty(), "Forged direct dependency roots accepted");
+    forged = schedule;
+    forged.nonsinkPrerequisites.clear();
+    require(!sim::verifySinkSchedule(fixture.graph, forged).empty(), "Forged shared dependency DAG accepted");
+    rejects([&] { sim::requiredNonsinkOrdinals(forged, forged.generalRuns.front()); },
+            "Malformed shared dependency CSR accepted by query");
+    forged = schedule;
+    forged.generalRuns.front().directNonsinkRoots.push_back(forged.generalRuns.front().directNonsinkRoots.front());
+    rejects([&] { sim::requiredNonsinkOrdinals(forged, forged.generalRuns.front()); },
+            "Noncanonical repeated roots accepted by query");
 }
 }
 
@@ -294,9 +361,9 @@ int main() {
     try {
         testOrderedRunsAndSnapshots(); testLifecycleAndNegativeContracts();
         testMultidimensionalSamplingAndLatch(); testForgedGroupsAndEffectDependencies();
-        testEqualPriorityDeclarationOrder();
-        testSharedSinkConeAfterSimplify();
+        testExplicitPriority();
         testSharedRunDependencyClosure();
+        testInterleavedRunsShareDependencyDag();
     }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

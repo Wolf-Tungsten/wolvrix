@@ -17,25 +17,18 @@ The simulation stages then operate on that same design:
 | Step | Result |
 | --- | --- |
 | `grh-to-grhsim` | Explicit logic domain, edge detectors and simulation writers/calls; no partitions |
-| `grhsim-simplify`, bit-register packing, masked-OR recovery | Global optimization with state, effect and declaration identities preserved |
-| `grhsim-node-cse` for annotated FIRRTL | Whole-node equivalence with thresholded sharing, before extraction |
+| `dead-code-elim` → `expr-opt` → `used-bits` → `split-nodes` → `dead-code-elim` → `constant-analysis` → `dead-code-elim` → `alias-analysis` → `pattern-detect` → `common-expr` → `dead-code-elim` | GSIM-aligned ordinary-GRH liveness, expression cleanup, used-bit narrowing, scalar splitting, constant propagation, aliasing, pattern detection and common-expression sharing before `grh-to-grhsim`; declaration anchors are off by default |
 | `grhsim-split-event-and-output` | Event, General and Output owners |
 | `grhsim-split-nonsink-and-sink` | General becomes NonSink, SmallSink and LargeSink |
-| `grhsim-partition-nonsink`, leaf simplify | Activity partitions and complete leaf owners |
+| `grhsim-partition-nonsink` | Activity partitions and complete leaf owners |
 | `grhsim-partition-sink` | Ordered sink groups/runs and a typed `SinkSchedule` in the session |
 | `emit_grhsim_cpu_st_cpp` | C++ sources, header, Makefile and manifest |
 
-The production helper enables bit-register packing, masked-OR recovery and
-leaf simplify by default. Pass options and their contracts are specified in
-[GrhSIM transforms](transform/grhsim-transforms.md). Work limits control
-activity partitions; function line limits control emitted C++ functions.
-For annotated FIRRTL it runs whole-node CSE in `gsim` mode; `off` disables
-only additional whole-expression merging. Ordinary CSE and inlining are
-transparent to node annotations. Nonsink `firrtl-nodes=off|prefer|auto` consumes
-current op associations as optional hints (default off); `cost-model=bytes` and
-leaf fusion are separate experiments. Policy and
-configuration are checkpoint metadata and enter generation identity; see
-[FIRRTL node CSE](ingest/node-cse.md).
+Pass options and their contracts are specified in [GrhSIM transforms](transform/grhsim-transforms.md).
+Work limits control activity partitions; function line limits control emitted
+C++ functions. Nonsink `firrtl-nodes=off|prefer|auto` consumes current op
+associations as optional hints (default off); `cost-model=bytes` and leaf
+fusion are separate experiments.
 
 ## Python and checkpoints
 

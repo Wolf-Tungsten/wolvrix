@@ -65,12 +65,10 @@ Missing identities are diagnostic and never keep computation alive or fail a
 legal optimization. Categories overlap.
 
 Schema 1 / `source-node-v1` checkpoints require re-ingest; clearing attrs cannot
-undo optimization history. The [whole-expression pass](node-cse.md) has a
 separate v2 identity. [Nonsink partitioning](../transform/grhsim-transforms.md#firrtl-soft-hints)
 uses current members after simplify.
 
 Playground validation targets: `test_firrtl_node_attributes`,
-`test_firrtl_cse_scope`, `test_firrtl_node_pipeline`, `test_grhsim_firrtl_nodes`,
 `test_wolvrix`. Transparency tests optimize annotated and stripped copies of
 one graph and compare normalized functional structure/sharing plus independent
 behavior. `inspect_firrtl_node_retention` / `inspect_firrtl_partitions` measure a

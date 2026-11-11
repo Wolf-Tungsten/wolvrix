@@ -204,6 +204,16 @@ mixed packed consumers use private access analysis with an explicit snapshot
 when a writer can overlap its source. Dynamic state access checks every indexed
 dimension; `sliceArray` retains its separate flattened-offset contract.
 
+Private concat/replicate/mux assembly into shaped values may write the result's
+leaves directly. A private wide TwoState constant supplies sliced literal leaf
+patterns; adjacent equal patterns use one bounded loop, including explicit zero
+writes when a frame is reused. Storage, boundary, output and saved scalar
+consumers retain their materialized snapshots. Only operations whose complete
+data-use set is covered by these plans are elided; a reverse-use worklist finds
+the same coverage closure without repeated candidate scans. Source terminals
+and mux controls remain live. Statically single-element copies and writes emit
+one assignment while keeping the original guards and bookkeeping order.
+
 Generated C++ requires little-endian Clang with `_BitInt`. Wide TwoState leaves
 use native `unsigned _BitInt` expressions with logical-width masking. Existing
 pointer/output-buffer strategies remain at DPI and task/helper boundaries;

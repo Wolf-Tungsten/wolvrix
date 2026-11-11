@@ -164,6 +164,23 @@ int main() {
             require(json == slim, "default JSON did not use slim def/users/loc settings");
         }
 
+        auto prunedDesign = fixture();
+        auto& prunedTop = *prunedDesign.findGraph("top");
+        prunedTop.semanticTree()->addNode(prunedTop.semanticTree()->root(),
+                                          grh::SemanticNodeKind::Declaration, "dead");
+        const auto prunedStats = prunedTop.pruneSemanticTree();
+        require(prunedStats.removedNodes == 3,
+                "failed to prune the JSON fixture's unreferenced expressions and dead source: " +
+                    std::to_string(prunedStats.removedNodes));
+        for (const auto mode : {store::JsonPrintMode::PrettyCompact, store::JsonPrintMode::Compact,
+                                store::JsonPrintMode::Pretty}) {
+            const auto prunedJson = stored(prunedDesign, mode);
+            auto prunedRestored = load::LoadJson().load(prunedJson);
+            compareDesign(prunedDesign, prunedRestored);
+            require(stored(prunedRestored, mode) == prunedJson,
+                    "pruned store/load/store changed v4 bytes");
+        }
+
         const auto json = stored(design, store::JsonPrintMode::PrettyCompact);
         expectReject(replaceOnce(json, "\"formatVersion\": 4", "\"formatVersion\": 3"), "v3 compatibility");
         expectReject(replaceOnce(json, "\"parent\": 2", "\"parent\": 99"), "invalid parent");

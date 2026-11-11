@@ -8,6 +8,10 @@
 
 #include <array>
 #include <charconv>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <initializer_list>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
@@ -35,6 +39,116 @@ struct OpConversion {
     std::vector<EventInput> events;
     int64_t writerOrder = -1;
     std::vector<std::pair<std::size_t, LogicalType>> inputViews;
+};
+
+struct EventKey {
+    ValueId value;
+    std::string_view edge;
+    std::string_view previous;
+    bool fallback;
+    std::string_view sampleScope;
+    std::string_view historyUpdate;
+
+    bool operator==(const EventKey&) const = default;
+};
+
+struct EventKeyHash {
+    std::size_t operator()(const EventKey& key) const noexcept {
+        std::size_t hash = ValueIdHash{}(key.value);
+        const auto mix = [&](std::size_t value) {
+            hash ^= value + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+        };
+        mix(std::hash<std::string_view>{}(key.edge));
+        mix(std::hash<std::string_view>{}(key.previous));
+        mix(std::hash<bool>{}(key.fallback));
+        mix(std::hash<std::string_view>{}(key.sampleScope));
+        mix(std::hash<std::string_view>{}(key.historyUpdate));
+        return hash;
+    }
+};
+
+struct JoinKey {
+    ValueId left;
+    ValueId right;
+    bool operator==(const JoinKey&) const = default;
+};
+
+struct JoinKeyHash {
+    std::size_t operator()(const JoinKey& key) const noexcept {
+        const auto left = ValueIdHash{}(key.left);
+        const auto right = ValueIdHash{}(key.right);
+        return left ^ (right + 0x9e3779b9u + (left << 6) + (left >> 2));
+    }
+};
+
+// Keep source references outside the append-only graph pools until each shared
+// helper's complete provenance is known. Repeated consumers of a large clock
+// neither rescan its identities nor leave every intermediate union in the pool.
+class HelperMetadata {
+public:
+    std::size_t add(OperationId operation, ValueId value) {
+        records_.push_back({operation, value});
+        return records_.size() - 1;
+    }
+
+    void addOperation(std::size_t index, OperationId source, bool origin) {
+        if (!source) return;
+        auto& record = records_[index];
+        const auto [it, inserted] = record.operationIndices.emplace(source, record.operations.size());
+        if (inserted) record.operations.push_back({source, origin});
+        else record.operations[it->second].origin |= origin;
+    }
+
+    void addValue(std::size_t index, ValueId source) {
+        if (!source) return;
+        auto& record = records_[index];
+        if (record.valueSet.insert(source).second) record.values.push_back(source);
+    }
+
+    void publish(Graph& graph) const {
+        std::vector<SemanticId> ids;
+        std::unordered_set<SemanticId> seen;
+        std::vector<std::string> origins;
+        for (const auto& record : records_) {
+            ids.clear(); seen.clear(); origins.clear();
+            // Each source role retains first-use order; operation identities
+            // precede value identities on the shared operation and its result.
+            const auto append = [&](std::span<const SemanticId> source) {
+                for (const auto id : source)
+                    if (seen.insert(id).second) ids.push_back(id);
+            };
+            for (const auto& source : record.operations) {
+                append(graph.opSemanticIds(source.operation));
+                if (source.origin)
+                    if (const auto paths = getOriginModules(graph, source.operation))
+                        appendOriginModules(origins, *paths);
+            }
+            for (const auto source : record.values) append(graph.valueSemanticIds(source));
+            graph.setOpSemanticIds(record.operation, ids);
+            graph.setValueSemanticIds(record.value, ids);
+            if (!origins.empty()) graph.setAttr(record.operation, kOriginModulesKey, origins);
+        }
+    }
+
+private:
+    struct OperationSource {
+        OperationId operation;
+        bool origin;
+    };
+    struct Record {
+        OperationId operation;
+        ValueId value;
+        std::vector<OperationSource> operations;
+        std::unordered_map<OperationId, std::size_t, OperationIdHash> operationIndices;
+        std::vector<ValueId> values;
+        std::unordered_set<ValueId, ValueIdHash> valueSet;
+    };
+    std::vector<Record> records_;
+};
+
+struct EventHelper {
+    ValueId pulse;
+    std::size_t metadata;
 };
 
 slang::SVInt parseBits(std::string_view literal, int32_t width, std::optional<bool> sign = std::nullopt)
@@ -208,11 +322,37 @@ bool scalarCondition(const Graph& graph, ValueId value)
 
 ValueId constant(Graph& graph, const LogicalType& type, std::string literal)
 {
-    const auto value = graph.createValue(type);
-    const auto operation = graph.createOperation(OperationKind::kConstant);
+    const auto value = graph.createTemporaryValue(type);
+    const auto operation = graph.createTemporaryOperation(OperationKind::kConstant);
     graph.addResult(operation, value);
     graph.setAttr(operation, "constValue", std::move(literal));
     return value;
+}
+
+// Conversion synthesizes a small number of helper operations (edge detectors,
+// reductions, views and joins).  Keep their source identity in the compact
+// SemanticTree pools instead of manufacturing source-name strings for every
+// helper.  Operation identities and result-value identities are transferred
+// together because later GRH passes may retain either row independently.
+void inheritSemantic(Graph& graph, OperationId targetOperation, ValueId targetValue,
+                     std::initializer_list<OperationId> sourceOperations,
+                     std::initializer_list<ValueId> sourceValues)
+{
+    for (const auto source : sourceOperations)
+    {
+        if (!source.valid()) continue;
+        graph.mergeOpSemanticIds(targetOperation, source);
+        if (targetValue.valid()) graph.addValueSemanticIds(targetValue, graph.opSemanticIds(source));
+    }
+    for (const auto source : sourceValues)
+    {
+        if (!source.valid()) continue;
+        const auto semantics = graph.valueSemanticIds(source);
+        if (semantics.empty()) continue;
+        graph.addOpSemanticIds(targetOperation, semantics);
+        // The operation update can reallocate the shared semantic pool.
+        if (targetValue.valid()) graph.addValueSemanticIds(targetValue, graph.valueSemanticIds(source));
+    }
 }
 } // namespace
 
@@ -230,6 +370,19 @@ PassResult GrhToGrhsimPass::run()
 {
     PassResult result;
     Graph* graph = nullptr;
+    const bool phaseTiming = std::getenv("WOLVRIX_SIMPLIFY_PHASE_TIMING") != nullptr;
+    const auto timingStart = std::chrono::steady_clock::now();
+    auto previousPhase = timingStart;
+    const auto phase = [&](const char* name) {
+        if (!phaseTiming) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - previousPhase).count();
+        const auto total = std::chrono::duration_cast<std::chrono::milliseconds>(now - timingStart).count();
+        std::fprintf(stderr, "[grh-to-grhsim-phase] phase=%s elapsed_ms=%lld total_ms=%lld operations=%zu values=%zu\n",
+                     name, static_cast<long long>(elapsed), static_cast<long long>(total),
+                     graph ? graph->operations().size() : 0, graph ? graph->values().size() : 0);
+        previousPhase = now;
+    };
     try
     {
         const auto domain = options_.logicDomain;
@@ -244,11 +397,6 @@ PassResult GrhToGrhsimPass::run()
         }
         graph = design().findGraph(top);
         if (!graph) throw std::invalid_argument("Top graph does not exist: " + top);
-        // FIRRTL lowering and hierarchy flattening may leave implementation
-        // temporaries without SymbolTable entries. GrhSIM still uses symbol
-        // text as its identity, so materialize that legacy ABI exactly at its
-        // boundary instead of paying the cost during ingest/flatten.
-        graph->materializeInternalSymbols();
         // Pre-F08 checkpoints can still be inspected, but cannot be upgraded
         // into a node-aware simulation merely by attaching a new policy.
         if (graph->metadata(ingest::node::kScopePolicy)) ingest::node::requirePolicy(*graph);
@@ -263,9 +411,14 @@ PassResult GrhToGrhsimPass::run()
                     throw std::invalid_argument(problem);
             return result;
         }
+        phase("preverify-start");
         PassManager verifier;
         verifier.addPass(std::make_unique<GrhVerifyPass>());
-        if (!verifier.run(design(), diags()).success) return {false, true, {}};
+        if (!verifier.run(design(), diags()).success) {
+            phase("preverify-failed");
+            return {false, true, {}};
+        }
+        phase("preverify-done");
 
         // Preflight all source contracts before changing types or operations.
         const std::vector<OperationId> operations(graph->operations().begin(), graph->operations().end());
@@ -274,7 +427,7 @@ PassResult GrhToGrhsimPass::run()
         {
             const auto kind = graph->opKind(op);
             const auto* descriptor = findOpDescriptor(kind);
-            if (!descriptor || descriptor->dialect != "grh" || graph->getOperation(op).attr(kPartition))
+            if (!descriptor || descriptor->dialect != "grh" || graph->opAttrRange(op).find(kPartition))
                 throw std::invalid_argument("Expected an unpartitioned base GRH graph");
             if (kind == OperationKind::kInstance || kind == OperationKind::kBlackbox ||
                 kind == OperationKind::kXMRRead || kind == OperationKind::kXMRWrite)
@@ -289,6 +442,7 @@ PassResult GrhToGrhsimPass::run()
                     throw std::invalid_argument("State readers disagree on the value kind");
             }
         }
+        phase("operation-contracts-done");
         std::vector<StateConversion> states;
         for (const auto op : operations)
         {
@@ -309,6 +463,7 @@ PassResult GrhToGrhsimPass::run()
             validateInitSpec(type, init);
             states.push_back({op, type, std::move(init)});
         }
+        phase("state-contracts-done");
         EventInitialValue initial(*graph, states, domain);
         std::vector<OpConversion> conversions;
         std::unordered_map<std::string, std::unordered_set<int64_t>> usedWriterOrders;
@@ -408,6 +563,7 @@ PassResult GrhToGrhsimPass::run()
             }
             conversions.push_back(std::move(conversion));
         }
+        phase("event-contracts-done");
         std::vector<std::pair<OperationId, std::string>> constants;
         for (const auto op : operations)
             if (graph->opKind(op) == OperationKind::kConstant && graph->opResults(op).size() == 1)
@@ -417,6 +573,7 @@ PassResult GrhToGrhsimPass::run()
                     constants.emplace_back(op, projectLiteral(attribute<std::string>(*graph, op, "constValue").value(),
                         graph->valueWidth(value), graph->valueSigned(value), domain));
             }
+        phase("constant-literals-prepared");
         std::unordered_set<ValueId, ValueIdHash> inputs;
         for (const auto& port : graph->inoutPorts()) inputs.insert(port.in);
         std::vector<ValueId> undriven;
@@ -429,6 +586,7 @@ PassResult GrhToGrhsimPass::run()
                 throw std::invalid_argument("Referenced undriven values require explicit TwoState projection");
             undriven.push_back(value);
         }
+        phase("undriven-scan-done");
         for (auto& state : states)
             if (state.type.kind == ValueType::Logic)
                 for (auto& step : state.init)
@@ -437,6 +595,7 @@ PassResult GrhToGrhsimPass::run()
                             step.kind == InitKind::Fill ? state.type.leafWidth() : state.type.width,
                             state.type.isSigned, domain);
 
+        phase("state-literals-prepared");
         result.changed = true;
         const std::vector<ValueId> values(graph->values().begin(), graph->values().end());
         for (const auto value : values)
@@ -444,65 +603,219 @@ PassResult GrhToGrhsimPass::run()
             auto type = graph->valueLogicalType(value);
             if (type.kind == ValueType::Logic) { type.domain = domain; graph->setValueLogicalType(value, type); }
         }
+        phase("value-domains-updated");
         for (const auto& [op, literal] : constants) graph->setAttr(op, "constValue", literal);
+        phase("constant-literals-updated");
         for (const auto& state : states)
         {
             setStateLogicalType(*graph, state.declaration, state.type);
             setStateInitSpec(*graph, state.declaration, state.init);
         }
+        phase("states-updated");
         for (const auto value : undriven)
         {
-            const auto op = graph->createOperation(OperationKind::kConstant);
+            const auto op = graph->createTemporaryOperation(OperationKind::kConstant);
             graph->addResult(op, value);
             graph->setAttr(op, "constValue", std::to_string(graph->valueWidth(value)) + "'h0");
             graph->setOpSrcLoc(op, makeTransformSrcLoc(id(), "undriven-zero"));
+            inheritSemantic(*graph, op, value, {}, {value});
         }
+        phase("undriven-materialized");
         const LogicalType pulseType{ValueType::Logic, 1, false, LogicDomain::TwoState, {}};
         ValueId always;
+        HelperMetadata helperMetadata;
+        // Key string_views refer to the completed, immutable conversions list.
+        std::unordered_map<EventKey, EventHelper, EventKeyHash> eventHelpers;
+        std::unordered_map<JoinKey, EventHelper, JoinKeyHash> joinHelpers;
+        struct RewriteStats {
+            uint64_t originNs = 0, semanticNs = 0, descriptorNs = 0;
+            uint64_t sourceOpIds = 0, sourceValueIds = 0, sourceOriginPaths = 0;
+            std::size_t maxOpIds = 0, maxValueIds = 0, maxOriginPaths = 0;
+            uint32_t maxOp = 0, maxValue = 0, maxOriginOp = 0;
+            std::size_t events = 0, reductions = 0, views = 0, detectors = 0, joins = 0;
+        } rewriteStats;
+        const auto rewriteStart = std::chrono::steady_clock::now();
+        const auto nsSince = [](auto start) {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count());
+        };
+        const auto opSource = [&](OperationId source) {
+            if (!phaseTiming || !source) return std::size_t{0};
+            const auto size = graph->opSemanticIds(source).size();
+            rewriteStats.sourceOpIds += size;
+            if (size > rewriteStats.maxOpIds) { rewriteStats.maxOpIds = size; rewriteStats.maxOp = source.index; }
+            if (const auto attr = graph->opAttrRange(source).find(kOriginModulesKey))
+                if (const auto origins = attr->value().get<std::vector<std::string>>()) {
+                    rewriteStats.sourceOriginPaths += origins->size();
+                    if (origins->size() > rewriteStats.maxOriginPaths) {
+                        rewriteStats.maxOriginPaths = origins->size(); rewriteStats.maxOriginOp = source.index;
+                    }
+                }
+            return size;
+        };
+        const auto valueSource = [&](ValueId source) {
+            if (!phaseTiming || !source) return std::size_t{0};
+            const auto size = graph->valueSemanticIds(source).size();
+            rewriteStats.sourceValueIds += size;
+            if (size > rewriteStats.maxValueIds) { rewriteStats.maxValueIds = size; rewriteStats.maxValue = source.index; }
+            return size;
+        };
+        if (phaseTiming) {
+            for (const auto& conversion : conversions) {
+                opSource(conversion.operation);
+                for (const auto& event : conversion.events) {
+                    ++rewriteStats.events; opSource(graph->valueDef(event.value)); valueSource(event.value);
+                }
+                if (conversion.kind != kSystemFunction) {
+                    const auto condition = graph->opOperands(conversion.operation)[0];
+                    opSource(graph->valueDef(condition)); valueSource(condition);
+                }
+                for (const auto& [index, type] : conversion.inputViews) {
+                    const auto input = graph->opOperands(conversion.operation)[index];
+                    opSource(graph->valueDef(input)); valueSource(input);
+                }
+            }
+            std::fprintf(stderr, "[grh-to-grhsim-rewrite] census conversions=%zu events=%zu op_ids_sum=%llu max_op_ids=%zu op=%u value_ids_sum=%llu max_value_ids=%zu value=%u origin_paths_sum=%llu max_origin_paths=%zu origin_op=%u\n",
+                conversions.size(), rewriteStats.events, static_cast<unsigned long long>(rewriteStats.sourceOpIds),
+                rewriteStats.maxOpIds, rewriteStats.maxOp, static_cast<unsigned long long>(rewriteStats.sourceValueIds),
+                rewriteStats.maxValueIds, rewriteStats.maxValue, static_cast<unsigned long long>(rewriteStats.sourceOriginPaths),
+                rewriteStats.maxOriginPaths, rewriteStats.maxOriginOp);
+            // The census totals count pre-rewrite sources once per role. The
+            // following totals count sources at each actual propagation call.
+            rewriteStats.sourceOpIds = rewriteStats.sourceValueIds = rewriteStats.sourceOriginPaths = 0;
+        }
+        std::size_t rewriteOrdinal = 0, tracedLargeRecords = 0;
+        bool traceRecord = false;
+        const auto mark = [&](const char* bucket, const char* state, OperationId target) {
+            if (phaseTiming && traceRecord)
+                std::fprintf(stderr, "[grh-to-grhsim-rewrite] ordinal=%zu bucket=%s state=%s target=%u elapsed_ms=%llu\n",
+                    rewriteOrdinal, bucket, state, target.index, static_cast<unsigned long long>(nsSince(rewriteStart) / 1000000));
+        };
+        const auto inheritOriginTimed = [&](OperationId target, std::initializer_list<OperationId> sources) {
+            for (const auto source : sources) opSource(source);
+            mark("origin", "start", target);
+            const auto start = phaseTiming ? std::chrono::steady_clock::now() : rewriteStart;
+            inheritOrigin(*graph, target, sources);
+            if (phaseTiming) rewriteStats.originNs += nsSince(start);
+            mark("origin", "done", target);
+        };
+        const auto inheritSemanticTimed = [&](OperationId target, ValueId value,
+                std::initializer_list<OperationId> ops, std::initializer_list<ValueId> values) {
+            for (const auto source : ops) opSource(source);
+            for (const auto source : values) valueSource(source);
+            mark("semantic", "start", target);
+            const auto start = phaseTiming ? std::chrono::steady_clock::now() : rewriteStart;
+            inheritSemantic(*graph, target, value, ops, values);
+            if (phaseTiming) rewriteStats.semanticNs += nsSince(start);
+            mark("semantic", "done", target);
+        };
         for (const auto& conversion : conversions)
         {
             const auto op = conversion.operation;
+            ++rewriteOrdinal;
+            traceRecord = rewriteOrdinal <= 8;
+            if (phaseTiming) {
+                bool largeSource = graph->opSemanticIds(op).size() > 1024;
+                for (const auto& event : conversion.events) {
+                    const auto source = graph->valueDef(event.value);
+                    largeSource |= graph->valueSemanticIds(event.value).size() > 1024 ||
+                        (source && graph->opSemanticIds(source).size() > 1024);
+                }
+                if (conversion.kind != kSystemFunction) {
+                    const auto value = graph->opOperands(op)[0];
+                    const auto source = graph->valueDef(value);
+                    largeSource |= graph->valueSemanticIds(value).size() > 1024 ||
+                        (source && graph->opSemanticIds(source).size() > 1024);
+                }
+                for (const auto& [index, type] : conversion.inputViews) {
+                    const auto value = graph->opOperands(op)[index];
+                    const auto source = graph->valueDef(value);
+                    largeSource |= graph->valueSemanticIds(value).size() > 1024 ||
+                        (source && graph->opSemanticIds(source).size() > 1024);
+                }
+                // Bound verbose tracing when thousands of writers share one
+                // large clock; retain periodic cumulative progress thereafter.
+                if (largeSource) traceRecord |= tracedLargeRecords++ < 32;
+                if (traceRecord)
+                    std::fprintf(stderr, "[grh-to-grhsim-rewrite] ordinal=%zu/%zu op=%u events=%zu state=start elapsed_ms=%llu\n",
+                        rewriteOrdinal, conversions.size(), op.index, conversion.events.size(),
+                        static_cast<unsigned long long>(nsSince(rewriteStart) / 1000000));
+            }
             if (conversion.kind != kSystemFunction && !scalarBit(*graph, graph->opOperands(op)[0])) {
-                const auto condition = graph->createOperation(OperationKind::kReduceOr);
-                const auto bit = graph->createValue(pulseType);
-                graph->addOperand(condition, graph->opOperands(op)[0]);
+                const auto sourceCondition = graph->opOperands(op)[0];
+                const auto sourceConditionDef = graph->valueDef(sourceCondition);
+                const auto condition = graph->createTemporaryOperation(OperationKind::kReduceOr);
+                ++rewriteStats.reductions;
+                const auto bit = graph->createTemporaryValue(pulseType);
+                graph->addOperand(condition, sourceCondition);
                 graph->addResult(condition, bit);
                 graph->replaceOperand(op, 0, bit);
                 graph->setOpSrcLoc(condition, makeTransformSrcLoc(id(), "call-condition"));
-                inheritOrigin(*graph, condition, {op});
+                inheritOriginTimed(condition, {op});
+                inheritSemanticTimed(condition, bit, {op, sourceConditionDef}, {sourceCondition});
             }
             for (const auto& [index, type] : conversion.inputViews) {
-                const auto view = graph->createOperation(OperationKind::kAssign);
-                const auto value = graph->createValue(type);
-                graph->addOperand(view, graph->opOperands(op)[index]);
+                const auto sourceValue = graph->opOperands(op)[index];
+                const auto sourceDef = graph->valueDef(sourceValue);
+                const auto view = graph->createTemporaryOperation(OperationKind::kAssign);
+                ++rewriteStats.views;
+                const auto value = graph->createTemporaryValue(type);
+                graph->addOperand(view, sourceValue);
                 graph->addResult(view, value);
                 graph->replaceOperand(op, index, value);
                 graph->setOpSrcLoc(view, makeTransformSrcLoc(id(), "dpi-input-view"));
-                inheritOrigin(*graph, view, {op});
+                inheritOriginTimed(view, {op});
+                inheritSemanticTimed(view, value, {op, sourceDef}, {sourceValue});
             }
             ValueId fire;
-            for (const auto& event : conversion.events)
+            for (std::size_t eventIndex = 0; eventIndex < conversion.events.size(); ++eventIndex)
             {
-                const auto detector = graph->createOperation(kEdgeDetect);
-                const auto pulse = graph->createValue(pulseType);
-                graph->addOperand(detector, event.value);
-                graph->addResult(detector, pulse);
-                graph->setAttr(detector, "edge", event.edge);
-                graph->setAttr(detector, "prevInit", event.previous);
-                graph->setAttr(detector, "sampleScope", std::string("event-round"));
-                graph->setAttr(detector, "historyUpdate", std::string("unconditional"));
-                if (event.fallback) graph->setAttr(detector, "prevInitFallback", true);
-                graph->setOpSrcLoc(detector, makeTransformSrcLoc(id(), "edge-detect"));
-                inheritOrigin(*graph, detector, {op, graph->valueDef(event.value)});
+                const auto& event = conversion.events[eventIndex];
+                const auto sourceDef = graph->valueDef(event.value);
+                const EventKey key{event.value, event.edge, event.previous, event.fallback,
+                                   "event-round", "unconditional"};
+                const auto [eventIt, created] = eventHelpers.try_emplace(key);
+                if (created) {
+                    const auto detector = graph->createTemporaryOperation(kEdgeDetect);
+                    const auto pulse = graph->createTemporaryValue(pulseType);
+                    ++rewriteStats.detectors;
+                    graph->addOperand(detector, event.value);
+                    graph->addResult(detector, pulse);
+                    graph->setAttr(detector, "edge", event.edge);
+                    graph->setAttr(detector, "prevInit", event.previous);
+                    graph->setAttr(detector, "sampleScope", std::string(key.sampleScope));
+                    graph->setAttr(detector, "historyUpdate", std::string(key.historyUpdate));
+                    if (event.fallback) graph->setAttr(detector, "prevInitFallback", true);
+                    graph->setOpSrcLoc(detector, makeTransformSrcLoc(id(), "edge-detect"));
+                    eventIt->second = {pulse, helperMetadata.add(detector, pulse)};
+                }
+                const auto& eventHelper = eventIt->second;
+                helperMetadata.addOperation(eventHelper.metadata, op, true);
+                helperMetadata.addOperation(eventHelper.metadata, sourceDef, true);
+                helperMetadata.addValue(eventHelper.metadata, event.value);
+                const auto pulse = eventHelper.pulse;
                 if (fire)
                 {
-                    const auto joined = graph->createValue(pulseType);
-                    const auto join = graph->createOperation(OperationKind::kOr);
-                    graph->addOperand(join, fire);
-                    graph->addOperand(join, pulse);
-                    graph->addResult(join, joined);
-                    inheritOrigin(*graph, join, {op});
-                    fire = joined;
+                    const auto [joinIt, joined] = joinHelpers.try_emplace(JoinKey{fire, pulse});
+                    if (joined) {
+                        const auto value = graph->createTemporaryValue(pulseType);
+                        const auto join = graph->createTemporaryOperation(OperationKind::kOr);
+                        ++rewriteStats.joins;
+                        graph->addOperand(join, fire);
+                        graph->addOperand(join, pulse);
+                        graph->addResult(join, value);
+                        joinIt->second = {value, helperMetadata.add(join, value)};
+                    }
+                    const auto& joinHelper = joinIt->second;
+                    helperMetadata.addOperation(joinHelper.metadata, op, true);
+                    // Shared pulse metadata includes other consumers. Derive
+                    // this prefix's identity from its original sources only.
+                    for (std::size_t prefix = 0; prefix <= eventIndex; ++prefix) {
+                        const auto value = conversion.events[prefix].value;
+                        helperMetadata.addOperation(joinHelper.metadata, graph->valueDef(value), false);
+                        helperMetadata.addValue(joinHelper.metadata, value);
+                    }
+                    fire = joinHelper.pulse;
                 }
                 else fire = pulse;
             }
@@ -535,19 +848,46 @@ PassResult GrhToGrhsimPass::run()
                 if (effect != "pure")
                 {
                     if (!graph->getOperation(op).attr("sampleId"))
-                        graph->setAttr(op, "sampleId", "grhsim.sample/" + std::string(graph->getOperation(op).symbolText()));
+                        graph->setAttr(op, "sampleId", "grhsim.sample/" + graph->operationDisplayName(op));
                     if (!graph->getOperation(op).attr("sampleScope")) graph->setAttr(op, "sampleScope", std::string("eval"));
                 }
             }
+            const auto descriptorStart = phaseTiming ? std::chrono::steady_clock::now() : rewriteStart;
             if (const auto problem = verifyOpDescriptor(*graph, op); !problem.empty()) throw std::invalid_argument(problem);
+            if (phaseTiming) rewriteStats.descriptorNs += nsSince(descriptorStart);
+            if (phaseTiming && (traceRecord || rewriteOrdinal % 4096 == 0 || rewriteOrdinal == conversions.size())) {
+                const auto totalNs = nsSince(rewriteStart);
+                std::fprintf(stderr, "[grh-to-grhsim-rewrite] ordinal=%zu/%zu op=%u state=done total_ms=%llu origin_ms=%llu semantic_ms=%llu descriptor_ms=%llu other_ms=%llu reductions=%zu views=%zu detectors=%zu joins=%zu op_ids_sum=%llu value_ids_sum=%llu origin_paths_sum=%llu max_op_ids=%zu max_op=%u max_value_ids=%zu max_value=%u max_origin_paths=%zu max_origin_op=%u\n",
+                    rewriteOrdinal, conversions.size(), op.index, static_cast<unsigned long long>(totalNs / 1000000),
+                    static_cast<unsigned long long>(rewriteStats.originNs / 1000000),
+                    static_cast<unsigned long long>(rewriteStats.semanticNs / 1000000),
+                    static_cast<unsigned long long>(rewriteStats.descriptorNs / 1000000),
+                    static_cast<unsigned long long>((totalNs - rewriteStats.originNs - rewriteStats.semanticNs - rewriteStats.descriptorNs) / 1000000),
+                    rewriteStats.reductions, rewriteStats.views, rewriteStats.detectors, rewriteStats.joins,
+                    static_cast<unsigned long long>(rewriteStats.sourceOpIds), static_cast<unsigned long long>(rewriteStats.sourceValueIds),
+                    static_cast<unsigned long long>(rewriteStats.sourceOriginPaths), rewriteStats.maxOpIds, rewriteStats.maxOp,
+                    rewriteStats.maxValueIds, rewriteStats.maxValue, rewriteStats.maxOriginPaths, rewriteStats.maxOriginOp);
+            }
         }
+        phase("operation-rewrites-done");
+        helperMetadata.publish(*graph);
+        phase("helper-metadata-published");
         graph->setMetadata("grhsim.logicDomain", std::string(toString(domain)));
         graph->setMetadata(kStage, std::string("converted"));
+        phase("postverify-start");
         if (!verifier.run(design(), diags()).success) throw std::invalid_argument("Converted graph verification failed");
+        phase("postverify-done");
+        // GrhSIM's legacy ABI still requires symbols, but keep temporary rows
+        // symbol-free throughout conversion and all semantic propagation.  Do
+        // this single bulk materialization only at the conversion boundary.
+        phase("symbol-materialization-start");
+        graph->materializeInternalSymbols();
+        phase("symbol-materialization-done");
         logInfo("converted operations=" + std::to_string(conversions.size()) + " states=" + std::to_string(states.size()));
     }
     catch (const std::exception& exception)
     {
+        phase("failed");
         if (graph && result.changed) graph->setMetadata(kStage, std::string("conversion-failed"));
         error(exception.what(), graph ? graph->symbol() : std::string{});
         result.failed = true;

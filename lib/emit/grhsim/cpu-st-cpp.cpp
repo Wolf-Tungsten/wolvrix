@@ -15,9 +15,13 @@
 #include <atomic>
 #include <bit>
 #include <charconv>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -44,6 +48,39 @@ const std::vector<std::string> namedStores{
     "prevEventStore", "eventActStore", "timeslotTriggerStore", "sampledStore",
     "onceStore", "largeBeforeStore", "largeWholeBeforeStore",
     "largeWholeDirtyStore", "memoryReadIndexStore", "memoryTouchedStore"};
+
+class EmitPhaseTiming {
+public:
+    explicit EmitPhaseTiming(const char* scope) : scope_(scope) {}
+    bool enabled() const { return enabled_; }
+    void mark(const char* phase, std::initializer_list<std::pair<const char*, std::size_t>> counts = {}) {
+        if (!enabled_) return;
+        uint64_t rss = 0, peak = 0;
+        if (auto* status = std::fopen("/proc/self/status", "r")) {
+            char line[256];
+            unsigned long long value;
+            while (std::fgets(line, sizeof(line), status)) {
+                if (std::sscanf(line, "VmRSS: %llu kB", &value) == 1) rss = value;
+                if (std::sscanf(line, "VmHWM: %llu kB", &value) == 1) peak = value;
+            }
+            std::fclose(status);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = [&](auto from) {
+            return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - from).count());
+        };
+        std::fprintf(stderr, "[grhsim-cpu-st-cpp-phase] scope=%s phase=%s elapsed_ms=%llu total_ms=%llu rss_kib=%llu peak_rss_kib=%llu",
+            scope_, phase, ms(previous_), ms(start_), static_cast<unsigned long long>(rss), static_cast<unsigned long long>(peak));
+        for (const auto& [name, value] : counts) std::fprintf(stderr, " %s=%zu", name, value);
+        std::fputc('\n', stderr);
+        previous_ = now;
+    }
+private:
+    const char* scope_;
+    const bool enabled_ = std::getenv("WOLVRIX_SIMPLIFY_PHASE_TIMING") != nullptr;
+    const std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point previous_ = start_;
+};
 
 std::string identifier(std::string_view text) {
     std::string result;
@@ -204,7 +241,9 @@ public:
           tuBytes_(option(options, "max-tu-bytes", 1024 * 1024)),
           maxRounds_(option(options, "max-round", 100000)),
           prefix_("grhsim_" + identifier(graph.symbol())),
-          class_("GrhSIM_" + identifier(graph.symbol())), counterSnapshot_(std::move(counterSnapshot)) {}
+          class_("GrhSIM_" + identifier(graph.symbol())), counterSnapshot_(std::move(counterSnapshot)) {
+        phase("constructed");
+    }
 
     std::vector<std::string> generate(const std::filesystem::path& staging);
 private:
@@ -213,6 +252,19 @@ private:
     const EmitOptions& options_;
     std::size_t maxLines_, tuBytes_, maxRounds_;
     std::string prefix_, class_;
+    EmitPhaseTiming timing_{"context"};
+    std::size_t writtenFunctions_ = 0, writtenBytes_ = 0, codeNodes_ = 0;
+    void phase(const char* name) {
+        if (!timing_.enabled()) return;
+        std::size_t fields = 0;
+        for (const auto& [store, members] : fields_) fields += members.size();
+        timing_.mark(name, {{"owners", executionKeys_.size()}, {"member_groups", members_.size()},
+            {"nonsinks", nonsink_.size()}, {"fields", fields}, {"storage", storage_.size()},
+            {"operation_names", operationNames_.size()}, {"value_names", valueNames_.size()},
+            {"leaf_plans", leafPlans_.size()}, {"identity_elisions", identityElisions_.size()},
+            {"leaf_elisions", leafElisions_.size()}, {"root_functions", functionNames_.size()},
+            {"written_functions", writtenFunctions_}, {"written_bytes", writtenBytes_}, {"code_nodes", codeNodes_}});
+    }
     std::map<Key, std::vector<OperationId>> members_;
     std::set<Key> executionKeys_;
     std::vector<const Key*> executionOwners_;
@@ -223,6 +275,9 @@ private:
     std::unordered_map<ValueId, std::size_t, grh::ValueIdHash> smallEnableOrdinal_;
     std::unordered_map<ValueId, std::set<std::size_t>, grh::ValueIdHash> fanout_;
     std::unordered_map<OperationId, std::set<std::size_t>, grh::OperationIdHash> stateFanout_;
+    std::unordered_set<ValueId, grh::ValueIdHash> changePublications_, pulsePublications_;
+    std::unordered_set<OperationId, grh::OperationIdHash> statePublications_;
+    std::size_t nonsinkDataEdges_ = 0, nonsinkDependencyEdges_ = 0;
     struct IndexedState {
         int64_t cells = 0;
         std::set<std::size_t> fullFanout;
@@ -248,7 +303,7 @@ private:
     std::unordered_set<ValueId, grh::ValueIdHash> publishedCaptureConstants_;
     std::unordered_set<OperationId, grh::OperationIdHash> identityElisions_;
     struct LeafPlan {
-        enum class Kind { Source, Concat, Repeat, Mux };
+        enum class Kind { Source, Constant, Concat, Repeat, Mux };
         Kind kind = Kind::Source;
         ValueId source;
         int64_t width = 0;
@@ -296,6 +351,7 @@ private:
     std::unordered_map<ValueId, std::string, grh::ValueIdHash> packedNames_;
     std::string counterBinding(const std::filesystem::path& staging) const;
     std::string counterMetadata() const;
+    std::string activationStats() const;
     void codeMap(std::ostream& output, const std::vector<WrittenFunctions>& written,
                  const std::map<std::string, std::string>& sources) const;
     void countOperation(std::vector<Code>& code, OperationId op, std::string category = "operation") {
@@ -585,7 +641,9 @@ std::vector<OperationId> CpuStEmitContext::topological(const std::vector<Operati
 }
 
 void CpuStEmitContext::analyze() {
+    phase("analyze-start");
     analyzeNames();
+    phase("names-options");
     // requireSinkSchedule already verified this immutable graph and schedule.
     if (graph_.metadata(sim::kStage) != std::optional<grh::AttributeValue>(std::string("sink-partitioned")))
         throw std::invalid_argument("grhsim-cpu-st-cpp requires the sink-partitioned stage");
@@ -599,6 +657,7 @@ void CpuStEmitContext::analyze() {
         if (key.size() == 4 && key[0] == "general" && key[1] == "nonsink") key.resize(3);
         executionOwners_[op.index] = &*executionKeys_.insert(std::move(key)).first;
     }
+    phase("execution-owners");
     if (const auto found = options_.attributes.find("mem-write-activate"); found != options_.attributes.end()) {
         if (found->second != "on-change" && found->second != "on-write") throw std::invalid_argument("mem-write-activate must be on-change or on-write");
         activateOnWrite_ = found->second == "on-write";
@@ -618,6 +677,7 @@ void CpuStEmitContext::analyze() {
         field("largeSinkEnableBoundaryStore", "std::array<std::uint64_t," + std::to_string((largeWriteOrdinal_.size() + 63) / 64) + ">", "words");
     waveform_ = options_.attributes.contains("waveform") && options_.attributes.at("waveform") != "none";
     for (const auto value : graph_.values()) (void)cppType(graph_.valueLogicalType(value));
+    phase("value-types-checked");
     std::set<std::string> ports;
     const auto bindPort = [&](const grh::Port& port, bool input) {
         const auto sanitized = identifier(port.name);
@@ -662,6 +722,7 @@ void CpuStEmitContext::analyze() {
         }
         if (kind == sim::kSystemFunction && sim::systemFunctionEffect(graph_, op) != "pure") field("sampledStore", "bool", op);
     }
+    phase("operation-members-and-states");
     // Whole-array writes can use the native std::array assignment route.  A
     // large on-change state needs one aggregate before-image so the publish
     // phase can compare the complete write without materializing one map entry
@@ -685,6 +746,7 @@ void CpuStEmitContext::analyze() {
         field("largeWholeBeforeStore", cppType(type), state);
         field("largeWholeDirtyStore", "bool", state);
     }
+    phase("whole-array-states");
     std::map<Key, std::set<Key>> dependencies;
     for (const auto& [key, ops] : members_) if (key.size() > 1 && key[0] == "general" && key[1] == "nonsink") {
         dependencies[key];
@@ -695,6 +757,7 @@ void CpuStEmitContext::analyze() {
         }
     }
     std::map<int64_t, Key> effects;
+    for (const auto& [key, inputs] : dependencies) nonsinkDataEdges_ += inputs.size();
     for (const auto& [key, ops] : members_) for (const auto op : ops)
         if (const auto order = sim::attribute<int64_t>(graph_, op, "grhsim.effectOrder")) effects.emplace(*order, key);
     Key previous;
@@ -702,6 +765,7 @@ void CpuStEmitContext::analyze() {
         if (!previous.empty() && previous != key && dependencies.contains(key) && dependencies.contains(previous)) dependencies[key].insert(previous);
         previous = key;
     }
+    for (const auto& [key, inputs] : dependencies) nonsinkDependencyEdges_ += inputs.size();
     std::map<Key, std::size_t> dependencyIndex;
     std::vector<const Key*> keys;
     for (const auto& [key, inputs] : dependencies) {
@@ -727,6 +791,7 @@ void CpuStEmitContext::analyze() {
         if (ready.empty()) ready.swap(nextSweep);
     }
     if (nonsink_.size() != dependencies.size()) throw std::invalid_argument("CPU nonsink virtual partition DAG is cyclic");
+    phase("execution-dag-ordered");
     // Classify crossing values by the consumer cone, not just the producer.
     // A value shared by enable, payload and nonsink users needs each view.
     std::unordered_map<ValueId, unsigned, grh::ValueIdHash> smallRoles;
@@ -746,6 +811,7 @@ void CpuStEmitContext::analyze() {
             classify(args[enableIndex], run.partitionKey, 1);
             for (std::size_t i = enableIndex + 1; i < args.size(); ++i) classify(args[i], run.partitionKey, 2);
         }
+    timing_.mark("small-roles", {{"crossing_values", smallRoles.size()}, {"visited_groups", visitedRoles.size()}});
     for (const auto value : graph_.values()) {
         const auto users = graph_.valueUsers(value);
         const auto producer = graph_.valueDef(value);
@@ -804,6 +870,7 @@ void CpuStEmitContext::analyze() {
     }
     if (!smallEnableOrdinal_.empty())
         field("smallSinkEnableBoundaryStore", "std::array<std::uint64_t," + std::to_string((smallEnableOrdinal_.size() + 63) / 64) + ">", "words");
+    phase("value-boundaries-and-fanout");
     for (const auto op : graph_.operations()) {
         const auto kind = graph_.opKind(op);
         if (kind != OperationKind::kRegisterReadPort && kind != OperationKind::kRegisterReadArrayPort && kind != OperationKind::kLatchReadPort) continue;
@@ -815,13 +882,19 @@ void CpuStEmitContext::analyze() {
         // still run the next detector round to observe NBA-derived edges.
         else if (key == Key{"event"} || (key.size() == 3 && key[0] == "general")) stateRound_.insert(state);
     }
+    phase("state-fanout");
     analyzeIndexedReads();
+    phase("indexed-reads");
     analyzeSnapshotViews();
+    phase("snapshot-views");
     for (const auto op : graph_.operations()) if (graph_.opKind(op) == OperationKind::kAssign)
         (void)viewOnly(graph_.opResults(op)[0]);
+    phase("assign-views");
     // Remove only dead local projections into the proven identity views.
     bool removed = true;
+    std::size_t projectionRounds = 0;
     while (removed) {
+        ++projectionRounds;
         removed = false;
         for (const auto op : graph_.operations()) {
             const auto kind = graph_.opKind(op);
@@ -837,8 +910,12 @@ void CpuStEmitContext::analyze() {
                 dead &= executionOwner(use.operation) == executionOwner(op) && identityElisions_.contains(use.operation);
             if (dead) { identityElisions_.insert(op); removed = true; }
         }
+        timing_.mark("dead-projection-round", {{"round", projectionRounds},
+            {"scanned", graph_.operations().size()}, {"elisions", identityElisions_.size()}, {"changed", removed}});
     }
+    phase("dead-projections");
     analyzeLeafPlans();
+    phase("leaf-plans");
     for (const auto op : graph_.operations()) {
         if (graph_.opKind(op) != OperationKind::kConstant) continue;
         const auto id = graph_.opResults(op)[0];
@@ -851,6 +928,7 @@ void CpuStEmitContext::analyze() {
             if (specializeLargeCaptures_) captureConstantSources_.emplace(id, std::move(text));
         }
     }
+    phase("constant-literals");
     // Register capture fields before rendering accesses. Every function must
     // use the same layout regardless of the order in which writers are emitted.
     for (const auto op : graph_.operations()) if (sim::isWriter(graph_.opKind(op)) && large(sim::writerTarget(graph_, op))) {
@@ -863,16 +941,20 @@ void CpuStEmitContext::analyze() {
                   "; " + operationDescription(op) : std::string{});
         }
     }
+    phase("capture-fields");
     // Named stores expose semantic state and boundary fields directly.  The
     // indexed layout is reserved for emitter-private chunk frames; sharing it
     // here turns a store into opaque cells_* arrays and breaks its ABI/readability.
     for (const auto& [store, fields] : fields_)
         fieldLayouts_.emplace(store, writeDirectValueLayout(store + "Type", fields));
+    phase("field-layouts");
     for (auto& [value, reference] : storage_) {
         const auto separator = reference.find('.');
         reference = fieldRef(reference.substr(0, separator), reference.substr(separator + 1));
     }
+    phase("storage-references");
     analyzeLargeCommitEnables();
+    phase("analyze-done");
 }
 
 void CpuStEmitContext::analyzeLargeCommitEnables() {
@@ -969,6 +1051,7 @@ void CpuStEmitContext::analyzeIndexedReads() {
 }
 
 void CpuStEmitContext::analyzeSnapshotViews() {
+    phase("snapshot-views-start");
     const auto localView = [&](ValueId value, const Key& key) {
         const auto producer = graph_.valueDef(value);
         return producer && executionOwner(producer) == key && !storage_.contains(value) &&
@@ -999,10 +1082,13 @@ void CpuStEmitContext::analyzeSnapshotViews() {
         }
         if (valid && source && offset == type.width) { snapshotViews_.emplace(id, source); identityElisions_.insert(op); }
     }
+    timing_.mark("snapshot-array-identities", {{"views", snapshotViews_.size()}, {"elisions", identityElisions_.size()}});
     // Preserve scalar view handling, while forwarding shaped aliases all the
     // way to scalar consumers such as mux through their original snapshot.
     bool changed = true;
+    std::size_t rounds = 0;
     while (changed) {
+        ++rounds;
         changed = false;
         for (const auto op : graph_.operations()) {
             if (graph_.opKind(op) != OperationKind::kAssign) continue;
@@ -1021,15 +1107,23 @@ void CpuStEmitContext::analyzeSnapshotViews() {
                 snapshotViews_.emplace(id, found->second); identityElisions_.insert(op); changed = true;
             }
         }
+        timing_.mark("snapshot-alias-round", {{"round", rounds}, {"scanned", graph_.operations().size()},
+            {"views", snapshotViews_.size()}, {"changed", changed}});
     }
 }
 
 void CpuStEmitContext::analyzeLeafPlans() {
+    phase("leaf-plans-start");
     std::unordered_set<OperationId, grh::OperationIdHash> candidates;
+    std::size_t scanned = 0, attempted = 0;
     const auto dataUse = [&](OperationId op, std::size_t index) {
         return graph_.opKind(op) != OperationKind::kMux || index != 0;
     };
     for (const auto root : graph_.operations()) {
+        ++scanned;
+        if (timing_.enabled() && scanned % 1048576 == 0)
+            timing_.mark("leaf-plan-progress", {{"scanned", scanned}, {"attempted", attempted},
+                {"plans", leafPlans_.size()}, {"candidates", candidates.size()}});
         const auto kind = graph_.opKind(root);
         if (kind != OperationKind::kAssign && kind != OperationKind::kConcat &&
             kind != OperationKind::kReplicate && kind != OperationKind::kMux) continue;
@@ -1038,6 +1132,7 @@ void CpuStEmitContext::analyzeLeafPlans() {
         const auto target = graph_.valueLogicalType(results[0]);
         if (target.kind != grh::ValueType::Logic || target.shape.empty() ||
             target.width <= 64 || target.leafWidth() > 64) continue;
+        ++attempted;
         const auto& key = executionOwner(root);
         const auto compatible = [&](const LogicalType& type) {
             return type.kind == target.kind && type.domain == target.domain &&
@@ -1058,7 +1153,10 @@ void CpuStEmitContext::analyzeLeafPlans() {
                 return valuePlan(args[0], depth + 1);
             }
             LeafPlan plan; plan.width = type.width;
-            if (kind == OperationKind::kConcat) {
+            if (kind == OperationKind::kConstant) {
+                if (!args.empty() || type.domain != grh::LogicDomain::TwoState || type.width <= 64) return {};
+                plan.kind = LeafPlan::Kind::Constant; plan.source = graph_.opResults(op)[0];
+            } else if (kind == OperationKind::kConcat) {
                 plan.kind = LeafPlan::Kind::Concat;
                 int64_t width = 0;
                 // The last concat operand supplies the low array leaves.
@@ -1107,31 +1205,67 @@ void CpuStEmitContext::analyzeLeafPlans() {
         leafPlans_.emplace(root, std::move(*plan));
         candidates.insert(followed.begin(), followed.end());
     }
+    timing_.mark("leaf-plans-built", {{"scanned", scanned}, {"attempted", attempted},
+        {"plans", leafPlans_.size()}, {"candidates", candidates.size()}});
     // One target may expand a private scalar while another leaf width must
     // read its materialized value. Pin every terminal in the final plans,
     // including mux controls; a successful root alone is not use coverage.
     std::unordered_set<OperationId, grh::OperationIdHash> materialized;
     const auto retain = [&](auto&& self, const LeafPlan& plan) -> void {
-        if (plan.source) materialized.insert(graph_.valueDef(plan.source));
+        if (plan.kind == LeafPlan::Kind::Source || plan.kind == LeafPlan::Kind::Mux)
+            materialized.insert(graph_.valueDef(plan.source));
         for (const auto& input : plan.inputs) self(self, input);
     };
     for (const auto& [op, plan] : leafPlans_) retain(retain, plan);
     // A mux condition is still read at the consumer. Only data operands of
     // a planned root or an already eliminated private node are covered.
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (const auto op : candidates) {
-            if (leafElisions_.contains(op) || materialized.contains(op)) continue;
-            const auto users = graph_.valueUsers(graph_.opResults(op)[0]);
-            if (users.empty()) continue;
-            bool dead = true;
-            for (const auto& use : users)
-                dead &= executionOwner(use.operation) == executionOwner(op) && dataUse(use.operation, use.operandIndex) &&
-                    (leafPlans_.contains(use.operation) || leafElisions_.contains(use.operation));
-            if (dead) { leafElisions_.insert(op); changed = true; }
+    struct Coverage {
+        std::size_t pending = 0;
+        bool blocked = false;
+        std::vector<OperationId> waiting;
+    };
+    std::unordered_map<OperationId, Coverage, grh::OperationIdHash> coverage;
+    coverage.reserve(candidates.size());
+    for (const auto op : candidates) coverage.try_emplace(op);
+    std::size_t pendingUses = 0, blocked = 0;
+    for (const auto op : candidates) {
+        auto& entry = coverage.at(op);
+        const auto users = graph_.valueUsers(graph_.opResults(op)[0]);
+        entry.blocked = materialized.contains(op) || leafElisions_.contains(op) || users.empty();
+        if (entry.blocked) { ++blocked; continue; }
+        for (const auto& use : users) {
+            if (executionOwner(use.operation) != executionOwner(op) || !dataUse(use.operation, use.operandIndex)) {
+                entry.blocked = true;
+            } else if (!leafPlans_.contains(use.operation) && !leafElisions_.contains(use.operation)) {
+                const auto user = coverage.find(use.operation);
+                if (user == coverage.end() || materialized.contains(use.operation)) entry.blocked = true;
+                else {
+                    ++entry.pending; ++pendingUses;
+                    // Keep one reverse edge per operand use, including duplicates.
+                    user->second.waiting.push_back(op);
+                }
+            }
+        }
+        blocked += entry.blocked;
+    }
+    std::vector<OperationId> ready;
+    ready.reserve(candidates.size());
+    for (const auto op : candidates) {
+        const auto& entry = coverage.at(op);
+        if (!entry.blocked && !entry.pending) ready.push_back(op);
+    }
+    timing_.mark("leaf-elision-worklist-built", {{"scanned", candidates.size()}, {"pending_uses", pendingUses},
+        {"blocked", blocked}, {"ready", ready.size()}});
+    for (std::size_t first = 0; first < ready.size(); ++first) {
+        const auto op = ready[first];
+        leafElisions_.insert(op);
+        for (const auto producer : coverage.at(op).waiting) {
+            auto& entry = coverage.at(producer);
+            if (--entry.pending == 0 && !entry.blocked) ready.push_back(producer);
         }
     }
+    timing_.mark("leaf-elision-worklist-done", {{"scanned", candidates.size()}, {"queued", ready.size()},
+        {"elisions", leafElisions_.size()}});
 }
 
 void CpuStEmitContext::emitLeaves(std::vector<Code>& code, const std::string& destination, const LogicalType& target,
@@ -1141,6 +1275,12 @@ void CpuStEmitContext::emitLeaves(std::vector<Code>& code, const std::string& de
     if (plan.kind == LeafPlan::Kind::Source) {
         const auto type = graph_.valueLogicalType(plan.source);
         const auto source = readSource(plan.source);
+        if (count == 1) {
+            const auto value = type.shape.empty() ? "static_cast<std::uint64_t>(" + clean(source, type) + ")" :
+                clean(row(source, type.shape, "0"), leafType(type));
+            code.push_back(Code::line(row(destination, target.shape, offset) + " = " + clean(value, leaf) + ";"));
+            return;
+        }
         const auto i = temporary("std::size_t", "leaf_index");
         const auto value = type.shape.empty() ?
             "(static_cast<std::uint64_t>(" + clean(source, type) + ") >> (" + i + " * " + std::to_string(leaf.width) + "))" :
@@ -1148,6 +1288,24 @@ void CpuStEmitContext::emitLeaves(std::vector<Code>& code, const std::string& de
         code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(count) + "; ++" + i + ")", {
             Code::line(row(destination, target.shape, "(" + offset + "+" + i + ")") + " = " + clean(value, leaf) + ";")
         }));
+    } else if (plan.kind == LeafPlan::Kind::Constant) {
+        const auto type = graph_.valueLogicalType(plan.source);
+        const auto value = bits(attr(graph_.valueDef(plan.source), "constValue"), type.width, type.isSigned);
+        for (int64_t first = 0; first < count;) {
+            const auto image = value.slice((first + 1) * leaf.width - 1, first * leaf.width);
+            int64_t last = first + 1;
+            while (last < count && value.slice((last + 1) * leaf.width - 1, last * leaf.width).getRawPtr()[0] == image.getRawPtr()[0]) ++last;
+            const auto text = literal(image, leaf);
+            if (last == first + 1)
+                code.push_back(Code::line(row(destination, target.shape, "(" + offset + "+" + std::to_string(first) + ")") + " = " + text + ";"));
+            else {
+                const auto i = temporary("std::size_t", "leaf_index");
+                code.push_back(Code::block("for (" + i + " = " + std::to_string(first) + "; " + i + " < " + std::to_string(last) + "; ++" + i + ")", {
+                    Code::line(row(destination, target.shape, "(" + offset + "+" + i + ")") + " = " + text + ";")
+                }));
+            }
+            first = last;
+        }
     } else if (plan.kind == LeafPlan::Kind::Concat) {
         int64_t first = 0;
         for (const auto& input : plan.inputs) {
@@ -1155,6 +1313,10 @@ void CpuStEmitContext::emitLeaves(std::vector<Code>& code, const std::string& de
             first += input.width / leaf.width;
         }
     } else if (plan.kind == LeafPlan::Kind::Repeat) {
+        if (plan.width == plan.inputs[0].width) {
+            emitLeaves(code, destination, target, plan.inputs[0], offset);
+            return;
+        }
         const auto i = temporary("std::size_t", "leaf_index");
         std::vector<Code> body;
         emitLeaves(body, destination, target, plan.inputs[0], "(" + offset + "+" + i + "*" + std::to_string(plan.inputs[0].width / leaf.width) + ")");
@@ -1230,6 +1392,7 @@ void CpuStEmitContext::touchState(std::vector<Code>& code, OperationId state, co
     else code.push_back(Code::line("memory_touch_range(" + touched + ".data(), " + start + ", " + std::to_string(count) + ");"));
 }
 void CpuStEmitContext::activateState(std::vector<Code>& code, OperationId state) {
+    statePublications_.insert(state);
     const auto found = indexedStates_.find(state);
     if (found == indexedStates_.end()) {
         activate(code, stateFanout_[state], std::numeric_limits<std::size_t>::max());
@@ -1323,6 +1486,7 @@ void CpuStEmitContext::publish(std::vector<Code>& code, ValueId id, const std::s
     const auto destination = storage_.contains(id) ? storage_.at(id) : read(id);
     if (!storage_.contains(id)) { copy(code, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id)); return; }
     if (owner_ == Key{"event"} && sim::isFire(graph_, id)) {
+        if (!fanout_[id].empty()) pulsePublications_.insert(id);
         // An event pulse activates its consumers when asserted, including
         // consecutive asserted rounds. Clearing it is not a data change.
         copy(code, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id));
@@ -1332,6 +1496,7 @@ void CpuStEmitContext::publish(std::vector<Code>& code, ValueId id, const std::s
         if (!triggered.empty()) code.push_back(Code::block("if (" + source + ")", std::move(triggered)));
         return;
     }
+    if (!fanout_[id].empty()) changePublications_.insert(id);
     if (groupPublications_ && scalarPublication(id)) {
         const auto& destinations = fanout_[id];
         const auto found = publicationGroups_.find(destinations);
@@ -1415,6 +1580,20 @@ void CpuStEmitContext::unpack(std::vector<Code>& code, const std::string& destin
         code.push_back(Code::line("std::memcpy(&(" + destination + "), &(" + scalar + "), " + std::to_string(type.width / 8) + ");"));
         return;
     }
+    if (type.kind == grh::ValueType::Logic && type.domain == grh::LogicDomain::TwoState &&
+        !type.isSigned && type.leafWidth() == 1 && type.width > 64 && sourceWidth >= type.width) {
+        // Keep the scalar reference in the loop so chunk liveness preserves
+        // its lifetime when the loop moves to a helper.
+        const auto bytes = "reinterpret_cast<const unsigned char*>(&(" + scalar + "))";
+        const auto i = temporary("std::size_t", "leaf_index");
+        code.push_back(Code::line("static_assert(__CHAR_BIT__ == 8);"));
+        code.push_back(Code::line("static_assert(sizeof(" + scalar + ") == " +
+            std::to_string((sourceWidth + 63) / 64 * 8) + ");"));
+        code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(type.width) + "; ++" + i + ")", {
+            Code::line(row(destination, type.shape, i) + " = ((" + bytes + "[" + i + " / 8] >> (" + i + " % 8)) & 1u) != 0;")
+        }));
+        return;
+    }
     const auto i = temporary("std::size_t", "leaf_index");
     code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(type.width / type.leafWidth()) + "; ++" + i + ")", {
         Code::line(row(destination, type.shape, i) + " = " + clean("(" + scalar + ") >> (" + i + " * " + std::to_string(type.leafWidth()) + ")", leafType(type)) + ";")
@@ -1427,6 +1606,11 @@ void CpuStEmitContext::copy(std::vector<Code>& code, const std::string& destinat
         code.push_back(Code::line(destination + " = " + convert(source, sourceType, target) + ";")); return;
     }
     if (target.width == sourceType.width && target.leafWidth() == sourceType.leafWidth()) {
+        if (target.width == target.leafWidth()) {
+            code.push_back(Code::line(row(destination, target.shape, "0") + " = " +
+                convert(row(source, sourceType.shape, "0"), leafType(sourceType), leafType(target)) + ";"));
+            return;
+        }
         const auto i = temporary("std::size_t", "leaf_index");
         code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(target.width / target.leafWidth()) + "; ++" + i + ")", {
             Code::line(row(destination, target.shape, i) + " = " + convert(row(source, sourceType.shape, i), leafType(sourceType), leafType(target)) + ";")
@@ -1861,8 +2045,8 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
         if (!maskType.shape.empty() && maskType.leafWidth() != element.width)
             packedMask = pack(body, maskData, maskType, temporary(unsignedType(maskType.width), "packed_mask"));
     }
-    const auto i = temporary("std::size_t", "leaf_index");
-    const auto addressedRow = "(" + start + " + " + i + ")";
+    const auto i = count == 1 ? std::string("0") : temporary("std::size_t", "leaf_index");
+    const auto addressedRow = count == 1 ? start : "(" + start + " + " + i + ")";
     const auto destination = type.shape.empty() ? (inPlace ? stateRef(state) : nextStateRef(state)) :
         row(inPlace ? stateRef(state) : nextStateRef(state), type.shape, addressedRow);
     if (wholeArray) {
@@ -1896,6 +2080,7 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
     const auto elementFrom = [&](const std::string& source, const LogicalType& sourceType, const std::string& packedSource, bool broadcast) {
         if (broadcast) return clean(source, element);
         if (!sourceType.shape.empty() && sourceType.leafWidth() == element.width) return clean(row(source, sourceType.shape, i), element);
+        if (count == 1) return clean(sourceType.shape.empty() ? source : packedSource, element);
         return clean("(" + (sourceType.shape.empty() ? source : packedSource) + ") >> (" + i + " * " + std::to_string(element.width) + ")", element);
     };
     const bool broadcast = kind == sim::kFill && dataType.width == type.leafWidth();
@@ -1921,7 +2106,8 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
         markState(write, state);
     }
     if (inPlace && writeActivation(state)) touchState(body, state, start, count);
-    body.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(count) + "; ++" + i + ")", std::move(write)));
+    if (count == 1) body.insert(body.end(), std::make_move_iterator(write.begin()), std::make_move_iterator(write.end()));
+    else body.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(count) + "; ++" + i + ")", std::move(write)));
     code.push_back(Code::block("if (" + condition + ")", std::move(body)));
 }
 
@@ -2005,6 +2191,7 @@ void CpuStEmitContext::task(std::vector<Code>& code, OperationId op) {
 }
 
 void CpuStEmitContext::buildPhases() {
+    phase("build-phases-start");
     Function input{"pInput"};
     inFunction(input, {}, [&](auto& code) {
         for (const auto& port : graph_.inputPorts()) {
@@ -2020,10 +2207,12 @@ void CpuStEmitContext::buildPhases() {
             const auto destination = read(port.value);
             std::vector<Code> changed{Code::line(destination + " = " + incoming + ";")};
             syncSmallBoundary(changed, port.value, destination);
+            if (!fanout_[port.value].empty()) changePublications_.insert(port.value);
             activate(changed, fanout_[port.value]);
             code.push_back(Code::block("if (" + destination + " != " + incoming + ")", std::move(changed)));
         }
     }); addFunction(std::move(input));
+    phase("phase-input");
 
     Function event{"pEvent"};
     inFunction(event, {"event"}, [&](auto& code) {
@@ -2034,6 +2223,7 @@ void CpuStEmitContext::buildPhases() {
             if (attr(op, "grhsim.timeslot") == "event")
                 code.push_back(Code::line(fieldRef("timeslotTriggerStore", name(op)) + " |= " + fireExpression(graph_.opOperands(op)[0]) + ";"));
     }); addFunction(std::move(event));
+    phase("phase-event");
 
     Function general{"pGeneral"};
     // Keep sink locals in bounded, ordered batches. Merging every run
@@ -2042,6 +2232,10 @@ void CpuStEmitContext::buildPhases() {
     general.zeroInitializeLocals = false;
     if (!largeWriteOrdinal_.empty()) general.body.push_back(Code::line("largeSinkEnableBoundaryStore = {};"));
     for (std::size_t ordinal = 0; ordinal < nonsink_.size(); ++ordinal) {
+        if (timing_.enabled() && ordinal % 4096 == 0) {
+            timing_.mark("nonsink-progress", {{"ordinal", ordinal}, {"total", nonsink_.size()}});
+            phase("nonsink-function-totals");
+        }
         const auto& key = nonsink_[ordinal];
         Function function{"sn_" + std::to_string(ordinal)};
         inFunction(function, key, [&](auto& code) {
@@ -2077,6 +2271,7 @@ void CpuStEmitContext::buildPhases() {
             code.push_back(Code::line("GRHSIM_PERF_COUNT(computeBatchExecCount);"));
         }); addFunction(std::move(function));
     }
+    phase("phase-nonsink-functions");
     const auto activeWords = (nonsink_.size() + 7) / 8;
     // Keep the phase driver small.  A flat byte/bit dispatcher is still
     // ordered and observes same-round activations, but putting all words
@@ -2108,6 +2303,7 @@ void CpuStEmitContext::buildPhases() {
         addFunction(std::move(active));
         activeBatchNames.push_back(name);
     }
+    phase("phase-active-dispatch");
     std::map<Key, const sim::SinkGroup*> sinkGroups;
     for (const auto& group : schedule_.sinkGroups) sinkGroups.emplace(group.partitionKey, &group);
     const auto smallEnableBit = [&](OperationId writerOp, const Key& key) -> std::optional<std::size_t> {
@@ -2160,6 +2356,10 @@ void CpuStEmitContext::buildPhases() {
         runBatch.zeroInitializeLocals = false;
     };
     for (std::size_t index = 0; index < schedule_.generalRuns.size(); ++index) {
+        if (timing_.enabled() && index % 16384 == 0) {
+            timing_.mark("writer-run-progress", {{"run", index}, {"total", schedule_.generalRuns.size()}});
+            phase("writer-function-totals");
+        }
         const auto& run = schedule_.generalRuns[index];
         const auto batchFire = sinkGroups.at(run.partitionKey)->fire;
         const auto batchFireExpression = batchFire ? fireExpression(batchFire) : std::string{};
@@ -2382,6 +2582,7 @@ void CpuStEmitContext::buildPhases() {
     activeBatchNames.insert(activeBatchNames.end(), writerBatchNames.begin(), writerBatchNames.end());
     appendDispatch(activeBatchNames);
     addFunction(std::move(general));
+    phase("phase-general-writers");
 
     Function largeCommit{"pLargeSink"};
     // Keep commit locals in bounded batches as well, so pLargeSink
@@ -2414,6 +2615,8 @@ void CpuStEmitContext::buildPhases() {
         commitBatch.zeroInitializeLocals = false;
     };
     for (std::size_t index = 0; index < schedule_.largeCommitRuns.size(); ++index) {
+        if (timing_.enabled() && index % 16384 == 0)
+            timing_.mark("commit-run-progress", {{"run", index}, {"total", schedule_.largeCommitRuns.size()}});
         const auto& run = schedule_.largeCommitRuns[index];
         std::set<std::size_t> runWords;
         for (const auto writerOp : run.orderedWriters) runWords.insert(largeWriteOrdinal_.at(writerOp) / 64);
@@ -2473,6 +2676,7 @@ void CpuStEmitContext::buildPhases() {
         largeCommit.body.push_back(Code::block(header, {Code::line("(this->*phase)();")}));
     }
     addFunction(std::move(largeCommit));
+    phase("phase-large-commit");
 
     Function publishState{"pPublish"};
     publishState.body.push_back(Code::line("pending_ = false;"));
@@ -2586,6 +2790,7 @@ void CpuStEmitContext::buildPhases() {
         Code::line("pending_ |= activeCurrent[activeWord] != 0;")
     }));
     addFunction(std::move(publishState));
+    phase("phase-publish-state");
 
     Function output{"pOutput"};
     inFunction(output, {"output"}, [&](auto& code) {
@@ -2611,6 +2816,7 @@ void CpuStEmitContext::buildPhases() {
             if (!large(state)) code.push_back(Code::line(nextStateRef(state) + " = " + snapshot + ";"));
         }
     }); addFunction(std::move(output));
+    phase("phase-output");
 
     Function eval{"eval"};
     inFunction(eval, {}, [&](auto& code) {
@@ -2639,6 +2845,7 @@ void CpuStEmitContext::buildPhases() {
         code.push_back(Code::line("pOutput();"));
         if (waveform_) code.push_back(Code::line("dump_waveform();"));
     }); addFunction(std::move(eval), true);
+    phase("build-phases-done");
 }
 
 void CpuStEmitContext::buildConstantSources() {
@@ -3352,7 +3559,53 @@ void CpuStEmitContext::codeMap(std::ostream& output, const std::vector<WrittenFu
     output.put('\n');
 }
 
+std::string CpuStEmitContext::activationStats() const {
+    uint64_t valueEdges = 0, inputEdges = 0, constantEdges = 0, computeEdges = 0, pulseEdges = 0;
+    uint64_t stateChangeEdges = 0, stateWriteEdges = 0;
+    std::set<std::pair<std::size_t, std::size_t>> computePairs;
+    for (const auto value : changePublications_) {
+        const auto& targets = fanout_.at(value);
+        valueEdges += targets.size();
+        const auto producer = graph_.valueDef(value);
+        if (!producer) inputEdges += targets.size();
+        else {
+            if (graph_.opKind(producer) == OperationKind::kConstant) constantEdges += targets.size();
+            const auto& source = executionOwner(producer);
+            if (ordinal_.contains(source)) {
+                computeEdges += targets.size();
+                for (const auto target : targets) computePairs.emplace(ordinal_.at(source), target);
+            }
+        }
+    }
+    for (const auto value : pulsePublications_) pulseEdges += fanout_.at(value).size();
+    for (const auto state : statePublications_) {
+        const auto found = stateFanout_.find(state);
+        if (found == stateFanout_.end()) continue;
+        if (writeActivation(state)) stateWriteEdges += found->second.size();
+        else stateChangeEdges += found->second.size();
+    }
+    std::ostringstream out;
+    out << "{\n  \"schema\": \"grhsim-activation-stats.v1\",\n  \"graph\": " << quote(graph_.symbol())
+        << ",\n  \"compute_supernodes\": " << nonsink_.size()
+        << ",\n  \"compute_data_dag_edges\": " << nonsinkDataEdges_
+        << ",\n  \"compute_dependency_dag_edges\": " << nonsinkDependencyEdges_
+        << ",\n  \"value_change_activation_edges\": " << valueEdges
+        << ",\n  \"input_change_activation_edges\": " << inputEdges
+        << ",\n  \"constant_change_activation_edges\": " << constantEdges
+        << ",\n  \"compute_compute_change_activation_edges\": " << computeEdges
+        << ",\n  \"unique_compute_compute_change_activation_edges\": " << computePairs.size()
+        << ",\n  \"event_pulse_activation_edges\": " << pulseEdges
+        << ",\n  \"state_change_activation_edges\": " << stateChangeEdges
+        << ",\n  \"state_write_activation_edges\": " << stateWriteEdges
+        << ",\n  \"total_activation_edges\": " << valueEdges + pulseEdges + stateChangeEdges + stateWriteEdges
+        << ",\n  \"value_change_sources\": " << changePublications_.size()
+        << ",\n  \"event_pulse_sources\": " << pulsePublications_.size()
+        << ",\n  \"state_publication_sources\": " << statePublications_.size() << "\n}\n";
+    return out.str();
+}
+
 std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path& staging) {
+    phase("generate-start");
     // Consume each source function as it is built. The large structured bodies
     // and rendered definitions never accumulate alongside the whole model.
     struct Definition { std::uint64_t bytes; };
@@ -3362,21 +3615,37 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
     std::ofstream bodies(bodyPath, std::ios::binary);
     bodies.exceptions(std::ios::badbit | std::ios::failbit);
     writeFunction_ = [&](Function function) {
+        if (timing_.enabled()) {
+            const auto count = [&](auto&& self, const std::vector<Code>& code) -> std::size_t {
+                std::size_t nodes = code.size();
+                for (const auto& statement : code) nodes += self(self, statement.body);
+                return nodes;
+            };
+            codeNodes_ += count(count, function.body);
+            if (functionNames_.size() <= 4) phase("function-write-start");
+        }
         auto group = writeFunction(std::move(function), class_, maxLines_);
         for (auto& emitted : group.functions) {
             definitions.push_back({emitted.definition.size()});
+            if (timing_.enabled()) { ++writtenFunctions_; writtenBytes_ += emitted.definition.size(); }
             bodies << emitted.definition;
             std::string().swap(emitted.definition);
         }
         written.push_back(std::move(group));
+        if (timing_.enabled() && (functionNames_.size() <= 4 || functionNames_.size() % 4096 == 0))
+            phase("function-write-progress");
     };
     analyze();
     buildConstantSources();
+    phase("constant-source-functions");
     buildPhases();
     buildInit();
+    phase("init-functions");
     for (auto& [store, layout] : fieldLayouts_) std::vector<Local>().swap(layout.physicalFields);
     buildRuntime();
+    phase("runtime-functions");
     buildObservers();
+    phase("observer-functions");
     writeFunction_ = {};
     bodies.close();
     std::vector<std::string> files;
@@ -3450,6 +3719,7 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
     }
     header << "};\n";
     header.close(); finished(prefix_ + ".hpp");
+    phase("header-written");
     // Declarations have been written. Keep only metadata needed by code-map.
     for (auto& group : written) {
         std::string().swap(group.frameDeclaration);
@@ -3467,7 +3737,7 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
     std::string unitPath;
     std::ostringstream manifest;
     manifest << "{\n  \"emitter\": \"grhsim-cpu-st-cpp\",\n  \"top\": " << quote(graph_.symbol())
-        << ",\n  \"code_map\": \"code-map.json\",\n  \"readable_names\": " << (readableNames_ ? "true" : "false")
+        << ",\n  \"code_map\": \"code-map.json\",\n  \"activation_stats\": \"activation-stats.json\",\n  \"readable_names\": " << (readableNames_ ? "true" : "false")
         << ",\n  \"source_comments\": " << (sourceComments_ ? "true" : "false")
         << ",\n  \"readable_frames\": " << (readableFrames_ ? "true" : "false")
         << ",\n  \"max_function_lines\": " << maxLines_ << ",\n  \"max_tu_bytes\": " << tuBytes_
@@ -3500,12 +3770,14 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
         manifest << "    {\"name\":" << quote(function.name) << ",\"lines\":" << function.lines << "}";
     }
     flush();
+    timing_.mark("translation-units-written", {{"units", sources.size()}, {"definitions", definitions.size()}, {"body_bytes", writtenBytes_}});
     bodyInput.close(); std::filesystem::remove(bodyPath);
     {
         std::ofstream output(staging / "code-map.json", std::ios::binary);
         output.exceptions(std::ios::badbit | std::ios::failbit);
         codeMap(output, written, functionSources); output.close(); finished("code-map.json");
     }
+    phase("code-map-written");
     std::vector<WrittenFunctions>().swap(written);
     if (!counterSnapshot_.empty()) {
         // Bind executable sources only; inspection artifacts are not part of
@@ -3557,7 +3829,9 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
         save("execution-counter-graph.json", counterSnapshot_);
     }
     manifest << "\n}\n";
+    save("activation-stats.json", activationStats());
     save("manifest.json", manifest.str());
+    phase("manifest-and-activation-written");
     std::ostringstream make;
     make << ".DEFAULT_GOAL := all\nifeq ($(origin CXX),default)\nCXX := clang++\nendif\n"
         << "CXXFLAGS ?= -std=c++20 -O3 -fno-strict-aliasing\nAR ?= ar\nSOURCES :=";
@@ -3576,18 +3850,24 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
         << "%.o: %.cpp $(PCH)\n\t$(CXX) $(CPPFLAGS) $(CXXFLAGS) -include-pch $(PCH) -c $< -o $@\n";
     if (waveform_) for (const auto source : {"fstapi", "fastlz", "lz4"}) make << source << ".o: $(LIBFST_SRC_DIR)/" << source << ".c\n\t$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@\n";
     make << ".PHONY: all\n"; save("Makefile", make.str());
+    phase("generate-done");
     return files;
 }
 
 } // namespace
 
 EmitResult GrhSimCpuStCpp::emitImpl(const grh::Design& design, std::span<const grh::Graph* const> tops, const EmitOptions& options) {
+    EmitPhaseTiming timing("emit");
+    timing.mark("start");
     std::filesystem::path staging;
     bool ownsStaging = false;
     try {
         if (tops.size() != 1) throw std::invalid_argument("grhsim-cpu-st-cpp requires exactly one flattened top graph");
         const auto& graph = *tops[0];
+        timing.mark("schedule-verification-start");
         const auto& schedule = sim::requireSinkSchedule(options.session, graph);
+        timing.mark("schedule-verified", {{"dag_nodes", schedule.nonsinkKeys.size()},
+            {"dag_edges", schedule.nonsinkPrerequisites.size()}, {"runs", schedule.generalRuns.size()}});
         const auto destination = resolveOutputDir(options);
         if (std::filesystem::exists(destination) && !std::filesystem::is_empty(destination))
             throw std::invalid_argument("grhsim-cpu-st-cpp output directory must be empty: " + destination.string());
@@ -3615,7 +3895,9 @@ EmitResult GrhSimCpuStCpp::emitImpl(const grh::Design& design, std::span<const g
             CpuStEmitContext context(graph, schedule, options, std::move(counterSnapshot));
             files = context.generate(staging);
         }
+        timing.mark("context-released", {{"files", files.size()}});
         if (enabledOption(options, "readable-dump")) {
+            timing.mark("readable-dump-start");
             store::StoreText serializer(nullptr, options.session);
             store::StoreOptions snapshotOptions;
             snapshotOptions.topOverrides = {std::string(graph.symbol())};
@@ -3626,6 +3908,7 @@ EmitResult GrhSimCpuStCpp::emitImpl(const grh::Design& design, std::span<const g
             if (std::filesystem::file_size(staging / "grhsim.txt") > options.maxOutputFileBytes)
                 throw std::invalid_argument("grhsim.txt exceeds maxOutputFileBytes");
             files.push_back("grhsim.txt");
+            timing.mark("readable-dump-done");
         }
         EmitResult result;
         for (const auto& path : files) {
@@ -3633,8 +3916,10 @@ EmitResult GrhSimCpuStCpp::emitImpl(const grh::Design& design, std::span<const g
         }
         if (std::filesystem::exists(destination)) std::filesystem::remove(destination);
         std::filesystem::rename(staging, destination); staging.clear();
+        timing.mark("published", {{"files", files.size()}});
         return result;
     } catch (const std::exception& error) {
+        timing.mark("failed");
         if (ownsStaging && !staging.empty()) { std::error_code ignored; std::filesystem::remove_all(staging, ignored); }
         reportError(error.what(), "grhsim-cpu-st-cpp"); return {false, {}};
     }

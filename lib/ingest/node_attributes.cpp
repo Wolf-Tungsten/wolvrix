@@ -452,6 +452,12 @@ Attributes unite(Attributes target, const Attributes& source, MergeReason) {
 void mergeEquivalentOperations(grh::Graph& graph, grh::OperationId target,
                               grh::OperationId source, std::span<const int64_t> resultMap) {
     if (target == source) return;
+    graph.mergeOpSemanticIds(target, source);
+    const auto sourceResults = graph.opResults(source);
+    const auto targetResults = graph.opResults(target);
+    for (std::size_t i = 0; i < sourceResults.size() && i < resultMap.size(); ++i)
+        if (resultMap[i] >= 0 && static_cast<std::size_t>(resultMap[i]) < targetResults.size())
+            graph.mergeValueSemanticIds(targetResults[static_cast<std::size_t>(resultMap[i])], sourceResults[i]);
     const auto mapped = remapResults(read(graph, source), resultMap);
     write(graph, target, unite(read(graph, target), mapped, MergeReason::WholeNode));
     auto remaining = read(graph, source);
@@ -466,6 +472,14 @@ void mergeCseOperations(grh::Graph& graph, grh::OperationId target, grh::Operati
         throw std::invalid_argument("primitive CSE would cross an execution owner");
     if (graph.opResults(target).size() != graph.opResults(source).size())
         throw std::invalid_argument("CSE result count mismatch");
+    // FIRRTL node metadata and SemanticTree IDs describe the same surviving
+    // computation.  CSE must transfer both before the source operation is
+    // erased by the caller.
+    graph.mergeOpSemanticIds(target, source);
+    const auto targetResults = graph.opResults(target);
+    const auto sourceResults = graph.opResults(source);
+    for (std::size_t i = 0; i < targetResults.size(); ++i)
+        graph.mergeValueSemanticIds(targetResults[i], sourceResults[i]);
     const auto reason = finalLeaf(owner(graph, target)) || (literal(graph, target) && literal(graph, source))
         ? MergeReason::ExecutionLeaf : MergeReason::SameComputation;
     write(graph, target, unite(read(graph, target), read(graph, source), reason));

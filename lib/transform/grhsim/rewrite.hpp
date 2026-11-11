@@ -155,6 +155,20 @@ inline void mergeOrigins(Graph& graph, OperationId target, std::initializer_list
     for (const auto source : sources)
         if (source) {
             if (const auto origins = getOriginModules(graph, source)) mergeOriginModules(graph, target, *origins);
+            // Source-level SemanticTree identities are independent of the
+            // legacy FIRRTL node attributes above.  Rewrites that fold or
+            // share an operation must carry both identities to the surviving
+            // operation and its corresponding result values.  Keep result
+            // positions aligned; all current GrhSIM rewrites are
+            // single-result or preserve their result arity.
+            if (target) {
+                graph.mergeOpSemanticIds(target, source);
+                const auto targetResults = graph.opResults(target);
+                const auto sourceResults = graph.opResults(source);
+                const auto count = std::min(targetResults.size(), sourceResults.size());
+                for (std::size_t i = 0; i < count; ++i)
+                    graph.mergeValueSemanticIds(targetResults[i], sourceResults[i]);
+            }
             if (source != target && ingest::node::annotated(graph, source)) {
                 auto hints = ingest::node::read(graph, source); hints.roots.clear();
                 ingest::node::write(graph, target, ingest::node::unite(ingest::node::read(graph, target),
@@ -164,24 +178,30 @@ inline void mergeOrigins(Graph& graph, OperationId target, std::initializer_list
 }
 
 inline ValueId makeOperation(Graph& graph, OperationId source, OperationKind kind,
-                             const LogicalType& type, std::span<const ValueId> operands) {
+                             const LogicalType& type, std::span<const ValueId> operands,
+                             std::string_view transformName = "grh-transform") {
     const auto op = graph.createOperation(kind);
     const auto result = graph.createValue(type);
     for (const auto input : operands) graph.addOperand(op, input);
     graph.addResult(op, result);
     if (const auto partition = attribute<Owner>(graph, source, kPartition)) graph.setAttr(op, kPartition, *partition);
     inheritOrigin(graph, op, {source});
+    graph.mergeOpSemanticIds(op, source);
+    if (const auto sourceResults = graph.opResults(source); !sourceResults.empty())
+        graph.mergeValueSemanticIds(result, sourceResults.front());
     ingest::node::copyMembers(graph, source, op);
-    graph.setOpSrcLoc(op, makeTransformSrcLoc("grhsim-simplify"));
+    graph.setOpSrcLoc(op, makeTransformSrcLoc(transformName));
     return result;
 }
 
-inline ValueId lowBits(Graph& graph, OperationId source, ValueId input, int32_t width) {
+inline ValueId lowBits(Graph& graph, OperationId source, ValueId input, int32_t width,
+                       std::string_view transformName = "grh-transform") {
     if (graph.valueWidth(input) <= width) return input;
     auto type = graph.valueLogicalType(input);
     if (type.kind != ValueType::Logic || !type.shape.empty()) throw std::invalid_argument("Cannot prefix-narrow an aggregate");
     type.width = width;
-    const auto value = makeOperation(graph, source, OperationKind::kSliceStatic, type, std::array{input});
+    const auto value = makeOperation(graph, source, OperationKind::kSliceStatic, type,
+                                     std::array{input}, transformName);
     graph.setAttr(graph.valueDef(value), "sliceStart", int64_t{0});
     graph.setAttr(graph.valueDef(value), "sliceEnd", int64_t{width - 1});
     return value;
@@ -321,7 +341,11 @@ struct Scope {
         for (const auto& use : graph.valueUsers(value)) if (!contains(use.operation)) return true;
         return false;
     }
-    bool alias(OperationId op, ValueId input) {
+    // Replace an operation by an equivalent input.  The GSIM ExprOpt pass
+    // rewrites its expression tree and leaves unreachable rows for the
+    // caller's explicit RemoveDeadNodes/DCE stage; the broader simplify pass
+    // keeps the historical eager cleanup through the default argument.
+    bool alias(OperationId op, ValueId input, bool eraseInternal = true) {
         const auto result = graph.opResults(op)[0];
         if (result == input) return false;
         if (!graph.sameValueType(result, input)) {
@@ -331,9 +355,21 @@ struct Scope {
         const auto args = graph.opOperands(op);
         if (graph.opKind(op) == OperationKind::kAssign && args.size() == 1 && args[0] == input &&
             (exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input))) return false;
-        if (exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input)) {
+        // An externally visible alias keeps its operation/value rows alive,
+        // so carry the source value identity before rewriting the operation
+        // in place.  Internal aliases take the same union before their rows
+        // are erased below.
+        graph.mergeValueSemanticIds(result, input);
+        if (const auto producer = graph.valueDef(input)) mergeOrigins(graph, op, {producer});
+        if (!eraseInternal || exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input)) {
+            graph.mergeValueSemanticIds(input, result);
             rewrite(graph, op, OperationKind::kAssign, std::array{input});
         } else {
+            // The result may carry a source declaration/expression identity
+            // even when the operation is erased as an internal alias. Move
+            // that identity onto the surviving input before deleting the
+            // value row.
+            graph.mergeValueSemanticIds(input, result);
             mergeOrigins(graph, graph.valueDef(input), {op});
             const auto replacement = ingest::node::redirectRoots(graph, result, input);
             graph.replaceAllUses(result, replacement);
@@ -396,6 +432,10 @@ inline ValueId replaceStateWithView(Graph& graph, OperationId declaration, Value
         graph.setAttr(op, "sliceStart", static_cast<int64_t>(offset));
         graph.setAttr(op, "sliceEnd", static_cast<int64_t>(offset + type.width - 1));
     }
+    graph.mergeOpSemanticIds(op, declaration);
+    graph.mergeValueSemanticIds(value, source);
+    if (const auto semantics = graph.opSemanticIds(declaration); !semantics.empty())
+        graph.addValueSemanticIds(value, semantics);
     if (location) { graph.setOpSrcLoc(op, *location); graph.setValueSrcLoc(value, *location); }
     inheritOrigin(graph, op, {declaration});
     graph.eraseOp(declaration);

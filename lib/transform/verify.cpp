@@ -911,7 +911,13 @@ namespace wolvrix::lib::transform
                         graph->valueType(operands[0]) != graph->valueType(results[0]) ||
                         graph->valueDomain(operands[0]) != graph->valueDomain(results[0]))
                     {
-                        error(*graph, op, "grh.verify: kAssign requires equal widths and compatible kinds");
+                        const auto describe = [&](ValueId value) {
+                            return std::string(grh::toString(graph->valueType(value))) + "<" +
+                                std::to_string(graph->valueWidth(value)) + ",domain=" +
+                                std::to_string(static_cast<unsigned>(graph->valueDomain(value))) + ">";
+                        };
+                        error(*graph, op, "grh.verify: kAssign requires equal widths and compatible kinds: " +
+                            describe(operands[0]) + " -> " + describe(results[0]));
                     }
                     break;
                 }

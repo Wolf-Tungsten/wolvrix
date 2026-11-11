@@ -1289,6 +1289,7 @@ public:
                                           std::string module);
     SemanticId appendSemanticTree(const Graph& source, SemanticId parent,
                                   std::string_view rootName);
+    SemanticTreePruneStats pruneSemanticTree();
 
     std::span<const OperationId> operations() const;
     std::span<const ValueId> values() const;

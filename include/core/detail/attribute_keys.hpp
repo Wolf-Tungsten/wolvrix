@@ -5,7 +5,7 @@
 
 namespace wolvrix::lib::grh::detail {
 
-inline constexpr std::array<std::string_view, 82> kBuiltinAttributeKeys = {
+inline constexpr std::array<std::string_view, 83> kBuiltinAttributeKeys = {
     "argsDirection",
     "argsName",
     "argsSigned",
@@ -20,6 +20,7 @@ inline constexpr std::array<std::string_view, 82> kBuiltinAttributeKeys = {
     "eventEdge",
     "firrtl.effectKind",
     "firrtl.effectLabel",
+    "firrtl.line",
     "firrtl.memory",
     "firrtl.memoryClockHistory",
     "firrtl.memoryCollision",

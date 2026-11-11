@@ -143,11 +143,9 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/activity_schedule.cpp
     lib/transform/grhsim/ops.cpp
     lib/transform/grhsim/grh-to-grhsim.cpp
-    lib/transform/grhsim/simplify.cpp
-    lib/transform/grhsim/node-cse.cpp
+    lib/transform/grhsim/expr-opt.cpp
     lib/transform/grhsim/used-bits.cpp
-    lib/transform/grhsim/pack-bit-registers.cpp
-    lib/transform/grhsim/recover-masked-or.cpp
+    lib/transform/split_nodes.cpp
     lib/transform/grhsim/split-event-and-output.cpp
     lib/transform/grhsim/split-nonsink-and-sink.cpp
     lib/transform/grhsim/partition-nonsink.cpp
@@ -162,11 +160,16 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/multidriven_guard.cpp
     lib/transform/blackbox_guard.cpp
     lib/transform/comb_loop_elim.cpp
+    lib/transform/alias_analysis.cpp
+    lib/transform/common_expr.cpp
+    lib/transform/constant_analysis.cpp
+    lib/transform/pattern_detect.cpp
     lib/transform/hier_flatten.cpp
     lib/transform/instance_inline.cpp
     lib/transform/xmr_resolve.cpp
     lib/transform/latch_transparent_read.cpp
     lib/transform/slice_index_const.cpp
+    lib/transform/split_static_array.cpp
     lib/transform/mux_tree_fold.cpp
     lib/transform/register_write_normalize.cpp
     lib/transform/strip_debug.cpp
@@ -679,6 +682,17 @@ target_link_libraries(transform-dead-code-elim
 
 register_test_exe(transform-dead-code-elim)
 
+add_executable(transform-split-static-array
+    tests/transform/test_split_static_array_pass.cpp
+)
+
+target_link_libraries(transform-split-static-array
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-split-static-array)
+
 add_executable(transform-mux-tree-fold
     tests/transform/test_mux_tree_fold.cpp
 )
@@ -898,8 +912,8 @@ target_compile_definitions(transform-repcut-partition-count
 
 register_test_exe(transform-repcut-partition-count)
 
-# ingest: FIRRTL syntax, combinational lowering and node CSE boundaries
-foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects firrtl-semantic-tree ingest-mixed ingest-indexes grhsim-node-cse firrtl-node-pipeline)
+# ingest: FIRRTL syntax, combinational lowering, and semantic-tree boundaries
+foreach(test_name firrtl-node-attributes firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects firrtl-semantic-tree ingest-mixed ingest-indexes)
     string(REPLACE "-" "_" test_file ${test_name})
     add_executable(${test_name} tests/ingest/test_${test_file}.cpp)
     target_link_libraries(${test_name} PRIVATE wolvrix-lib)

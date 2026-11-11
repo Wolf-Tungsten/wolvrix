@@ -643,7 +643,8 @@ int main()
         graph.addDeclaredSymbol(graph.lookupSymbol("alias_wire"));
         graph.addDeclaredSymbol(graph.lookupSymbol("held_q"));
 
-        PassManager manager; // keepDeclaredSymbols defaults to true
+        PassManager manager;
+        manager.options().keepDeclaredSymbols = true;
         manager.addPass(std::make_unique<SimplifyPass>());
         PassDiagnostics diags;
         PassManagerResult res{};

@@ -23,7 +23,12 @@ The condition includes enclosing when guards.
 
 For example `assert(clk,good,en,"bad=%d",value)` yields condition `en & !good`,
 arguments `[1,"bad=%d",value]` and event `clk`. `firrtl.effectKind`,
-`firrtl.effectLabel` and source locations retain provenance. Assume behaves as
+`firrtl.effectLabel`, and the integer operation attribute `firrtl.line` retain
+provenance. `firrtl.line` is the 1-based line of the originating FIRRTL
+statement, matching GSIM's `lineno` field and its `ASSERT_<line>`,
+`PRINTF_<line>`, and `STOP_<line>` special-node names. The attribute is copied
+by graph transforms and is serialized with ordinary operation attributes.
+Assume behaves as
 assert in simulation. Cover produces a hit trace and a frontend warning that no
 formal coverage model is generated.
 
@@ -88,7 +93,9 @@ unused and linked original blackbox JSON. Unicode
 escapes and surrogate pairs are decoded. Unknown initialization/randomization
 annotations are not discarded.
 
-Selected instances resolve through the shared mixed linker. A missing external
+Selected instances resolve through the shared mixed linker. Instance operations
+also carry `firrtl.line`, the line of the FIRRTL `inst` statement, for matching
+external-module boundary nodes. A missing external
 implementation fails without publishing a design. Pending payload metadata does
 not constitute completed SV binding.
 

@@ -2,6 +2,7 @@
 
 #include "core/grh.hpp"
 #include "ingest/node_attributes.hpp"
+#include "constant_index.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,12 +11,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <limits>
 #include <map>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace wolvrix::lib::transform
@@ -29,6 +33,53 @@ namespace wolvrix::lib::transform
         using wolvrix::lib::grh::ValueId;
         using wolvrix::lib::grh::ValueIdHash;
 
+        // A liveness region is a set of half-open flat bit intervals.  The
+        // DCE root mask still records why an item is live; the region records
+        // which part of a value is needed.  Keeping this separate from the
+        // root mask lets aggregate/array values shed operands that are only
+        // present in an overwritten slice.
+        struct LiveRegion
+        {
+            bool all = false;
+            std::vector<std::pair<int64_t, int64_t>> ranges;
+
+            static LiveRegion allBits() { return {.all = true}; }
+
+            bool empty() const noexcept { return !all && ranges.empty(); }
+
+            bool merge(const LiveRegion &other)
+            {
+                if (all) return false;
+                if (other.all) {
+                    all = true;
+                    ranges.clear();
+                    return true;
+                }
+                const auto before = ranges;
+                for (const auto [begin, end] : other.ranges) {
+                    if (begin >= end) continue;
+                    ranges.push_back({begin, end});
+                }
+                if (ranges == before) return false;
+                std::sort(ranges.begin(), ranges.end());
+                std::vector<std::pair<int64_t, int64_t>> merged;
+                merged.reserve(ranges.size());
+                for (const auto [begin, end] : ranges) {
+                    if (merged.empty() || begin > merged.back().second) merged.push_back({begin, end});
+                    else merged.back().second = std::max(merged.back().second, end);
+                }
+                ranges.swap(merged);
+                return ranges != before;
+            }
+
+            static LiveRegion interval(int64_t begin, int64_t end)
+            {
+                LiveRegion result;
+                if (begin < end) result.ranges.push_back({begin, end});
+                return result;
+            }
+        };
+
         struct StorageInfo
         {
             OperationId declOp = OperationId::invalid();
@@ -36,6 +87,7 @@ namespace wolvrix::lib::transform
             bool live = false;
             bool declaredRoot = false;
             uint32_t rootMask = 0;
+            LiveRegion region;
         };
 
         enum RootMaskBit : uint32_t
@@ -232,6 +284,75 @@ namespace wolvrix::lib::transform
             }
         }
 
+        LiveRegion clampRegion(const LiveRegion &region, int64_t width)
+        {
+            if (width <= 0) return {};
+            if (region.all) return LiveRegion::allBits();
+            LiveRegion result;
+            for (const auto [begin, end] : region.ranges)
+                result.merge(LiveRegion::interval(std::max<int64_t>(0, begin), std::min(width, end)));
+            if (result.ranges.size() == 1 && result.ranges.front() == std::pair<int64_t, int64_t>{0, width})
+                return LiveRegion::allBits();
+            return result;
+        }
+
+        LiveRegion mapSliceRegion(const LiveRegion &resultRegion, int64_t offset, int64_t width)
+        {
+            if (resultRegion.all) return LiveRegion::interval(offset, offset + width);
+            LiveRegion result;
+            for (const auto [begin, end] : resultRegion.ranges) {
+                const auto lo = std::max<int64_t>(0, begin);
+                const auto hi = std::min(width, end);
+                if (lo < hi) result.merge(LiveRegion::interval(offset + lo, offset + hi));
+            }
+            return result;
+        }
+
+        LiveRegion mapPackedOperandRegion(const LiveRegion &resultRegion,
+                                          int64_t offset, int64_t width)
+        {
+            // The operand occupies [offset, offset + width) in the packed
+            // result. Intersect demand there, then subtract its low-bit offset
+            // to recover operand-local coordinates. Concat computes offsets
+            // in reverse operand order; ArrayCreate computes them forwards.
+            if (resultRegion.all) return LiveRegion::allBits();
+            LiveRegion result;
+            for (const auto [begin, end] : resultRegion.ranges) {
+                const auto lo = std::max<int64_t>(begin, offset);
+                const auto hi = std::min<int64_t>(end, offset + width);
+                if (lo < hi) result.merge(LiveRegion::interval(lo - offset, hi - offset));
+            }
+            return result;
+        }
+
+        LiveRegion mapArraySliceRegion(const LiveRegion &resultRegion,
+                                       std::span<const ValueId> operands,
+                                       const wolvrix::lib::grh::Graph &graph,
+                                       int64_t resultWidth)
+        {
+            if (operands.size() < 2) return {};
+            const auto base = operands[0];
+            const auto shape = graph.valueShape(base);
+            if (shape.empty()) return LiveRegion::allBits();
+            const auto indexCount = operands.size() - 1;
+            if (indexCount > shape.size()) return LiveRegion::allBits();
+            int64_t elementCount = 1;
+            int64_t linearIndex = 0;
+            for (std::size_t i = 0; i < indexCount; ++i) {
+                if (shape[i] <= 0 || elementCount > std::numeric_limits<int64_t>::max() / shape[i])
+                    return LiveRegion::allBits();
+                const auto index = detail::constantIndex(graph, operands[i + 1]);
+                if (!index || *index >= static_cast<uint64_t>(shape[i])) return LiveRegion::allBits();
+                linearIndex = linearIndex * shape[i] + static_cast<int64_t>(*index);
+                elementCount *= shape[i];
+            }
+            if (elementCount <= 0 || graph.valueWidth(base) % elementCount != 0)
+                return LiveRegion::allBits();
+            const auto elementWidth = graph.valueWidth(base) / elementCount;
+            return mapSliceRegion(resultRegion, linearIndex * elementWidth,
+                                  resultWidth);
+        }
+
         std::string jsonEscape(std::string_view text)
         {
             std::string out;
@@ -352,6 +473,7 @@ namespace wolvrix::lib::transform
             if (activeGraphs && !activeGraphs->contains(entry.first)) continue;
             wolvrix::lib::grh::Graph &graph = *entry.second;
             bool graphChanged = false;
+            const auto graphTimingStart = std::chrono::steady_clock::now();
 
             const auto opSpan = graph.operations();
             const auto valueSpan = graph.values();
@@ -381,17 +503,21 @@ namespace wolvrix::lib::transform
             std::vector<uint8_t> isDeclaredValue;
             std::vector<uint32_t> liveValueMask;
             std::vector<uint32_t> liveOpMask;
+            std::vector<LiveRegion> liveValueRegion;
+            std::vector<LiveRegion> liveOpRegion;
             std::vector<OperationId> defOpByValue;
             if (maxValueIndex > 0)
             {
                 isPort.assign(static_cast<std::size_t>(maxValueIndex + 1), 0);
                 isDeclaredValue.assign(static_cast<std::size_t>(maxValueIndex + 1), 0);
                 liveValueMask.assign(static_cast<std::size_t>(maxValueIndex + 1), 0);
+                liveValueRegion.resize(static_cast<std::size_t>(maxValueIndex + 1));
                 defOpByValue.assign(static_cast<std::size_t>(maxValueIndex + 1), OperationId::invalid());
             }
             if (maxOpIndex > 0)
             {
                 liveOpMask.assign(static_cast<std::size_t>(maxOpIndex + 1), 0);
+                liveOpRegion.resize(static_cast<std::size_t>(maxOpIndex + 1));
             }
 
             auto markPort = [&](ValueId valueId) {
@@ -424,8 +550,8 @@ namespace wolvrix::lib::transform
             {
                 OperationId id;
                 OperationKind kind = OperationKind::kConstant;
-                std::vector<ValueId> operands;
-                std::vector<ValueId> results;
+                std::span<const ValueId> operands;
+                std::span<const ValueId> results;
             };
 
             std::vector<OpInfo> ops;
@@ -445,10 +571,8 @@ namespace wolvrix::lib::transform
                 OpInfo info;
                 info.id = opId;
                 info.kind = graph.opKind(opId);
-                const auto operands = graph.opOperands(opId);
-                const auto results = graph.opResults(opId);
-                info.operands.assign(operands.begin(), operands.end());
-                info.results.assign(results.begin(), results.end());
+                info.operands = graph.opOperands(opId);
+                info.results = graph.opResults(opId);
                 const std::size_t infoIndex = ops.size();
                 ops.push_back(std::move(info));
                 ++stats_.operationsVisited;
@@ -510,44 +634,63 @@ namespace wolvrix::lib::transform
             {
                 ValueId id = ValueId::invalid();
                 uint32_t deltaMask = 0;
+                LiveRegion region;
             };
             struct OpWorkItem
             {
                 OperationId id = OperationId::invalid();
                 uint32_t deltaMask = 0;
+                LiveRegion region;
             };
 
-            auto markValueLive = [&](ValueId valueId, uint32_t mask, std::deque<ValueWorkItem> &worklist) {
+            const auto fullRegion = [&](ValueId value) {
+                // Most dependencies demand the whole value. Keep that common
+                // case inline instead of allocating one interval per edge.
+                return value.valid() && graph.valueWidth(value) > 0 ? LiveRegion::allBits() : LiveRegion{};
+            };
+            const auto normalizeRegion = [&](ValueId value, const LiveRegion &region) {
+                return clampRegion(region, graph.valueWidth(value));
+            };
+            auto markValueLive = [&](ValueId valueId, uint32_t mask, const LiveRegion &region,
+                                     std::deque<ValueWorkItem> &worklist) {
                 if (!valueId.valid() || valueId.index >= liveValueMask.size())
                 {
                     return;
                 }
+                const auto normalized = normalizeRegion(valueId, region);
+                // An empty demand on a positive-width value carries no data
+                // dependency. Preserve the historical structural treatment of
+                // zero-width roots until their IR contract changes.
+                if (normalized.empty() && graph.valueWidth(valueId) > 0) return;
                 const uint32_t prevMask = liveValueMask[valueId.index];
                 const uint32_t deltaMask = mask & ~prevMask;
-                if (deltaMask == 0)
-                {
-                    return;
-                }
+                const bool regionChanged = liveValueRegion[valueId.index].merge(normalized);
+                if (deltaMask == 0 && !regionChanged) return;
                 liveValueMask[valueId.index] = prevMask | deltaMask;
-                worklist.push_back({valueId, deltaMask});
+                // New bits can reach operands not touched by the previous
+                // region. They inherit every reason already reaching this
+                // value even when no new root-mask bit arrived this time.
+                const uint32_t propagationMask = regionChanged ? liveValueMask[valueId.index] : deltaMask;
+                worklist.push_back({valueId, propagationMask, normalized});
             };
-            auto markOpLive = [&](OperationId opId, uint32_t mask, std::deque<OpWorkItem> &worklist) {
+            auto markOpLive = [&](OperationId opId, uint32_t mask, const LiveRegion &region,
+                                  std::deque<OpWorkItem> &worklist) {
                 if (!opId.valid() || opId.index >= liveOpMask.size())
                 {
                     return;
                 }
                 const uint32_t prevMask = liveOpMask[opId.index];
                 const uint32_t deltaMask = mask & ~prevMask;
-                if (deltaMask == 0)
-                {
-                    return;
-                }
+                const bool regionChanged = liveOpRegion[opId.index].merge(region);
+                if (deltaMask == 0 && !regionChanged) return;
                 liveOpMask[opId.index] = prevMask | deltaMask;
-                worklist.push_back({opId, deltaMask});
+                const uint32_t propagationMask = regionChanged ? liveOpMask[opId.index] : deltaMask;
+                worklist.push_back({opId, propagationMask, region});
             };
             auto markStorageLive = [&](std::unordered_map<std::string, StorageInfo> &map,
                                        const std::string &sym,
                                        uint32_t mask,
+                                       const LiveRegion &region,
                                        std::deque<OpWorkItem> &worklist) {
                 auto it = map.find(sym);
                 if (it == map.end())
@@ -556,18 +699,17 @@ namespace wolvrix::lib::transform
                 }
                 it->second.live = true;
                 const uint32_t deltaMask = mask & ~it->second.rootMask;
-                if (deltaMask == 0)
-                {
-                    return;
-                }
+                const bool regionChanged = it->second.region.merge(region);
+                if (deltaMask == 0 && !regionChanged) return;
                 it->second.rootMask |= deltaMask;
+                const uint32_t propagationMask = regionChanged ? it->second.rootMask : deltaMask;
                 if (it->second.declOp.valid())
                 {
-                    markOpLive(it->second.declOp, deltaMask, worklist);
+                    markOpLive(it->second.declOp, propagationMask, region, worklist);
                 }
                 for (const auto writeOp : it->second.writePorts)
                 {
-                    markOpLive(writeOp, deltaMask, worklist);
+                    markOpLive(writeOp, propagationMask, region, worklist);
                 }
             };
 
@@ -606,11 +748,11 @@ namespace wolvrix::lib::transform
                 }
                 if (isPort[valueId.index] != 0)
                 {
-                    markValueLive(valueId, kRootPort, liveValueWorklist);
+                    markValueLive(valueId, kRootPort, fullRegion(valueId), liveValueWorklist);
                 }
                 if (valueId.index < isDeclaredValue.size() && isDeclaredValue[valueId.index] != 0)
                 {
-                    markValueLive(valueId, kRootDeclaredValue, liveValueWorklist);
+                    markValueLive(valueId, kRootDeclaredValue, fullRegion(valueId), liveValueWorklist);
                 }
             }
 
@@ -618,14 +760,14 @@ namespace wolvrix::lib::transform
             {
                 if (info.declaredRoot)
                 {
-                    markStorageLive(regInfos, sym, kRootDeclaredStorage, liveOpWorklist);
+                    markStorageLive(regInfos, sym, kRootDeclaredStorage, LiveRegion::allBits(), liveOpWorklist);
                 }
             }
             for (auto &[sym, info] : latchInfos)
             {
                 if (info.declaredRoot)
                 {
-                    markStorageLive(latchInfos, sym, kRootDeclaredStorage, liveOpWorklist);
+                    markStorageLive(latchInfos, sym, kRootDeclaredStorage, LiveRegion::allBits(), liveOpWorklist);
                 }
             }
 
@@ -636,7 +778,7 @@ namespace wolvrix::lib::transform
                     const uint32_t rootMask = rootMaskForObservableBoundaryOp(info.kind);
                     if (rootMask != 0)
                     {
-                        markOpLive(info.id, rootMask, liveOpWorklist);
+                        markOpLive(info.id, rootMask, LiveRegion::allBits(), liveOpWorklist);
                     }
                 }
             }
@@ -645,7 +787,7 @@ namespace wolvrix::lib::transform
             {
                 while (!liveValueWorklist.empty())
                 {
-                    const ValueWorkItem item = liveValueWorklist.front();
+                    const ValueWorkItem item = std::move(liveValueWorklist.front());
                     liveValueWorklist.pop_front();
                     const ValueId valueId = item.id;
                     if (!valueId.valid() || valueId.index >= defOpByValue.size())
@@ -655,13 +797,13 @@ namespace wolvrix::lib::transform
                     const OperationId defOp = defOpByValue[valueId.index];
                     if (defOp.valid())
                     {
-                        markOpLive(defOp, item.deltaMask, liveOpWorklist);
+                        markOpLive(defOp, item.deltaMask, item.region, liveOpWorklist);
                     }
                 }
 
                 while (!liveOpWorklist.empty())
                 {
-                    const OpWorkItem item = liveOpWorklist.front();
+                    const OpWorkItem item = std::move(liveOpWorklist.front());
                     liveOpWorklist.pop_front();
                     const OperationId opId = item.id;
                     if (!opId.valid() || opId.index >= opIndexById.size())
@@ -681,13 +823,100 @@ namespace wolvrix::lib::transform
                         auto *map = storageMapForKind(info.kind, regInfos, latchInfos);
                         if (sym && map)
                         {
-                            markStorageLive(*map, *sym, item.deltaMask, liveOpWorklist);
+                            // Indexed-read demand is local to the selected
+                            // result, not the whole storage. Until indices are
+                            // mapped explicitly, retain the entire family.
+                            if (info.kind == OperationKind::kRegisterReadArrayPort)
+                                markStorageLive(*map, *sym, item.deltaMask, LiveRegion::allBits(), liveOpWorklist);
+                            else
+                                markStorageLive(*map, *sym, item.deltaMask, item.region, liveOpWorklist);
                         }
                     }
 
-                    for (const auto operandId : info.operands)
-                    {
-                        markValueLive(operandId, item.deltaMask, liveValueWorklist);
+                    const auto markOperand = [&](std::size_t index, const LiveRegion &region) {
+                        if (index < info.operands.size())
+                            markValueLive(info.operands[index], item.deltaMask, region, liveValueWorklist);
+                    };
+                    const auto markAllOperands = [&]() {
+                        for (std::size_t i = 0; i < info.operands.size(); ++i)
+                            markOperand(i, fullRegion(info.operands[i]));
+                    };
+
+                    // Storage demand uses whole-state coordinates; indexed
+                    // write/fill data uses coordinates local to one row.
+                    // Keep data and controls full-live until the indexed or
+                    // broadcast inverse map is explicit.
+                    if (info.kind == OperationKind::kRegisterWriteArrayPort ||
+                        info.kind == OperationKind::kRegisterWriteArrayMaskPort ||
+                        info.kind == OperationKind::kRegisterFillPort) {
+                        markAllOperands();
+                        continue;
+                    }
+
+                    // State writes have a storage-family dependency, but the
+                    // data operand only needs the region demanded by the
+                    // corresponding read.  Enables, indices and clocks remain
+                    // control dependencies and are conservatively full-live.
+                    if (isStateWriteOp(info.kind) && !info.operands.empty()) {
+                        constexpr std::size_t dataIndex = 1;
+                        for (std::size_t i = 0; i < info.operands.size(); ++i)
+                            markOperand(i, i == dataIndex ? item.region : fullRegion(info.operands[i]));
+                        continue;
+                    }
+
+                    switch (info.kind) {
+                    case OperationKind::kAssign:
+                        markOperand(0, item.region);
+                        break;
+                    case OperationKind::kConcat: {
+                        if (item.region.all) {
+                            markAllOperands();
+                            break;
+                        }
+                        int64_t offset = 0;
+                        for (std::size_t i = info.operands.size(); i-- > 0;) {
+                            const auto width = graph.valueWidth(info.operands[i]);
+                            markOperand(i, mapPackedOperandRegion(item.region, offset, width));
+                            offset += width;
+                        }
+                        break;
+                    }
+                    case OperationKind::kArrayCreate: {
+                        int64_t offset = 0;
+                        for (std::size_t i = 0; i < info.operands.size(); ++i) {
+                            const auto width = graph.valueWidth(info.operands[i]);
+                            // ArrayCreate places element i at flat bit offset
+                            // i*W; demand maps back by subtracting that offset.
+                            markOperand(i, mapPackedOperandRegion(item.region, offset, width));
+                            offset += width;
+                        }
+                        break;
+                    }
+                    case OperationKind::kSliceStatic: {
+                        int64_t start = 0;
+                        if (const auto attr = graph.opAttrRange(opId).find("sliceStart"))
+                            start = attr->value().get<int64_t>().value_or(0);
+                        const auto resultWidth = info.results.empty() ? graph.valueWidth(info.operands[0]) :
+                                                  graph.valueWidth(info.results[0]);
+                        markOperand(0, mapSliceRegion(item.region, start, resultWidth));
+                        break;
+                    }
+                    case OperationKind::kSliceArray: {
+                        const auto resultWidth = info.results.empty() ? graph.valueWidth(info.operands[0]) :
+                                                  graph.valueWidth(info.results[0]);
+                        markOperand(0, mapArraySliceRegion(item.region, info.operands, graph, resultWidth));
+                        for (std::size_t i = 1; i < info.operands.size(); ++i)
+                            markOperand(i, fullRegion(info.operands[i]));
+                        break;
+                    }
+                    case OperationKind::kMux:
+                        markOperand(0, fullRegion(info.operands[0]));
+                        markOperand(1, item.region);
+                        markOperand(2, item.region);
+                        break;
+                    default:
+                        markAllOperands();
+                        break;
                     }
                 }
             }
@@ -879,6 +1108,10 @@ namespace wolvrix::lib::transform
             // A frozen graph's value span belongs to its view.  The first
             // erase thaws the graph and releases that view, so retain the ID
             // traversal before beginning mutations.
+            const auto removalTimingStart = std::chrono::steady_clock::now();
+            const auto analysisMs = static_cast<std::size_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                removalTimingStart - graphTimingStart).count());
+            stats_.analysisMs += analysisMs;
             const std::vector<ValueId> valueOrder(valueSpan.begin(), valueSpan.end());
             ingest::node::DeadRootBatch deadRoots(graph);
             for (const auto &info : ops)
@@ -937,12 +1170,37 @@ namespace wolvrix::lib::transform
                 }
             }
 
-            anyChanged = anyChanged || graphChanged;
-            if (graphChanged)
+            const auto semanticTimingStart = std::chrono::steady_clock::now();
+            const auto removalMs = static_cast<std::size_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                semanticTimingStart - removalTimingStart).count());
+            stats_.removalMs += removalMs;
+            const auto semanticStats = graph.pruneSemanticTree();
+            const auto semanticPruneMs = static_cast<std::size_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - semanticTimingStart).count());
+            stats_.semanticPruneMs += semanticPruneMs;
+            stats_.semanticNodesRemoved += semanticStats.removedNodes;
+            stats_.semanticNameBytesRemoved += semanticStats.removedNameBytes;
+            stats_.semanticNodesRetained += semanticStats.retainedNodes;
+            stats_.semanticIndirectNodesRetained += semanticStats.retainedIndirectNodes;
+            stats_.semanticIds += semanticStats.semanticIds;
+            const bool semanticChanged = semanticStats.removedNodes != 0;
+            if (!options_.outputKey.empty())
             {
-                ++changedGraphs;
-                changedGraphNames.insert(entry.first);
+                std::ostringstream phase;
+                phase << "{\"graph\":\"" << jsonEscape(graph.symbol()) << "\",";
+                phase << "\"analysisMs\":" << analysisMs << ",\"removalMs\":" << removalMs
+                      << ",\"semanticPruneMs\":" << semanticPruneMs << ",";
+                phase << "\"semantic\":{\"nodesRemoved\":" << semanticStats.removedNodes
+                      << ",\"nameBytesRemoved\":" << semanticStats.removedNameBytes
+                      << ",\"nodesRetained\":" << semanticStats.retainedNodes
+                      << ",\"indirectNodesRetained\":" << semanticStats.retainedIndirectNodes
+                      << ",\"ids\":" << semanticStats.semanticIds << "}}";
+                setSessionValue(options_.outputKey + ".phase", phase.str(), "stats");
             }
+
+            anyChanged = anyChanged || graphChanged || semanticChanged;
+            if (graphChanged || semanticChanged) ++changedGraphs;
+            if (graphChanged) changedGraphNames.insert(entry.first);
         }
 
         result.changed = anyChanged;
@@ -964,6 +1222,11 @@ namespace wolvrix::lib::transform
                          static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                                     std::chrono::steady_clock::now() - timingStart)
                                                     .count()));
+            std::fprintf(stderr,
+                         "[dce-phase] analysis_ms=%zu removal_ms=%zu semantic_prune_ms=%zu "
+                         "semantic_nodes_removed=%zu semantic_name_bytes_removed=%zu semantic_ids=%zu\n",
+                         stats_.analysisMs, stats_.removalMs, stats_.semanticPruneMs,
+                         stats_.semanticNodesRemoved, stats_.semanticNameBytesRemoved, stats_.semanticIds);
         }
         return result;
     }

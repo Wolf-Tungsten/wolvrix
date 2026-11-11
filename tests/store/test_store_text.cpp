@@ -117,7 +117,10 @@ void testReadableSnapshot() {
     contains(*snapshot, "status: validated complete=true");
     contains(*snapshot, "logical-partition-tree:");
     contains(*snapshot, "execution-owners:");
-    contains(*snapshot, "requires-logical-leaf");
+    contains(*snapshot, "requires-logical-roots");
+    contains(*snapshot, "logical-nonsink-dag");
+    contains(*snapshot, "direct-prerequisites");
+    contains(*snapshot, "complete transitive closure");
     contains(*snapshot, "hoisted-enable");
     contains(*snapshot, "logical-owner=[\"general\", \"nonsink\",");
     contains(*snapshot, "origin-set[");

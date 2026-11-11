@@ -3415,6 +3415,69 @@ namespace wolvrix::lib::grh
         return semanticTree_->appendTree(*source.semanticTree_, parent, rootName);
     }
 
+    SemanticTreePruneStats Graph::pruneSemanticTree()
+    {
+        SemanticTreePruneStats stats;
+        if (!semanticTree_) return stats;
+        GraphStore& builder = *store_;
+        std::vector<uint8_t> referenced(semanticTree_->size() + 1, 0);
+        const auto& pool = builder.topology_->semantics;
+        const auto markRange = [&](Range range) {
+            if (range.offset > pool.size() || range.count > pool.size() - range.offset)
+                throw std::out_of_range("semantic list is out of range during tree pruning");
+            for (std::size_t offset = range.offset; offset < range.offset + range.count; ++offset) {
+                const SemanticId id = pool[offset];
+                if (!semanticTree_->contains(id))
+                    throw std::invalid_argument("invalid SemanticId during tree pruning");
+                referenced[id] = 1;
+            }
+            stats.semanticIds += range.count;
+        };
+        for (const ValueId value : values()) markRange(builder.values_.semantics_[builder.valueIndex(value)]);
+        for (const OperationId op : operations())
+            markRange(builder.operations_.semantics_[builder.opIndex(op)]);
+
+        SemanticTreePruneResult prune;
+        auto compacted = semanticTree_->buildPruned(referenced, prune);
+        stats.removedNodes = prune.removedNodes;
+        stats.removedNameBytes = prune.removedNameBytes;
+        stats.retainedNodes = prune.retainedNodes;
+        stats.retainedIndirectNodes = prune.retainedIndirectNodes;
+        if (!compacted) return stats;
+
+        auto& topology = *builder.topology_;
+        for (const SemanticId id : topology.semantics) {
+            if (id >= prune.oldToNew.size())
+                throw std::invalid_argument("SemanticId exceeds tree pruning map");
+        }
+        decltype(topology.semanticListIds) remappedListIds;
+        remappedListIds.reserve(topology.semanticLists.size());
+        std::vector<uint32_t> remappedHashNext(topology.semanticLists.size(), 0);
+        for (uint32_t index = 1; index < topology.semanticLists.size(); ++index) {
+            const Range range = topology.semanticLists[index];
+            if (range.offset > topology.semantics.size() ||
+                range.count > topology.semantics.size() - range.offset)
+                throw std::out_of_range("cached semantic list is out of range during tree pruning");
+            std::size_t hash = range.count;
+            for (std::size_t offset = range.offset; offset < range.offset + range.count; ++offset) {
+                const SemanticId id = prune.oldToNew[topology.semantics[offset]];
+                hash ^= std::hash<SemanticId>{}(id) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+            }
+            auto [it, inserted] = remappedListIds.try_emplace(hash, index);
+            if (!inserted) {
+                remappedHashNext[index] = it->second;
+                it->second = index;
+            }
+        }
+
+        mutableStore(false);
+        *semanticTree_ = std::move(*compacted);
+        for (SemanticId& id : topology.semantics) id = prune.oldToNew[id];
+        topology.semanticListIds.swap(remappedListIds);
+        topology.semanticHashNext.swap(remappedHashNext);
+        return stats;
+    }
+
     std::span<const SemanticId> Graph::valueSemanticIds(ValueId value) const
     {
         const std::size_t row = store_->valueIndex(value);
@@ -3435,14 +3498,32 @@ namespace wolvrix::lib::grh
         builder.values_.semantics_[row] = builder.storeSemanticIds(ids);
     }
 
+    namespace {
+        void appendUniqueSemanticIds(slang::SmallVector<SemanticId, 4>& merged,
+                                     std::span<const SemanticId> ids)
+        {
+            // Preserve first-seen order without quadratic scans for large lists.
+            if (ids.size() < 8 || merged.size() + ids.size() < 64) {
+                for (const SemanticId id : ids)
+                    if (std::find(merged.begin(), merged.end(), id) == merged.end()) merged.push_back(id);
+                return;
+            }
+            slang::flat_hash_set<SemanticId, std::hash<SemanticId>> seen;
+            seen.reserve(merged.size() + ids.size());
+            for (const SemanticId id : merged) seen.insert(id);
+            for (const SemanticId id : ids)
+                if (seen.insert(id).second) merged.push_back(id);
+        }
+    }
+
     void Graph::addValueSemanticIds(ValueId value, std::span<const SemanticId> ids)
     {
         if (ids.empty()) return;
         slang::SmallVector<SemanticId, 4> merged;
         const auto existing = valueSemanticIds(value);
+        if (ids.data() == existing.data() && ids.size() <= existing.size()) return;
         merged.append(existing.begin(), existing.end());
-        for (const SemanticId id : ids)
-            if (std::find(merged.begin(), merged.end(), id) == merged.end()) merged.push_back(id);
+        appendUniqueSemanticIds(merged, ids);
         if (merged.size() != existing.size()) setValueSemanticIds(value,
             std::span<const SemanticId>(merged.data(), merged.size()));
     }
@@ -3478,9 +3559,9 @@ namespace wolvrix::lib::grh
         if (ids.empty()) return;
         slang::SmallVector<SemanticId, 4> merged;
         const auto existing = opSemanticIds(op);
+        if (ids.data() == existing.data() && ids.size() <= existing.size()) return;
         merged.append(existing.begin(), existing.end());
-        for (const SemanticId id : ids)
-            if (std::find(merged.begin(), merged.end(), id) == merged.end()) merged.push_back(id);
+        appendUniqueSemanticIds(merged, ids);
         if (merged.size() != existing.size()) setOpSemanticIds(op,
             std::span<const SemanticId>(merged.data(), merged.size()));
     }

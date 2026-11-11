@@ -22,6 +22,14 @@ namespace wolvrix::lib::transform
             std::size_t operationsVisited = 0;
             std::size_t opsRemoved = 0;
             std::size_t valuesRemoved = 0;
+            std::size_t semanticNodesRemoved = 0;
+            std::size_t semanticNameBytesRemoved = 0;
+            std::size_t semanticNodesRetained = 0;
+            std::size_t semanticIndirectNodesRetained = 0;
+            std::size_t semanticIds = 0;
+            std::size_t analysisMs = 0;
+            std::size_t removalMs = 0;
+            std::size_t semanticPruneMs = 0;
         };
 
         DeadCodeElimPass();

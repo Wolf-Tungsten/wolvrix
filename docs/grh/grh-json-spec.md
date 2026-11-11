@@ -43,6 +43,8 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
   - `kind` 只接受 `module/declaration/expression/field/element`。flatten 深拷贝来源树时，源 Module 根可以成为非根节点；F20.P1 起，复制根的 `name` 使用规范化并唯一化后的实例名，不再使用来源模块定义名。
   - Element 必须有非负 `index`，允许空 name；其他节点名称非空且不允许 index。
   - SemanticId 就是该 Graph 树内的节点 ID，不包含实例 scope、外部树编号或指针。
+    F21 起，DCE 可以删除不再被存活 op/value 引用的分支并批量重编号；存活来源路径不变，
+    数字 ID 不得作为跨 pass 或跨 checkpoint 的稳定身份。
 - `metadata`: Graph 属性对象，负载编码与 op attrs 相同；保存转换阶段及逻辑域等语义。
   分区/调度缓存、裸实体 ID、CPU 布局及 chunk 不进入此对象。
 - `declaredSymbols`: 模块内部声明的符号名数组（必需）。
@@ -74,7 +76,12 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
   - `kind`: 操作类型字符串（来自 `wolvrix::lib::grh::toString(OperationKind)`）。
   - `in` / `out`: 操作数与结果值局部 ID 数组，保持插入顺序。
   - `semanticIds`: 可选，正整数数组，规则与 value 相同。
-  - `attrs`: 可选属性对象，键为属性名，值为属性负载。
+  - `attrs`: 可选属性对象，键为属性名，值为属性负载。FIRRTL effect
+    operations (`kSystemTask`) use `firrtl.line` (int) for the 1-based source
+    line of the originating FIRRTL statement; FIRRTL instance boundary
+    operations (`kInstance`) use the same attribute for their `inst` statement.
+    This is the parser line convention used by GSIM's serialized `lineno` and
+    survives graph transforms and StoreJson round trips.
   - `loc`: 可选，源码位置与扩展调试信息 `{ file, line, col, endLine, endCol, origin, pass, note }`。
 
 FIRRTL 来源由 semanticTree 和 value/op 的 semanticIds 持久化，不生成旧

@@ -261,11 +261,16 @@ class Session:
         design: str,
         args: list[str] | None = None,
         dryrun: bool = False,
-        keep_declared_symbols: bool = True,
+        keep_declared_symbols: bool | None = None,
         **named_args,
     ) -> list[dict]:
         self._ensure_open()
         canonical_name, pass_args = _compile_run_pass(name, args or [], named_args)
+        if keep_declared_symbols is None:
+            keep_declared_symbols = canonical_name not in {
+                "dead-code-elim", "split-static-array", "expr-opt", "used-bits", "split-nodes",
+                "constant-analysis", "alias-analysis", "pattern-detect", "common-expr", "comm-expr"
+            }
         success, changed, diagnostics = _native.session_run_pass(
             self._capsule,
             name=canonical_name,
@@ -503,11 +508,24 @@ def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tupl
 
 
 _GRHSIM_PASS_OPTIONS = {
+    # Canonical F24 names. Legacy spellings remain below for replaying older
+    # checkpoints and clients.
+    "grhsim-dialect-translate": ("top", "logic_domain"),
+    "split-event-and-output": ("top",),
+    "split-nonsink-and-sink": ("top", "mem_min_bytes"),
+    "partition-nonsink": ("top", "max_supernode_nodes", "segment_penalty",
+                           "semantic_nodes", "clone_shared", "clone_max_fanout", "max_clones", "clone_lossy_compare",
+                           "firrtl_nodes", "cost_model", "report"),
+    "partition-sink": ("top", "enable_guard_min_size"),
+    "comm-expr": ("top",),
     "grh-to-grhsim": ("top", "logic_domain"),
-    "grhsim-simplify": ("top", "max_rounds"),
-    "grhsim-node-cse": ("top", "firrtl_node_cse", "report"),
-    "grhsim-pack-bit-registers": ("top", "report"),
-    "grhsim-recover-masked-or": ("top", "min_terms", "report"),
+    "expr-opt": ("top",),
+    "used-bits": ("top",),
+    "split-nodes": ("top",),
+    "constant-analysis": ("top",),
+    "alias-analysis": ("top",),
+    "pattern-detect": ("top",),
+    "common-expr": ("top",),
     "grhsim-split-event-and-output": ("top",),
     "grhsim-split-nonsink-and-sink": ("top", "mem_min_bytes"),
     "grhsim-partition-nonsink": ("top", "max_supernode_nodes", "segment_penalty",

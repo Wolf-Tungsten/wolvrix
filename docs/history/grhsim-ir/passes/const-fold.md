@@ -29,6 +29,5 @@
 ## 实现
 
 一次 worklist 传播即达局部不动点：折叠一个 op 后只把其 result 的消费者重新入队；
-每个 op 至多折叠一次，总复杂度 O(ops)。作为 `grhsim.simplify` 子步骤调用时按
 `SimplifyScope` 限定可改写的 op 集合（常量本身在任何 scope 下都可作为折叠输入被读取）。
 独立运行时计数 `const_fold_ops`。

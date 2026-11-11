@@ -4,6 +4,8 @@
 #include "transform/hier_flatten.hpp"
 #include "slang/numeric/SVInt.h"
 
+#include <unordered_set>
+
 namespace {
 using namespace firrtl_test;
 void shape(const grh::Graph& graph, std::string_view name, int width, std::vector<int64_t> expected) {
@@ -20,6 +22,23 @@ void requireCycleRejectedAfterFlatten(ingest::IngestResult& result, std::string_
     tx::PassDiagnostics diagnostics;
     const auto outcome = manager.run(*result.design, diagnostics);
     require(!outcome.success, std::string(message));
+}
+grh::Design oracleCopy(const grh::Design& source) {
+    // Deferred array false loops require the same post-flatten repair as the
+    // simulation pipeline. Keep the ingested graph available for raw checks.
+    auto design = source.clone();
+    tx::PassManager manager;
+    manager.addPass(std::make_unique<tx::HierFlattenPass>());
+    tx::CombLoopElimOptions options;
+    options.failOnTrueLoop = true;
+    options.numThreads = 1;
+    manager.addPass(std::make_unique<tx::CombLoopElimPass>(options));
+    tx::PassDiagnostics diagnostics;
+    const auto outcome = manager.run(design, diagnostics);
+    std::string messages;
+    for (const auto& diagnostic : diagnostics.messages()) messages += diagnostic.message + '\n';
+    require(outcome.success, "oracle graph preparation failed: " + messages);
+    return design;
 }
 void rectangularMixedIndexBounds() {
     // FIRRTL's final suffix is the outer dimension: this is two rows of three.
@@ -89,12 +108,42 @@ void geometry() {
     shape(graph,"packet__DOT__valid",2,{2}); shape(graph,"packet__DOT__data",16,{2,2});
     shape(graph,"packet__DOT__meta__DOT__flag",2,{2}); shape(graph,"result__DOT__data",20,{2,2});
     shape(graph,"one",1,{1,1}); shape(graph,"single",1,{1,1}); shape(graph,"sub",8,{2});
-    const auto inspection = node::inspect(graph); require(inspection.errors.empty(),inspection.report(graph));
-    require(inspection.nodes.size()==6,"Vector node identity was expanded per element or Bundle field omitted");
-    for (const auto& record : inspection.nodes) {
-        const auto identity = node::parseKey(record.key);
-        require(identity.fieldPath==std::vector<std::string>{"valid"} || identity.fieldPath==std::vector<std::string>{"data"} || identity.fieldPath==std::vector<std::string>{"meta","flag"},"node identity field geometry is wrong");
-        if (identity.name=="aliasPacket") require(record.members.size()==1,"aggregate alias relabeled its producer");
+    const auto* tree = graph.semanticTree(); require(tree, "aggregate nodes lost SemanticTree");
+    std::unordered_set<grh::SemanticId> nodeFields;
+    for (const std::string_view name : {"selected", "aliasPacket"}) {
+        for (const auto& fields : {std::vector<std::string>{"valid"}, std::vector<std::string>{"data"},
+                                  std::vector<std::string>{"meta", "flag"}}) {
+            auto symbol = std::string(name);
+            std::vector<std::string> path{"top", std::string(name)};
+            for (const auto& field : fields) { symbol += "__DOT__" + field; path.push_back(field); }
+            const auto value = graph.findValue(symbol); require(bool(value), "missing aggregate node field root");
+            const auto ids = graph.valueSemanticIds(value);
+            require(ids.size() == 1 && tree->node(ids[0]).kind == grh::SemanticNodeKind::Field &&
+                    tree->path(ids[0]) == path, "node identity field geometry is wrong");
+            require(nodeFields.insert(ids[0]).second, "aggregate node fields share an identity");
+            const auto root = graph.valueDef(value);
+            require(root && graph.opSemanticIds(root).size() == 1 && graph.opSemanticIds(root)[0] == ids[0],
+                    "aggregate node field root lost its direct source association");
+            if (name != "aliasPacket") continue;
+            const auto operands = graph.opOperands(root);
+            require(operands.size() == 1, "aggregate alias changed its source");
+            const auto sourceIds = graph.valueSemanticIds(operands[0]);
+            path[1] = "packet";
+            require(sourceIds.size() == 1 && tree->path(sourceIds[0]) == path,
+                    "aggregate alias relabeled its source value");
+            const auto members = std::count_if(graph.operations().begin(), graph.operations().end(), [&](const auto op) {
+                const auto sources = graph.opSemanticIds(op);
+                return std::find(sources.begin(), sources.end(), ids[0]) != sources.end();
+            });
+            require(members == 1, "aggregate alias relabeled its producer");
+        }
+    }
+    require(nodeFields.size() == 6, "Vector node identity was expanded per element or Bundle field omitted");
+    for (grh::SemanticId id = 1; id <= tree->size(); ++id) {
+        const auto path = tree->path(id);
+        if (path.size() < 2 || (path[1] != "selected" && path[1] != "aliasPacket")) continue;
+        require(tree->node(id).kind != grh::SemanticNodeKind::Element,
+                "Vector node identity was expanded per element");
     }
     require(count(graph,OperationKind::kArrayCreate)>0,"per-element width adaptation lost array construction");
     bool multiIndex = false;
@@ -277,15 +326,18 @@ void elementDependencies() {
 )FIR");
     require(result.success(), diagnostics(result));
     auto restored = roundTrip(*result.design);
-    const auto& graph = *restored.findGraph("top");
-    shape(graph, "y", 4, {2, 2});
-    require(graph.metadata("firrtl.pendingCombLoopCheck").has_value(),
-            "post-flatten cycle-analysis deferral was lost before publication");
-    Oracle oracle(graph);
-    for (unsigned a = 0; a < 16; ++a) for (unsigned b = 0; b < 16; ++b)
-        require(oracle.output("y", {{"a", a}, {"b", b}}) == (a < b ? 2 : 4),
-            "acyclic element dependencies changed while preserving arrays");
-    valid(restored);
+    for (const auto* source : {&*result.design, &restored}) {
+        const auto& graph = *source->findGraph("top");
+        shape(graph, "y", 4, {2, 2});
+        require(graph.metadata("firrtl.pendingCombLoopCheck").has_value(),
+                "post-flatten cycle-analysis deferral was lost before publication");
+        valid(*source);
+        auto evaluated = oracleCopy(*source);
+        Oracle oracle(*evaluated.findGraph("top"));
+        for (unsigned a = 0; a < 16; ++a) for (unsigned b = 0; b < 16; ++b)
+            require(oracle.output("y", {{"a", a}, {"b", b}}) == (a < b ? 2 : 4),
+                "acyclic element dependencies changed while preserving arrays");
+    }
     auto cycle = text("real-array-cycle", R"FIR(    output y : UInt<1>[2]
     connect y[0], not(y[1])
     connect y[1], not(y[0])
@@ -319,6 +371,9 @@ void conditionalElementDependencies() {
 )FIR");
     require(result.success(), diagnostics(result));
     auto restored = roundTrip(*result.design);
+    require(restored.findGraph("top")->metadata("firrtl.pendingCombLoopCheck") ==
+            result.design->findGraph("top")->metadata("firrtl.pendingCombLoopCheck"),
+            "JSON roundtrip changed conditional-array cycle-analysis deferral");
     const auto check = [&](const grh::Design& design) {
         const auto& graph = *design.findGraph("top");
         shape(graph, "y", 24, {24});
@@ -342,8 +397,15 @@ void conditionalElementDependencies() {
                     "conditional partial connect introduced dependencies on untouched array elements");
             }
     };
-    check(*result.design); check(restored);
-    run(restored, std::make_unique<tx::SimplifyPass>()); valid(restored); check(restored);
+    for (const auto* source : {&*result.design, &restored}) {
+        shape(*source->findGraph("top"), "y", 24, {24});
+        valid(*source);
+        auto evaluated = oracleCopy(*source);
+        check(evaluated);
+        if (source == &restored) {
+            run(evaluated, std::make_unique<tx::SimplifyPass>()); valid(evaluated); check(evaluated);
+        }
+    }
     for (unsigned high : {5u, 10u}) {
         auto unknown = text("unknown-conditional-element", std::string(R"FIR(    output y : UInt<4>[2]
     wire condition : UInt<1>
@@ -373,8 +435,129 @@ void conditionalElementDependencies() {
     requireCycleRejectedAfterFlatten(cycle,
         "conditional partial connect hid a real dependency on its own destination");
 }
+void guardedPieceRanges() {
+    auto result = text("guarded-piece-ranges", R"FIR(    input initial : SInt<4>[2][3]
+    input row : SInt<4>[2]
+    input first : SInt<4>
+    input last : SInt<4>
+    input rowEnable : UInt<1>
+    input lastEnable : UInt<1>
+    input otherEnable : UInt<1>
+    output y : SInt<4>[2][3]
+    wire values : SInt<4>[2][3]
+    connect values, initial
+    connect values[1][0], first
+    when rowEnable : connect values[1], row
+    when lastEnable : connect values[1][1], last
+    when otherEnable : connect values[0], row
+    connect y, values
+)FIR");
+    require(result.success(), diagnostics(result));
+    valid(*result.design);
+    auto restored = roundTrip(*result.design);
+    for (const auto* graph : {result.design->findGraph("top"), restored.findGraph("top")}) {
+        shape(*graph, "y", 24, {3, 2});
+        bool multiPiecePrior = false;
+        for (const auto op : graph->operations()) {
+            if (graph->opKind(op) != OperationKind::kMux || graph->opResults(op).size() != 1) continue;
+            const auto width = graph->valueWidth(graph->opResults(op)[0]);
+            if (width != 4 && width != 8) continue;
+            const auto prior = graph->opOperands(op)[2];
+            const auto producer = graph->valueDef(prior);
+            if (width == 8 && producer && graph->opKind(producer) == OperationKind::kConcat &&
+                graph->opOperands(producer).size() > 1) multiPiecePrior = true;
+            std::vector<grh::ValueId> pending{prior};
+            std::unordered_set<grh::ValueId, grh::ValueIdHash> visited;
+            while (!pending.empty()) {
+                const auto value = pending.back(); pending.pop_back();
+                if (!visited.insert(value).second) continue;
+                const auto definition = graph->valueDef(value);
+                if (!definition) continue;
+                require(graph->opKind(definition) != OperationKind::kConcat || graph->valueWidth(value) < 24,
+                        "guarded partial write kept a historical whole-array concat in its prior value");
+                for (const auto operand : graph->opOperands(definition)) pending.push_back(operand);
+            }
+        }
+        require(multiPiecePrior, "guarded whole-row overwrite did not exercise a prior range spanning pieces");
+        Oracle oracle(*graph);
+        for (const uint64_t initial : {UINT64_C(0), UINT64_C(0x654321), UINT64_C(0xabcdef), UINT64_C(0xffffff)})
+            for (const unsigned row : {0u, 0x81u, 0xf7u, 0xffu})
+                for (const unsigned first : {0u, 7u, 8u, 15u}) for (unsigned flags = 0; flags < 8; ++flags) {
+                    const unsigned last = first ^ 9;
+                    uint64_t expected = (initial & ~UINT64_C(0xf00)) | (uint64_t(first) << 8);
+                    if (flags & 1) expected = (expected & ~UINT64_C(0xff00)) | (uint64_t(row) << 8);
+                    if (flags & 2) expected = (expected & ~UINT64_C(0xf000)) | (uint64_t(last) << 12);
+                    if (flags & 4) expected = (expected & ~UINT64_C(0xff)) | row;
+                    const std::map<std::string, uint64_t> inputs{{"initial", initial}, {"row", row},
+                        {"first", first}, {"last", last}, {"rowEnable", flags & 1},
+                        {"lastEnable", (flags >> 1) & 1}, {"otherEnable", (flags >> 2) & 1}};
+                    require(oracle.output("y", inputs) == expected,
+                            "guarded overlapping signed writes changed a multi-piece prior range or priority");
+                }
+    }
+}
+void mixedStaticDynamicPieceRanges() {
+    auto result = text("mixed-static-dynamic-piece-ranges", R"FIR(    input initial : UInt<4>[2][3]
+    input row : UInt<4>[2]
+    input cell : UInt<4>
+    input index : UInt<2>
+    input dynamicEnable : UInt<1>
+    input staticEnable : UInt<1>
+    output dynamicFirst : UInt<4>[2][3]
+    output staticFirst : UInt<4>[2][3]
+    wire beforeStatic : UInt<4>[2][3]
+    wire beforeDynamic : UInt<4>[2][3]
+    connect beforeStatic, initial
+    when dynamicEnable : connect beforeStatic[index], row
+    when staticEnable : connect beforeStatic[1][0], cell
+    connect dynamicFirst, beforeStatic
+    connect beforeDynamic, initial
+    when staticEnable : connect beforeDynamic[1][0], cell
+    when dynamicEnable : connect beforeDynamic[index], row
+    connect staticFirst, beforeDynamic
+)FIR");
+    require(result.success(), diagnostics(result));
+    valid(*result.design);
+    auto restored = roundTrip(*result.design);
+    for (const auto* graph : {result.design->findGraph("top"), restored.findGraph("top")}) {
+        Oracle oracle(*graph);
+        for (const uint64_t initial : {UINT64_C(0), UINT64_C(0x654321), UINT64_C(0xabcdef), UINT64_C(0xffffff)})
+            for (const unsigned row : {0u, 0x81u, 0xf7u, 0xffu}) for (unsigned index = 0; index < 4; ++index)
+                for (unsigned flags = 0; flags < 4; ++flags) {
+                    const unsigned cell = row ^ (row >> 4) ^ 9;
+                    const auto dynamicWrite = [&](uint64_t value) {
+                        return (flags & 1) && index < 3 ?
+                            (value & ~(UINT64_C(0xff) << (8 * index))) | (uint64_t(row) << (8 * index)) : value;
+                    };
+                    const auto staticWrite = [&](uint64_t value) {
+                        return flags & 2 ? (value & ~UINT64_C(0xf00)) | (uint64_t(cell & 15) << 8) : value;
+                    };
+                    const std::map<std::string, uint64_t> inputs{{"initial", initial}, {"row", row},
+                        {"cell", cell}, {"index", index}, {"dynamicEnable", flags & 1},
+                        {"staticEnable", (flags >> 1) & 1}};
+                    require(oracle.output("dynamicFirst", inputs) == staticWrite(dynamicWrite(initial)) &&
+                            oracle.output("staticFirst", inputs) == dynamicWrite(staticWrite(initial)),
+                            "static/dynamic piece transitions changed write priority or out-of-range behavior");
+                }
+    }
+}
 }
 int main() {
-    try { geometry(); flowsAndCoverage(); accessSize(); constantIndexBounds(); inferredAlias(); elementDependencies(); conditionalElementDependencies(); return 0; }
+    const auto stage = [](const char* name, auto function) {
+        std::cerr << "[firrtl-aggregate] " << name << '\n';
+        function();
+    };
+    try {
+        stage("geometry", geometry);
+        stage("flowsAndCoverage", flowsAndCoverage);
+        stage("accessSize", accessSize);
+        stage("constantIndexBounds", constantIndexBounds);
+        stage("inferredAlias", inferredAlias);
+        stage("elementDependencies", elementDependencies);
+        stage("conditionalElementDependencies", conditionalElementDependencies);
+        stage("guardedPieceRanges", guardedPieceRanges);
+        stage("mixedStaticDynamicPieceRanges", mixedStaticDynamicPieceRanges);
+        return 0;
+    }
     catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

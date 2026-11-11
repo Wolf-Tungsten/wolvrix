@@ -167,7 +167,6 @@ Operation, leaf and supernode dependency graphs include effect-order arcs and
 must be acyclic. Top outputs/inout bindings refer to extracted Output values,
 raw inputs, Event pulses or marked held samples.
 
-`grhsim-simplify` validates attribution and optimizes each complete leaf
 separately. Bare IDs and SymbolIds are not durable keys across freeze/load.
 Owner key strings are stored facts and survive symbol renaming; resolved IDs
 are valid only for the current instance/top/revision. Store/load preserves graph

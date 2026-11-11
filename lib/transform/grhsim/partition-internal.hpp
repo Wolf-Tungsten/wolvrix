@@ -100,12 +100,14 @@ inline OperationId cloneOperation(Graph& graph, OperationId source,
     const Operation old = graph.getOperation(source);
     const auto op = graph.createOperation(old.kind());
     for (const auto& attr : old.attrs()) graph.setAttr(op, attr.key, attr.value);
+    graph.mergeOpSemanticIds(op, source);
     graph.setAttr(op, kPartition, destination);
     if (ingest::node::annotated(graph, source)) graph.setAttr(op, "grhsim.nodeClone", true);
     if (old.srcLoc()) graph.setOpSrcLoc(op, *old.srcLoc());
     for (const auto value : operands) graph.addOperand(op, value);
     for (const auto value : old.results()) {
         const auto result = graph.createValue(graph.valueLogicalType(value));
+        graph.addValueSemanticIds(result, graph.valueSemanticIds(value));
         if (const auto location = graph.getValue(value).srcLoc()) graph.setValueSrcLoc(result, *location);
         graph.addResult(op, result);
     }
@@ -120,13 +122,19 @@ inline std::vector<OperationId> orderedWriters(const Graph& graph, bool includeO
     std::vector<OperationId> result;
     for (const auto op : graph.operations())
         if (isWriter(graph.opKind(op)) && (includeOutput || !outputEnd(graph, op))) result.push_back(op);
-    std::stable_sort(result.begin(), result.end(), [&](OperationId a, OperationId b) {
-        const auto left = attribute<int64_t>(graph, a, "writerOrder").value();
-        const auto right = attribute<int64_t>(graph, b, "writerOrder").value();
-        // Equal explicit priorities retain declaration order, including after
-        // rename/freeze; symbol spelling must not choose the winning write.
-        return left < right;
-    });
+    const auto original = result;
+    std::map<std::string, std::vector<std::size_t>> byState;
+    for (std::size_t i = 0; i < result.size(); ++i)
+        byState[std::string(graph.getOperation(writerTarget(graph, result[i])).symbolText())].push_back(i);
+    for (const auto& [target, positions] : byState) {
+        auto ordered = positions;
+        std::sort(ordered.begin(), ordered.end(), [&](const std::size_t lhs, const std::size_t rhs) {
+            return attribute<int64_t>(graph, original[lhs], "writerOrder").value() <
+                attribute<int64_t>(graph, original[rhs], "writerOrder").value();
+        });
+        for (std::size_t i = 0; i < positions.size(); ++i)
+            result[positions[i]] = original[ordered[i]];
+    }
     return result;
 }
 

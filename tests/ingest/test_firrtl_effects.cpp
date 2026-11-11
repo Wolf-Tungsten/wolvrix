@@ -237,6 +237,27 @@ int main() {
 }
 )CPP");
 }
+void sourceLines() {
+    auto result = read(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "effects/source_lines.fir");
+    require(result.success(), diagnostics(result));
+    run(*result.design, std::make_unique<tx::GrhVerifyPass>()); valid(*result.design);
+    const auto check = [](const grh::Graph& graph) {
+        std::map<std::string, int64_t> lines;
+        for (const auto op : graph.operations()) {
+            if (graph.opKind(op) != OperationKind::kSystemTask) continue;
+            const auto kind = graph.getOperation(op).attr("firrtl.effectKind");
+            const auto line = graph.getOperation(op).attr("firrtl.line");
+            require(kind && line, "FIRRTL effect source line attribute missing");
+            lines.emplace(std::get<std::string>(*kind), std::get<int64_t>(*line));
+        }
+        require(lines == std::map<std::string, int64_t>{{"printf", 7}, {"assert", 8}, {"stop", 9}},
+                "FIRRTL effect source line does not match the statement line");
+    };
+    check(*result.design->findGraph("top"));
+    auto restored = roundTrip(*result.design);
+    check(*restored.findGraph("top"));
+    valid(restored);
+}
 void terminal(const std::filesystem::path& output, std::string_view name, std::string_view command, int code, std::string_view stderrText) {
     std::string body = "    input clk : Clock\n    input en : UInt<1>\n    input data : UInt<8>\n    printf(clk, en, \"before\\n\")\n    ";
     body += command; body += "\n    printf(clk, en, \"after\\n\")\n";
@@ -254,6 +275,7 @@ int main(){GrhSIM_top m;m.init();m.clk=0;m.en=0;m.data=9;m.eval();m.clk=1;m.eval
 void test() {
     const auto output = artifact("firrtl-effects");
     ordered(output);
+    sourceLines();
     annotations();
     probes(output); layers(output);
     terminal(output, "stop", "stop(clk, en, 7) : end", 7, "");

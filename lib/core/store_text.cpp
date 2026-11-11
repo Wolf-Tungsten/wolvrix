@@ -220,6 +220,21 @@ void schedule(std::ostream& out, const grh::Graph& graph, const transform::Sessi
         << " config-hash=" << plan->partitionConfigHash << '\n';
     out << "    stamp: instance=" << plan->stamp.instance << " revision=" << plan->stamp.revision
         << " graph=" << plan->stamp.top.index << '.' << plan->stamp.top.generation << '\n';
+    out << "    # Run prerequisites are the complete transitive closure of requires-logical-roots in this DAG.\n"
+        << "    # Each DAG row lists immediate prerequisites; ordinals increase in topological leaf order.\n"
+        << "    logical-nonsink-dag:\n";
+    for (std::size_t i = 0; i < plan->nonsinkKeys.size(); ++i) {
+        const auto& prerequisite = plan->nonsinkKeys[i];
+        out << "      leaf[" << i << "] owner="; key(out, prerequisite);
+        out << " execution-owner="; key(out, executionOwner(prerequisite));
+        out << " direct-prerequisites=[";
+        const auto begin = plan->nonsinkPrerequisiteOffsets[i];
+        for (auto edge = begin; edge < plan->nonsinkPrerequisiteOffsets[i + 1]; ++edge) {
+            if (edge != begin) out << ',';
+            out << plan->nonsinkPrerequisites[edge];
+        }
+        out << "]\n";
+    }
     std::unordered_map<grh::OperationId, std::size_t, grh::OperationIdHash> targetRanks, nextRank;
     for (const auto& run : plan->generalRuns) for (const auto writer : run.orderedWriters)
         targetRanks.emplace(writer, nextRank[sim::writerTarget(graph, writer)]++);
@@ -235,10 +250,12 @@ void schedule(std::ostream& out, const grh::Graph& graph, const transform::Sessi
         for (std::size_t i = 0; i < sequence.size(); ++i) {
             const auto& run = sequence[i];
             out << "      run[" << i << "] owner="; key(out, run.partitionKey); out << '\n';
-            for (const auto& prerequisite : run.requiredNonsinkKeys) {
-                out << "        requires-logical-leaf "; key(out, prerequisite);
-                out << " execution-owner="; key(out, executionOwner(prerequisite)); out << '\n';
+            out << "        requires-logical-roots=[";
+            for (std::size_t j = 0; j < run.directNonsinkRoots.size(); ++j) {
+                if (j) out << ',';
+                out << run.directNonsinkRoots[j];
             }
+            out << "]\n";
             for (std::size_t j = 0; j < run.orderedWriters.size(); ++j) {
                 const auto writer = run.orderedWriters[j];
                 out << "        writer[" << j << "] "; opRef(out, graph, writer);

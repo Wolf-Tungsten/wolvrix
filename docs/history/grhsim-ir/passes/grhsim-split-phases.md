@@ -15,7 +15,6 @@ Position in the target pipeline: after B1-B4
 [`lower-edge-detect`](lower-edge-detect.md),
 [`extract-output-cones`](extract-output-cones.md),
 [`migrate-timeslot-tasks`](migrate-timeslot-tasks.md)) and before the B6
-per-partition [`grhsim.simplify --scope phase`](simplify.md). The B8 seal
 (`grhsim.verify --seal semantic`, see below) closes the partition stage right
 after B6 (the predictive B7 was removed in V3-M3; boundary cloning moved to
 the C segment as `cpu.st.clone-shared-boundaries`).

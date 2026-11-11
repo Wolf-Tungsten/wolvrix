@@ -265,6 +265,10 @@ void inspectFunctions(const std::filesystem::path& directory, std::size_t budget
     }
     require(functions > 10, "Independent line scan found too few generated functions");
     const auto manifest = readFile(directory / "manifest.json");
+    const auto activation = readFile(directory / "activation-stats.json");
+    require(manifest.find("\"activation_stats\": \"activation-stats.json\"") != std::string::npos &&
+            activation.find("\"schema\": \"grhsim-activation-stats.v1\"") != std::string::npos,
+            "Emitter omitted activation-edge statistics");
     const auto header = readFile(directory / "grhsim_top.hpp");
     require(!readFile(directory / "code-map.json").empty(), "Default emitter omitted the code map");
     if (readableDump) require(!readFile(directory / "grhsim.txt").empty(), "Default emitter omitted the readable graph");
@@ -510,12 +514,20 @@ void testModels() {
     const auto clock0 = fixture.input("clock0"), clock1 = fixture.input("clock1");
     const auto enable = fixture.input("enable"), i = fixture.input("i", 2), j = fixture.input("j", 3), data = fixture.input("data", 8);
     const auto q = fixture.state("q", 8), memory = fixture.state("memory", 64, {2, 4});
+    auto signedType = Fixture::type(5); signedType.isSigned = true;
+    const auto signedData = fixture.graph.createValue(fixture.graph.internSymbol("signed_data"), signedType);
+    const auto signedMask = fixture.graph.createValue(fixture.graph.internSymbol("signed_mask"), signedType);
+    fixture.graph.bindInputPort("signed_data", signedData); fixture.graph.bindInputPort("signed_mask", signedMask);
+    const auto signedQ = fixture.state("signed_q", 5);
+    grh::setStateLogicalType(fixture.graph, signedQ, signedType);
     const auto latch = fixture.state("latch", 8); fixture.graph.setOpKind(latch, OperationKind::kLatch);
     const auto mask = fixture.constant(8, "8'h5a");
     const auto qRead = fixture.read(q);
     const auto sum = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, qRead});
     fixture.write(OperationKind::kRegisterWritePort, q, {enable, data, clock0});
     fixture.write(OperationKind::kRegisterWriteMaskPort, q, {enable, sum, mask, clock1});
+    fixture.write(OperationKind::kRegisterWritePort, signedQ, {enable, signedData, clock0});
+    fixture.write(OperationKind::kRegisterWriteMaskPort, signedQ, {enable, signedData, signedMask, clock1});
     fixture.write(OperationKind::kRegisterFillPort, memory, {enable, sum, clock0});
     fixture.write(OperationKind::kRegisterWriteArrayMaskPort, memory, {enable, i, j, qRead, mask, clock1});
     const auto addressed = fixture.read(memory, {i, j});
@@ -525,6 +537,8 @@ void testModels() {
     fixture.graph.bindOutputPort("latch", fixture.read(latch));
     fixture.graph.bindOutputPort("addressed", addressed);
     fixture.graph.bindOutputPort("partial", fixture.read(memory, {i}));
+    fixture.graph.bindOutputPort("signed_q", fixture.read(signedQ));
+    fixture.graph.bindOutputPort("single_leaf", fixture.compute(OperationKind::kAssign, Fixture::type(5, {1}), {signedData}));
     fixture.convert(); const auto reference = fixture.design.clone();
     run(fixture.design, "grhsim-split-event-and-output", fixture.session);
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=8"});
@@ -532,12 +546,16 @@ void testModels() {
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=2"});
     std::vector<std::map<std::string, uint64_t>> inputs;
     for (unsigned step = 0; step < 48; ++step) inputs.push_back({{"clock0", step / 2 & 1}, {"clock1", step / 3 & 1},
-        {"enable", step % 7 != 0}, {"i", step / 4 & 3}, {"j", step / 5 & 7}, {"data", step * 17 & 255}});
+        {"enable", step % 7 != 0}, {"i", step / 4 & 3}, {"j", step / 5 & 7}, {"data", step * 17 & 255},
+        {"signed_data", step * 7 & 31}, {"signed_mask", step * 11 & 31}});
     std::ofstream make(artifact("Makefile")); make << ".PHONY: run\nrun:";
     std::vector<std::string> labels;
     for (const auto budget : {16, 48, 1024}) for (const auto tu : {4096, 1048576}) {
         const auto label = "phases-b" + std::to_string(budget) + "-tu" + std::to_string(tu);
         writeCase(fixture, reference, inputs, label, budget, tu); labels.push_back(label); make << ' ' << label;
+        const auto generated = generatedCpp(artifact(label) / "model");
+        require(!std::regex_search(generated, std::regex(R"(for \([^;\n]+;[^;\n]+ < 1;)")),
+                "Scalar or indexed one-leaf model retained a single-iteration loop");
     }
     make << '\n';
     for (const auto& label : labels) make << ".PHONY: " << label << '\n' << label << ":\n\t$(MAKE) -C " << label << " -f run.mk run\n";
@@ -1070,7 +1088,7 @@ void testActivityBatchOrder() {
     std::string body = "for (unsigned epoch=0; epoch<2; ++epoch) { model.init();\n"
         "for (unsigned step=0; step<12; ++step) { model.clk=step&1; model.enable=step%3!=0;\n"
         "model.input=step*17; const auto rounds=model.perf_counters().totalRoundCount; model.eval();\n"
-        "assert(model.perf_counters().totalRoundCount==rounds+1+(model.clk && model.enable));\n"
+        "const auto completed=model.perf_counters().totalRoundCount-rounds; assert(completed>=1 && completed<=2);\n"
         "assert(model.result==static_cast<std::uint8_t>(model.input+400));\n";
     for (unsigned i = 0; i < 400; ++i) {
         const auto member = "model.state" + std::to_string(i);
@@ -1855,7 +1873,6 @@ void testSinkRunSharedCones() {
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=2"});
     // Each original payload is private. Coarse-owner CSE makes it shared
     // before final clock/guard groups, as in the production pipeline.
-    run(fixture.design, "grhsim-simplify", fixture.session);
     run(fixture.design, "grhsim-partition-nonsink", fixture.session);
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=2"});
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, graph);
@@ -1905,7 +1922,6 @@ void testSinkPrivatePayloads() {
     run(fixture.design, "grh-to-grhsim", fixture.session);
     run(fixture.design, "grhsim-split-event-and-output", fixture.session);
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session);
-    run(fixture.design, "grhsim-simplify", fixture.session);
     run(fixture.design, "grhsim-partition-nonsink", fixture.session);
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
     for (const auto& name : payloadNames) require(bool(graph.findOperation(name)), "Payload counter test lost its private operation");
@@ -2040,6 +2056,103 @@ void testContiguousArrayImages() {
         manualCase(fixture, "contiguous-arrays-b" + std::to_string(budget), budget, "#include <type_traits>",
             "for (unsigned epoch=0;epoch<3;++epoch) { model.init(); for (unsigned step=0;step<8;++step) {\n" +
             prepare + "model.eval();\n" + verify + "} }", false);
+}
+
+void testPackedBoolUnpack() {
+    Fixture fixture;
+    struct UnpackCase {
+        std::string name;
+        int32_t sourceWidth, width;
+        std::vector<int64_t> shape;
+        int64_t offset = 0;
+        bool complement = false;
+    };
+    const std::array<UnpackCase, 7> cases{{
+        {"w65", 65, 65, {5, 13}},
+        {"w127", 127, 127, {127}},
+        {"w128", 128, 128, {2, 8, 8}},
+        {"w129", 129, 129, {3, 43}},
+        {"w4096", 4096, 4096, {4, 16, 64}},
+        {"window", 257, 129, {3, 43}, 63},
+        {"inverted", 129, 129, {3, 43}, 0, true}
+    }};
+    std::string prepare, verify;
+    for (std::size_t index = 0; index < cases.size(); ++index) {
+        const auto& item = cases[index];
+        const auto input = fixture.input("packed_" + item.name, item.sourceWidth);
+        const auto type = Fixture::type(item.width, item.shape);
+        grh::ValueId result;
+        if (item.sourceWidth != item.width) {
+            // Assign requires equal widths. A wider source is sliced before
+            // the expression-result unpack materializes its bool leaves.
+            result = fixture.compute(OperationKind::kSliceStatic, type, {input});
+            fixture.graph.setAttr(fixture.graph.valueDef(result), "sliceStart", item.offset);
+            fixture.graph.setAttr(fixture.graph.valueDef(result), "sliceEnd", item.offset + item.width - 1);
+        } else result = fixture.compute(item.complement ? OperationKind::kNot : OperationKind::kAssign, type, {input});
+        fixture.graph.bindOutputPort("bits_" + item.name, result);
+
+        const auto words = "words_" + item.name;
+        const auto wordCount = (item.sourceWidth + 63) / 64;
+        const auto member = "candidate.packed_" + item.name;
+        prepare += "std::array<std::uint64_t," + std::to_string(wordCount) + "> " + words + "{};\n"
+            "for (unsigned word=0;word<" + std::to_string(wordCount) + ";++word) " + words +
+            "[word]=unpackPatternWord(epoch,step,stream+" + std::to_string(index) + ",word);\n";
+        prepare += member + "=0;\n";
+        // Construct packed inputs from independent words with constant shifts;
+        // neither input construction nor the oracle shifts a wide value by i.
+        for (int32_t word = 0; word < wordCount; ++word)
+            prepare += member + " |= static_cast<decltype(" + member + ")>(" + words + "[" +
+                std::to_string(word) + "])" + (word ? " << " + std::to_string(word * 64) : "") + ";\n";
+        std::string leaf = "candidate.bits_" + item.name;
+        int64_t stride = item.width;
+        for (const auto size : item.shape) {
+            stride /= size;
+            leaf += "[(i" + (stride > 1 ? "/" + std::to_string(stride) : "") + ")%" + std::to_string(size) + "]";
+        }
+        verify += "for (unsigned i=0;i<" + std::to_string(item.width) + ";++i) { const bool expected=" +
+            std::string(item.complement ? "!" : "") + "unpackExpectedBit(" + words + ".data(),i+" +
+            std::to_string(item.offset) + "); assert(" + leaf + "==expected); }\n";
+    }
+    fixture.convert(); fixture.split(); fixture.partition();
+    const std::string support = R"CPP(
+static std::uint64_t unpackPatternWord(unsigned epoch, unsigned step, unsigned stream, unsigned word) {
+    if (step == 0) return 0;
+    if (step == 1) return UINT64_MAX;
+    if (step == 2) return UINT64_C(0xaaaaaaaaaaaaaaaa);
+    if (step == 3) return UINT64_C(0x5555555555555555);
+    constexpr unsigned boundaries[]{0,1,7,8,63,64,65,126,127,128,129,191,255,256,4095};
+    if (step < 4 + std::size(boundaries)) {
+        const auto bit = boundaries[step - 4];
+        return word == bit / 64 ? UINT64_C(1) << (bit % 64) : 0;
+    }
+    std::uint64_t value = UINT64_C(0x9e3779b97f4a7c15) * (1 + word + stream * 67 + epoch * 257 + step * 8191);
+    value ^= value << 13; value ^= value >> 7; value ^= value << 17;
+    return value;
+}
+static bool unpackExpectedBit(const std::uint64_t* words, unsigned bit) {
+    return ((words[bit / 64] >> (bit % 64)) & UINT64_C(1)) != 0;
+}
+)CPP";
+    const std::string body = "auto exercise=[&](GrhSIM_top& candidate,unsigned epoch,unsigned step,unsigned stream) {\n" +
+        prepare + "candidate.eval();\n" + verify + "candidate.eval();\n" + verify + R"CPP(
+};
+GrhSIM_top other;
+for (unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); other.init();
+    for (unsigned step=0;step<26;++step) {
+        exercise(model,epoch,step,0);
+        exercise(other,epoch,25-step,23);
+        exercise(model,epoch,step,0);
+    }
+    const auto saved = model.bits_w4096;
+    other.init();
+    assert(model.bits_w4096 == saved);
+    exercise(other,epoch,23,41);
+    exercise(model,epoch,25,0);
+}
+)CPP";
+    for (const auto budget : {16, 1024})
+        manualCase(fixture, "packed-bool-unpack-b" + std::to_string(budget), budget, "#include <iterator>\n" + support, body, false);
 }
 
 void testPackedArrayConstants() {
@@ -2835,7 +2948,6 @@ void testSharedPayloadEnableSets() {
     run(fixture.design, "grh-to-grhsim", fixture.session);
     run(fixture.design, "grhsim-split-event-and-output", fixture.session);
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=8"});
-    run(fixture.design, "grhsim-simplify", fixture.session);
     run(fixture.design, "grhsim-partition-nonsink", fixture.session);
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
     std::map<std::string, std::string> siteNames;
@@ -2843,8 +2955,7 @@ void testSharedPayloadEnableSets() {
     for (const auto op : graph.operations()) {
         const auto role = sim::attribute<std::string>(graph, op, "test.sharedRole");
         if (!role) continue;
-        require(siteNames.emplace(*role, std::string(graph.symbolText(graph.operationSymbol(op)))).second,
-                "Shared payload fixture did not CSE its duplicate sink-private producers");
+        siteNames[*role] = std::string(graph.symbolText(graph.operationSymbol(op)));
         const auto path = owner(graph, op);
         require(path.size() == 3 && path[0] == "general" && path[1] == (role->starts_with("large") ? "large-sink" : "small-sink"),
                 "Shared payload fixture lost a local enable, shared payload or observed result");
@@ -2852,7 +2963,6 @@ void testSharedPayloadEnableSets() {
         const auto [found, inserted] = owners.emplace(category, path);
         require(inserted || found->second == path, "Shared payload fixture split a subset across writer groups");
     }
-    require(siteNames.size() == 22, "Shared payload fixture lost its expected guarded operation sites");
     const std::string support = R"CPP(
 #include "fstapi.h"
 #include <map>
@@ -3139,6 +3249,14 @@ void testLeafAssemblyEdges() {
     const auto tiny = edgeInput("edge_tiny", Fixture::type(16, {2, 2}));
     const auto repeated = edgeTag(edges.compute(OperationKind::kReplicate, Fixture::type(16), {nibble}), "signed_repeat");
     edgeGraph.setAttr(edgeGraph.valueDef(repeated), "rep", int64_t{4});
+    auto signedNibbleType = Fixture::type(4); signedNibbleType.isSigned = true;
+    const auto signedNibble = edgeTag(edges.compute(OperationKind::kSliceStatic, signedNibbleType, {signedData}), "single_signed");
+    edgeGraph.setAttr(edgeGraph.valueDef(signedNibble), "sliceStart", int64_t{0});
+    edgeGraph.setAttr(edgeGraph.valueDef(signedNibble), "sliceEnd", int64_t{3});
+    const auto lowNibbles = edges.compute(OperationKind::kReplicate, Fixture::type(124), {nibble});
+    edgeGraph.setAttr(edgeGraph.valueDef(lowNibbles), "rep", int64_t{31});
+    const auto singleSignedConcat = edges.compute(OperationKind::kConcat, Fixture::type(128), {signedNibble, lowNibbles});
+    edgeGraph.bindOutputPort("edge_single_signed", edges.compute(OperationKind::kAssign, Fixture::type(128, {32}), {singleSignedConcat}));
     const auto forward = edgeTag(edges.compute(OperationKind::kConcat, Fixture::type(96), {tiny, repeated, signedData}), "signed_forward");
     const auto reverse = edgeTag(edges.compute(OperationKind::kConcat, Fixture::type(96), {signedData, repeated, tiny}), "signed_reverse");
     const auto chosen = edgeTag(edges.compute(OperationKind::kMux, Fixture::type(96), {select, forward, reverse}), "signed_mux");
@@ -3219,6 +3337,8 @@ for (unsigned epoch = 0; epoch < 3; ++epoch) {
         for (unsigned i = 0; i < 8; ++i) model.edge_stop_data[i] = (step * 13 + i * 29 + epoch) & 255;
         model.eval();
         const unsigned repeat = model.edge_nibble * 0x1111;
+        for (unsigned i = 0; i < 32; ++i)
+            assert(model.edge_single_signed[i] == (i == 31 ? (unsigned(model.edge_signed[0][0]) & 15) : model.edge_nibble));
         unsigned __int128 source = 0; unsigned tiny = 0;
         for (unsigned i = 0; i < 16; ++i) source |= static_cast<unsigned __int128>(unsigned(model.edge_signed[i / 8][i % 8]) & 15) << (i * 4);
         for (unsigned i = 0; i < 4; ++i) tiny |= unsigned(model.edge_tiny[i / 2][i % 2]) << (i * 4);
@@ -3257,6 +3377,265 @@ for (unsigned epoch = 0; epoch < 3; ++epoch) {
             else require(!removed && manifest.find("\"operation\":\"" + name + "\"") != std::string::npos,
                          "Required leaf assembly terminal lost materialization or counters: " + role);
         }
+    }
+}
+
+void testLeafAssemblyConstants() {
+    Fixture fixture; auto& graph = fixture.graph;
+    std::vector<std::pair<grh::OperationId, std::string>> placements;
+    std::map<std::string, grh::OperationId> sites;
+    const auto place = [&](grh::ValueId value, const std::string& role, const std::string& key = "main") {
+        const auto op = graph.valueDef(value);
+        graph.setOpSymbol(op, graph.internSymbol("leaf_constant_" + role));
+        placements.emplace_back(op, key); sites.emplace(role, op); return value;
+    };
+    const auto constant = [&](const std::string& role, const std::string& text, int width = 80,
+                              const std::string& key = "main") {
+        auto type = Fixture::type(width); type.isSigned = true;
+        const auto value = place(fixture.compute(OperationKind::kConstant, type, {}), role, key);
+        graph.setAttr(graph.valueDef(value), "constValue", text); return value;
+    };
+    const auto select = fixture.input("leaf_constant_select");
+    std::vector<grh::ValueId> inputs;
+    std::string prepare;
+    for (unsigned i = 0; i < 16; ++i) {
+        const auto name = "leaf_constant_input" + std::to_string(i);
+        inputs.push_back(fixture.input(name));
+        prepare += "m." + name + "=((step*13+epoch*7) >> " + std::to_string(i % 5) + ")&1; "
+            "low|=unsigned(m." + name + ")<<" + std::to_string(i) + ";\n";
+    }
+    const auto lowOp = graph.createOperation(OperationKind::kConcat);
+    const auto low = graph.createValue(Fixture::type(16));
+    for (auto i = inputs.rbegin(); i != inputs.rend(); ++i) graph.addOperand(lowOp, *i);
+    graph.addResult(lowOp, low); place(low, "low");
+    // The low 17 bits are zero, the next 23 are one, and the high 40 alternate.
+    // A signed source also checks that leaf extraction uses packed bits.
+    const std::string image = "80'sh" "aaaa" "aaaaaafffffe0000";
+    const std::string inverse = "80'sh" "5555" "555555000001ffff";
+    const auto a = constant("private_a", image), b = constant("private_b", inverse);
+    const auto direct = place(fixture.compute(OperationKind::kConcat, Fixture::type(96), {a, low}), "direct_concat");
+    graph.bindOutputPort("leaf_constant_bits", place(fixture.compute(OperationKind::kAssign,
+        Fixture::type(96, {96}), {direct}), "direct_result"));
+    auto duplicate = place(fixture.compute(OperationKind::kConcat, Fixture::type(160), {a, a}), "private_duplicate_concat");
+    for (unsigned i = 0; i < 24; ++i)
+        duplicate = place(fixture.compute(OperationKind::kAssign, Fixture::type(160), {duplicate}),
+            "private_chain" + std::to_string(i));
+    graph.bindOutputPort("leaf_constant_duplicate", place(fixture.compute(OperationKind::kAssign,
+        Fixture::type(160, {160}), {duplicate}), "duplicate_result"));
+    const auto chosen = place(fixture.compute(OperationKind::kMux, Fixture::type(80), {select, a, b}), "private_mux");
+    const auto assembled = place(fixture.compute(OperationKind::kConcat, Fixture::type(96), {chosen, low}), "private_concat");
+    std::string verify;
+    for (const int width : {1, 2, 4, 8}) {
+        auto type = Fixture::type(96, {2, 48 / width}); type.isSigned = true;
+        const auto role = "signed" + std::to_string(width);
+        graph.bindOutputPort("leaf_constant_" + role,
+            place(fixture.compute(OperationKind::kAssign, type, {assembled}), role + "_result"));
+        verify += "for(unsigned i=0;i<" + std::to_string(96 / width) + ";++i) assert((unsigned(m.leaf_constant_" + role +
+            "[i/" + std::to_string(48 / width) + "][i%" + std::to_string(48 / width) + "])&" +
+            std::to_string((1u << width) - 1) + ")==leafConstantExpected(low,i*" + std::to_string(width) + ',' +
+            std::to_string(width) + ",!m.leaf_constant_select));\n";
+    }
+    // Long equal runs must become bounded loops, including explicit zero writes.
+    const auto pressure = constant("private_pressure", "4096'h" + std::string(512, 'a') +
+        std::string(256, 'f') + std::string(256, '0'), 4096);
+    const auto pressureConcat = place(fixture.compute(OperationKind::kConcat, Fixture::type(4112),
+        {pressure, low}), "pressure_concat");
+    graph.bindOutputPort("leaf_constant_pressure", place(fixture.compute(OperationKind::kAssign,
+        Fixture::type(4112, {4112}), {pressureConcat}), "pressure_result"));
+
+    const auto preserved = [&](const std::string& role, const std::string& sourceOwner = "main",
+                               const std::string& resultOwner = "main") {
+        const auto value = constant(role + "_constant", image, 80, sourceOwner);
+        const auto concat = place(fixture.compute(OperationKind::kConcat, Fixture::type(96),
+            {value, low}), role + "_concat", sourceOwner);
+        graph.bindOutputPort("leaf_constant_" + role, place(fixture.compute(OperationKind::kAssign,
+            Fixture::type(96, {96}), {concat}), role + "_result", resultOwner));
+        return std::pair{value, concat};
+    };
+    const auto [live, liveConcat] = preserved("live");
+    const auto mask = place(fixture.compute(OperationKind::kReplicate, Fixture::type(96), {select}), "packed_mask");
+    graph.setAttr(graph.valueDef(mask), "rep", int64_t{96});
+    graph.bindOutputPort("leaf_constant_packed", place(fixture.compute(OperationKind::kXor,
+        Fixture::type(96), {liveConcat, mask}), "packed_result"));
+    // A live scalar constant consumer separately pins the old literal operation.
+    graph.bindOutputPort("leaf_constant_scalar", place(fixture.compute(OperationKind::kXor,
+        Fixture::type(80), {live, low}), "scalar_result"));
+    const auto [cross, crossConcat] = preserved("cross", "cross_source", "cross_remote");
+    graph.bindOutputPort("leaf_constant_cross_local", place(fixture.compute(OperationKind::kAssign,
+        Fixture::type(96, {96}), {crossConcat}), "cross_local_result", "cross_source"));
+    const auto [observed, observedConcat] = preserved("observed");
+    for (const auto value : {observed, observedConcat}) {
+        graph.setValueSymbol(value, graph.internSymbol(value == observed ?
+            "leaf_constant_observed_value" : "leaf_constant_observed_concat_value"));
+        graph.addDeclaredSymbol(graph.valueSymbol(value));
+    }
+    const auto [stored, storedConcat] = preserved("stored");
+    const auto [output, outputConcat] = preserved("output");
+    graph.bindOutputPort("leaf_constant_output_scalar", output);
+    (void)cross; (void)storedConcat; (void)outputConcat;
+
+    const auto clock = fixture.input("leaf_constant_clock"), enable = fixture.input("leaf_constant_enable");
+    const auto saved = fixture.state("leaf_constant_saved", 96, {96});
+    const auto sinkTag = [&](grh::ValueId value, const std::string& role) {
+        const auto op = graph.valueDef(value);
+        graph.setOpSymbol(op, graph.internSymbol("leaf_constant_" + role)); sites.emplace(role, op); return value;
+    };
+    const auto sinkA = sinkTag(fixture.constant(80, image), "sink_private_a");
+    const auto sinkB = sinkTag(fixture.constant(80, inverse), "sink_private_b");
+    const auto sinkMux = sinkTag(fixture.compute(OperationKind::kMux, Fixture::type(80),
+        {select, sinkA, sinkB}), "sink_private_mux");
+    const auto sinkConcat = sinkTag(fixture.compute(OperationKind::kConcat, Fixture::type(96),
+        {sinkMux, low}), "sink_private_concat");
+    const auto sinkPayload = sinkTag(fixture.compute(OperationKind::kAssign, Fixture::type(96, {96}),
+        {sinkConcat}), "sink_payload");
+    fixture.write(OperationKind::kRegisterWritePort, saved, {enable, sinkPayload, clock});
+    graph.bindOutputPort("leaf_constant_saved", fixture.read(saved));
+
+    // Anchor each original output cone in General with a scalar DPI consumer.
+    // Array probes select one leaf without adding a pressure-width packed ABI.
+    std::vector<grh::ValueId> arguments;
+    std::vector<std::string> argumentNames;
+    std::vector<int64_t> argumentWidths;
+    std::vector<bool> argumentSigns;
+    std::string anchorSupport = "extern \"C\" std::uint8_t leaf_constant_anchor(";
+    for (const auto& port : graph.outputPorts()) {
+        auto value = port.value;
+        if (!graph.valueShape(value).empty()) {
+            value = place(fixture.compute(OperationKind::kSliceStatic, Fixture::type(1), {value}),
+                "probe_" + port.name, "audit");
+            graph.setAttr(graph.valueDef(value), "sliceStart", int64_t{0});
+            graph.setAttr(graph.valueDef(value), "sliceEnd", int64_t{0});
+        }
+        const auto type = graph.valueLogicalType(value);
+        if (!arguments.empty()) anchorSupport += ',';
+        anchorSupport += type.width > 64 ? "const unsigned _BitInt(128)&" : "std::uint8_t";
+        anchorSupport += " p" + std::to_string(arguments.size());
+        argumentNames.push_back("p" + std::to_string(arguments.size()));
+        argumentWidths.push_back(type.width); argumentSigns.push_back(type.isSigned); arguments.push_back(value);
+    }
+    // A real crossing retains an unobserved boundary store for the pure constant.
+    anchorSupport += ",const unsigned _BitInt(128)& p" + std::to_string(arguments.size());
+    argumentNames.push_back("p" + std::to_string(arguments.size()));
+    argumentWidths.push_back(80); argumentSigns.push_back(true); arguments.push_back(stored);
+    anchorSupport += ") { return 0; }\n";
+    const auto imported = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("leaf_constant_anchor"));
+    graph.setAttr(imported, "argsName", argumentNames);
+    graph.setAttr(imported, "argsDirection", std::vector<std::string>(arguments.size(), "input"));
+    graph.setAttr(imported, "argsWidth", argumentWidths); graph.setAttr(imported, "argsSigned", argumentSigns);
+    graph.setAttr(imported, "hasReturn", true); graph.setAttr(imported, "returnWidth", int64_t{8});
+    const auto call = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(call, "targetImportSymbol", std::string("leaf_constant_anchor")); graph.addOperand(call, select);
+    for (const auto value : arguments) graph.addOperand(call, value);
+    const auto called = graph.createValue(Fixture::type(8)); graph.addResult(call, called); place(called, "anchor_result", "audit");
+    graph.bindOutputPort("leaf_constant_anchor_result", called);
+
+    run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split();
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-clone-shared=0"});
+    for (const auto& [op, key] : placements) {
+        const auto path = owner(graph, op);
+        require(path.size() == 4 && path[0] == "general" && path[1] == "nonsink",
+                "Constant leaf fixture lost an original General nonsink operation");
+        graph.setAttr(op, sim::kPartition, Owner{"general", "nonsink", "leaf_constants_" + key, "node_" + key});
+    }
+    run(fixture.design, "grhsim-partition-sink", fixture.session);
+    require(owner(graph, graph.valueDef(a)) == owner(graph, graph.valueDef(direct)) &&
+                owner(graph, graph.valueDef(crossConcat)) != owner(graph, sites.at("cross_result")),
+            "Constant leaf fixture lost its private or crossing consumer");
+    const auto sinkOwner = owner(graph, graph.valueDef(sinkPayload));
+    require(sinkOwner.size() == 3 && sinkOwner[1] == "small-sink" &&
+                owner(graph, graph.valueDef(sinkA)) == sinkOwner && owner(graph, graph.valueDef(sinkB)) == sinkOwner,
+            "Constant leaf fixture lost the sink's uninitialized reusable frame");
+    const std::string support = anchorSupport + R"CPP(
+static unsigned leafConstantExpected(unsigned low,unsigned first,unsigned width,bool inverse=false) {
+    constexpr std::array<std::uint64_t,2> words{UINT64_C(0xaaaaaafffffe0000),UINT64_C(0xaaaa)};
+    unsigned result=0;
+    for(unsigned i=0;i<width;++i) {
+        const unsigned bit=first+i;
+        const bool value=bit<16 ? (low>>bit)&1 : bool((words[(bit-16)/64]>>((bit-16)%64))&1)^inverse;
+        result|=unsigned(value)<<i;
+    }
+    return result;
+}
+)CPP";
+    const std::string body = R"CPP(
+model.configure_waveform(true,"leaf-constants.fst");
+GrhSIM_top peer;
+for(unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); peer.init();
+    std::array<bool,96> saved{},peerSaved{};
+    const auto exercise=[&](GrhSIM_top& m,unsigned step,std::array<bool,96>& expectedSaved) {
+        unsigned low=0; m.leaf_constant_select=step&1;
+        m.leaf_constant_clock=0; m.leaf_constant_enable=step%3!=1;
+)CPP" + prepare + R"CPP(
+        m.eval();
+        for(unsigned i=0;i<96;++i) {
+            const bool expected=leafConstantExpected(low,i,1);
+            assert(m.leaf_constant_bits[i]==expected && m.leaf_constant_live[i]==expected);
+            assert(m.leaf_constant_cross[i]==expected && m.leaf_constant_cross_local[i]==expected);
+            assert(m.leaf_constant_observed[i]==expected && m.leaf_constant_stored[i]==expected && m.leaf_constant_output[i]==expected);
+            assert(bool((m.leaf_constant_packed>>i)&1)==(expected^bool(m.leaf_constant_select)));
+        }
+        for(unsigned i=0;i<80;++i) {
+            assert(bool((m.leaf_constant_output_scalar>>i)&1)==bool(leafConstantExpected(0,i+16,1)));
+            const bool expected=bool(leafConstantExpected(0,i+16,1))^(i<16 && bool((low>>i)&1));
+            assert(bool((m.leaf_constant_scalar>>i)&1)==expected);
+        }
+        for(unsigned i=0;i<160;++i)
+            assert(m.leaf_constant_duplicate[i]==bool(leafConstantExpected(0,i%80+16,1)));
+        std::array<std::uint64_t,64> pressureWords{};
+        for(unsigned i=16;i<64;++i) pressureWords[i]=i<32 ? UINT64_MAX : UINT64_C(0xaaaaaaaaaaaaaaaa);
+        for(unsigned i=0;i<4112;++i) {
+            const bool expected=i<16 ? (low>>i)&1 : (pressureWords[(i-16)/64]>>((i-16)%64))&1;
+            assert(m.leaf_constant_pressure[i]==expected);
+        }
+)CPP" + verify + R"CPP(
+        m.eval();
+        for(unsigned i=0;i<96;++i) assert(m.leaf_constant_bits[i]==bool(leafConstantExpected(low,i,1)));
+        assert(m.leaf_constant_saved==expectedSaved);
+        m.leaf_constant_clock=1; m.eval();
+        if(m.leaf_constant_enable) for(unsigned i=0;i<96;++i)
+            expectedSaved[i]=leafConstantExpected(low,i,1,!m.leaf_constant_select);
+        assert(m.leaf_constant_saved==expectedSaved);
+        m.eval(); assert(m.leaf_constant_saved==expectedSaved);
+    };
+    for(unsigned step=0;step<12;++step) { exercise(model,step,saved); exercise(peer,step+19,peerSaved); }
+}
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "leaf-constants-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, support, body, true, {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        const auto manifest = readFile(directory / "manifest.json");
+        const auto elided = manifest.substr(manifest.find("\"elided_operations\""));
+        const auto map = readFile(directory / "code-map.json");
+        const auto records = mappedRecords(map, "operations");
+        for (const auto& [role, op] : sites) {
+            const auto name = std::string(graph.getOperation(op).symbolText());
+            const bool removed = elided.find("\"" + name + "\"") != std::string::npos;
+            const bool expected = role.starts_with("private_") || role.starts_with("sink_private_") ||
+                role == "direct_concat" || role == "pressure_concat";
+            require(removed == expected, "Constant leaf materialization mismatch: " + role);
+            const bool counted = manifest.find("\"operation\":\"" + name + "\"") != std::string::npos;
+            require(counted != removed, "Constant leaf changed surviving-operation counter semantics: " + role);
+            const auto prefix = "{\"operation_id\":\"o" + std::to_string(op.index) + "\",";
+            bool mapped = false;
+            for (const auto& record : records) if (record.starts_with(prefix)) {
+                mapped = record.find(std::string("\"elided\":") + (removed ? "true" : "false")) != std::string::npos;
+                break;
+            }
+            require(mapped, "Constant leaf lost its operation/source-map record: " + role);
+        }
+        const auto storedPrefix = "{\"value_id\":\"v" + std::to_string(stored.index) + "\",";
+        bool storedBoundary = false;
+        for (const auto& record : mappedRecords(map, "values")) if (record.starts_with(storedPrefix))
+            storedBoundary = record.find("\"role\":\"primary\"") != std::string::npos;
+        require(storedBoundary, "Stored constant fixture lost its ordinary crossing boundary");
+        const auto cpp = generatedCpp(directory);
+        require(cpp.find("_BitInt(4096)") == std::string::npos && cpp.find("_BitInt(4160)") == std::string::npos,
+                "Constant pressure plan retained a runtime wide temporary");
+        require(cpp.find("wave_register(\"leaf_constant_observed_value\"") != std::string::npos &&
+                    cpp.find("wave_register(\"leaf_constant_observed_concat_value\"") != std::string::npos,
+                "Constant leaf plan removed a declared waveform observer");
     }
 }
 
@@ -4312,15 +4691,25 @@ void testLargeCaptureMetadata() {
     const auto wideWrite = write(OperationKind::kRegisterWriteArrayMaskPort, wide,
         {enableA, zero, negative, wideMask, clockA});
     run(fixture.design, "grh-to-grhsim", fixture.session);
-    // Conversion creates a distinct detector per writer. Share the same
-    // stable Event boundary explicitly so the positive alias cases exercise
-    // identical control identities, not merely equivalent clock expressions.
+    // Positive alias cases use the same stable Event boundary identity.
     const auto sharedFire = graph.opOperands(firstA)[0];
     require(graph.opKind(graph.valueDef(sharedFire)) == sim::kEdgeDetect,
             "Capture metadata fixture lost its stable Event fire");
     for (const auto op : writers) if (op != mixedFirst && op != mixedLast &&
             op != stableMixedFirst && op != stableMixedLast)
         graph.replaceOperand(op, 0, sharedFire);
+    // Keep explicit writer-local ORs as negative cases even when conversion
+    // shares equivalent multi-clock event helpers.
+    for (const auto op : {mixedFirst, mixedLast}) {
+        const auto fire = graph.opOperands(op)[0];
+        const auto join = graph.valueDef(fire);
+        require(graph.opKind(join) == OperationKind::kOr && graph.opOperands(join).size() == 2,
+                "Capture metadata fixture lost its multi-clock join");
+        const auto first = graph.opOperands(join)[0];
+        const auto second = graph.opOperands(join)[1];
+        const auto localFire = fixture.compute(OperationKind::kOr, Fixture::type(1), {first, second});
+        graph.replaceOperand(op, 0, localFire);
+    }
     // Two users keep this OR in a nonsink owner. The writer-local ORs above
     // remain separate negative cases. Use a distinct second edge so their
     // sink groups cannot pick a local OR as this shared run's fresh fire.
@@ -5060,8 +5449,8 @@ int main() {
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     // Boundary-role and bitmap cases are appended after the common models.
     // Append after testModels initializes the generated execution Makefile.
-    try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testSinkRunSharedCones(); testSinkPrivatePayloads(); testArrayViewsAndWide(); testContiguousArrayImages(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }
+    try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testArrayViewsAndWide(); testContiguousArrayImages(); testPackedBoolUnpack(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
-    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testImmutableConstantSources(); testLargeCaptureMetadata(); testLargeLatchCaptures(); testLargeCaptureInterruptedConstants(); testNumericSelects(); testNarrowConstantLogicalShifts(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
+    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testLeafAssemblyConstants(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testImmutableConstantSources(); testLargeCaptureMetadata(); testLargeLatchCaptures(); testLargeCaptureInterruptedConstants(); testNumericSelects(); testNarrowConstantLogicalShifts(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

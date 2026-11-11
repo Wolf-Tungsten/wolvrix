@@ -1,4 +1,7 @@
 #include "rewrite.hpp"
+#include "transform/grhsim/used-bits.hpp"
+
+#include "transform/verify.hpp"
 
 #include <deque>
 #include <limits>
@@ -13,6 +16,51 @@ struct StateUses {
     bool eligible = true;
     uint32_t used = 0;
 };
+
+bool stateReadKind(OperationKind kind)
+{
+    return kind == OperationKind::kRegisterReadPort || kind == OperationKind::kRegisterReadArrayPort ||
+        kind == OperationKind::kLatchReadPort;
+}
+
+bool stateWriteKind(OperationKind kind)
+{
+    return kind == kWrite || kind == kWriteMask || kind == kWriteArray || kind == kWriteArrayMask ||
+        kind == kFill || kind == kLatchWrite ||
+        kind == OperationKind::kRegisterWritePort || kind == OperationKind::kRegisterWriteMaskPort ||
+        kind == OperationKind::kRegisterWriteArrayPort || kind == OperationKind::kRegisterWriteArrayMaskPort ||
+        kind == OperationKind::kRegisterFillPort;
+}
+
+// Return data/mask operands for both ordinary GRH writes and lowered GrhSIM
+// writes.  The F22 passes run before conversion, so the ordinary port forms
+// are the common case; retaining the lowered forms keeps the helper useful
+// for standalone compatibility tests.
+std::vector<std::size_t> stateWriteDataOperands(const Graph& graph, OperationId op)
+{
+    const auto kind = graph.opKind(op);
+    if (kind == kWrite || kind == kWriteMask || kind == kWriteArray || kind == kWriteArrayMask ||
+        kind == kFill || kind == kLatchWrite) {
+        // Converted GrhSIM writers have [fire, updateCond, indices..., data,
+        // mask?, events...].  The state data and mask are the only operands
+        // whose width follows the used state prefix.
+        const auto args = graph.opOperands(op);
+        std::size_t eventCount = attribute<std::vector<std::string>>(graph, op, "eventEdge").value_or(std::vector<std::string>{}).size();
+        const std::size_t eventStart = args.size() >= eventCount ? args.size() - eventCount : args.size();
+        if (kind == kLatchWrite) return eventStart >= 3 ? std::vector<std::size_t>{eventStart - 2, eventStart - 1} : std::vector<std::size_t>{};
+        if (kind == kWriteMask || kind == kWriteArrayMask)
+            return eventStart >= 2 ? std::vector<std::size_t>{eventStart - 2, eventStart - 1} : std::vector<std::size_t>{};
+        return eventStart >= 1 ? std::vector<std::size_t>{eventStart - 1} : std::vector<std::size_t>{};
+    }
+    const auto args = graph.opOperands(op);
+    if (kind == OperationKind::kRegisterFillPort) return args.size() > 1 ? std::vector<std::size_t>{1} : std::vector<std::size_t>{};
+    const auto eventStart = firstEventOperandIndex(graph, op);
+    if (!eventStart) return {};
+    if (kind == OperationKind::kRegisterWriteMaskPort || kind == OperationKind::kRegisterWriteArrayMaskPort ||
+        kind == OperationKind::kLatchWritePort)
+        return *eventStart >= 2 ? std::vector<std::size_t>{*eventStart - 2, *eventStart - 1} : std::vector<std::size_t>{};
+    return *eventStart >= 1 ? std::vector<std::size_t>{*eventStart - 1} : std::vector<std::size_t>{};
+}
 
 struct StateTable {
     static constexpr uint32_t absent = std::numeric_limits<uint32_t>::max();
@@ -46,8 +94,18 @@ StateTable stateUses(Scope& scope)
         lastOperation = std::max(lastOperation, op.index);
         if (graph.opKind(op) != OperationKind::kRegister && graph.opKind(op) != OperationKind::kLatch) continue;
         StateUses state{op, stateLogicalType(graph, op), stateInitSpec(graph, op)};
-        state.eligible = scope.partition.empty() && twoState(state.type) && state.type.shape.empty();
-        for (const auto& step : state.init) state.eligible &= step.kind == InitKind::Constant;
+        // F22 executes on the ordinary GRH before grh-to-grhsim projects the
+        // logic domain to two-state.  Prefix demand is bit-local for scalar
+        // logic in either domain, so retain the same narrowing opportunity
+        // for four-state FIRRTL input; unknown bits are preserved by the
+        // literal resize below.
+        state.eligible = scope.partition.empty() && state.type.kind == ValueType::Logic &&
+            state.type.shape.empty();
+        // GSIM can narrow scalar state with either a literal or a random
+        // initializer.  Random initialization is width-parametric at the
+        // emitter boundary, so it does not need a literal resize below.
+        for (const auto& step : state.init)
+            state.eligible &= step.kind == InitKind::Constant || step.kind == InitKind::Random;
         states.entries.emplace_back(op, std::move(state));
     }
     std::sort(states.entries.begin(), states.entries.end(), [](const auto& left, const auto& right) {
@@ -64,8 +122,8 @@ StateTable stateUses(Scope& scope)
         states.byOperation[op.index] = states.byOperation[target.index];
         const auto kind = graph.opKind(op);
         state.eligible &= scope.contains(op);
-        if (kind == OperationKind::kRegisterReadPort || kind == OperationKind::kLatchReadPort) state.reads.push_back(op);
-        else if (kind == kWrite || kind == kWriteMask || kind == kLatchWrite) state.writes.push_back(op);
+        if (stateReadKind(kind)) state.reads.push_back(op);
+        else if (stateWriteKind(kind)) state.writes.push_back(op);
         else state.eligible = false;
     }
     return states;
@@ -73,7 +131,7 @@ StateTable stateUses(Scope& scope)
 
 bool prefixValue(const Graph& graph, ValueId value) {
     return graph.valueType(value) == ValueType::Logic &&
-        graph.valueDomain(value) == LogicDomain::TwoState && graph.valueShape(value).empty();
+        graph.valueShape(value).empty();
 }
 
 bool rebuildable(const Graph& graph, OperationId op)
@@ -86,8 +144,17 @@ bool rebuildable(const Graph& graph, OperationId op)
         return args.size() == 1 && graph.valueShape(args[0]).empty();
     case OperationKind::kConcat:
         return std::all_of(args.begin(), args.end(), [&](auto value) { return graph.valueShape(value).empty(); });
+    case OperationKind::kAdd: case OperationKind::kSub: case OperationKind::kMul: {
+        // FourState arithmetic propagates any operand X/Z into the retained
+        // low bits too, so a low result prefix still depends on whole inputs.
+        const auto results = graph.opResults(op);
+        return results.size() == 1 && graph.valueDomain(results[0]) == LogicDomain::TwoState &&
+            std::all_of(args.begin(), args.end(), [&](auto value) {
+                return prefixValue(graph, value) && graph.valueDomain(value) == LogicDomain::TwoState;
+            });
+    }
     case OperationKind::kAnd: case OperationKind::kOr: case OperationKind::kXor: case OperationKind::kXnor:
-    case OperationKind::kNot: case OperationKind::kAdd: case OperationKind::kSub: case OperationKind::kMul:
+    case OperationKind::kNot:
     case OperationKind::kShl: case OperationKind::kMux: case OperationKind::kReplicate:
         return std::all_of(args.begin(), args.end(), [&](auto value) { return prefixValue(graph, value); });
     default: return kind == kBitSelect || kind == kPrioritySelect;
@@ -218,7 +285,10 @@ bool simplifyUsedBits(Scope& scope)
         uint32_t used = 0;
         for (const auto result : results) used = std::max(used, demand(result).bits);
         if (kind == OperationKind::kConstant) continue;
-        if (kind == OperationKind::kRegisterReadPort || kind == OperationKind::kLatchReadPort) {
+        if (stateReadKind(kind)) {
+            // Array-read indices select storage rows; their high bits remain
+            // observable even when the read result only needs a low prefix.
+            for (const auto arg : args) full(arg);
             if (!scope.partition.empty()) continue;
             auto& state = states.forPort(op);
             if (used > state.used) {
@@ -227,13 +297,16 @@ bool simplifyUsedBits(Scope& scope)
             }
             continue;
         }
-        if (kind == kWrite || kind == kWriteMask || kind == kLatchWrite) {
+        if (stateWriteKind(kind)) {
             if (!scope.partition.empty()) { for (const auto arg : args) full(arg); continue; }
             auto& state = states.forPort(op);
-            const std::size_t data = kind == kLatchWrite ? 1 : 2;
-            for (std::size_t i = 0; i < data; ++i) full(args[i]);
             const auto bits = state.eligible ? state.used : state.type.width;
-            for (std::size_t i = data; i < args.size(); ++i) raise(args[i], bits);
+            const auto dataOperands = stateWriteDataOperands(graph, op);
+            for (std::size_t i = 0; i < args.size(); ++i) {
+                if (std::find(dataOperands.begin(), dataOperands.end(), i) != dataOperands.end())
+                    raise(args[i], bits);
+                else full(args[i]);
+            }
             continue;
         }
         if (used == 0 && operationEffect(graph, op) == OpEffect::Pure) continue;
@@ -257,20 +330,16 @@ bool simplifyUsedBits(Scope& scope)
     }
 
     bool changed = false;
-    std::unordered_set<OperationId, OperationIdHash> removed;
     std::unordered_map<OperationId, uint32_t, OperationIdHash> stateWidth;
-    std::vector<OperationId> deadStates;
     for (auto& [target, state] : states) {
         if (!state.eligible || state.used >= static_cast<uint32_t>(state.type.width)) continue;
         if (state.used == 0) {
-            if (std::any_of(state.writes.begin(), state.writes.end(), [&](auto op) { return scope.anchored(op); })) continue;
-            for (const auto op : state.writes) { graph.eraseOp(op); removed.insert(op); }
-            // Drop write roots first; the ordinary dead-cone worklist will
-            // then remove feedback reads and their private compute chains.
-            deadStates.push_back(target); changed = true;
+            // UsedBits only records demand. The caller's explicit DCE owns
+            // removal of an entirely unused state/write cone.
+            continue;
         } else {
             auto type = state.type; type.width = state.used;
-            for (auto& step : state.init) {
+            for (auto& step : state.init) if (step.kind == InitKind::Constant) {
                 auto bits = slang::SVInt::fromString(step.value);
                 bits.setSigned(type.isSigned); bits = bits.resize(type.width);
                 step.value = bits.toString(slang::LiteralBase::Hex, true, bits.getBitWidth());
@@ -281,11 +350,11 @@ bool simplifyUsedBits(Scope& scope)
     }
     std::unordered_map<OperationId, uint32_t, OperationIdHash> narrow;
     for (const auto op : operations) {
-        if (removed.contains(op) || !scope.contains(op) || graph.opResults(op).size() != 1) continue;
+        if (!scope.contains(op) || graph.opResults(op).size() != 1) continue;
         const auto result = graph.opResults(op)[0];
         const auto& original = demand(result);
         uint32_t width = demand(result).bits;
-        if (graph.opKind(op) == OperationKind::kRegisterReadPort || graph.opKind(op) == OperationKind::kLatchReadPort) {
+        if (stateReadKind(graph.opKind(op))) {
             if (!dense) continue;
             const auto target = states.forPort(op).declaration;
             if (!stateWidth.contains(target)) continue;
@@ -296,19 +365,20 @@ bool simplifyUsedBits(Scope& scope)
         type.width = width; graph.setValueLogicalType(result, type); narrow.emplace(op, width); changed = true;
     }
     // Without a narrowed value or state, every operand already has its
-    // original width. The caller has just run DCE, so neither the operand
-    // rebuild nor another complete dead-cone scan can change this scope.
+    // original width. DCE is intentionally a separate pass boundary.
     if (!changed) return false;
     for (const auto op : operations) {
-        if (removed.contains(op) || !scope.contains(op)) continue;
+        if (!scope.contains(op)) continue;
         const auto kind = graph.opKind(op);
         const std::vector<ValueId> args(graph.opOperands(op).begin(), graph.opOperands(op).end());
-        if (kind == kWrite || kind == kWriteMask || kind == kLatchWrite) {
+        if (stateWriteKind(kind)) {
             if (!dense) continue;
             const auto found = stateWidth.find(states.forPort(op).declaration);
-            if (found != stateWidth.end())
-                for (std::size_t i = kind == kLatchWrite ? 1 : 2; i < args.size(); ++i)
-                    graph.replaceOperand(op, i, lowBits(graph, op, args[i], found->second));
+            if (found != stateWidth.end()) {
+                for (const auto index : stateWriteDataOperands(graph, op))
+                    if (index < args.size()) graph.replaceOperand(op, index,
+                        lowBits(graph, op, args[index], found->second, "used-bits"));
+            }
             continue;
         }
         if (graph.opResults(op).size() != 1) continue;
@@ -327,40 +397,115 @@ bool simplifyUsedBits(Scope& scope)
             std::vector<ValueId> parts;
             for (std::size_t i = args.size(); i-- > 0 && remaining > 0;) {
                 const auto keep = std::min(remaining, demand(args[i]).width);
-                parts.push_back(lowBits(graph, op, args[i], keep)); remaining -= keep;
+                parts.push_back(lowBits(graph, op, args[i], keep, "used-bits")); remaining -= keep;
             }
             std::reverse(parts.begin(), parts.end());
             if (parts != args) { replaceOperands(graph, op, parts); changed = true; }
         } else if (kind == OperationKind::kReplicate && narrow.contains(op)) {
             const auto stride = demand(args[0]).width;
-            if (width <= stride) rewrite(graph, op, OperationKind::kAssign, std::array{lowBits(graph, op, args[0], width)});
+            if (width <= stride) rewrite(graph, op, OperationKind::kAssign,
+                        std::array{lowBits(graph, op, args[0], width, "used-bits")});
             else if (width % stride == 0) graph.setAttr(op, "rep", static_cast<int64_t>(width / stride));
             else {
                 auto type = graph.valueLogicalType(graph.opResults(op)[0]); type.width = width - width % stride;
-                const auto low = makeOperation(graph, op, OperationKind::kReplicate, type, std::array{args[0]});
+                const auto low = makeOperation(graph, op, OperationKind::kReplicate, type,
+                                               std::array{args[0]}, "used-bits");
                 graph.setAttr(graph.valueDef(low), "rep", static_cast<int64_t>(width / stride));
-                const auto high = lowBits(graph, op, args[0], width % stride);
+                const auto high = lowBits(graph, op, args[0], width % stride, "used-bits");
                 rewrite(graph, op, OperationKind::kConcat, std::array{high, low});
             }
         } else if (narrow.contains(op)) {
             const auto count = kind == OperationKind::kMux ? 1 : kind == kPrioritySelect ? (args.size() - 1) / 2 : 0;
             for (std::size_t i = 0; i < args.size(); ++i)
                 if (i >= count && !(kind == OperationKind::kShl && i == 1))
-                    graph.replaceOperand(op, i, lowBits(graph, op, args[i], width));
+                    graph.replaceOperand(op, i, lowBits(graph, op, args[i], width, "used-bits"));
         }
-    }
-    changed = scope.dce() || changed;
-    if (!deadStates.empty()) {
-        std::unordered_set<std::string_view> names;
-        for (const auto target : deadStates) names.insert(graph.symbolText(graph.operationSymbol(target)));
-        for (const auto op : graph.operations())
-            for (const auto entry : graph.opAttrRange(op))
-                if ((entry.key() == "regSymbol" || entry.key() == "latchSymbol") &&
-                    names.contains(entry.value().asString()))
-                    throw std::logic_error("Dead state still has a live reference");
-        for (const auto target : deadStates) graph.eraseOp(target);
     }
     return changed;
 }
 
 } // namespace wolvrix::lib::transform::grhsim::detail
+
+namespace wolvrix::lib::transform::grhsim {
+namespace {
+using namespace grh;
+
+void requireGrhWhole(Graph& graph)
+{
+    if (graph.metadata(kStage))
+        throw std::invalid_argument("used-bits requires an unpartitioned GRH graph before grh-to-grhsim");
+    for (const auto op : graph.operations())
+        if (attribute<std::vector<std::string>>(graph, op, kPartition))
+            throw std::invalid_argument("used-bits requires an unpartitioned GRH graph");
+}
+
+Graph& selectGrhGraph(Design& design, std::string_view top)
+{
+    if (top.empty()) {
+        if (design.topGraphs().size() != 1) throw std::invalid_argument("Select exactly one top graph with -top");
+        top = design.topGraphs()[0];
+    }
+    auto* graph = design.findGraph(top);
+    if (!graph) throw std::invalid_argument("Top graph does not exist: " + std::string(top));
+    return *graph;
+}
+
+void verifyWhole(Graph& graph)
+{
+    if (const auto problem = verifyGraph(graph); !problem.empty()) throw std::invalid_argument(problem);
+    for (const auto op : graph.operations())
+        if (const auto problem = verifyOpDescriptor(graph, op); !problem.empty())
+            throw std::invalid_argument(problem);
+}
+
+} // namespace
+
+UsedBitsPass::UsedBitsPass(UsedBitsOptions options)
+    : Pass("used-bits", "used-bits", "GSIM-compatible backward used-bit analysis"),
+      options_(std::move(options))
+{}
+
+bool UsedBitsPass::supportsDialect(std::string_view dialect) const noexcept
+{
+    return detail::supports(dialect);
+}
+
+PassResult UsedBitsPass::run()
+{
+    PassResult result;
+    try {
+        auto& graph = selectGrhGraph(design(), options_.top);
+        requireGrhWhole(graph);
+        verifyWhole(graph);
+        const auto beforeOperations = graph.operations().size();
+        const auto beforeValues = graph.values().size();
+        std::size_t beforeWidth = 0;
+        for (const auto value : graph.values()) beforeWidth += static_cast<std::size_t>(std::max(0, graph.valueWidth(value)));
+
+        // See ExprOptPass: an empty anchor set is the F22 default.  The
+        // operation/value roots used by GSIM are represented by ports,
+        // state/effect operations and exported values in Scope itself.
+        const std::unordered_set<uint32_t> noAnchors;
+        const auto* anchors = keepDeclaredSymbols() ? nullptr : &noAnchors;
+        detail::Scope scope(graph, {}, std::nullopt, anchors, nullptr, true);
+        const bool narrowed = detail::simplifyUsedBits(scope);
+        std::size_t afterWidth = 0;
+        for (const auto value : graph.values()) afterWidth += static_cast<std::size_t>(std::max(0, graph.valueWidth(value)));
+        result.changed = narrowed || beforeOperations != graph.operations().size() ||
+            beforeValues != graph.values().size() || beforeWidth != afterWidth;
+        verifyWhole(graph);
+        const auto summary = "narrowed=" + std::to_string(narrowed ? 1 : 0) +
+            " operations=" + std::to_string(beforeOperations) + "->" + std::to_string(graph.operations().size()) +
+            " values=" + std::to_string(beforeValues) + "->" + std::to_string(graph.values().size()) +
+            " width-sum=" + std::to_string(beforeWidth) + "->" + std::to_string(afterWidth) +
+            " semantic-pruned=0";
+        info(summary);
+        logInfo(summary);
+    } catch (const std::exception& error) {
+        this->error(error.what());
+        result.failed = true;
+    }
+    return result;
+}
+
+} // namespace wolvrix::lib::transform::grhsim

@@ -3,9 +3,14 @@
 
 #include "core/store.hpp"
 #include "transform/grhsim/grh-to-grhsim.hpp"
-#include "transform/grhsim/simplify.hpp"
-#include "transform/grhsim/pack-bit-registers.hpp"
-#include "transform/grhsim/recover-masked-or.hpp"
+#include "transform/grhsim/expr-opt.hpp"
+#include "transform/grhsim/used-bits.hpp"
+#include "transform/alias_analysis.hpp"
+#include "transform/constant_analysis.hpp"
+#include "transform/common_expr.hpp"
+#include "transform/pattern_detect.hpp"
+#include "transform/split_nodes.hpp"
+#include "transform/dead_code_elim.hpp"
 #include "transform/verify.hpp"
 
 #include <filesystem>
@@ -80,8 +85,10 @@ struct Builder {
     void output(std::string name, grh::ValueId value) { graph.bindOutputPort(name, value); }
 };
 
-bool run(grh::Design& design, std::unique_ptr<transform::Pass> pass, bool* changed = nullptr) {
-    transform::PassManager manager; manager.addPass(std::move(pass)); transform::PassDiagnostics diagnostics;
+bool run(grh::Design& design, std::unique_ptr<transform::Pass> pass, bool* changed = nullptr,
+         std::optional<bool> keepDeclaredSymbols = std::nullopt) {
+    transform::PassManager manager; manager.options().keepDeclaredSymbols = keepDeclaredSymbols;
+    manager.addPass(std::move(pass)); transform::PassDiagnostics diagnostics;
     const auto result = manager.run(design, diagnostics);
     if (changed) *changed = result.changed;
     if (!result.success) for (const auto& message : diagnostics.messages()) std::cerr << message.message << '\n';
@@ -97,7 +104,6 @@ grh::Design roundTrip(const grh::Design& design) {
     require(run(loaded, std::make_unique<transform::GrhVerifyPass>()), "checkpoint verify failed"); return loaded;
 }
 void convert(grh::Design& design) { require(run(design, std::make_unique<sim::GrhToGrhsimPass>()), "conversion failed"); }
-void simplify(grh::Design& design) { require(run(design, std::make_unique<sim::SimplifyPass>()), "simplify failed"); }
 
 void testOperandReplacement() {
     Builder b;
@@ -214,457 +220,846 @@ void testGenerateGroupMembershipIndex() {
     }
 }
 
-void testEventsCallsAndPacking() {
+void testF22Passes() {
+    // ExprOpt must carry source identities while rewriting an internal
+    // same-arm mux.  GSIM leaves dead rows for the explicit DCE stage, so the
+    // operation remains as an assignment until that stage is requested.
+    {
+        Builder b;
+        const auto input = b.input("input", 8);
+        const auto base = b.compute(OperationKind::kAssign, b.type(8), {input});
+        const auto mux = b.compute(OperationKind::kMux, b.type(8), {base, base, base});
+        const auto muxOp = b.graph.valueDef(mux);
+        const auto view = b.compute(OperationKind::kAssign, b.type(8), {mux});
+        b.output("out", view);
+        auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
+        const auto semantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "muxNode");
+        b.graph.setOpSemanticIds(muxOp, std::array{semantic});
+        b.graph.setValueSemanticIds(mux, std::array{semantic});
+        require(run(b.design, std::make_unique<sim::ExprOptPass>()), "F22 ExprOpt failed");
+        require(std::find(b.graph.operations().begin(), b.graph.operations().end(), muxOp) != b.graph.operations().end() &&
+                    b.graph.opKind(muxOp) == OperationKind::kAssign,
+                "F22 ExprOpt did not rewrite the same-arm mux without hidden DCE");
+        require(std::find(b.graph.valueSemanticIds(base).begin(), b.graph.valueSemanticIds(base).end(), semantic) !=
+                    b.graph.valueSemanticIds(base).end(),
+                "F22 ExprOpt dropped the surviving SemanticTree identity");
+    }
+
+    // GSIM compares complete expression subtrees, rather than only the
+    // ValueId at each mux arm.  Two independently-built but equivalent
+    // subtrees must therefore collapse to one arm while carrying the mux
+    // source identity to the surviving value.
+    {
+        Builder b;
+        const auto input = b.input("input", 8), select = b.input("select");
+        const auto left = b.compute(OperationKind::kNot, b.type(8), {input});
+        const auto right = b.compute(OperationKind::kNot, b.type(8), {input});
+        const auto rightOp = b.graph.valueDef(right);
+        const auto mux = b.compute(OperationKind::kMux, b.type(8), {select, left, right});
+        const auto muxOp = b.graph.valueDef(mux);
+        const auto view = b.compute(OperationKind::kAssign, b.type(8), {mux});
+        b.output("out", view);
+        auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
+        const auto semantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "structuralMux");
+        const auto rightSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "structuralMuxCopy");
+        b.graph.setOpSemanticIds(muxOp, std::array{semantic});
+        b.graph.setValueSemanticIds(mux, std::array{semantic});
+        b.graph.setOpSemanticIds(b.graph.valueDef(right), std::array{rightSemantic});
+        b.graph.setValueSemanticIds(right, std::array{rightSemantic});
+        require(run(b.design, std::make_unique<sim::ExprOptPass>()), "F22 structural ExprOpt failed");
+        require(std::find(b.graph.operations().begin(), b.graph.operations().end(), muxOp) !=
+                    b.graph.operations().end() && b.graph.opKind(muxOp) == OperationKind::kAssign,
+                "F22 ExprOpt did not rewrite a structurally redundant mux without hidden DCE");
+        require(std::find(b.graph.valueSemanticIds(left).begin(), b.graph.valueSemanticIds(left).end(), semantic) !=
+                    b.graph.valueSemanticIds(left).end(),
+                "F22 structural ExprOpt dropped the mux SemanticTree identity");
+        require(std::find(b.graph.valueSemanticIds(left).begin(), b.graph.valueSemanticIds(left).end(), rightSemantic) !=
+                    b.graph.valueSemanticIds(left).end(),
+                "F22 structural ExprOpt dropped the equivalent arm SemanticTree identity");
+        require(run(b.design, std::make_unique<transform::DeadCodeElimPass>()),
+                "explicit DCE after F22 ExprOpt failed");
+        require(std::find(b.graph.operations().begin(), b.graph.operations().end(), rightOp) ==
+                    b.graph.operations().end(),
+                "explicit DCE did not reclaim the discarded equivalent arm");
+    }
+
+    // UsedBits deliberately ignores declared symbols by default, matching
+    // GSIM's liveness roots.  A declared wide state used only through a low
+    // slice therefore narrows to that slice width.
+    {
+        Builder b;
+        const auto clk = b.input("clk"), enable = b.input("enable"), data = b.input("data", 8);
+        auto twoState = b.type(8); twoState.domain = grh::LogicDomain::TwoState;
+        auto dataType = b.graph.valueLogicalType(data); dataType.domain = grh::LogicDomain::TwoState;
+        b.graph.setValueLogicalType(data, dataType);
+        const auto state = b.state("declared_wide", twoState, "8'h00", true);
+        const auto readValue = b.read(state);
+        const auto lowValue = b.slice(readValue, 0, 3);
+        b.output("low", lowValue);
+        b.write(OperationKind::kRegisterWritePort, state, {enable, data, clk});
+        const auto deadPure = b.compute(OperationKind::kNot, b.type(8), {data});
+        const auto deadPureOp = b.graph.valueDef(deadPure);
+        const bool usedBitsOk = run(b.design, std::make_unique<sim::UsedBitsPass>(), nullptr, false);
+        require(usedBitsOk, "F22 UsedBits failed");
+        require(grh::stateLogicalType(b.graph, state).width == 3,
+                "F22 UsedBits kept a declared state at its original width");
+        require(std::find(b.graph.operations().begin(), b.graph.operations().end(), deadPureOp) !=
+                    b.graph.operations().end(), "F22 UsedBits performed hidden DCE");
+        require(run(b.design, std::make_unique<transform::DeadCodeElimPass>(), nullptr, false),
+                "explicit DCE after UsedBits failed");
+        require(std::find(b.graph.operations().begin(), b.graph.operations().end(), deadPureOp) ==
+                    b.graph.operations().end(), "explicit DCE did not remove the dead pure cone");
+    }
+
+    // Random scalar initialization is width-parametric, so it remains
+    // eligible for the same prefix narrowing as a literal initializer.
+    {
+        Builder b;
+        auto twoState = b.type(8); twoState.domain = grh::LogicDomain::TwoState;
+        const auto state = b.state("random_wide", twoState, "$random", true);
+        b.output("low", b.slice(b.read(state), 0, 3));
+        require(run(b.design, std::make_unique<sim::UsedBitsPass>(), nullptr, false), "F22 random UsedBits failed");
+        require(grh::stateLogicalType(b.graph, state).width == 3,
+                "F22 UsedBits rejected a random scalar initializer");
+    }
+}
+
+void testF24UsedBitsIndexedReadKeepsFullIndex() {
     Builder b;
-    const auto clk = b.input("clk"), reset = b.input("reset"), en = b.input("enable"), gate = b.input("gate");
-    const auto data = b.input("data", 8), mask = b.input("mask", 8), io = b.input("io", 32);
-    const auto one = b.constant(1, "1'h1");
-    const auto gated = b.compute(OperationKind::kAnd, b.type(1), {clk, gate});
-    std::vector<std::string> probes;
-    for (int32_t lane = 0; lane < 8; ++lane) {
-        const auto name = "flag" + std::to_string(lane); probes.push_back(name);
-        const auto state = b.state(name, b.type(1), lane % 2 ? "1'h1" : "1'h0");
-        const auto group = b.graph.addGenerateGroup(b.graph.internSymbol("flags"), b.graph.internSymbol(name + "_decl"));
-        b.graph.addGenerateGroupSymbol(group, b.graph.operationSymbol(state));
-        b.write(OperationKind::kRegisterWritePort, state, {en, b.slice(data, lane, 1), gated});
-        b.output(name, b.read(state));
+    const auto rawIndex = b.input("index", 4);
+    const auto computedIndex = b.compute(OperationKind::kOr, b.type(4),
+                                          {rawIndex, b.constant(4, "4'b0000")});
+    const auto indexView = b.compute(OperationKind::kAssign, b.type(4), {computedIndex});
+    const auto state = b.state("rows", b.type(128, {16}),
+        "128'h0f0e0d0c0b0a09080706050403020100", false);
+    b.output("selected", b.read(state, {indexView}));
+    b.output("index_low", b.slice(computedIndex, 0, 1));
+    auto reference = roundTrip(b.design);
+
+    // The low-bit output alone would narrow computedIndex to one bit. The
+    // indexed read must demand all four address bits through the assign view.
+    require(run(b.design, std::make_unique<sim::UsedBitsPass>(), nullptr, false),
+            "F24 UsedBits indexed-read fixture failed");
+    require(b.graph.valueWidth(computedIndex) == 4 && b.graph.valueWidth(indexView) == 4,
+            "F24 UsedBits narrowed an observable indexed-read address");
+    require(run(b.design, std::make_unique<transform::GrhVerifyPass>()),
+            "F24 UsedBits left a live invalid assign before the DCE boundary");
+    {
+        grhsim_test::Oracle original(*reference.findGraph("top")), rewritten(b.graph);
+        for (uint64_t index = 0; index < 16; ++index) {
+            const std::map<std::string, uint64_t> inputs{{"index", index}};
+            require(original.eval(inputs) == rewritten.eval(inputs),
+                    "F24 UsedBits changed an indexed state read before DCE");
+        }
     }
-    const auto state = b.state("q", b.type(8), "8'h01"); probes.push_back("q");
-    const auto q = b.read(state); b.output("q", q);
-    b.write(OperationKind::kRegisterWriteMaskPort, state, {en, data, mask, clk}, {"negedge"});
-    b.write(OperationKind::kRegisterWritePort, state, {en, data, clk, reset}, {"posedge", "negedge"});
-    for (const auto& [name, function] : std::vector<std::pair<std::string, std::string>>{{"random0", "random"}, {"random1", "urandom"}, {"unused_random", "random"}}) {
-        const auto value = b.compute(OperationKind::kSystemFunction, b.type(32), {}, name);
-        b.graph.setAttr(b.graph.valueDef(value), "name", function);
-        if (name != "unused_random") b.output(name, value);
+    require(run(b.design, std::make_unique<transform::DeadCodeElimPass>(), nullptr, false),
+            "F24 explicit DCE failed after indexed-read demand propagation");
+    require(run(b.design, std::make_unique<transform::GrhVerifyPass>()),
+            "F24 indexed-read fixture became invalid after explicit DCE");
+    grhsim_test::Oracle original(*reference.findGraph("top")), rewritten(b.graph);
+    for (uint64_t index = 0; index < 16; ++index) {
+        const std::map<std::string, uint64_t> inputs{{"index", index}};
+        require(original.eval(inputs) == rewritten.eval(inputs),
+                "F24 UsedBits/DCE changed the selected row for a four-bit address");
     }
-    for (const auto& [name, taskName] : std::vector<std::pair<std::string, std::string>>{{"display", "display"}, {"monitor", "monitor"}, {"strobe", "strobe"}}) {
-        const auto op = b.graph.createOperation(OperationKind::kSystemTask, b.graph.internSymbol(name));
-        for (const auto value : {en, q, clk}) b.graph.addOperand(op, value);
-        b.graph.setAttr(op, "name", taskName); b.graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+}
+
+void testF24UsedBitsPreservesFourStateArithmetic() {
+    for (const auto kind : {OperationKind::kAdd, OperationKind::kSub, OperationKind::kMul}) {
+        Builder b;
+        const auto packed = b.compute(OperationKind::kConcat, b.type(8),
+                                      {b.constant(4, "4'bxxxx"), b.constant(4, "4'b0011")});
+        const bool multiply = kind == OperationKind::kMul;
+        const auto lhs = multiply ? packed : b.compute(OperationKind::kConcat, b.type(9),
+                                                        {b.constant(1, "1'b0"), packed});
+        const auto rhs = b.constant(multiply ? 8 : 9, multiply ? "8'd3" : "9'd1");
+        const auto result = b.compute(kind, b.type(multiply ? 16 : 9), {lhs, rhs});
+        b.output("low", b.slice(result, 0, 4));
+        auto reference = roundTrip(b.design);
+        const auto allX = slang::SVInt::createFillX(4, false).toString(slang::LiteralBase::Hex, true, 4);
+        const auto checkUnknowns = [&] {
+            grhsim_test::Oracle original(*reference.findGraph("top"), {}, nullptr, true);
+            grhsim_test::Oracle rewritten(b.graph, {}, nullptr, true);
+            const auto expected = original.eval({});
+            require(expected.outputs.at("low") == allX,
+                    "F24 high-X arithmetic fixture did not produce an unknown low result");
+            require(expected == rewritten.eval({}),
+                    "F24 UsedBits discarded high unknown arithmetic dependencies");
+        };
+
+        require(run(b.design, std::make_unique<sim::UsedBitsPass>(), nullptr, false),
+                "F24 FourState arithmetic UsedBits failed");
+        require(b.graph.valueWidth(packed) == 8 && b.graph.valueWidth(lhs) == (multiply ? 8 : 9) &&
+                    b.graph.valueWidth(result) == (multiply ? 16 : 9),
+                "F24 UsedBits narrowed FourState arithmetic or its operand cone");
+        require(run(b.design, std::make_unique<transform::GrhVerifyPass>()),
+                "F24 FourState arithmetic became invalid before explicit DCE");
+        checkUnknowns();
+        require(run(b.design, std::make_unique<transform::DeadCodeElimPass>(), nullptr, false),
+                "F24 explicit DCE failed after FourState arithmetic UsedBits");
+        require(run(b.design, std::make_unique<transform::GrhVerifyPass>()),
+                "F24 FourState arithmetic became invalid after explicit DCE");
+        checkUnknowns();
+
+        // Folding before TwoState projection must retain the original X
+        // result, which the conversion policy then projects to zero.
+        require(run(reference, std::make_unique<transform::ConstantAnalysisPass>()) &&
+                    run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
+                "F24 high-X arithmetic constant analysis failed");
+        convert(reference); convert(b.design);
+        grhsim_test::Oracle original(*reference.findGraph("top")), rewritten(b.graph);
+        const auto projected = original.eval({});
+        require(projected.outputs.at("low") == "4'h0" && projected == rewritten.eval({}),
+                "F24 UsedBits changed arithmetic after folding and TwoState projection");
     }
-    const auto imported = b.graph.createOperation(OperationKind::kDpicImport, b.graph.internSymbol("dpi"));
-    b.graph.setAttr(imported, "argsDirection", std::vector<std::string>{"inout", "input", "output"});
-    b.graph.setAttr(imported, "argsWidth", std::vector<int64_t>{32, 8, 16});
-    b.graph.setAttr(imported, "argsSigned", std::vector<bool>{false, false, false});
-    b.graph.setAttr(imported, "argsName", std::vector<std::string>{"io", "in", "out"});
-    b.graph.setAttr(imported, "hasReturn", true); b.graph.setAttr(imported, "returnWidth", int64_t{8});
-    for (unsigned i = 0; i < 2; ++i) {
-        const auto name = "dpi_call" + std::to_string(i);
-        const auto call = b.graph.createOperation(OperationKind::kDpicCall, b.graph.internSymbol(name));
-        for (const auto arg : {en, data, io, clk}) b.graph.addOperand(call, arg);
-        for (const auto width : {8, 16, 32}) { const auto result = b.graph.createValue(b.type(width)); b.graph.addResult(call, result); b.output(name + "_" + std::to_string(width), result); }
-        b.graph.setAttr(call, "targetImportSymbol", std::string("dpi"));
-        b.graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+
+    // TwoState arithmetic retains the modular low-prefix optimization.
+    for (const auto kind : {OperationKind::kAdd, OperationKind::kSub, OperationKind::kMul}) {
+        Builder b;
+        const auto lhs = b.input("lhs", 8), rhs = b.input("rhs", 8);
+        const auto result = b.compute(kind, b.type(kind == OperationKind::kMul ? 16 : 8), {lhs, rhs});
+        b.output("low", b.slice(result, 0, 4));
+        for (const auto value : b.graph.values()) {
+            auto type = b.graph.valueLogicalType(value); type.domain = grh::LogicDomain::TwoState;
+            b.graph.setValueLogicalType(value, type);
+        }
+        auto reference = roundTrip(b.design);
+        require(run(b.design, std::make_unique<sim::UsedBitsPass>(), nullptr, false),
+                "F24 TwoState arithmetic UsedBits failed");
+        require(b.graph.valueWidth(result) == 4,
+                "F24 UsedBits stopped narrowing TwoState arithmetic");
+        require(run(b.design, std::make_unique<transform::GrhVerifyPass>()),
+                "F24 TwoState arithmetic became invalid after UsedBits");
+        grhsim_test::Oracle original(*reference.findGraph("top")), rewritten(b.graph);
+        for (uint64_t lhsBits = 0; lhsBits < 256; ++lhsBits) {
+            const std::map<std::string, uint64_t> inputs{{"lhs", lhsBits}, {"rhs", 255 - lhsBits}};
+            require(original.eval(inputs) == rewritten.eval(inputs),
+                    "F24 UsedBits changed TwoState arithmetic low bits");
+        }
     }
-    const auto reference = b.design.clone();
+}
+
+void testGrhToGrhsimSemanticTree() {
+    Builder b;
+    const auto clk = b.input("clk"), enable = b.input("enable"), data = b.input("data", 8);
+    const auto state = b.state("semantic_state", b.type(8), "8'h00");
+    const auto readValue = b.read(state);
+    b.output("out", readValue);
+    const auto write = b.write(OperationKind::kRegisterWritePort, state, {enable, data, clk});
+
+    auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
+    const auto stateSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Declaration, "semantic_state");
+    const auto writeSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "write");
+    const auto clockSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Declaration, "clk");
+    b.graph.setOpSemanticIds(state, std::array{stateSemantic});
+    b.graph.setOpSemanticIds(write, std::array{writeSemantic});
+    b.graph.setValueSemanticIds(readValue, std::array{stateSemantic});
+    b.graph.setValueSemanticIds(clk, std::array{clockSemantic});
+
     convert(b.design);
-    const auto converted = roundTrip(b.design);
-    compare(reference, converted, probes, 128, "r2-calls-events");
-    const auto before = count(b.graph, sim::kEdgeDetect);
-    simplify(b.design);
-    require(count(b.graph, sim::kEdgeDetect) < before, "equivalent detectors did not share");
-    require(count(b.graph, sim::kSystemFunction) == 3 && count(b.graph, sim::kDpiCall) == 2, "effectful calls removed or merged");
-    require(run(b.design, std::make_unique<sim::PackBitRegistersPass>()), "packing failed");
-    require(count(b.graph, OperationKind::kRegister) == 2, "eight flags did not pack into one word");
-    std::vector<std::string> packedOrigins;
-    for (unsigned lane = 0; lane < 8; ++lane) {
-        const auto name = "flag" + std::to_string(lane);
-        packedOrigins.push_back("top$" + name);
-        const auto view = b.graph.findValue(name);
-        require(view && transform::getOriginModules(b.graph, b.graph.valueDef(view)) ==
-                std::vector<std::string>{"top$" + name}, "packed declaration view inherited unrelated lane origins");
+    bool sawEdge = false;
+    for (const auto op : b.graph.operations()) {
+        if (b.graph.opKind(op) != sim::kEdgeDetect) continue;
+        sawEdge = true;
+        const auto opIds = b.graph.opSemanticIds(op);
+        require(std::find(opIds.begin(), opIds.end(), writeSemantic) != opIds.end(),
+                "grh-to-grhsim dropped source SemanticId from edge detector");
+        require(!b.graph.opResults(op).empty(), "edge detector has no result");
+        const auto resultIds = b.graph.valueSemanticIds(b.graph.opResults(op).front());
+        require(std::find(resultIds.begin(), resultIds.end(), writeSemantic) != resultIds.end(),
+                "grh-to-grhsim dropped SemanticId from edge detector result");
+        require(std::find(opIds.begin(), opIds.end(), clockSemantic) != opIds.end() &&
+                    std::find(resultIds.begin(), resultIds.end(), clockSemantic) != resultIds.end(),
+                "grh-to-grhsim dropped clock value SemanticId while growing the semantic pool");
     }
-    for (const auto op : b.graph.operations())
-        if (b.graph.opKind(op) == OperationKind::kRegister && op != b.graph.findOperation("q"))
-            require(transform::getOriginModules(b.graph, op) == packedOrigins, "packed state lost member origins");
-    for (const auto& probe : probes) require(b.graph.findOperation(probe) || b.graph.findValue(probe), "state name projection disappeared");
-    require(b.graph.validateDeclaredSymbols().empty() && b.graph.generateGroups().size() == 8, "packing lost declaration provenance");
-    simplify(b.design);
-    bool changed = true;
-    require(run(b.design, std::make_unique<sim::SimplifyPass>(), &changed) && !changed, "simplify is not idempotent");
-    auto loaded = roundTrip(b.design); loaded.findGraph("top")->freeze();
-    compare(reference, loaded, probes, 256, "r3-calls-packed");
-    for (const auto op : b.graph.operations()) require(!b.graph.getOperation(op).attr(sim::kPartition), "optimization created partitions");
+    require(sawEdge, "grh-to-grhsim did not synthesize an edge detector");
+
+    // A plain SV-style graph has no SemanticTree. Conversion must keep that
+    // representation valid and must not invent source identities.
+    Builder plain;
+    const auto plainClk = plain.input("clk"), plainEnable = plain.input("enable"), plainData = plain.input("data", 8);
+    const auto plainState = plain.state("plain_state", plain.type(8), "8'h00");
+    const auto plainRead = plain.read(plainState);
+    plain.output("out", plainRead);
+    plain.write(OperationKind::kRegisterWritePort, plainState, {plainEnable, plainData, plainClk});
+    convert(plain.design);
+    require(!plain.graph.semanticTree(), "grh-to-grhsim created a SemanticTree for a plain graph");
+    for (const auto op : plain.graph.operations())
+        require(plain.graph.opSemanticIds(op).empty(), "plain conversion invented operation SemanticIds");
+    for (const auto value : plain.graph.values())
+        require(plain.graph.valueSemanticIds(value).empty(), "plain conversion invented value SemanticIds");
 }
 
-void testConstantAliasConvergence() {
+void testF23SplitNodes() {
     Builder b;
-    const auto first = b.constant(8, "8'h2a");
-    const auto duplicate = b.constant(8, "8'h2a");
-    const auto declared = b.constant(8, "8'h2a");
-    b.graph.addDeclaredSymbol(b.graph.valueSymbol(declared));
-    b.output("first", first); b.output("duplicate", duplicate); b.output("declared", declared);
-    // Retained declarations must share the source without growing an alias
-    // chain one link per simplify round.
-    for (int i = 0; i < 32; ++i) {
-        const auto value = b.constant(8, "8'h2a");
-        b.graph.addDeclaredSymbol(b.graph.valueSymbol(value));
-        b.output("alias" + std::to_string(i), value);
-    }
-    const auto reference = b.design.clone(); convert(b.design);
-    transform::PassManager manager;
-    sim::SimplifyOptions options; options.maxRounds = 4;
-    manager.addPass(std::make_unique<sim::SimplifyPass>(options));
-    transform::PassDiagnostics diagnostics;
-    require(manager.run(b.design, diagnostics).success, "constant alias simplify failed");
-    for (const auto& message : diagnostics.messages())
-        require(message.message.find("before convergence") == std::string::npos, "constant aliases did not converge");
-    require(count(b.graph, OperationKind::kConstant) == 1, "duplicate exported constants did not share");
-    bool changed = true;
-    require(run(b.design, std::make_unique<sim::SimplifyPass>(), &changed) && !changed,
-            "retained constant aliases are not idempotent");
-    compare(reference, roundTrip(b.design), {}, 4, "r3-constant-aliases");
-}
+    const auto lhs = b.input("lhs", 8), rhs = b.input("rhs", 8);
+    const auto wide = b.compute(OperationKind::kAnd, b.type(8), {lhs, rhs});
+    const auto low = b.slice(wide, 0, 3), high = b.slice(wide, 5, 2);
+    b.output("low", low); b.output("high", high);
 
-void testCseAttributePayloads() {
-    Builder b;
-    const auto input = b.input("input", 8), rhs = b.input("rhs", 8);
-    const std::array<grh::AttributeValue, 8> payloads{
-        true, int64_t{-7}, -7.0, std::string(4096, 'x'),
-        std::vector<bool>{true, false}, std::vector<int64_t>{-7, 0, 9},
-        std::vector<double>{-7.0, 0.5}, std::vector<std::string>{"", std::string("a\0b", 3), std::string(1024, 'y')}
-    };
-    std::vector<grh::OperationId> representatives;
-    for (std::size_t i = 0; i < payloads.size(); ++i) {
-        for (int copy = 0; copy < 2; ++copy) {
-            const auto result = b.compute(OperationKind::kAnd, b.type(8), {input, rhs});
-            const auto op = b.graph.valueDef(result);
-            if (!copy) representatives.push_back(op);
-            b.graph.setAttr(op, "csePayload", payloads[i]);
-            if (i >= 4) {
-                for (int extra = 0; extra < 5; ++extra)
-                    b.graph.setAttr(op, "cseExtra" + std::to_string(extra), std::string("same"));
-            }
-            b.graph.setAttr(op, "originModules", std::vector<std::string>{
-                "source" + std::to_string(i) + "_" + std::to_string(copy)});
-            b.output("out" + std::to_string(i) + "_" + std::to_string(copy), result);
-        }
-    }
-    const auto reference = b.design.clone(); convert(b.design);
-    b.graph.freeze();
-    simplify(b.design);
-    require(count(b.graph, OperationKind::kAnd) == payloads.size(), "CSE lost attribute payload identity");
-    for (std::size_t i = 0; i < payloads.size(); ++i) {
-        const auto op = representatives[i];
-        require(b.graph.opKind(op) == OperationKind::kAnd, "CSE changed the first representative");
-        require(b.graph.getOperation(op).attr("csePayload") == std::optional(payloads[i]), "CSE changed an attribute payload");
-        require(transform::getOriginModules(b.graph, op) == std::vector<std::string>{
-            "source" + std::to_string(i) + "_0", "source" + std::to_string(i) + "_1"}, "CSE changed origin ordering");
-    }
-    bool changed = true;
-    require(run(b.design, std::make_unique<sim::SimplifyPass>(), &changed) && !changed,
-            "attribute-key CSE did not converge");
-    compare(reference, roundTrip(b.design), {}, 128, "r3-cse-attribute-payloads");
-}
+    const auto wideOp = b.graph.valueDef(wide);
+    require(run(b.design, std::make_unique<transform::SplitNodesPass>()),
+            "F23 SplitNodes failed");
+    require(b.graph.opKind(b.graph.valueDef(low)) == OperationKind::kAssign &&
+                b.graph.opKind(b.graph.valueDef(high)) == OperationKind::kAssign,
+            "F23 SplitNodes did not retarget static slices");
+    require(b.graph.valueWidth(b.graph.opOperands(b.graph.valueDef(low))[0]) == 3 &&
+                b.graph.valueWidth(b.graph.opOperands(b.graph.valueDef(high))[0]) == 2,
+            "F23 SplitNodes did not create narrow expression results");
+    require(std::find(b.graph.operations().begin(), b.graph.operations().end(), wideOp) !=
+                b.graph.operations().end(),
+            "F23 SplitNodes performed hidden DCE");
 
-void testVerifiedUnpartitionedScope() {
-    Builder b;
-    const auto input = b.input("input", 8);
-    const auto value = b.compute(OperationKind::kNot, b.type(8), {input});
-    const auto alias = b.compute(OperationKind::kAssign, b.type(8), {value});
-    b.output("out", value);
+    require(run(b.design, std::make_unique<transform::DeadCodeElimPass>(), nullptr, false),
+            "F23 explicit DCE after SplitNodes failed");
+    require(std::find(b.graph.operations().begin(), b.graph.operations().end(), wideOp) ==
+                b.graph.operations().end(),
+            "F23 explicit DCE did not reclaim the unused wide producer");
+
     convert(b.design);
-    require(run(b.design, std::make_unique<transform::GrhVerifyPass>()), "converted scope verify failed");
-    sim::detail::Scope scanned(b.graph, {});
-    sim::detail::Scope verified(b.graph, {}, std::nullopt, nullptr, nullptr, true);
-    const auto op = b.graph.valueDef(value);
-    auto outside = op; outside.index += static_cast<uint32_t>(b.graph.operations().size()) + 1;
-    auto foreign = op; ++foreign.graph.index;
-    const auto rejection = [](const sim::detail::Scope& scope, grh::OperationId operation) {
-        try { (void)scope.contains(operation); }
-        catch (const std::exception& error) { return std::string(error.what()); }
-        return std::string{};
-    };
-    const auto check = [&] {
-        require(!scanned.contains({}) && !verified.contains({}), "invalid scope operation became local");
-        require(scanned.contains(op) && verified.contains(op), "converted operation left its scope");
-        for (const auto invalid : {outside, foreign}) {
-            const auto expected = rejection(scanned, invalid);
-            require(!expected.empty() && rejection(verified, invalid) == expected,
-                    "verified scope changed invalid-operation rejection");
-        }
-    };
-    check();
-    b.graph.freeze(); check();
-    const auto appended = b.compute(OperationKind::kNot, b.graph.valueLogicalType(value), {input});
-    const auto appendedOp = b.graph.valueDef(appended);
-    require(scanned.contains(appendedOp) && verified.contains(appendedOp), "new operation left converted scope");
-    require(b.graph.eraseOp(appendedOp), "scope fixture erase failed");
-    const auto erasedError = rejection(scanned, appendedOp);
-    require(!erasedError.empty() && rejection(verified, appendedOp) == erasedError,
-            "verified scope changed erased-operation rejection");
-    const auto aliasOp = b.graph.valueDef(alias);
-    require(verified.alias(aliasOp, value), "scope alias was not erased");
-    scanned.erased.insert(aliasOp);
-    require(!scanned.contains(aliasOp) && !verified.contains(aliasOp), "scope erasure lost its short circuit");
-    check();
-
-    Builder invalid;
-    const auto arg = invalid.input("arg", 8);
-    const auto result = invalid.compute(OperationKind::kNot, invalid.type(8), {arg});
-    invalid.output("out", result); convert(invalid.design);
-    const std::array<grh::AttributeValue, 3> owners{
-        std::vector<std::string>{}, std::vector<std::string>{"general"}, int64_t{1}
-    };
-    for (const auto& owner : owners) {
-        invalid.graph.setAttr(invalid.graph.valueDef(result), sim::kPartition, owner);
-        const auto stamp = transform::DesignStamp::capture(invalid.graph);
-        require(!run(invalid.design, std::make_unique<sim::SimplifyPass>()) && stamp.matches(invalid.graph),
-                "converted graph with a partition was optimized");
-    }
-}
-
-void testNamedAliasConsumers() {
-    Builder b;
-    const auto input = b.input("input", 8), rhs = b.input("rhs", 8);
-    auto previous = input;
-    std::vector<grh::ValueId> aliases;
-    for (int i = 0; i < 96; ++i) {
-        const auto value = b.compute(OperationKind::kAssign, b.type(8), {previous}, "named" + std::to_string(i));
-        b.graph.addDeclaredSymbol(b.graph.operationSymbol(b.graph.valueDef(value)));
-        b.graph.addDeclaredSymbol(b.graph.valueSymbol(value));
-        aliases.push_back(value); previous = value;
-    }
-    b.output("direct", b.compute(OperationKind::kAnd, b.type(8), {input, rhs}));
-    b.output("throughAliases", b.compute(OperationKind::kAnd, b.type(8), {previous, rhs}));
-    const auto reference = b.design.clone(); convert(b.design);
-    transform::PassManager manager;
-    sim::SimplifyOptions options; options.maxRounds = 2;
-    manager.addPass(std::make_unique<sim::SimplifyPass>(options));
-    transform::PassDiagnostics diagnostics;
-    require(manager.run(b.design, diagnostics).success, "named alias simplify failed");
-    for (const auto& message : diagnostics.messages())
-        require(message.message.find("before convergence") == std::string::npos, "named alias consumers did not converge");
-    require(count(b.graph, OperationKind::kAnd) == 1, "named aliases blocked same-round CSE");
-    for (const auto value : aliases) {
-        const auto op = b.graph.valueDef(value);
-        require(op && b.graph.opKind(op) == OperationKind::kAssign && b.graph.opOperands(op)[0] == input,
-                "named alias view disappeared or retained a dependency chain");
-    }
-    require(b.graph.validateDeclaredSymbols().empty(), "alias propagation lost declarations");
-    compare(reference, roundTrip(b.design), {}, 128, "r3-named-alias-consumers");
-}
-
-void testArraysAndWriters() {
-    Builder b;
-    const auto clk = b.input("clk"), en = b.input("enable"), en2 = b.input("enable2"), fill = b.input("fill");
-    const auto i = b.input("index0", 2), j = b.input("index1", 2), data = b.input("data", 8), mask = b.input("mask", 8);
-    const auto flat = b.input("flat", 32), one = b.constant(1, "1'h1");
-    const auto memory = b.state("memory", b.type(32, {2, 2}), "8'h12");
-    const auto row = b.compute(OperationKind::kArrayCreate, b.type(16, {2}), {data, mask});
-    const auto all = b.read(memory);
-    b.output("packed", b.compute(OperationKind::kAssign, b.type(32), {all}));
-    b.output("element", b.read(memory, {i, j}));
-    b.output("row", b.read(memory, {i}));
-    b.write(OperationKind::kRegisterWritePort, memory, {en, flat, clk});
-    b.write(OperationKind::kRegisterWriteArrayPort, memory, {en2, i, row, clk});
-    b.write(OperationKind::kRegisterWriteArrayMaskPort, memory, {en, i, j, data, mask, clk});
-    b.write(OperationKind::kRegisterFillPort, memory, {fill, data, clk});
-    const auto latch = b.state("latch", b.type(8), "8'h00", true, true);
-    b.write(OperationKind::kLatchWritePort, latch, {en, data, mask}, {}); b.output("latch", b.read(latch));
-    const auto c0 = b.constant(2, "2'h0"), c1 = b.constant(2, "2'h1"), c3 = b.constant(2, "2'h3");
-    const auto table = b.compute(OperationKind::kArrayCreate, b.type(32, {2, 2}), {row, row});
-    b.output("sliceArrayValid", b.compute(OperationKind::kSliceArray, b.type(8), {table, c0, c1}));
-    b.output("sliceArrayDynamic", b.compute(OperationKind::kSliceArray, b.type(8), {table, c0, j}));
-    b.output("sliceArrayOob", b.compute(OperationKind::kSliceArray, b.type(8), {table, c0, c3}));
-    b.output("readArrayOob", b.read(memory, {c0, c3}));
-    const auto known = b.compute(OperationKind::kArrayCreate, b.type(16, {2}), {b.constant(8, "8'h23"), b.constant(8, "8'h45")});
-    b.output("constArray", known);
-    const auto reference = b.design.clone(); convert(b.design); simplify(b.design);
-    require(b.graph.valueLogicalType(known).shape == std::vector<int64_t>{2}, "folding erased array type");
-    require(count(b.graph, sim::kWriteArray) == 1 && count(b.graph, sim::kWriteArrayMask) == 1 && count(b.graph, sim::kFill) == 1 && count(b.graph, sim::kLatchWrite) == 1, "array/latch writers lost");
-    auto loaded = roundTrip(b.design); compare(reference, loaded, {"memory", "latch"}, 256, "r2-r3-arrays");
-}
-
-void testNarrowingAndStateSharing() {
-    Builder b;
-    const auto clk = b.input("clk"), en = b.input("enable"), data = b.input("data", 129);
-    const auto mask = b.constant(129, "129'h1ffffffffffffffffffffffffffffffff");
-    const auto wide = b.state("wide", b.type(129), "129'h123", false);
-    const auto q = b.read(wide); b.output("low", b.slice(q, 0, 5));
-    b.write(OperationKind::kRegisterWriteMaskPort, wide, {en, data, mask, clk});
-    const auto dead = b.state("dead", b.type(1), "1'h0", false);
-    const auto deadRead = b.read(dead), inverted = b.compute(OperationKind::kNot, b.type(1), {deadRead});
-    b.write(OperationKind::kRegisterWritePort, dead, {en, inverted, clk});
-    const auto deadSecond = b.state("dead_second_with_a_long_symbol", b.type(2), "2'h0", false);
-    const auto secondRead = b.read(deadSecond);
-    b.write(OperationKind::kRegisterWritePort, deadSecond,
-            {en, b.compute(OperationKind::kNot, b.type(2), {secondRead}), clk});
-    const auto byte = b.slice(data, 0, 8);
-    for (const auto& name : {"same0", "same1"}) {
-        const auto state = b.state(name, b.type(8), "8'h0");
-        b.write(OperationKind::kRegisterWritePort, state, {en, byte, clk}); b.output(name, b.read(state));
-    }
-    const auto sum = b.compute(OperationKind::kAdd, b.type(129), {data, b.constant(129, "129'h7")});
-    b.output("sumLow", b.slice(sum, 0, 9));
-    const auto reference = b.design.clone(); convert(b.design); simplify(b.design);
-    require(grh::stateLogicalType(b.graph, b.graph.findOperation("wide")).width == 5, "used-bits did not narrow shared state/read/write/init");
-    require(!b.graph.findOperation("dead"), "unobserved feedback state survived");
-    require(!b.graph.findOperation("dead_second_with_a_long_symbol"), "second unobserved feedback state survived");
-    require(count(b.graph, OperationKind::kRegister) == 2, "equivalent scalar states did not merge");
-    require(b.graph.validateDeclaredSymbols().empty(), "state sharing lost declared anchors");
-    compare(reference, roundTrip(b.design), {"same0", "same1"}, 256, "r3-narrow-shared");
-}
-
-void testMaskedOr() {
-    for (const bool dense : {true, false}) {
-        Builder b; const auto mask = b.input("mask", 4), enable = b.input("enable");
-        const auto data = b.input("data", 32), zero = b.constant(8, "8'h0");
-        const auto array = b.compute(OperationKind::kAssign, b.type(32, {4}), {data});
-        grh::ValueId reduction;
-        for (int32_t lane = 0; lane < 4; ++lane) {
-            const auto select = b.slice(mask, lane, 1);
-            const auto index = b.constant(2, "2'd" + std::to_string(lane));
-            const auto item = b.compute(OperationKind::kSliceArray, b.type(8), {array, index});
-            grh::ValueId term;
-            if (dense) term = b.compute(OperationKind::kMux, b.type(8), {select, item, zero});
-            else {
-                const auto broadcast = b.compute(OperationKind::kReplicate, b.type(8), {select});
-                b.graph.setAttr(b.graph.valueDef(broadcast), "rep", int64_t{8});
-                const auto gate = b.compute(OperationKind::kReplicate, b.type(8), {enable});
-                b.graph.setAttr(b.graph.valueDef(gate), "rep", int64_t{8});
-                term = b.compute(OperationKind::kAnd, b.type(8), {b.compute(OperationKind::kAnd, b.type(8), {item, gate}), broadcast});
-            }
-            reduction = reduction ? b.compute(OperationKind::kOr, b.type(8), {reduction, term}) : term;
-        }
-        b.output("result", reduction); const auto reference = b.design.clone(); convert(b.design);
-        require(run(b.design, std::make_unique<sim::RecoverMaskedOrPass>(sim::RecoverMaskedOrOptions{"", 2, {}})), "maskedOr recovery failed");
-        require(count(b.graph, sim::kMaskedOr) == 1, "maskedOr tree did not recover");
-        simplify(b.design); compare(reference, roundTrip(b.design), {}, 256, dense ? "r3-masked-dense" : "r3-masked-views");
-    }
-}
-
-void testPackingRejectionsAndOrigins() {
-    Builder b;
-    const auto clk = b.input("clk"), en = b.input("enable");
-    const auto one = b.constant(1, "1'h1");
-    std::vector<std::string> probes;
-    for (int32_t lane = 0; lane < 5; ++lane) {
-        const auto name = "kept" + std::to_string(lane);
-        const auto data = b.input("data" + std::to_string(lane));
-        const auto mask = lane < 2 ? b.input("mask" + std::to_string(lane)) : one;
-        const auto state = b.state(name, b.type(1, lane == 3 ? std::vector<int64_t>{1} : std::vector<int64_t>{}, lane == 2), "1'h0");
-        b.write(OperationKind::kRegisterWriteMaskPort, state, {en, data, mask, clk});
-        if (lane == 4) b.write(OperationKind::kRegisterWritePort, state, {en, one, clk});
-        b.output(name, b.read(state)); probes.push_back(name);
-    }
-    const auto reference = b.design.clone(); convert(b.design); simplify(b.design);
-    bool changed = true;
-    require(run(b.design, std::make_unique<sim::PackBitRegistersPass>(), &changed) && !changed,
-            "packing merged different masks, signed/shaped states or a multi-writer state");
-    compare(reference, roundTrip(b.design), probes, 128, "r3-pack-rejections");
-
-    Builder origins;
-    const auto a = origins.input("a", 8), c = origins.input("b", 8);
-    for (const auto& name : {"u_core", "u_mmu"}) {
-        const auto value = origins.compute(OperationKind::kAnd, origins.type(8), {a, c});
-        origins.graph.setAttr(origins.graph.valueDef(value), "originModules", std::vector<std::string>{name});
-        origins.output(name, value);
-    }
-    convert(origins.design); simplify(origins.design);
-    require(count(origins.graph, OperationKind::kAnd) == 1, "origin annotations prevented CSE");
-    for (const auto op : origins.graph.operations())
-        if (origins.graph.opKind(op) == OperationKind::kAnd)
-            require(sim::attribute<std::vector<std::string>>(origins.graph, op, "originModules") ==
-                    std::vector<std::string>{"u_core", "u_mmu"}, "CSE lost the ordered origin union");
-}
-
-void testFourStateBoundaries() {
-    Builder b;
-    const auto input = b.input("input", 8);
-    b.output("xor", b.compute(OperationKind::kXor, b.type(8), {input, input}));
-    const auto x = b.constant(4, "4'hx"), z = b.constant(4, "4'hz");
-    const auto array = b.compute(OperationKind::kArrayCreate, b.type(8, {2}), {x, z});
-    b.output("array", array);
-    const auto a = b.state("a", b.type(1), "1'hx"), c = b.state("c", b.type(1), "1'hz");
-    b.output("a", b.read(a)); b.output("c", b.read(c));
-    sim::GrhToGrhsimOptions options; options.logicDomain = grh::LogicDomain::FourState;
-    require(run(b.design, std::make_unique<sim::GrhToGrhsimPass>(options)), "FourState conversion failed");
-    simplify(b.design);
-    require(count(b.graph, OperationKind::kXor) == 1, "TwoState xor identity was applied to FourState input");
-    const auto folded = b.graph.valueDef(array);
-    require(b.graph.opKind(folded) == OperationKind::kConstant &&
-            b.graph.valueLogicalType(array).shape == std::vector<int64_t>{2} &&
-            slang::SVInt::fromString(sim::attribute<std::string>(b.graph, folded, "constValue").value()).hasUnknown(),
-            "FourState array folding lost shape or unknown bits");
-    bool changed = true;
-    require(run(b.design, std::make_unique<sim::PackBitRegistersPass>(), &changed) && !changed,
-            "FourState states were bit packed");
     roundTrip(b.design);
 }
 
-void testSelectRules() {
-    Builder b;
-    const auto c0 = b.input("c0"), c1 = b.input("c1"), c2 = b.input("c2");
-    const auto bit0 = b.input("bit0"), bit1 = b.input("bit1");
-    b.output("bitChoice", b.compute(OperationKind::kMux, b.type(1), {c0, bit0, bit1}));
-    const auto a = b.input("a", 8), c = b.input("b", 8), d = b.input("d", 8), fallback = b.input("fallback", 8);
-    const auto tail = b.compute(OperationKind::kMux, b.type(8), {c2, d, fallback});
-    const auto middle = b.compute(OperationKind::kMux, b.type(8), {c1, c, tail});
-    b.output("priority", b.compute(OperationKind::kMux, b.type(8), {c0, a, middle}));
-    const auto logarithm = b.compute(OperationKind::kSystemFunction, b.type(32), {b.constant(32, "32'd17")});
-    b.graph.setAttr(b.graph.valueDef(logarithm), "name", std::string("clog2")); b.output("logarithm", logarithm);
-    const auto reference = b.design.clone(); convert(b.design); simplify(b.design);
-    require(count(b.graph, sim::kBitSelect) == 1 && count(b.graph, sim::kPrioritySelect) == 1,
-            "simulation select rewrites did not apply");
-    require(count(b.graph, sim::kSystemFunction) == 0, "pure system function did not fold");
-    compare(reference, roundTrip(b.design), {}, 256, "r3-select-rules");
-}
+void testF24SplitNodesShapedInputView() {
+    for (const bool sign : {false, true}) {
+        Builder b;
+        const auto input = b.graph.createValue(b.graph.internSymbol("array"), b.type(24, {3}, sign));
+        b.graph.bindInputPort("array", input);
+        const auto flat = b.compute(OperationKind::kAssign, b.type(24), {input});
+        const auto selected = b.slice(flat, 9, 5);
+        b.output("selected", selected);
+        auto reference = roundTrip(b.design);
 
-void testOwnersAndDetectorKeys() {
-    Builder b; const auto a = b.input("a", 8), rhs = b.input("b", 8);
-    std::vector<grh::ValueId> roots;
-    for (int i = 0; i < 3; ++i) { const auto result = b.compute(OperationKind::kAnd, b.type(8), {a, rhs}); roots.push_back(result); b.output("and" + std::to_string(i), result); }
-    convert(b.design);
-    for (int i = 0; i < 3; ++i) b.graph.setAttr(b.graph.valueDef(roots[i]), sim::kPartition, std::vector<std::string>{"general", "nonsink", i == 2 ? "sn1" : "sn0", "leaf"});
-    const std::vector<grh::Port> ports(b.graph.outputPorts().begin(), b.graph.outputPorts().end());
-    // A complete split graph owns its output calculation in Output. This
-    // artificial owner-isolation fixture probes declared internal values.
-    std::vector<std::string> internalProbes;
-    for (const auto& port : ports) {
-        b.graph.removeOutputPort(port.name);
-        b.graph.addDeclaredSymbol(b.graph.valueSymbol(port.value));
-        internalProbes.emplace_back(b.graph.symbolText(b.graph.valueSymbol(port.value)));
+        require(run(b.design, std::make_unique<transform::SplitNodesPass>()),
+                "SplitNodes failed to slice an array through a scalar assignment");
+        const auto selectedOp = b.graph.valueDef(selected);
+        require(b.graph.opKind(selectedOp) == OperationKind::kAssign,
+                "SplitNodes did not replace the scalar view's slice");
+        const auto replacement = b.graph.opOperands(selectedOp)[0];
+        require(b.graph.valueLogicalType(replacement) == b.type(5),
+                "SplitNodes retained array shape or signedness on a bit-range view");
+        const auto view = b.graph.valueDef(replacement);
+        require(b.graph.opKind(view) == OperationKind::kSliceStatic &&
+                    b.graph.opOperands(view)[0] == input,
+                "SplitNodes did not preserve the shaped source of the scalar slice");
+
+        grhsim_test::Oracle original(*reference.findGraph("top")), rewritten(b.graph);
+        for (uint64_t bits = 0; bits < 256; ++bits) {
+            const std::map<std::string, uint64_t> inputs{{"array", bits * 0x010101u}};
+            require(original.eval(inputs) == rewritten.eval(inputs),
+                    "SplitNodes changed the bits extracted from a shaped input");
+        }
     }
-    b.graph.setMetadata(sim::kStage, std::string("nonsink-partitioned"));
-    const sim::detail::Owner firstOwner{"general", "nonsink", "sn0", "leaf"};
-    const sim::detail::Owner secondOwner{"general", "nonsink", "sn1", "leaf"};
-    sim::detail::Scope unowned(b.graph, {}), firstScope(b.graph, firstOwner), secondScope(b.graph, secondOwner);
-    require(!unowned.contains(b.graph.valueDef(roots[0])) &&
-            firstScope.contains(b.graph.valueDef(roots[0])) && !firstScope.contains(b.graph.valueDef(roots[2])) &&
-            secondScope.contains(b.graph.valueDef(roots[2])) && !secondScope.contains(b.graph.valueDef(roots[0])),
-            "default scope membership lost its partition barrier");
-    const auto before = b.design.clone(); simplify(b.design);
-    require(count(b.graph, OperationKind::kAnd) == 2, "same-owner CSE or cross-owner barrier failed");
-    compare(before, roundTrip(b.design), internalProbes, 128, "r3-owner-isolation");
-    b.graph.eraseAttr(b.graph.valueDef(roots[2]), sim::kPartition);
-    const auto stamp = transform::DesignStamp::capture(b.graph);
-    require(!run(b.design, std::make_unique<sim::SimplifyPass>()) && stamp.matches(b.graph), "partial owner attribution was optimized");
+}
 
-    Builder events; const auto clk = events.input("clk"), en = events.constant(1, "1'h1"), data = events.input("data", 8);
-    const auto state = events.state("state", events.type(8), "8'h0"); events.output("q", events.read(state));
-    for (int i = 0; i < 5; ++i) events.write(OperationKind::kRegisterWritePort, state, {en, data, clk});
-    convert(events.design);
-    std::vector<grh::OperationId> detectors;
-    for (const auto op : events.graph.operations()) if (events.graph.opKind(op) == sim::kEdgeDetect) detectors.push_back(op);
-    events.graph.setAttr(detectors[2], "edge", std::string("negedge"));
-    events.graph.setAttr(detectors[3], "prevInit", std::string("1'h1"));
-    events.graph.setAttr(detectors[4], "sampleScope", std::string("another-round"));
-    const auto reference = events.design.clone(); simplify(events.design);
-    require(count(events.graph, sim::kEdgeDetect) == 4, "different edge/init/scope detectors merged");
-    compare(reference, roundTrip(events.design), {"state"}, 128, "r3-detector-keys");
-    std::string error; const std::array<std::string_view, 1> role{"-role=event"};
-    require(!transform::makePass("grhsim-simplify", role, error), "simplify still accepts a role");
+void testF24SplitNodesRecursiveOperandsAndAttributes() {
+    Builder b;
+    const auto a = b.input("a", 16), c = b.input("c", 16);
+    const auto select = b.input("select");
+    auto left = a, right = c;
+    for (int i = 0; i < 32; ++i) {
+        left = b.compute(OperationKind::kXor, b.type(16), {left, c});
+        right = b.compute(OperationKind::kAnd, b.type(16), {right, a});
+    }
+    const auto joined = b.compute(OperationKind::kMux, b.type(16), {select, left, right});
+    const auto source = b.graph.valueDef(joined);
+    b.graph.setAttr(source, "originModules", std::vector<std::string>{"top$source"});
+    b.graph.setAttr(source, "splitFixture", std::string("copied"));
+    b.graph.setAttr(source, "splitFixtureBits", std::vector<int64_t>{2, 3, 5});
+    const auto low = b.slice(joined, 0, 3), high = b.slice(joined, 9, 5);
+    b.output("low", low); b.output("high", high);
+    auto reference = roundTrip(b.design);
+    require(run(b.design, std::make_unique<transform::SplitNodesPass>()),
+            "SplitNodes failed while recursive slicing grew shared graph pools");
+    for (const auto value : {low, high}) {
+        const auto replacement = b.graph.opOperands(b.graph.valueDef(value))[0];
+        const auto clone = b.graph.valueDef(replacement);
+        require(b.graph.opKind(clone) == OperationKind::kMux &&
+                    sim::attribute<std::string>(b.graph, clone, "splitFixture") == "copied" &&
+                    sim::attribute<std::vector<int64_t>>(b.graph, clone, "splitFixtureBits") ==
+                        std::vector<int64_t>{2, 3, 5} &&
+                    sim::attribute<std::vector<std::string>>(b.graph, clone, "originModules") ==
+                        std::vector<std::string>{"top$source"},
+                "SplitNodes did not preserve source attributes across graph pool growth");
+    }
+    grhsim_test::Oracle original(*reference.findGraph("top")), rewritten(b.graph);
+    for (uint64_t bits = 0; bits < 512; ++bits) {
+        const std::map<std::string, uint64_t> inputs{
+            {"a", bits * 0x0101u}, {"c", (bits * 0x132du) & 0xffffu}, {"select", bits & 1}};
+        require(original.eval(inputs) == rewritten.eval(inputs),
+                "SplitNodes changed a recursively sliced mux expression");
+    }
 }
+
+void testF23PatternDetect() {
+    Builder b;
+    const auto high = b.input("high", 4), low = b.input("low", 4);
+    const auto joined = b.compute(OperationKind::kConcat, b.type(8), {high, low}, "joined");
+    const auto expected = b.constant(8, "8'hA5");
+    const auto match = b.compute(OperationKind::kEq, b.type(1), {joined, expected}, "match");
+    b.output("match", match);
+    const auto joinedOp = b.graph.valueDef(joined), matchOp = b.graph.valueDef(match);
+    require(run(b.design, std::make_unique<transform::PatternDetectPass>()),
+            "F23 PatternDetect failed");
+    require(b.graph.opKind(matchOp) == OperationKind::kAnd &&
+                b.graph.opOperands(matchOp).size() == 2,
+            "F23 PatternDetect did not split concat equality");
+    for (const auto operand : b.graph.opOperands(matchOp))
+        require(b.graph.opKind(b.graph.valueDef(operand)) == OperationKind::kEq,
+                "F23 PatternDetect did not create equality tests");
+    require(std::find(b.graph.operations().begin(), b.graph.operations().end(), joinedOp) !=
+                b.graph.operations().end(),
+            "F23 PatternDetect performed hidden DCE");
+    require(run(b.design, std::make_unique<transform::DeadCodeElimPass>(), nullptr, false),
+            "explicit DCE after F23 PatternDetect failed");
+    require(std::find(b.graph.operations().begin(), b.graph.operations().end(), joinedOp) ==
+                b.graph.operations().end(),
+            "explicit DCE did not reclaim the replaced concat");
 }
+
+void testF23AliasAnalysis() {
+    Builder b;
+    const auto input = b.input("input", 8);
+    const auto alias = b.compute(OperationKind::kAssign, b.type(8), {input}, "alias");
+    const auto full = b.slice(alias, 0, 8);
+    const auto consumer = b.compute(OperationKind::kNot, b.type(8), {full}, "consumer");
+    b.output("out", consumer);
+    const auto aliasOp = b.graph.valueDef(alias), fullOp = b.graph.valueDef(full);
+    auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
+    const auto aliasSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "aliasNode");
+    b.graph.setOpSemanticIds(aliasOp, std::array{aliasSemantic});
+    b.graph.setValueSemanticIds(alias, std::array{aliasSemantic});
+    require(run(b.design, std::make_unique<transform::AliasAnalysisPass>()),
+            "F23 AliasAnalysis failed");
+    require(std::find(b.graph.operations().begin(), b.graph.operations().end(), aliasOp) !=
+                b.graph.operations().end() &&
+                std::find(b.graph.operations().begin(), b.graph.operations().end(), fullOp) !=
+                b.graph.operations().end(),
+            "F23 AliasAnalysis performed hidden DCE");
+    require(b.graph.opOperands(b.graph.valueDef(consumer))[0] == input,
+            "F23 AliasAnalysis did not redirect identity views");
+    require(std::find(b.graph.valueSemanticIds(input).begin(), b.graph.valueSemanticIds(input).end(), aliasSemantic) !=
+                b.graph.valueSemanticIds(input).end(),
+            "F23 AliasAnalysis dropped the surviving SemanticTree identity");
+    require(run(b.design, std::make_unique<transform::DeadCodeElimPass>(), nullptr, false),
+            "explicit DCE after F23 AliasAnalysis failed");
+    require(std::find(b.graph.operations().begin(), b.graph.operations().end(), aliasOp) ==
+                b.graph.operations().end() &&
+                std::find(b.graph.operations().begin(), b.graph.operations().end(), fullOp) ==
+                b.graph.operations().end(),
+            "explicit DCE did not reclaim aliases");
+}
+
+void testF23ConstantAnalysis() {
+    // A pure scalar expression whose complete input cone is literal constants
+    // becomes a kConstant in place.  The pass must preserve the output value
+    // identity so callers can inspect the folded producer directly.
+    {
+        Builder b;
+        const auto sum = b.compute(OperationKind::kAdd, b.type(8),
+                                   {b.constant(8, "8'h03"), b.constant(8, "8'h04")}, "sum");
+        b.output("sum", sum);
+        require(run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
+                "F23 constant analysis failed on a pure expression");
+        const auto op = b.graph.valueDef(sum);
+        require(b.graph.opKind(op) == OperationKind::kConstant,
+                "F23 pure expression was not rewritten to a constant");
+        const auto folded = slang::SVInt::fromString(sim::attribute<std::string>(b.graph, op, "constValue").value());
+        require(folded.as<uint64_t>() == std::optional<uint64_t>(7),
+                "F23 pure expression produced the wrong literal");
+    }
+
+    // Folding keeps the producer identity, and also carries source node
+    // identities from constant operands that the later explicit DCE may
+    // reclaim.
+    {
+        Builder b;
+        const auto lhs = b.constant(8, "8'h03"), rhs = b.constant(8, "8'h04");
+        const auto sum = b.compute(OperationKind::kAdd, b.type(8), {lhs, rhs}, "semantic_sum");
+        b.output("sum", sum);
+        auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
+        const auto lhsSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "lhs");
+        const auto rhsSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "rhs");
+        const auto sumSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "sum");
+        b.graph.setValueSemanticIds(lhs, std::array{lhsSemantic});
+        b.graph.setOpSemanticIds(b.graph.valueDef(lhs), std::array{lhsSemantic});
+        b.graph.setValueSemanticIds(rhs, std::array{rhsSemantic});
+        b.graph.setOpSemanticIds(b.graph.valueDef(rhs), std::array{rhsSemantic});
+        b.graph.setValueSemanticIds(sum, std::array{sumSemantic});
+        b.graph.setOpSemanticIds(b.graph.valueDef(sum), std::array{sumSemantic});
+        require(run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
+                "F23 semantic constant analysis failed");
+        const auto semantics = b.graph.valueSemanticIds(sum);
+        require(std::find(semantics.begin(), semantics.end(), lhsSemantic) != semantics.end() &&
+                    std::find(semantics.begin(), semantics.end(), rhsSemantic) != semantics.end() &&
+                    std::find(semantics.begin(), semantics.end(), sumSemantic) != semantics.end(),
+                "F23 constant analysis dropped folded source SemanticTree identities");
+    }
+
+    // Pure system functions are still represented by the ordinary GRH kind
+    // before conversion.  ConstantAnalysis may fold the evaluator-supported
+    // subset, while effectful/sampled functions remain opaque.
+    {
+        Builder b;
+        const auto input = b.constant(32, "32'd17");
+        const auto pure = b.compute(OperationKind::kSystemFunction, b.type(32), {input}, "clog2");
+        b.graph.setAttr(b.graph.valueDef(pure), "name", std::string("clog2"));
+        const auto sampled = b.compute(OperationKind::kSystemFunction, b.type(32), {input}, "random");
+        b.graph.setAttr(b.graph.valueDef(sampled), "name", std::string("random"));
+        b.output("pure", pure); b.output("sampled", sampled);
+        require(run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
+                "F23 system-function constant analysis failed");
+        require(b.graph.opKind(b.graph.valueDef(pure)) == OperationKind::kConstant,
+                "F23 pure system function was not folded");
+        require(b.graph.opKind(b.graph.valueDef(sampled)) == OperationKind::kSystemFunction,
+                "F23 sampled system function was folded unsafely");
+    }
+
+    // A constant select can choose between two constant arms.  With a dynamic
+    // select, the same pass must leave a differing-arm mux intact because its
+    // result is not a compile-time constant.
+    {
+        Builder b;
+        const auto selected = b.compute(OperationKind::kMux, b.type(8),
+                                        {b.constant(1, "1'b1"), b.constant(8, "8'h11"),
+                                         b.constant(8, "8'h22")}, "selected");
+        const auto select = b.input("select");
+        const auto dynamic = b.compute(OperationKind::kMux, b.type(8),
+                                       {select, b.constant(8, "8'h11"), b.constant(8, "8'h22")}, "dynamic");
+        b.output("selected", selected); b.output("dynamic", dynamic);
+        require(run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
+                "F23 constant analysis failed on muxes");
+        require(b.graph.opKind(b.graph.valueDef(selected)) == OperationKind::kConstant,
+                "F23 constant-select mux was not folded");
+        require(b.graph.opKind(b.graph.valueDef(dynamic)) == OperationKind::kMux,
+                "F23 dynamic-select mux was folded unsafely");
+    }
+
+    // Constant analysis owns no liveness policy: an unobserved pure cone is
+    // folded but remains present, and a declared operation remains anchored
+    // until an explicit DCE pass is requested.
+    {
+        Builder b;
+        const auto dead = b.compute(OperationKind::kAdd, b.type(8),
+                                    {b.constant(8, "8'h09"), b.constant(8, "8'h01")}, "declared_dead");
+        b.graph.addDeclaredSymbol(b.graph.operationSymbol(b.graph.valueDef(dead)));
+        const auto deadOp = b.graph.valueDef(dead);
+        const auto live = b.compute(OperationKind::kNot, b.type(8), {b.constant(8, "8'h00")}, "live");
+        b.output("live", live);
+        require(run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
+                "F23 constant analysis failed on an anchored dead cone");
+        require(std::find(b.graph.operations().begin(), b.graph.operations().end(), deadOp) !=
+                    b.graph.operations().end() && b.graph.opKind(deadOp) == OperationKind::kConstant,
+                "F23 constant analysis performed hidden DCE or lost the declared cone");
+        require(b.graph.validateDeclaredSymbols().empty(),
+                "F23 constant analysis invalidated a declared symbol");
+    }
+}
+
+void testConstantAnalysisTopology() {
+    {
+        Builder b;
+        constexpr int32_t repetitions = 32768;
+        const auto one = b.constant(1, "1'b1");
+        const auto concat = b.graph.createOperation(OperationKind::kConcat);
+        const auto value = b.graph.createValue(b.type(repetitions));
+        b.graph.addResult(concat, value);
+        for (int32_t i = 0; i < repetitions; ++i) b.graph.addOperand(concat, one);
+        b.output("out", value);
+        require(run(b.design, std::make_unique<transform::GrhVerifyPass>()),
+                "ConstantAnalysis repeated-input fixture is invalid GRH");
+        require(run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
+                "ConstantAnalysis failed on a high-fanin repeated input");
+        require(b.graph.opKind(concat) == OperationKind::kConstant,
+                "ConstantAnalysis did not fold the high-fanin concat");
+        const auto folded = slang::SVInt::fromString(sim::attribute<std::string>(b.graph, concat, "constValue").value());
+        require(folded.getBitWidth() == repetitions && !folded.hasUnknown() && folded.countOnes() == repetitions,
+                "ConstantAnalysis produced incorrect repeated concat bits");
+    }
+    {
+        Builder b;
+        constexpr int32_t count = 4096;
+        std::vector<grh::ValueId> inputs;
+        for (int32_t i = 0; i < count; ++i) inputs.push_back(b.graph.createValue(b.type(1)));
+        const auto concat = b.graph.createOperation(OperationKind::kConcat);
+        const auto value = b.graph.createValue(b.type(count));
+        b.graph.addResult(concat, value);
+        for (const auto input : inputs) b.graph.addOperand(concat, input);
+        for (int32_t i = count; i-- > 0;) {
+            const auto constant = b.graph.createOperation(OperationKind::kConstant);
+            b.graph.addResult(constant, inputs[i]);
+            b.graph.setAttr(constant, "constValue", std::string(i % 2 == 0 ? "1'b1" : "1'b0"));
+        }
+        b.output("out", value);
+        require(run(b.design, std::make_unique<transform::GrhVerifyPass>()),
+                "ConstantAnalysis reverse-defined fixture is invalid GRH");
+        require(run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
+                "ConstantAnalysis failed on reverse-defined distinct producers");
+        require(b.graph.opKind(concat) == OperationKind::kConstant,
+                "ConstantAnalysis did not topologically fold the reverse-defined concat");
+        const auto folded = slang::SVInt::fromString(sim::attribute<std::string>(b.graph, concat, "constValue").value());
+        require(folded.countOnes() == count / 2 &&
+                    folded.slice(63, 0).as<uint64_t>() == std::optional<uint64_t>(0xaaaaaaaaaaaaaaaaULL),
+                "ConstantAnalysis changed reverse-defined concat operand order");
+    }
+    {
+        Builder b;
+        const auto input = b.input("input", 8);
+        const auto lhs = b.graph.createValue(b.type(8)), rhs = b.graph.createValue(b.type(8));
+        // A real external producer has several results. Its consumer is
+        // deliberately defined first and repeats each result, plus an input
+        // with no producer, so decrement multiplicities must match uses.
+        const auto dynamic = b.compute(OperationKind::kConcat, b.type(56), {lhs, lhs, rhs, input, lhs, rhs, rhs});
+        b.output("dynamic", dynamic);
+        const auto imported = b.graph.createOperation(OperationKind::kDpicImport, b.graph.internSymbol("dpi"));
+        b.graph.setAttr(imported, "argsName", std::vector<std::string>{"lhs", "rhs"});
+        b.graph.setAttr(imported, "argsDirection", std::vector<std::string>{"output", "output"});
+        b.graph.setAttr(imported, "argsWidth", std::vector<int64_t>{8, 8});
+        b.graph.setAttr(imported, "argsSigned", std::vector<bool>{false, false});
+        b.graph.setAttr(imported, "hasReturn", false);
+        const auto call = b.graph.createOperation(OperationKind::kDpicCall);
+        b.graph.addOperand(call, b.constant(1, "1'b1"));
+        b.graph.addResult(call, lhs);
+        b.graph.addResult(call, rhs);
+        b.graph.setAttr(call, "targetImportSymbol", std::string("dpi"));
+        const auto sum = b.compute(OperationKind::kAdd, b.type(8), {b.constant(8, "8'd7"), b.constant(8, "8'd8")});
+        b.output("sum", sum);
+        require(run(b.design, std::make_unique<transform::GrhVerifyPass>()),
+                "ConstantAnalysis multi-result fixture is invalid GRH");
+        require(run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
+                "ConstantAnalysis incorrectly rejected multi-result/repeated input topology");
+        require(b.graph.opKind(b.graph.valueDef(dynamic)) == OperationKind::kConcat &&
+                    b.graph.opOperands(b.graph.valueDef(dynamic)).size() == 7,
+                "ConstantAnalysis folded a dynamic multi-result producer");
+        const auto folded = slang::SVInt::fromString(sim::attribute<std::string>(b.graph, b.graph.valueDef(sum), "constValue").value());
+        require(folded.as<uint64_t>() == std::optional<uint64_t>(15),
+                "ConstantAnalysis lost an independent constant cone");
+    }
+    {
+        Builder b;
+        const auto lhs = b.graph.createValue(b.type(8)), rhs = b.graph.createValue(b.type(8));
+        const auto left = b.graph.createOperation(OperationKind::kNot);
+        b.graph.addOperand(left, rhs);
+        b.graph.addResult(left, lhs);
+        const auto right = b.graph.createOperation(OperationKind::kNot);
+        b.graph.addOperand(right, lhs);
+        b.graph.addResult(right, rhs);
+        b.output("out", lhs);
+        transform::PassManager manager;
+        manager.addPass(std::make_unique<transform::ConstantAnalysisPass>());
+        transform::PassDiagnostics diagnostics;
+        require(!manager.run(b.design, diagnostics).success,
+                "ConstantAnalysis accepted a combinational cycle");
+        require(std::any_of(diagnostics.messages().begin(), diagnostics.messages().end(), [](const auto& message) {
+                    return message.message.find("requires an acyclic expanded graph") != std::string::npos;
+                }), "ConstantAnalysis lost its cycle rejection diagnostic");
+    }
+}
+
+void testF23CommonExpr() {
+    Builder b;
+    const auto input = b.input("input", 8);
+    auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
+    std::vector<grh::SemanticId> semantics;
+    std::vector<grh::OperationId> duplicateOps;
+    for (int i = 0; i < 5; ++i) {
+        const auto value = b.compute(OperationKind::kNot, b.type(8), {input}, "common" + std::to_string(i));
+        duplicateOps.push_back(b.graph.valueDef(value));
+        const auto semantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression,
+                                           "common" + std::to_string(i));
+        semantics.push_back(semantic);
+        b.graph.setOpSemanticIds(duplicateOps.back(), std::array{semantic});
+        b.graph.setValueSemanticIds(value, std::array{semantic});
+        b.graph.setAttr(duplicateOps.back(), "originModules", std::vector<std::string>{"origin" + std::to_string(i)});
+        if (i == 4) b.graph.addDeclaredSymbol(b.graph.operationSymbol(duplicateOps.back()));
+        b.output("out" + std::to_string(i), b.compute(OperationKind::kAssign, b.type(8), {value}));
+    }
+    require(run(b.design, std::make_unique<transform::CommonExprPass>()),
+            "F23 CommonExpr failed on repeated pure expressions");
+    for (const auto op : duplicateOps)
+        require(std::find(b.graph.operations().begin(), b.graph.operations().end(), op) !=
+                    b.graph.operations().end(),
+                "F23 CommonExpr performed hidden DCE");
+    // The five expression rows remain until the caller requests liveness
+    // cleanup, but only the representative keeps a user after sharing.
+    std::size_t liveNot = 0;
+    for (const auto op : duplicateOps)
+        if (!b.graph.valueUsers(b.graph.opResults(op)[0]).empty()) ++liveNot;
+    require(liveNot == 1, "F23 CommonExpr did not redirect duplicate users");
+    const auto representative = duplicateOps.front();
+    for (const auto semantic : semantics) {
+        const auto opIds = b.graph.opSemanticIds(representative);
+        const auto valueIds = b.graph.valueSemanticIds(b.graph.opResults(representative)[0]);
+        require(std::find(opIds.begin(), opIds.end(), semantic) != opIds.end() &&
+                    std::find(valueIds.begin(), valueIds.end(), semantic) != valueIds.end(),
+                "F23 CommonExpr dropped a merged operation/value SemanticId");
+    }
+    require(transform::getOriginModules(b.graph, representative).value_or(std::vector<std::string>{}).size() == 5,
+            "F23 CommonExpr dropped merged origins");
+    require(run(b.design, std::make_unique<transform::DeadCodeElimPass>(), nullptr, false),
+            "explicit DCE after CommonExpr failed");
+    std::size_t survivingNot = 0;
+    for (const auto op : duplicateOps)
+        if (std::find(b.graph.operations().begin(), b.graph.operations().end(), op) !=
+            b.graph.operations().end()) ++survivingNot;
+    require(survivingNot == 1, "explicit DCE did not reclaim CommonExpr duplicates");
+}
+
+void testCommonExprSharedDagAndDeepChain() {
+    {
+        Builder b;
+        auto value = b.input("input", 8);
+        for (int i = 0; i < 48; ++i)
+            value = b.compute(OperationKind::kAdd, b.type(8), {value, value});
+        b.output("out", b.compute(OperationKind::kAssign, b.type(8), {value}));
+        const auto size = b.graph.operations().size();
+        bool changed = true;
+        require(run(b.design, std::make_unique<transform::CommonExprPass>(), &changed),
+                "CommonExpr failed on a 48-level shared doubling DAG");
+        require(!changed && b.graph.operations().size() == size,
+                "CommonExpr unexpectedly rewrote the unique shared DAG");
+    }
+    {
+        Builder b;
+        constexpr std::size_t depth = 16000;
+        std::vector<grh::ValueId> values{b.input("input", 8)};
+        for (std::size_t i = 0; i < depth; ++i) values.push_back(b.graph.createValue(b.type(8)));
+        // Define consumers first so the first candidate requires the complete
+        // postorder traversal rather than hitting already-memoized children.
+        for (std::size_t i = depth; i != 0; --i) {
+            const auto op = b.graph.createOperation(OperationKind::kNot);
+            b.graph.addOperand(op, values[i - 1]);
+            b.graph.addResult(op, values[i]);
+        }
+        b.output("out", b.compute(OperationKind::kAssign, b.type(8), {values.back()}));
+        bool changed = true;
+        require(run(b.design, std::make_unique<transform::CommonExprPass>(), &changed),
+                "CommonExpr failed on a reverse-defined deep unary chain");
+        require(!changed, "CommonExpr unexpectedly merged distinct chain depths");
+    }
+}
+
+void testCommonExprPolicyAndExactAttributes() {
+    const auto policy = [](int copies, int width, bool fanout, bool expected) {
+        Builder b;
+        const auto input = b.input("input", width);
+        std::vector<grh::OperationId> ops;
+        for (int i = 0; i < copies; ++i) {
+            const auto value = b.compute(OperationKind::kNot, b.type(width), {input});
+            ops.push_back(b.graph.valueDef(value));
+            b.output("out" + std::to_string(i), b.compute(OperationKind::kAssign, b.type(width), {value}));
+            if (fanout && i == 0)
+                b.output("extra", b.compute(OperationKind::kAssign, b.type(width), {value}));
+        }
+        bool changed = false;
+        require(run(b.design, std::make_unique<transform::CommonExprPass>(), &changed),
+                "CommonExpr policy fixture failed");
+        require(changed == expected, "CommonExpr changed the count/width/fanout merge threshold");
+        require(std::all_of(ops.begin(), ops.end(), [&](auto op) {
+                    return std::find(b.graph.operations().begin(), b.graph.operations().end(), op) != b.graph.operations().end();
+                }), "CommonExpr policy fixture performed hidden DCE");
+    };
+    policy(4, 256, false, false);
+    policy(5, 256, false, true);
+    policy(2, 257, false, true);
+    policy(2, 256, true, true);
+    {
+        Builder b;
+        const auto input = b.input("input", 8);
+        for (int i = 0; i < 2; ++i) {
+            const auto value = b.compute(OperationKind::kNot, b.type(8), {input});
+            b.output("out" + std::to_string(i), b.compute(OperationKind::kAdd, b.type(8), {value, value}));
+        }
+        bool changed = true;
+        require(run(b.design, std::make_unique<transform::CommonExprPass>(), &changed),
+                "CommonExpr repeated-operand fanout fixture failed");
+        require(!changed, "CommonExpr counted two operands of one consumer as fanout two");
+    }
+    for (const bool reverseDefinitions : {false, true}) {
+        Builder b;
+        const auto input = b.input("input", 8);
+        const std::array values{b.graph.createValue(b.type(8)), b.graph.createValue(b.type(8))};
+        const auto defineSources = [&]() {
+            for (const auto value : values) {
+                const auto op = b.graph.createOperation(OperationKind::kNot);
+                b.graph.addOperand(op, input);
+                b.graph.addResult(op, value);
+            }
+        };
+        if (!reverseDefinitions) defineSources();
+        std::vector<grh::OperationId> sums, users;
+        for (int i = 0; i < 2; ++i) {
+            const auto sum = b.compute(OperationKind::kAdd, b.type(8), {values[i], values[i]});
+            sums.push_back(b.graph.valueDef(sum));
+            for (int j = 0; j < 2; ++j) {
+                const auto user = b.compute(OperationKind::kAssign, b.type(8), {sum});
+                users.push_back(b.graph.valueDef(user));
+                b.output("out" + std::to_string(users.size()), user);
+            }
+        }
+        if (reverseDefinitions) defineSources();
+        require(run(b.design, std::make_unique<transform::CommonExprPass>()),
+                "CommonExpr interacting-group fanout fixture failed");
+        require(b.graph.opOperands(sums[0])[0] != b.graph.opOperands(sums[1])[0],
+                "CommonExpr changed the single-consumer source-group decision");
+        require(b.graph.opOperands(users[0])[0] == b.graph.opOperands(users[2])[0],
+                "CommonExpr failed to share the downstream group with two distinct consumers");
+    }
+    for (const bool vectorAttribute : {false, true}) {
+        Builder b;
+        const auto input = b.input("input", 8);
+        for (int i = 0; i < 5; ++i) {
+            const auto value = b.compute(OperationKind::kNot, b.type(8), {input});
+            if (vectorAttribute)
+                b.graph.setAttr(b.graph.valueDef(value), "exact", std::vector<double>{2.0000001 + i * 0.0000001});
+            else
+                b.graph.setAttr(b.graph.valueDef(value), "exact", 1.0000001 + i * 0.0000001);
+            b.output("out" + std::to_string(i), b.compute(OperationKind::kAssign, b.type(8), {value}));
+        }
+        bool changed = true;
+        require(run(b.design, std::make_unique<transform::CommonExprPass>(), &changed),
+                "CommonExpr exact-attribute fixture failed");
+        require(!changed, "CommonExpr merged unequal floating attributes after lossy formatting");
+    }
+    {
+        Builder b;
+        const auto lhs = b.input("lhs", 8), rhs = b.input("rhs", 8);
+        std::vector<grh::OperationId> users;
+        for (int direction = 0; direction < 2; ++direction)
+            for (int i = 0; i < 5; ++i) {
+                const auto value = b.compute(OperationKind::kSub, b.type(8),
+                                              {direction ? rhs : lhs, direction ? lhs : rhs});
+                const auto user = b.compute(OperationKind::kAssign, b.type(8), {value});
+                users.push_back(b.graph.valueDef(user));
+                b.output("out" + std::to_string(users.size()), user);
+            }
+        require(run(b.design, std::make_unique<transform::CommonExprPass>()),
+                "CommonExpr ordered-operand fixture failed");
+        require(b.graph.opOperands(users[0])[0] != b.graph.opOperands(users[5])[0],
+                "CommonExpr ignored operand order in its exact signature");
+    }
+}
+
+} // namespace
 
 int main() {
     try {
         testOperandReplacement();
         testGenerateGroupMembershipIndex();
-        testEventsCallsAndPacking(); testConstantAliasConvergence(); testCseAttributePayloads(); testVerifiedUnpartitionedScope(); testNamedAliasConsumers(); testArraysAndWriters(); testNarrowingAndStateSharing(); testMaskedOr();
-        testPackingRejectionsAndOrigins(); testFourStateBoundaries(); testSelectRules(); testOwnersAndDetectorKeys();
+        testF22Passes();
+        testF24UsedBitsIndexedReadKeepsFullIndex();
+        testF24UsedBitsPreservesFourStateArithmetic();
+        testGrhToGrhsimSemanticTree();
+        testF23ConstantAnalysis();
+        testConstantAnalysisTopology();
+        testF23CommonExpr();
+        testCommonExprSharedDagAndDeepChain();
+        testCommonExprPolicyAndExactAttributes();
+        testF23SplitNodes();
+        testF24SplitNodesShapedInputView();
+        testF24SplitNodesRecursiveOperandsAndAttributes();
+        testF23PatternDetect();
+        testF23AliasAnalysis();
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     std::cout << "GRH-based GrhSIM conversion/optimization observations agree\n";
     return 0;

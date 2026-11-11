@@ -59,7 +59,6 @@ void testConesHistoriesAndRestart() {
     run(candidate, "grhsim-partition-nonsink", fixture.session, {"-max-supernode-nodes=4"});
     require(activity == json(candidate) && activityStamp.matches(*candidate.findGraph("top")), "activity cutter is not idempotent");
     candidate = grh::Design::fromJsonString(activity);
-    run(candidate, "grhsim-simplify", fixture.session);
     run(candidate, "grhsim-partition-sink", fixture.session);
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, *candidate.findGraph("top"));
     compare(reference, candidate, {"memory", "q"}, inputs, "sink-schedule", &schedule);
@@ -123,7 +122,6 @@ void testActivityAndCloneIsolation() {
         require(sim::attribute<std::vector<std::string>>(fixture.graph, op, "originModules") == std::vector<std::string>{"top$shared"}, "boundary clone lost source annotation");
     }
     require(nots == 1 && owners.size() == 1, "clone introduced an unavailable input activation");
-    run(fixture.design, "grhsim-simplify", fixture.session);
     require(count(fixture.graph, OperationKind::kNot) == 1, "partition simplify changed bounded sharing");
     run(fixture.design, "grhsim-partition-sink", fixture.session);
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, fixture.graph);

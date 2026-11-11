@@ -2,10 +2,49 @@
 
 #include "partition-internal.hpp"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 namespace wolvrix::lib::transform::grhsim {
 namespace {
 using namespace grh;
 using namespace detail;
+
+class SinkPhaseTiming {
+public:
+    explicit SinkPhaseTiming(const char* scope) : scope_(scope) {}
+
+    void mark(const char* phase, std::size_t writers = 0, std::size_t groups = 0,
+              std::size_t runs = 0, std::size_t roots = 0, std::size_t nodes = 0,
+              std::size_t edges = 0, std::size_t clones = 0, std::size_t memberships = 0) {
+        if (!enabled_) return;
+        uint64_t rss = 0, peak = 0;
+        if (auto* status = std::fopen("/proc/self/status", "r")) {
+            char line[256];
+            unsigned long long value;
+            while (std::fgets(line, sizeof(line), status)) {
+                if (std::sscanf(line, "VmRSS: %llu kB", &value) == 1) rss = value;
+                if (std::sscanf(line, "VmHWM: %llu kB", &value) == 1) peak = value;
+            }
+            std::fclose(status);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = [&](auto from) {
+            return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - from).count());
+        };
+        std::fprintf(stderr, "[grhsim-partition-sink-phase] scope=%s phase=%s elapsed_ms=%llu total_ms=%llu rss_kib=%llu peak_rss_kib=%llu writers=%zu groups=%zu runs=%zu roots=%zu dag_nodes=%zu dag_edges=%zu clones=%zu memberships=%zu\n",
+            scope_, phase, ms(previous_), ms(start_), static_cast<unsigned long long>(rss),
+            static_cast<unsigned long long>(peak), writers, groups, runs, roots, nodes, edges, clones, memberships);
+        previous_ = now;
+    }
+
+private:
+    const char* scope_;
+    const bool enabled_ = std::getenv("WOLVRIX_SIMPLIFY_PHASE_TIMING") != nullptr;
+    const std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point previous_ = start_;
+};
 
 std::string clockSignature(const Graph& graph, ValueId fire) {
     if (!fire) return "level";
@@ -47,7 +86,8 @@ uint64_t configHash(const Graph& graph) {
 
 struct NonsinkDag {
     std::vector<StringListView> order;
-    std::vector<std::size_t> prerequisiteOffsets, prerequisites;
+    std::vector<std::size_t> prerequisiteOffsets;
+    std::vector<uint32_t> prerequisites;
     std::vector<std::size_t> operationNode;
     std::vector<uint8_t> general;
 };
@@ -76,6 +116,7 @@ NonsinkDag nonsinkDag(const Graph& graph) {
         if (keys.empty() || !sameOwner(keys.back(), key)) keys.push_back(key);
         result.operationNode[op.index] = keys.size() - 1;
     }
+    if (keys.size() > UINT32_MAX) throw std::invalid_argument("Too many nonsink schedule leaves");
     std::vector<std::pair<std::size_t, std::size_t>> edges;
     for (const auto op : operations) {
         const auto target = result.operationNode[op.index];
@@ -119,20 +160,21 @@ NonsinkDag nonsinkDag(const Graph& graph) {
         result.prerequisiteOffsets[i] += result.prerequisiteOffsets[i - 1];
     auto cursor = result.prerequisiteOffsets;
     result.prerequisites.resize(edges.size());
-    for (const auto& [source, target] : edges) result.prerequisites[cursor[ordinal[target]]++] = ordinal[source];
+    for (const auto& [source, target] : edges)
+        result.prerequisites[cursor[ordinal[target]]++] = static_cast<uint32_t>(ordinal[source]);
     for (const auto op : operations) result.operationNode[op.index] = ordinal[result.operationNode[op.index]];
     return result;
 }
 
-std::vector<std::size_t> directDependencies(const Graph& graph, OperationId writer, const NonsinkDag& dag) {
-    std::vector<std::size_t> result;
+std::vector<uint32_t> directDependencies(const Graph& graph, OperationId writer, const NonsinkDag& dag) {
+    std::vector<uint32_t> result;
     std::vector<OperationId> queue{writer};
     std::unordered_set<OperationId, OperationIdHash> seen;
     while (!queue.empty()) {
         const auto op = queue.back(); queue.pop_back();
         if (!seen.insert(op).second) continue;
         const auto node = dag.operationNode[op.index];
-        if (node != SIZE_MAX) { result.push_back(node); continue; }
+        if (node != SIZE_MAX) { result.push_back(static_cast<uint32_t>(node)); continue; }
         for (const auto value : graph.opOperands(op)) {
             const auto producer = graph.valueDef(value);
             if (producer) {
@@ -144,12 +186,17 @@ std::vector<std::size_t> directDependencies(const Graph& graph, OperationId writ
 }
 
 SinkSchedule buildSchedule(const Graph& graph) {
+    SinkPhaseTiming timing("schedule");
+    timing.mark("start");
     SinkSchedule schedule;
     schedule.stamp = DesignStamp::capture(graph);
     schedule.partitionConfigHash = configHash(graph);
     const auto writers = orderedWriters(graph);
-    const auto nonsinks = nonsinkDag(graph);
-    std::vector<std::vector<std::size_t>> runRoots;
+    timing.mark("writers-ordered", writers.size());
+    auto nonsinks = nonsinkDag(graph);
+    timing.mark("nonsink-dag", writers.size(), 0, 0, 0, nonsinks.order.size(), nonsinks.prerequisites.size());
+    schedule.nonsinkKeys.reserve(nonsinks.order.size());
+    for (const auto key : nonsinks.order) schedule.nonsinkKeys.push_back(copyOwner(key));
     std::map<PartitionKey, SinkGroup, OwnerLess> groups;
     std::map<PartitionKey, std::string> clocks;
     std::map<PartitionKey, uint32_t> groupPriorities;
@@ -183,37 +230,30 @@ SinkSchedule buildSchedule(const Graph& graph) {
         }
         if (schedule.generalRuns.empty() || schedule.generalRuns.back().partitionKey != key) {
             schedule.generalRuns.push_back({key, {}, {}});
-            runRoots.emplace_back();
         }
         auto& run = schedule.generalRuns.back();
         run.orderedWriters.push_back(writer);
         const auto required = directDependencies(graph, writer, nonsinks);
-        runRoots.back().insert(runRoots.back().end(), required.begin(), required.end());
+        run.directNonsinkRoots.insert(run.directNonsinkRoots.end(), required.begin(), required.end());
         if (key[1] == "large-sink") {
             if (schedule.largeCommitRuns.empty() || schedule.largeCommitRuns.back().partitionKey != key)
                 schedule.largeCommitRuns.push_back({key, {}, {}});
             schedule.largeCommitRuns.back().orderedWriters.push_back(writer);
         }
     }
-    // A run can contain thousands of writers sharing one cone. Expand its
-    // closure once using dense indices; keep text keys only in the published
-    // schedule, with the same complete leaf dependency/order contract.
-    std::vector<std::size_t> seen(nonsinks.order.size(), 0);
-    for (std::size_t i = 0; i < schedule.generalRuns.size(); ++i) {
-        auto pending = std::move(runRoots[i]);
-        std::vector<std::size_t> required;
-        while (!pending.empty()) {
-            const auto key = pending.back(); pending.pop_back();
-            if (seen[key] == i + 1) continue;
-            seen[key] = i + 1; required.push_back(key);
-            pending.insert(pending.end(), nonsinks.prerequisites.begin() + nonsinks.prerequisiteOffsets[key],
-                           nonsinks.prerequisites.begin() + nonsinks.prerequisiteOffsets[key + 1]);
-        }
-        std::sort(required.begin(), required.end());
-        auto& keys = schedule.generalRuns[i].requiredNonsinkKeys;
-        keys.reserve(required.size());
-        for (const auto key : required) keys.push_back(copyOwner(nonsinks.order[key]));
+    // Keep the shared DAG and canonical roots. Materializing every run's full
+    // ancestor closure duplicates the same leaf keys across interleaved runs.
+    std::size_t rootCount = 0;
+    for (auto& run : schedule.generalRuns) {
+        auto& roots = run.directNonsinkRoots;
+        std::sort(roots.begin(), roots.end());
+        roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+        rootCount += roots.size();
     }
+    schedule.nonsinkPrerequisiteOffsets = std::move(nonsinks.prerequisiteOffsets);
+    schedule.nonsinkPrerequisites = std::move(nonsinks.prerequisites);
+    timing.mark("run-roots", writers.size(), groups.size(), schedule.generalRuns.size(), rootCount,
+                schedule.nonsinkKeys.size(), schedule.nonsinkPrerequisites.size());
     for (const auto op : graph.operations()) {
         const auto& path = ownerView(graph, op);
         if (path.size() == 3 && path[0] == "general" && path[1] != "nonsink" && !groups.contains(path))
@@ -221,8 +261,47 @@ SinkSchedule buildSchedule(const Graph& graph) {
     }
     for (auto& [key, group] : groups) schedule.sinkGroups.push_back(std::move(group));
     schedule.complete = true;
+    timing.mark("done", writers.size(), schedule.sinkGroups.size(), schedule.generalRuns.size(), rootCount,
+                schedule.nonsinkKeys.size(), schedule.nonsinkPrerequisites.size());
     return schedule;
 }
+}
+
+std::vector<uint32_t> requiredNonsinkOrdinals(const SinkSchedule& schedule, const SinkRun& run) {
+    const auto nodes = schedule.nonsinkKeys.size();
+    const auto& offsets = schedule.nonsinkPrerequisiteOffsets;
+    const auto& edges = schedule.nonsinkPrerequisites;
+    if (nodes > UINT32_MAX || offsets.size() != nodes + 1 || offsets.front() != 0 || offsets.back() != edges.size())
+        throw std::invalid_argument("Invalid nonsink schedule DAG");
+    if (!std::is_sorted(run.directNonsinkRoots.begin(), run.directNonsinkRoots.end()) ||
+        std::adjacent_find(run.directNonsinkRoots.begin(), run.directNonsinkRoots.end()) != run.directNonsinkRoots.end())
+        throw std::invalid_argument("Noncanonical nonsink schedule roots");
+    std::vector<uint8_t> seen(nodes);
+    std::vector<uint32_t> pending;
+    const auto push = [&](uint32_t key) {
+        if (key >= nodes) throw std::invalid_argument("Nonsink schedule root is out of range");
+        if (!seen[key]) { seen[key] = 1; pending.push_back(key); }
+    };
+    for (const auto key : run.directNonsinkRoots) push(key);
+    std::vector<uint32_t> required;
+    while (!pending.empty()) {
+        const auto key = pending.back(); pending.pop_back();
+        required.push_back(key);
+        if (offsets[key] > offsets[key + 1] || offsets[key + 1] > edges.size())
+            throw std::invalid_argument("Invalid nonsink schedule row");
+        for (auto i = offsets[key]; i < offsets[key + 1]; ++i) {
+            if (edges[i] >= key) throw std::invalid_argument("Nonsink schedule prerequisite is not topological");
+            push(edges[i]);
+        }
+    }
+    std::sort(required.begin(), required.end());
+    return required;
+}
+
+std::vector<PartitionKey> requiredNonsinkKeys(const SinkSchedule& schedule, const SinkRun& run) {
+    std::vector<PartitionKey> result;
+    for (const auto ordinal : requiredNonsinkOrdinals(schedule, run)) result.push_back(schedule.nonsinkKeys[ordinal]);
+    return result;
 }
 
 std::string sinkScheduleKey(const grh::Graph& graph) {
@@ -235,7 +314,9 @@ std::string verifySinkSchedule(const grh::Graph& graph, const SinkSchedule& sche
         if (stage(graph) != "sink-partitioned") return "Sink schedule requires sink-partitioned stage";
         if (const auto problem = verifyGraph(graph); !problem.empty()) return problem;
         const auto expected = buildSchedule(graph);
-        if (schedule.partitionConfigHash != expected.partitionConfigHash || schedule.sinkGroups != expected.sinkGroups ||
+        if (schedule.partitionConfigHash != expected.partitionConfigHash || schedule.nonsinkKeys != expected.nonsinkKeys ||
+            schedule.nonsinkPrerequisiteOffsets != expected.nonsinkPrerequisiteOffsets ||
+            schedule.nonsinkPrerequisites != expected.nonsinkPrerequisites || schedule.sinkGroups != expected.sinkGroups ||
             schedule.generalRuns != expected.generalRuns || schedule.largeCommitRuns != expected.largeCommitRuns)
             return "Sink schedule disagrees with graph ownership, guards, dependencies or writer order";
         return {};
@@ -255,6 +336,8 @@ PartitionSinkPass::PartitionSinkPass(PartitionSinkOptions options)
 bool PartitionSinkPass::supportsDialect(std::string_view dialect) const noexcept { return supports(dialect); }
 
 PassResult PartitionSinkPass::run() {
+    SinkPhaseTiming timing("partition");
+    timing.mark("start");
     PassResult result;
     Graph* graph = nullptr;
     try {
@@ -266,6 +349,7 @@ PassResult PartitionSinkPass::run() {
             std::erase_if(*session(), [&](const auto& entry) { return entry.first.starts_with(prefix); });
         }
         graph = &partitionGraph(design(), top);
+        timing.mark("input-verified");
         const std::string configuration = std::to_string(options_.enableGuardMinSize);
         const bool rebuild = stage(*graph) == "sink-partitioned";
         if (rebuild && graph->metadata("grhsim.sinkConfig") != std::optional<AttributeValue>(configuration))
@@ -275,6 +359,7 @@ PassResult PartitionSinkPass::run() {
         if (!session()) throw std::invalid_argument("Sink partitioning requires a session");
         if (!rebuild) {
             const auto writers = orderedWriters(*graph);
+            timing.mark("writers-ordered", writers.size());
             std::unordered_map<OperationId, uint32_t, OperationIdHash> priorities;
             std::unordered_map<OperationId, uint32_t, OperationIdHash> nextPriority;
             std::unordered_map<OperationId, std::string, OperationIdHash> clocks;
@@ -290,6 +375,7 @@ PassResult PartitionSinkPass::run() {
                 // Counts are keyed by a textual value symbol, not ValueId's
                 // ordering (ValueId deliberately has equality only).
             }
+            timing.mark("clocks", writers.size(), clockCache.size());
             std::map<std::pair<std::string, std::string>, uint32_t> counts;
             for (const auto writer : writers) {
                 const auto args = graph->opOperands(writer);
@@ -297,6 +383,7 @@ PassResult PartitionSinkPass::run() {
                 if (!graph->valueDef(enable) || graph->opKind(graph->valueDef(enable)) != OperationKind::kConstant)
                     ++counts[{clocks.at(writer), std::string(graph->symbolText(graph->valueSymbol(enable)))}];
             }
+            timing.mark("guards-counted", writers.size(), counts.size());
             std::map<std::string, Owner> groups;
             std::map<Owner, std::unordered_set<OperationId, OperationIdHash>> members;
             std::unordered_map<OperationId, Owner, OperationIdHash> destinations;
@@ -328,10 +415,14 @@ PassResult PartitionSinkPass::run() {
                     }
                 }
             }
+            std::size_t membershipCount = 0;
+            for (const auto& [key, required] : members) membershipCount += required.size();
+            timing.mark("sink-cones", writers.size(), groups.size(), 0, 0, 0, 0, 0, membershipCount);
             for (const auto op : graph->operations()) {
                 const auto& path = ownerView(*graph, op);
                 if (path.size() == 2 && path[0] == "general" && path[1] != "nonsink" && !destinations.contains(op))
-                    throw std::invalid_argument("Orphaned sink computation");
+                    throw std::invalid_argument("Orphaned sink computation: " +
+                        std::string(graph->symbolText(graph->operationSymbol(op))));
             }
             const auto topo = topological(*graph, [&](OperationId op) { return destinations.contains(op); });
             std::unordered_map<OperationId, std::size_t, OperationIdHash> ranks;
@@ -341,10 +432,12 @@ PassResult PartitionSinkPass::run() {
                 const auto args = graph->opOperands(op);
                 originalOperands.emplace(op, std::vector<ValueId>(args.begin(), args.end()));
             }
+            timing.mark("sink-topological", writers.size(), groups.size(), 0, 0, 0, 0, 0, membershipCount);
             result.changed = true;
             for (const auto& [op, key] : destinations) graph->setAttr(op, kPartition, key);
             // Leaf-local CSE before this pass can share pure sink computation
             // across writers. Materialize it in each final clock/priority group.
+            std::size_t clones = 0;
             for (const auto& [key, required] : members) {
                 std::vector<OperationId> ordered(required.begin(), required.end());
                 std::sort(ordered.begin(), ordered.end(), [&](auto a, auto b) { return ranks.at(a) < ranks.at(b); });
@@ -355,23 +448,28 @@ PassResult PartitionSinkPass::run() {
                     const auto original = graph->opResults(op);
                     const std::vector<ValueId> results(original.begin(), original.end());
                     OperationId target = op;
-                    if (destinations.at(op) != key) target = cloneOperation(*graph, op, args, key);
+                    if (destinations.at(op) != key) { target = cloneOperation(*graph, op, args, key); ++clones; }
                     else for (std::size_t i = 0; i < args.size(); ++i)
                         if (args[i] != graph->opOperands(op)[i]) graph->replaceOperand(op, i, args[i]);
                     const auto copied = graph->opResults(target);
                     for (std::size_t i = 0; i < results.size(); ++i) values.emplace(results[i], copied[i]);
                 }
             }
+            timing.mark("sink-clones", writers.size(), groups.size(), 0, 0, 0, 0, clones, membershipCount);
             for (const auto& [op, hoist] : hoisted) graph->setAttr(op, "grhsim.hoistEnable", hoist);
             graph->setMetadata("grhsim.sinkConfig", configuration);
             graph->setMetadata(kStage, std::string("sink-partitioned"));
             verifyPartitionResult(*graph);
+            timing.mark("partition-verified", writers.size(), groups.size(), 0, 0, 0, 0, clones, membershipCount);
         }
         ingest::node::recordRetention(*graph);
+        timing.mark("retention-recorded");
         auto schedule = buildSchedule(*graph);
         session()->insert_or_assign(sinkScheduleKey(*graph),
             std::make_unique<SessionSlotValue<SinkSchedule>>(std::move(schedule)));
+        timing.mark("done");
     } catch (const std::exception& exception) {
+        timing.mark("failed");
         if (graph && result.changed) graph->setMetadata(kStage, std::string("sink-partitioned-failed"));
         error(exception.what(), graph ? graph->symbol() : std::string{}); result.failed = true;
     }

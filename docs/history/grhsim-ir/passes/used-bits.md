@@ -63,7 +63,6 @@ pass 幂等：收窄后 `used == width`，边界 slice 复用已有同形 op，�
 
 ## 相位 scope（M5d-2）
 
-作为 `grhsim.simplify --scope phase` 的子步骤运行时带 `SimplifyScope`：
 
 - 分析仍全图运行，共享状态的位需求是**全部分区的并集**；但分区外 op 一律视为 opaque
   汇：其 operand 与 result 全使用、其引用的状态按全宽需求处理，因此局部需求永远不能

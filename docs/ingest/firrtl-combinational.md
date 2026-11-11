@@ -137,6 +137,13 @@ for each static partial write in the generated simulator.
 Consecutive static partial writes share a packed accumulator, avoiding repeated
 conversion of every array element. The final assign restores the declaration's
 shape; CHIRRTL memory write data restores its leaf shape at the memory boundary.
+The accumulator keeps disjoint bit ranges. A guarded write obtains its old arm
+only from pieces intersecting the destination range, in high-to-low bit order.
+For example, after writing `a[0]`, `when en: connect a[1], d` selects between `d`
+and the old `a[1]` piece; it does not slice a newly rebuilt whole-array concat.
+A range crossing several pieces concatenates only those pieces. The updated
+whole driver is still materialized after the splice, and dynamic writes keep
+their existing packed-driver route.
 For a partial write containing dynamic indices, lower computes a row-major bit
 offset and merges a shifted data/mask pair into the current driver. Only dynamic
 dimensions contribute bounds checks. An OOB dynamic index preserves the driver;

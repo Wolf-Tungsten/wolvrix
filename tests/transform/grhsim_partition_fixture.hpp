@@ -5,7 +5,6 @@
 #include "transform/grhsim/grh-to-grhsim.hpp"
 #include "transform/grhsim/partition-nonsink.hpp"
 #include "transform/grhsim/partition-sink.hpp"
-#include "transform/grhsim/simplify.hpp"
 #include "transform/grhsim/split-event-and-output.hpp"
 #include "transform/grhsim/split-nonsink-and-sink.hpp"
 #include "transform/verify.hpp"
@@ -125,7 +124,10 @@ struct Fixture {
         for (const auto value : args) graph.addOperand(op, value);
         graph.setAttr(op, "name", std::move(name)); graph.setAttr(op, "eventEdge", std::move(edges)); return op;
     }
-    void convert() { run(design, "grh-to-grhsim", session); run(design, "grhsim-simplify", session); }
+    void convert() {
+        run(design, "common-expr", session);
+        run(design, "grh-to-grhsim", session);
+    }
     void split() { run(design, "grhsim-split-event-and-output", session); run(design, "grhsim-split-nonsink-and-sink", session); }
     void partition() { run(design, "grhsim-partition-nonsink", session); run(design, "grhsim-partition-sink", session); }
 };

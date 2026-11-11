@@ -20,7 +20,7 @@ namespace wolvrix::app::pybind
         PyObject *passArgsObj = Py_None;
         int dryrun = 0;
         const char *logLevelText = "warn";
-        int keepDeclaredSymbols = 1;
+        int keepDeclaredSymbols = -1;
         static const char *kwlist[] = {"session", "name", "design", "args", "dryrun", "log_level",
                                        "keep_declared_symbols", nullptr};
         if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|Opsp", const_cast<char **>(kwlist),
@@ -38,6 +38,14 @@ namespace wolvrix::app::pybind
         {
             PyErr_SetString(PyExc_ValueError, "pass name must be non-empty");
             return nullptr;
+        }
+        if (keepDeclaredSymbols < 0)
+        {
+            const std::string_view name(passName);
+            keepDeclaredSymbols = (name == "dead-code-elim" || name == "split-static-array" ||
+                                   name == "expr-opt" || name == "used-bits" || name == "split-nodes" ||
+                                   name == "constant-analysis" || name == "alias-analysis" ||
+                                   name == "pattern-detect" || name == "common-expr" || name == "comm-expr") ? 0 : 1;
         }
         auto *design = sessionDesign(*session, designKey);
         if (!design)

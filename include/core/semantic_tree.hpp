@@ -2,6 +2,7 @@
 #define WOLVRIX_SEMANTIC_TREE_HPP
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -31,6 +32,18 @@ struct SemanticNode {
     int64_t index = -1;
 };
 
+struct SemanticTreePruneStats {
+    std::size_t removedNodes = 0;
+    std::size_t removedNameBytes = 0;
+    std::size_t retainedNodes = 0;
+    std::size_t retainedIndirectNodes = 0;
+    std::size_t semanticIds = 0;
+};
+
+struct SemanticTreePruneResult : SemanticTreePruneStats {
+    std::vector<SemanticId> oldToNew;
+};
+
 class SemanticTree {
 public:
     SemanticTree(std::string sourceUnit, std::string circuit, std::string module);
@@ -52,6 +65,8 @@ public:
     // instance name. Every source ID moves by returnedId - 1.
     SemanticId appendTree(const SemanticTree& source, SemanticId parent,
                           std::string_view rootName);
+    std::unique_ptr<SemanticTree> buildPruned(std::span<const uint8_t> referenced,
+                                              SemanticTreePruneResult& result) const;
 
     std::vector<std::string> path(SemanticId id) const;
 

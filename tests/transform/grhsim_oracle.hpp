@@ -207,7 +207,8 @@ private:
             auto next = state_;
             std::vector<grh::OperationId> writers;
             if (schedule_) for (const auto& run : schedule_->generalRuns) {
-                for (const auto& key : run.requiredNonsinkKeys) if (!done.contains(key)) throw std::runtime_error("Missing sink dependency execution");
+                for (const auto ordinal : sim::requiredNonsinkOrdinals(*schedule_, run))
+                    if (!done.contains(schedule_->nonsinkKeys[ordinal])) throw std::runtime_error("Missing sink dependency execution");
                 writers.insert(writers.end(), run.orderedWriters.begin(), run.orderedWriters.end());
             } else {
                 for (const auto op : graph_.operations()) if (sim::isWriter(graph_.opKind(op))) writers.push_back(op);

@@ -2,17 +2,18 @@
 #include "core/op_descriptor.hpp"
 
 #include "transform/activity_schedule.hpp"
+#include "transform/alias_analysis.hpp"
 #include "transform/blackbox_guard.hpp"
 #include "transform/comb_loop_elim.hpp"
+#include "transform/common_expr.hpp"
+#include "transform/constant_analysis.hpp"
 #include "transform/dead_code_elim.hpp"
 #include "transform/demo_stats.hpp"
 #include "transform/hier_flatten.hpp"
 #include "transform/grhsim/grh-to-grhsim.hpp"
-#include "transform/grhsim/simplify.hpp"
-#include "transform/grhsim/node-cse.hpp"
+#include "transform/grhsim/expr-opt.hpp"
+#include "transform/grhsim/used-bits.hpp"
 #include "ingest/node_attributes.hpp"
-#include "transform/grhsim/pack-bit-registers.hpp"
-#include "transform/grhsim/recover-masked-or.hpp"
 #include "transform/grhsim/split-event-and-output.hpp"
 #include "transform/grhsim/split-nonsink-and-sink.hpp"
 #include "transform/grhsim/partition-nonsink.hpp"
@@ -27,6 +28,9 @@
 #include "transform/repcut.hpp"
 #include "transform/simplify.hpp"
 #include "transform/slice_index_const.hpp"
+#include "transform/split_nodes.hpp"
+#include "transform/split_static_array.hpp"
+#include "transform/pattern_detect.hpp"
 #include "transform/strip_debug.hpp"
 #include "transform/verify.hpp"
 #include "transform/xmr_resolve.hpp"
@@ -718,11 +722,23 @@ namespace wolvrix::lib::transform
             "dead-code-elim",
             "activity-schedule",
             "grh.verify",
+            "expr-opt",
+            "used-bits",
+            "split-nodes",
+            "constant-analysis",
+            "alias-analysis",
+            "pattern-detect",
+            "common-expr",
+            "comm-expr",
+            // Canonical FIRRTL-to-GrhSIM names.  The grhsim-* spellings below
+            // remain available as compatibility aliases for existing
+            // checkpoints and clients.
+            "grhsim-dialect-translate",
+            "split-event-and-output",
+            "split-nonsink-and-sink",
+            "partition-nonsink",
+            "partition-sink",
             "grh-to-grhsim",
-            "grhsim-simplify",
-            "grhsim-node-cse",
-            "grhsim-pack-bit-registers",
-            "grhsim-recover-masked-or",
             "grhsim-split-event-and-output",
             "grhsim-split-nonsink-and-sink",
             "grhsim-partition-nonsink",
@@ -730,6 +746,7 @@ namespace wolvrix::lib::transform
             "latch-transparent-read",
             "memory-read-retime",
             "slice-index-const",
+            "split-static-array",
             "multidriven-guard",
             "mux-tree-fold",
             "register-write-normalize",
@@ -748,7 +765,16 @@ namespace wolvrix::lib::transform
                                    std::span<const std::string_view> args,
                                    std::string &error)
     {
-        const std::string normalized = normalizePassName(name);
+        std::string normalized = normalizePassName(name);
+        // F24 uses short, dialect-oriented names.  Normalize them at the
+        // factory boundary so old Python/checkpoint callers continue to work
+        // while every new pipeline can publish the canonical spelling.
+        if (normalized == "grhsim-dialect-translate") normalized = "grh-to-grhsim";
+        else if (normalized == "split-event-and-output") normalized = "grhsim-split-event-and-output";
+        else if (normalized == "split-nonsink-and-sink") normalized = "grhsim-split-nonsink-and-sink";
+        else if (normalized == "partition-nonsink") normalized = "grhsim-partition-nonsink";
+        else if (normalized == "partition-sink") normalized = "grhsim-partition-sink";
+        else if (normalized == "comm-expr") normalized = "common-expr";
         if (normalized == "grhsim-split-event-and-output" || normalized == "grhsim-split-nonsink-and-sink" ||
             normalized == "grhsim-partition-nonsink" || normalized == "grhsim-partition-sink")
         {
@@ -808,40 +834,23 @@ namespace wolvrix::lib::transform
             if (normalized == "grhsim-partition-nonsink") return std::make_unique<grhsim::PartitionNonsinkPass>(nonsinkOptions);
             return std::make_unique<grhsim::PartitionSinkPass>(sinkOptions);
         }
-        if (normalized == "grhsim-node-cse") {
-            grhsim::NodeCseOptions options;
-            for (const auto argument : args) {
-                if (argument.starts_with("-top=")) options.top = argument.substr(5);
-                else if (argument.starts_with("-firrtl-node-cse=")) options.mode = argument.substr(std::string_view("-firrtl-node-cse=").size());
-                else if (argument.starts_with("-report=")) options.report = argument.substr(8);
-                else { error = "Unknown grhsim-node-cse option: " + std::string(argument); return nullptr; }
-            }
-            return std::make_unique<grhsim::NodeCsePass>(std::move(options));
-        }
-        if (normalized == "grhsim-simplify" || normalized == "grhsim-pack-bit-registers" ||
-            normalized == "grhsim-recover-masked-or")
+        if (normalized == "expr-opt" || normalized == "used-bits" || normalized == "split-nodes" || normalized == "constant-analysis" ||
+            normalized == "alias-analysis" || normalized == "pattern-detect" || normalized == "common-expr")
         {
             std::string top;
-            std::filesystem::path report;
-            uint32_t limit = normalized == "grhsim-simplify" ? 8 : 16;
             for (const auto argument : args)
             {
                 if (argument.starts_with("-top=")) top = argument.substr(5);
-                else if (argument.starts_with("-report=") && normalized != "grhsim-simplify") report = argument.substr(8);
-                else if ((argument.starts_with("-max-rounds=") && normalized == "grhsim-simplify") ||
-                         (argument.starts_with("-min-terms=") && normalized == "grhsim-recover-masked-or"))
-                {
-                    const auto value = argument.substr(argument.find('=') + 1);
-                    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), limit);
-                    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
-                        limit < (normalized == "grhsim-simplify" ? 1u : 2u))
-                    { error = "Invalid positive optimization limit"; return nullptr; }
-                }
                 else { error = "Unknown " + normalized + " option: " + std::string(argument); return nullptr; }
             }
-            if (normalized == "grhsim-simplify") return std::make_unique<grhsim::SimplifyPass>(grhsim::SimplifyOptions{top, limit});
-            if (normalized == "grhsim-pack-bit-registers") return std::make_unique<grhsim::PackBitRegistersPass>(grhsim::PackBitRegistersOptions{top, report});
-            return std::make_unique<grhsim::RecoverMaskedOrPass>(grhsim::RecoverMaskedOrOptions{top, limit, report});
+            if (normalized == "expr-opt") return std::make_unique<grhsim::ExprOptPass>(grhsim::ExprOptOptions{top});
+            if (normalized == "used-bits") return std::make_unique<grhsim::UsedBitsPass>(grhsim::UsedBitsOptions{top});
+            if (normalized == "split-nodes") return std::make_unique<SplitNodesPass>(SplitNodesOptions{top});
+            if (normalized == "constant-analysis") return std::make_unique<ConstantAnalysisPass>(ConstantAnalysisOptions{top});
+            if (normalized == "alias-analysis") return std::make_unique<AliasAnalysisPass>(AliasAnalysisOptions{top});
+            if (normalized == "pattern-detect") return std::make_unique<PatternDetectPass>(PatternDetectOptions{top});
+            if (normalized == "common-expr") return std::make_unique<CommonExprPass>(CommonExprOptions{top});
+            throw std::logic_error("unreachable GRH transform factory branch");
         }
         if (normalized == "grh-to-grhsim")
         {
@@ -1500,6 +1509,15 @@ namespace wolvrix::lib::transform
                 }
             }
             return std::make_unique<SimplifyPass>(options);
+        }
+        if (normalized == "split-static-array")
+        {
+            if (!args.empty())
+            {
+                error = "split-static-array does not accept arguments";
+                return nullptr;
+            }
+            return std::make_unique<SplitStaticArrayPass>();
         }
         if (normalized == "dead-code-elim")
         {

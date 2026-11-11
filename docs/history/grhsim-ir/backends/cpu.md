@@ -92,7 +92,6 @@ bool 操作数的 `a & b` / `a | b`，省去通用 scalar cast 包装。
 同类型 logical AND/OR 规范化到这些 op；两输入已求值且值域为 {0,1}，无需
 C++ 短路控制依赖。宽度、符号或 domain 不满足条件时沿用原规则。
 
-[grhsim.pack-bit-registers](../passes/pack-bit-registers.md) 使同控制bit寄存器共用
 至多64位的状态和提交操作。变换后重新mapping；emitter仍用已有scalar concat、
 slice和masked write路径。例如两个写口`q0<=d0; q1<=d1`成为一次
 `packed<={d1,d0}`，读者通过固定slice取得相应bit。packed的compute-only读取

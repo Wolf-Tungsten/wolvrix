@@ -160,6 +160,25 @@ value v changed -> set active bit of compute supernode S
 同一个 value 在同一个目标 supernode 内有多个 use，只算一个 activation target。
 同一个 value 扇出到多个目标 compute supernode，会产生多个 activation edge。
 
+当前统一 GRH emitter 输出 `activation-stats.json`，manifest 通过
+`activation_stats` 引用它。统计来自实际生成的发布路径，去重单位是
+`(value, target compute supernode)`；未生成发布代码的局部值不会计数。
+`value_change_activation_edges` 包括输入和普通值比较，
+`input_change_activation_edges`、`constant_change_activation_edges` 是其中的子集。
+`compute_compute_change_activation_edges` 只统计 nonsink 到 nonsink 的值比较，
+`unique_compute_compute_change_activation_edges` 进一步按源/目标超节点对去重。
+`compute_data_dag_edges` 和 `compute_dependency_dag_edges` 分别描述数据 DAG 和
+包含 effect-order 的调度 DAG。
+
+Event pulse、state changed 和按写入唤醒的 state 分别计入
+`event_pulse_activation_edges`、`state_change_activation_edges`、
+`state_write_activation_edges`；state 的去重单位是 `(state, target supernode)`，
+动态索引订阅仍只计算其可能激活的目标一次。`total_activation_edges` 是这三项
+与 value changed 项之和，包含不同来源的实际 activity-bit 路由。它不包含首次
+eval 的全部激活，也不把无 activity bit 的 sink/event/output 消费者作为目标。
+与 GSIM 做门禁时必须固定同一输入与配置，并显式核对其 Node、state 和各阶段
+口径；partition 的结构边数、GSIM 的 `dag_edges` 和发布边数不能互换。
+
 ### Activity bit
 
 `supernode_active_curr_` 是运行时的 compute activity bitset。它只表示

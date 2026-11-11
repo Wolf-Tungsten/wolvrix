@@ -9,35 +9,43 @@ See the [simulation workflow](../grhsim.md) for standard entries and evidence.
 
 ## Pipeline and options
 
-Run the existing GRH frontend and ordinary `simplify` first, then:
+Run the GRH frontend and ordinary GRH transforms first. The F22/F23 boundary is
+explicit and stays before conversion:
 
 ```text
-grh-to-grhsim
-  → optional grhsim-simplify / grhsim-pack-bit-registers / grhsim-recover-masked-or
-  → grhsim-node-cse                     (annotated FIRRTL only)
-  → grhsim-split-event-and-output        (first virtual partitions)
-  → grhsim-split-nonsink-and-sink
-  → grhsim-partition-nonsink
-  → grhsim-partition-sink                (first SinkSchedule artifact)
+dead-code-elim (keep_declared_symbols=false)
+  → expr-opt → used-bits → split-nodes
+  → dead-code-elim (keep_declared_symbols=false)
+  → constant-analysis
+  → dead-code-elim (keep_declared_symbols=false)
+  → alias-analysis → pattern-detect → comm-expr
+  → dead-code-elim (keep_declared_symbols=false)
+  → grhsim-dialect-translate
+  → split-event-and-output        (first virtual partitions)
+  → split-nonsink-and-sink
+  → partition-nonsink
+  → partition-sink                (first SinkSchedule artifact)
   → emit/grhsim/cpu-st-cpp.cpp
 ```
 
 | Pass | Options | Defaults |
 | --- | --- | --- |
-| `grh-to-grhsim` | `-top`, `-logic-domain=2state|4state` | the unique top, 2state |
-| `grhsim-simplify` | `-top`, `-max-rounds` | the unique top, 8 |
-| `grhsim-pack-bit-registers` | `-top`, `-report` | the unique top, no TSV |
-| `grhsim-recover-masked-or` | `-top`, `-min-terms`, `-report` | the unique top, 16, no TSV |
-| `grhsim-node-cse` | `-top`, `-firrtl-node-cse=off|gsim`, `-report` | the unique top, gsim, no report |
-| `grhsim-split-event-and-output` | `-top` | the unique top |
-| `grhsim-split-nonsink-and-sink` | `-top`, `-mem-min-bytes` | the unique top, 64 |
-| `grhsim-partition-nonsink` | `-top`, `-max-supernode-nodes`, `-segment-penalty`, `-semantic-nodes` | the unique top, 128, 1, 0 |
-| `grhsim-partition-nonsink` clone options | `-clone-shared`, `-clone-max-fanout`, `-max-clones`, `-clone-lossy-compare` | 1, 8, 250000, 1 |
-| `grhsim-partition-nonsink` hint/cost options | `-firrtl-nodes=off|prefer|auto`, `-cost-model=legacy|bytes`, `-report` | auto, legacy, no report |
-| `grhsim-partition-sink` | `-top`, `-enable-guard-min-size` | the unique top, 8 (0 disables hoisting) |
+| `grhsim-dialect-translate` | `-top`, `-logic-domain=2state|4state` | the unique top, 2state |
+| `expr-opt` | `-top` | the unique top; declaration anchors off |
+| `used-bits` | `-top` | the unique top; declaration anchors off |
+| `split-nodes` | `-top` | the unique top; declaration anchors off |
+| `constant-analysis` | `-top` | the unique top; declaration anchors off |
+| `alias-analysis` | `-top` | the unique top; declaration anchors off |
+| `pattern-detect` | `-top` | the unique top; declaration anchors off |
+| `comm-expr` | `-top` | the unique top; declaration anchors off |
+| `split-event-and-output` | `-top` | the unique top |
+| `split-nonsink-and-sink` | `-top`, `-mem-min-bytes` | the unique top, 64 |
+| `partition-nonsink` | `-top`, `-max-supernode-nodes`, `-segment-penalty`, `-semantic-nodes` | the unique top, 128, 1, 0 |
+| `partition-nonsink` clone options | `-clone-shared`, `-clone-max-fanout`, `-max-clones`, `-clone-lossy-compare` | 1, 8, 250000, 1 |
+| `partition-nonsink` hint/cost options | `-firrtl-nodes=off|prefer|auto`, `-cost-model=legacy|bytes`, `-report` | auto, legacy, no report |
+| `partition-sink` | `-top`, `-enable-guard-min-size` | the unique top, 8 (0 disables hoisting) |
 
-Factory arguments use `-key=value`, as with other ordinary passes. There are no
-`role` or `scope` options on the new simplify. An explicitly selected top must
+Factory arguments use `-key=value`, as with other ordinary passes. An explicitly selected top must
 exist; without `-top` there must be exactly one top. Reports are diagnostics,
 not executable plans.
 
@@ -57,47 +65,112 @@ same domain is a no-op. Unsupported source contracts are checked before
 mutation. An unexpected failure after mutation marks `conversion-failed`,
 which is not a valid checkpoint and must not continue into optimization/emit.
 
-## grhsim-simplify
+## expr-opt
 
-This is an independent simplify driver. It shares pure operation evaluation and
-type rules with GRH but does not invoke or add simulation modes to the ordinary
-GRH simplify. It performs constant folding, structural/bitwise rewrites,
-type-aware CSE, DCE, prefix used-bit narrowing, conservative equivalent-state
-merging and eligible mux-chain folding.
+This standalone pass is the GRH counterpart of GSIM's first `ExprOpt`. It
+operates on an unpartitioned ordinary GRH graph before `grh-to-grhsim` and
+performs the same-arm MUX expression rewrite. The caller runs
+`dead-code-elim` before this pass, matching GSIM's explicit
+`RemoveDeadNodes → ExprOpt` boundary. ExprOpt itself does not run DCE or
+semantic-tree pruning. It uses an empty declaration anchor set by default and
+leaves any newly dead alias rows for the caller's next explicit DCE.
 
-On an unpartitioned graph it works globally. Equivalent detectors with the
-same input/type/edge/history initialization and sample/update policy share one
-result/history; effectful calls and random samples do not undergo this CSE.
-On a fully attributed graph it works separately inside each complete leaf
-owner. It preserves exported values/types and cannot merge clones across
-owners. Shared-state narrowing/merging only runs before partitioning.
-FIRRTL source associations impose no extra CSE or structural inlining scope.
-`grhsim-node-cse` compares complete pure scalar expressions and applies the
-GSIM count/width/fanout thresholds; see [its contract](../ingest/node-cse.md).
+## used-bits
 
-Full LogicalType, including shape/domain, participates in aliases and CSE.
-ArrayCreate and sliceArray keep the established bit order and flattened
-sliceArray index behavior. Peeling a multidimensional construction requires
-proof that the remaining indices are in bounds. Register readArray keeps its
-separate state-access bounds behavior; optimizations cannot interchange the two
-to bypass those rules. Division/modulo by zero is not folded.
+This standalone pass is the GRH counterpart of GSIM's `UsedBits`. It runs
+backward demand analysis and state/value prefix narrowing on the whole
+ordinary GRH graph before conversion; DCE remains the caller's explicit pass. Declared symbols and
+generate-group members are ignored as liveness roots by default; ports,
+state/effect roots, and externally used values remain observable. SemanticTree
+IDs are preserved on surviving operations and values; the pass does not prune
+the semantic tree.
 
-## Packing and masked-OR recovery
+Indexed state reads demand every bit of each index operand, independently of
+the bits demanded from the selected row. Arithmetic prefix narrowing for
+`add`, `sub` and `mul` requires TwoState operands and results: in FourState,
+an unknown discarded high input bit can make even the low result bits unknown.
 
-Packing requires the unpartitioned converted graph. It combines eligible
-unsigned TwoState one-bit registers with constant initialization, full reads,
-one writer each and shared fire/enable/mask controls, up to 64 bits per word.
-Old state names become typed views of the packed state; declaredSymbols,
-generate groups, existing read result identities and sources remain valid.
-Other state/control/access forms are left unchanged.
+## split-nodes
 
-Masked-OR recovery matches eligible mux-to-zero/AND-mask OR reductions and
-static array views. It preserves each complete owner if already partitioned;
-matching does not cross owners. New operations reference the original values
-and carry their source annotations. S9 access optimizations are separate work.
+`split-nodes` is the first F23 ordinary-GRH structural pass. It consumes the
+static slice demand exposed by `used-bits` and recursively clones the safe
+scalar expression subset (`assign`, bitwise operations, `not`, `mux`, `concat`
+and static slices) at the demanded ranges. The resulting narrow producers are
+rewired into the existing slice users. Unsigned scalar pure expressions are
+eligible; signed values, arrays, registers, state ports, arithmetic and
+effectful operations are left unchanged until their GSIM-equivalent handling is
+implemented.
 
-Production bit-register packing remains enabled by default. The default-off
-legacy comb-pack pass, implementation, registry entry and switches are removed.
+The pass never performs liveness deletion or calls `dead-code-elim`. The old
+wide producer remains in the graph so the caller can inspect the transformation;
+the explicit `dead-code-elim` immediately after this pass is responsible for
+reclaiming it when it has no remaining users.
+
+## constant-analysis
+
+`constant-analysis` is the next standalone ordinary-GRH pass in the F23 flow.
+It walks the acyclic graph in producer order and evaluates pure logic
+expressions whose operands are already represented by constants. Supported
+arithmetic, comparisons, logic, mux, concatenation, replication and slice
+operations are rewritten in place as `kConstant` while
+retaining the result identity and source metadata. Division and modulo by a
+proven-zero divisor are left unchanged so the existing runtime contract is
+preserved. Pure system functions supported by the shared evaluator (such as
+`clog2`) are folded; sampled or effectful system functions stay opaque.
+
+Producer order uses a Kahn traversal with a dense pending-input counter per
+operation. It counts each operand use whose value has a producer, then
+decrements once per matching result-user entry. Repeated inputs and multiple
+results from one producer retain their full use multiplicity. The ready queue
+also stores the final order, so the traversal visits each operation and edge
+once without rescanning a high-fanin consumer's complete operand list.
+
+The pass does not remove dead operations, run `simplify`, or reclaim
+SemanticTree rows. A following explicit `dead-code-elim` owns that liveness
+boundary; this keeps constant propagation independently measurable and lets
+callers choose declaration retention explicitly. It requires an unpartitioned
+ordinary GRH graph and accepts only `-top=<graph>` when a design has more than
+one top graph.
+
+## alias-analysis
+
+`alias-analysis` redirects type-identical scalar `assign` and full static-slice
+views to their source values. It updates users and source-node roots while
+leaving the alias rows for the caller's explicit DCE boundary. Arrays, shaped
+or type-incompatible views, and effectful operations remain unchanged.
+
+## pattern-detect
+
+`pattern-detect` recognizes the safe ordinary-GRH pattern
+`(concat(high, low) == constant)` and rewrites it to two narrower equality
+tests joined by `and`. The rewritten result and generated comparisons retain
+source and SemanticTree metadata; dead concat rows are reclaimed only by the
+following explicit DCE.
+
+## common-expr
+
+`common-expr` shares structurally identical pure scalar expression trees. It
+uses the GSIM thresholds (at least five copies, a width above 256 bits, or a
+duplicate with multiple distinct consumer operations), rewires duplicate users to one representative,
+and leaves duplicate rows for the final explicit DCE. Effectful, port-bound,
+aggregate and constant producers are excluded from this pass. Declared symbols
+do not become liveness roots; they can still participate in a proven pure
+expression share.
+
+Expression signatures contain only the local operation kind, full result type,
+exact non-provenance attributes and ordered canonical IDs of the operands.
+Interning compares the complete signature after hashing; a hash collision cannot
+establish expression equality. An explicit postorder stack computes these IDs,
+so shared DAGs do not expand into repeated expression strings and deep chains do
+not consume the C++ call stack. Floating attribute payloads retain their exact
+bits. Sharing unions operation/value SemanticIds and origin/node metadata before
+redirecting users; provenance remains outside the functional signature.
+Consumer fanout is captured before any replacements; repeated operand uses by
+one operation count as one consumer, matching GSIM's distinct downstream nodes.
+
+Bit-level narrowing and structural splitting are performed by the ordinary-GRH
+`used-bits` and `split-nodes` passes before conversion. No converted-graph
+bit-register packing pass is part of this pipeline.
 
 ## Region extraction and state sinks
 
@@ -141,9 +214,15 @@ merging. No op/work capacity splits a node.
 
 ### Execution node construction
 
-With `firrtl-nodes=prefer|auto`, current FIRRTL member associations determine
-hinted regions. Identity includes source unit, circuit, module, instance path
-and node name. Bundle field paths normalize to their source family; arrays
+With `firrtl-nodes=prefer|auto`, SemanticTree associations determine hinted
+regions. Field and Element IDs normalize to their nearest Declaration or
+Expression ancestor; independent flattened instances retain different IDs.
+An operation's direct associations take precedence, with result associations
+as a fallback. The complete source expression forms one node, rather than one
+node per primitive operation. Legacy schema-v2 member associations remain a
+fallback for checkpoints without SemanticTree coverage. Their identity includes
+source unit, circuit, module, instance path and node name. Bundle field paths
+normalize to their source family; arrays
 retain shape. Roots are not required and origins never manufacture members.
 Identical membership sets form one execution node. A shared CSE operation with
 multiple families receives one shared owner, distinct from the private
@@ -161,7 +240,9 @@ its real consumers are already in that same unhinted cone. Fanout that
 reconverges within one cone is allowed; consumers outside it, graph outputs,
 hinted nodes and state/effect boundaries prevent absorption. There is no
 op-count or work cutoff. `semantic-nodes=1` additionally retains declaration
-anchors as MFFC boundaries. `firrtl-nodes=off` uses MFFC for all ordinary
+result anchors as MFFC boundaries, including declarations represented only by
+SemanticIds. Internal operation provenance alone is not a declaration-result
+anchor. `firrtl-nodes=off` uses MFFC for all ordinary
 logic while preserving source attrs.
 
 Simplify/CSE before partitioning remain annotation-transparent. No source
@@ -183,6 +264,14 @@ pulses participate. Cost overflow is diagnosed before mutation. Op work is
 never read by the upper partitioner and firing-times-work is not part of its
 objective. Neither heuristic promises a globally optimal partition.
 
+Greedy ties use descending link weight, then ascending source/target pair.
+Equal predecessor lists merge in node order, advancing the anchor when a
+merge exceeds capacity; member order and topological ready-queue order stay
+deterministic. Sorted quotient edges supply link counts directly, while
+content hashes only look up predecessor groups and never choose merge order.
+`WOLVRIX_SIMPLIFY_PHASE_TIMING` reports quotient, candidate, merge and reorder
+time for each coarsening attempt.
+
 A 180-op FIRRTL node, a 180-op MFFC node and a one-op node each cost one unit
 of capacity. Capacity K can hold K whole nodes; a K+1th node goes into another
 supernode. Compiler function/file limits remain independent emitter concerns.
@@ -198,8 +287,8 @@ separate clone-count/fanout limits. Actual dependency/schedule verification
 still applies. Cross-owner simplify cannot undo execution ownership.
 
 `grhsim.nonsinkConfig` is
-`v3/maxSupernodeNodes/segmentPenalty/semanticNodes/cloneShared/cloneMaxFanout/maxClones/cloneLossyCompare/firrtlNodes/costModel/hint-mffc-v1`.
-Old work limits, leaf fusion and v2/eight-field completed checkpoints require
+`v4/maxSupernodeNodes/segmentPenalty/semanticNodes/cloneShared/cloneMaxFanout/maxClones/cloneLossyCompare/firrtlNodes/costModel/semantic-tree-mffc-v1`.
+Old work limits, leaf fusion and pre-v4 completed checkpoints require
 an explicit restart at nonsink-sink-split. Thresholds are never converted from
 op/work units to node counts. Schema 1 source checkpoints require re-ingest.
 Python uses `max_supernode_nodes`; Make exposes
@@ -216,6 +305,17 @@ sink/event/output users. Replay can re-emit the same snapshot; it never
 reinterprets it as the later physical layout. `hint-analysis-us` covers node
 analysis, partitioning and reporting, rather than an isolated indexing timer.
 
+The post-clone report also records `node-data-edges` and
+`supernode-data-edges`: distinct directed producer/consumer pairs within the
+nonsink DAG. Repeated operands and multiple values between the same pair count
+once. `*-dependency-edges` additionally include ordered-effect arcs.
+`nonsink-internal-boundary-value-targets` counts distinct `(value, target
+supernode)` pairs crossing nonsink supernodes; the external counterpart counts
+inputs and values produced outside nonsink. Their sum is
+`nonsink-boundary-value-targets`. These are structural partition snapshots,
+including constant boundaries, before emitter elisions and activation policy.
+They must not be substituted for final runtime change-detection edge counts.
+
 ## Sink groups and SinkSchedule
 
 `grhsim-partition-sink` requires `nonsink-partitioned`. It refines small/large
@@ -228,14 +328,44 @@ The pass publishes the first cross-pass artifact in the existing SessionStore:
 configuration hash, completeness flag, `sinkGroups`, `generalRuns` and
 `largeCommitRuns`. Groups contain their PartitionKey, fire (empty for latch)
 and hoisted guards. Each run contains its PartitionKey, ordered original writer
-IDs and necessary nonsink leaf prerequisites. General prerequisites include
-transitive data and effect-order dependencies; large commit runs consume the
-snapshots already sampled in General.
+IDs and `directNonsinkRoots`. General prerequisites include transitive data and
+effect-order dependencies; large commit runs consume the snapshots already
+sampled in General and have no prerequisite roots.
+
+The schedule stores the prerequisite graph once, rather than copying a full
+ancestor closure into every interleaved writer run:
+
+- `nonsinkKeys[i]` is the unique logical leaf PartitionKey at topological ordinal
+  `i`. It retains all four owner components, including the enclosing supernode
+  and leaf; it is not a GRH OperationId or an emitter execution index.
+- `nonsinkPrerequisiteOffsets` has `nonsinkKeys.size() + 1` entries, starts at zero
+  and ends at `nonsinkPrerequisites.size()`. Its half-open range `[offsets[i],
+  offsets[i+1])` selects leaf `i`'s immediate prerequisites in the CSR edge array.
+- Each `nonsinkPrerequisites[e]` is a leaf ordinal strictly smaller than its
+  target row `i`. Data dependencies and explicit effect-order dependencies both
+  contribute edges.
+- Each run's `directNonsinkRoots` is a sorted unique list of the first nonsink
+  leaves reached from that run's writers through their sink-local parameter
+  cones. It is the input to closure expansion, not a list claiming to contain
+  every required leaf.
+
+For example, keys `[A,B,C]`, offsets `[0,0,1,2]`, and prerequisites `[0,1]` encode
+`B requires A` and `C requires B`. A run with roots `[2]` requires the full ordered
+closure `[0,1,2]`. `requiredNonsinkOrdinals(schedule, run)` returns that complete
+closure in topological leaf order; `requiredNonsinkKeys(schedule, run)` resolves
+the same ordinals to copied keys. Queries expand one run at a time. The stored
+artifact uses space proportional to the shared DAG and direct roots, even when
+many runs share the same long ancestor chain. The readable dump prints this
+same key dictionary, immediate prerequisite rows and per-run roots, with the
+closure rule stated in the dump; it does not repeat every transitive key for
+every run. Schedule verification reconstructs and compares the complete shared
+DAG and canonical roots as well as groups/writer order, rejecting forged edges
+or roots without materializing all run closures.
 
 Explicit `writerOrder` values are preserved across clock groups: A(clock0),
 B(clock1), C(clock0) may require the clock0 group to recur. Groups may not mix
 clocks, priority ranks or hoisted/local guard policies. The schedule holds no
-duplicate writer operands, Output history plan, nonsink execution graph,
+duplicate writer operands, Output history plan, nonsink execution operations,
 physical layout or chunks. `writerOrder` must be unique within each target state
 write group; ops order, symbol spelling and rename/freeze never decide the winning write.
 

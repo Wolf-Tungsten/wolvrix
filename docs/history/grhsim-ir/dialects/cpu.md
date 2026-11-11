@@ -93,7 +93,6 @@ Views 的定义为 `OR_t(operand[s_t][b_t] ? bits(operand[d_t], o_t, W) : 0)`。
 命中项。W=1 时等价于 maskedAny。该 op 是纯 value 计算，读取的是 `%data` 的既定值，
 本身不新增状态访问，也不授权跳过任意 producer、外部调用或随机采样。
 
-[`cpu.st.recover-masked-or`](../passes/recover-masked-or.md) 在 CPU 映射前恢复这种结构。
 CPU emitter 按 64-bit word 遍历 mask 的置位 bit；W=1 时遇到 true 可结束，W>1 时
 合并全部选中元素。Views 按 selector 来源和 word 分组；连续布局使用偏移表达式，
 置换使用静态 offset 表，离散数据源使用 switch 读取既有 SSA 值。W>64 使用原生

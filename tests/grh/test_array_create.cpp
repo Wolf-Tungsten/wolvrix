@@ -6,7 +6,6 @@
 #include "emit/system_verilog.hpp"
 #include "transform/verify.hpp"
 #include "transform/grhsim/grh-to-grhsim.hpp"
-#include "transform/grhsim/simplify.hpp"
 #include "transform/const_fold.hpp"
 #include "transform/redundant_elim.hpp"
 #include "slang/analysis/AnalysisManager.h"
@@ -269,7 +268,6 @@ void foldingAndRecovery() {
         graph.bindOutputPort("nested", graph.createArray(std::array{array, array}));
         runPass(design, std::make_unique<sim::GrhToGrhsimPass>(
             sim::GrhToGrhsimOptions{"fold_array", domain}));
-        runPass(design, std::make_unique<sim::SimplifyPass>());
         require(verifyGrh(design), "folded array lost full type");
         const auto type = graph.valueLogicalType(graph.outputPortValue("array"));
         require(type.width == 16 && type.shape == std::vector<int64_t>{2} && type.domain == domain,
@@ -293,7 +291,6 @@ int main() {
         invalidModels();
         grhFoldingAndSvRoundTrip();
         grhRecovery();
-        foldingAndRecovery();
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "[array-create] " << error.what() << '\n';

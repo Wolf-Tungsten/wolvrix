@@ -7,7 +7,6 @@
 `grhsim.select-state-stores` is the semantic store classification pass
 (M5d-4, pipeline stage A7): the **single decision point** that assigns every
 state its store class. It runs once at the end of the whole-graph
-optimization stage, after `grhsim.simplify(scope=whole)`. The pass is a pure
 annotation — it does not add, remove or rewrite any op, value, state or init
 record — so it is registered as a `MetadataTransform`.
 

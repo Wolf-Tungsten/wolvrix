@@ -42,7 +42,11 @@ for iter in 0..<maxIterations:
 DCE 在首轮裁剪图，之后积累删除需求，在常量折叠和冗余消除稳定后执行；到达
 `maxIterations` 上限时也执行待处理的 DCE。这样中间每次别名替换不必立即
 重算全图活性。DCE 已完成一次全图活性闭包，单独删除死操作不会产生新常量输入，因此不触发
-下一轮常量折叠或 DCE。常量池仍在每次 `const-fold` 调用时重建，不跨外层迭代缓存。
+下一轮常量折叠或 DCE。DCE 也会在电路删除后回收无引用的 SemanticTree 分支；
+仅来源变化不唤醒 `redundant-elim`，只有实际电路变化才按上表更新 dirty。
+常量池仍在每次 `const-fold` 调用时重建，不跨外层迭代缓存。
+FIRRTL/mixed 在 `comb-loop-elim` 后先执行 `split-static-array`，再执行一次独立 DCE；
+其统计不并入本 pass 的迭代数据，详见 [dead-code-elim](dead-code-elim.md)。
 
 冗余消除的 CSE 同样使用图内工作队列，合并结果前将被替换值的用户入队，
 使逆序存放的重复表达式链在一次调用中完成合并。每次替换输入都更新用户的

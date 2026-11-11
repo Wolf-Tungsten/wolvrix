@@ -7,7 +7,6 @@
 2026-10-16：已实现 `cpu.compute.maskedOr` 的连续数组/静态视图编码、B7 恢复 pass、CPU
 映射与 C++ 发射。默认关闭，使用开关进行整机 A/B。本文记录选择这一落点的原因；
 精确接口见 [CPU dialect](dialects/cpu.md#2-cpucomputemaskedor)，匹配规则和运行方法见
-[recover-masked-or](passes/recover-masked-or.md)。
 
 ## 问题与原始电路
 
@@ -89,7 +88,6 @@ W=1；移除 16,648 个旧 op，其中 2,688 个为无用的 element read。共�
 
 ## 性能验证与下一步
 
-`make bench_grhsim_masked_or` 比较编译优化后的完整展开表达式与当前稀疏代码，使用
 运行时生成的 mask/array，覆盖零命中、单命中、四命中、全命中、布尔全零和不同 W。
 首轮 Clang 22 `-O3` 的 48 项布尔结果中，零/单/四命中分别约 8.3/5.6/4.3 倍；
 全选、数据全零时约为原速度的 0.39 倍。多位结果的密集扫描也可能较慢。
@@ -97,7 +95,6 @@ W=1；移除 16,648 个旧 op，其中 2,688 个为无用的 element read。共�
 
 整机比较需保持输入程序、seed、周期、编译选项和 trace 设置一致，测仿真总时间、
 phase 时间和激活次数。融合会改变 General 的边界过滤和活动粒度，局部加速不保证
-总时间下降。现阶段使用 `XS_WOLF_GRHSIM_IR_MASKED_OR=1` 显式开启。
 
 后续按实测热点独立评估：
 

@@ -126,9 +126,9 @@ namespace wolvrix::lib::transform
         PassVerbosity verbosity = PassVerbosity::Info;
         LogLevel logLevel = LogLevel::Warn;
         std::function<void(LogLevel, std::string_view, std::string_view)> logSink;
-        // declaredSymbols/generateGroups are semantic anchors produced by
-        // ingest; passes must preserve them. Pipelines must not turn this off.
-        bool keepDeclaredSymbols = true;
+        // Explicit retention override. An empty value selects the pass-specific
+        // default: elimination passes do not retain declarations; others do.
+        std::optional<bool> keepDeclaredSymbols;
         SessionStore *session = nullptr;
         // Non-owning selection for an explicitly graph-local kernel. The
         // design catalog remains available for read-only ABI checks.
@@ -309,6 +309,13 @@ namespace wolvrix::lib::transform
             {
                 appendOriginModules(merged, *origins);
             }
+            // Keep operation-level provenance with the synthesized operation.
+            // Value-level SemanticTree identities are shape-dependent and are
+            // transferred explicitly by each rewrite (for example
+            // mergeOrigins/makeOperation); copying every source result here
+            // would incorrectly keep an aggregate declaration alive when a
+            // split view selects an unrelated scalar element.
+            graph.mergeOpSemanticIds(newOp, src);
         }
         if (!merged.empty())
         {
@@ -440,7 +447,17 @@ namespace wolvrix::lib::transform
         void warning(const wolvrix::lib::grh::Graph &graph, std::string message);
         void info(const wolvrix::lib::grh::Graph &graph, std::string message);
         void debug(const wolvrix::lib::grh::Graph &graph, std::string message);
-        bool keepDeclaredSymbols() const noexcept { return context_ ? context_->keepDeclaredSymbols : true; }
+        bool keepDeclaredSymbols() const noexcept
+        {
+            if (context_ && context_->keepDeclaredSymbols)
+            {
+                return *context_->keepDeclaredSymbols;
+            }
+            return id_ != "dead-code-elim" && id_ != "split-static-array" &&
+                id_ != "expr-opt" && id_ != "used-bits" && id_ != "split-nodes" &&
+                id_ != "constant-analysis" && id_ != "alias-analysis" &&
+                id_ != "pattern-detect" && id_ != "common-expr";
+        }
         SessionStore* session() noexcept { return context_ ? context_->session : nullptr; }
 
     private:
@@ -464,9 +481,9 @@ namespace wolvrix::lib::transform
         PassVerbosity verbosity = PassVerbosity::Info;
         LogLevel logLevel = LogLevel::Warn;
         std::function<void(LogLevel, std::string_view, std::string_view)> logSink;
-        // Forwarded to every PassContext; declaredSymbols are semantic anchors
-        // and must stay enabled in all pipelines (see PassContext).
-        bool keepDeclaredSymbols = true;
+        // Forwarded to every PassContext. Set a boolean to override the
+        // pass-specific declaration-retention default for the whole pipeline.
+        std::optional<bool> keepDeclaredSymbols;
         SessionStore *session = nullptr;
         std::size_t graphThreads = 1;
         // Optional eligibility gate for final compaction (e.g. positional ABI).

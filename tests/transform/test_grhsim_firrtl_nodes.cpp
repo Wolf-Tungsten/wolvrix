@@ -71,6 +71,59 @@ void largeNodes() {
     }
 }
 
+void semanticTreeNodes() {
+    for (const bool anchors : {false, true}) {
+        Fixture fixture; chain(fixture, 7);
+        const auto ops = computation(fixture.graph);
+        auto& tree = fixture.graph.getOrCreateSemanticTree("test", "top", "top");
+        const auto declaration = tree.addNode(tree.root(), grh::SemanticNodeKind::Declaration, "bundle");
+        const auto fieldA = tree.addNode(declaration, grh::SemanticNodeKind::Field, "a");
+        const auto fieldB = tree.addNode(declaration, grh::SemanticNodeKind::Field, "b");
+        const auto instance = tree.addNode(tree.root(), grh::SemanticNodeKind::Module, "other");
+        const auto separate = tree.addNode(instance, grh::SemanticNodeKind::Expression, "bundle");
+        for (unsigned i = 0; i < ops.size(); ++i) {
+            const auto semantic = i < 6 ? (i % 2 ? fieldA : fieldB) : separate;
+            fixture.graph.setOpSemanticIds(ops[i], std::array{semantic});
+        }
+        fixture.graph.setValueSemanticIds(fixture.graph.opResults(ops[5])[0], std::array{fieldA});
+        run(fixture.design, "partition-nonsink", fixture.session,
+            {"-max-supernode-nodes=1", "-clone-shared=0", anchors ? "-semantic-nodes=1" : "-semantic-nodes=0"});
+        for (unsigned i = 1; i < 6; ++i)
+            require(owner(fixture.graph, ops[0]) == owner(fixture.graph, ops[i]), "SemanticTree source expression split into op nodes");
+        require(owner(fixture.graph, ops[5]) != owner(fixture.graph, ops[6]), "different semantic instance families merged");
+        require(stat(fixture.graph, "semantic-covered-ops") == ops.size() && stat(fixture.graph, "firrtl-nodes") == 2,
+            "auto mode did not consume SemanticTree families");
+    }
+}
+
+void dagCensus() {
+    Fixture fixture;
+    const auto x = fixture.input("x", 8), y = fixture.input("y", 8), enable = fixture.input("enable");
+    const auto a = fixture.compute(OperationKind::kXor, Fixture::type(8), {x, y});
+    const auto a2 = fixture.compute(OperationKind::kAnd, Fixture::type(8), {x, y});
+    const auto b = fixture.compute(OperationKind::kAdd, Fixture::type(8), {a, a});
+    const auto c = fixture.compute(OperationKind::kOr, Fixture::type(8), {a, a2});
+    const auto d = fixture.compute(OperationKind::kXor, Fixture::type(8), {b, c});
+    fixture.task("display", {enable, d}); fixture.convert(); fixture.split();
+    for (const auto value : {a, a2}) tag(fixture.graph, fixture.graph.valueDef(value), {key("a")});
+    for (const auto value : {b, c, d}) tag(fixture.graph, fixture.graph.valueDef(value), {key(std::to_string(value.index))});
+    node::establishPolicy(fixture.graph);
+    run(fixture.design, "partition-nonsink", fixture.session, {"-max-supernode-nodes=1", "-clone-shared=0"});
+    checkpoint(fixture.design, "dag-census");
+    // Translation adds one constant fire operand to the task. Its explicit
+    // node contributes one data edge and one structural value-target pair.
+    require(stat(fixture.graph, "node-data-edges") == 6 && stat(fixture.graph, "supernode-data-edges") == 6,
+        "DAG census counted repeated uses or boundary values as node pairs: node=" +
+        std::to_string(stat(fixture.graph, "node-data-edges")) + " supernode=" +
+        std::to_string(stat(fixture.graph, "supernode-data-edges")));
+    require(stat(fixture.graph, "node-dependency-edges") == 6 && stat(fixture.graph, "supernode-dependency-edges") == 6,
+        "dependency census changed pure data edges");
+    require(stat(fixture.graph, "nonsink-internal-boundary-value-targets") == 7 &&
+            stat(fixture.graph, "nonsink-external-boundary-value-targets") == 3 &&
+            stat(fixture.graph, "nonsink-boundary-value-targets") == 10,
+        "boundary census did not deduplicate (value, target supernode)");
+}
+
 void nodeCountsAndReplay() {
     for (const unsigned count : {4u, 5u}) {
         Fixture fixture;
@@ -108,6 +161,80 @@ void nodeCountsAndReplay() {
         require(!tx::makePass("grhsim-partition-nonsink", args, error) && error.find("Retired") != std::string::npos,
             "retired work/fusion option silently accepted");
     }
+    for (const std::string_view name : {"grhsim-dialect-translate", "split-event-and-output",
+                                        "split-nonsink-and-sink", "partition-nonsink",
+                                        "partition-sink", "comm-expr"}) {
+        std::string error;
+        require(static_cast<bool>(tx::makePass(name, {}, error)),
+            "canonical F24 pass name is not registered: " + std::string(name));
+    }
+}
+
+void coarseningOrderGolden() {
+    const auto execution = [](const grh::Graph& graph, grh::OperationId op) {
+        auto path = owner(graph, op);
+        require(path.size() == 4, "golden partition lost its node owner");
+        path.resize(3);
+        return path;
+    };
+    const auto separateNodes = [](Fixture& fixture, const std::vector<grh::OperationId>& ops) {
+        for (unsigned i = 0; i < ops.size(); ++i) {
+            fixture.graph.setAttr(ops[i], sim::kPartition, Owner{"general", "nonsink"});
+            tag(fixture.graph, ops[i], {key("golden-" + std::to_string(i))});
+        }
+        node::establishPolicy(fixture.graph);
+    };
+    {
+        Fixture fixture;
+        const auto x = fixture.input("x", 8), y = fixture.input("y", 8);
+        fixture.convert(); fixture.split();
+        const auto root = fixture.compute(OperationKind::kXor, Fixture::type(8), {x, y});
+        std::vector<grh::OperationId> ops{fixture.graph.valueDef(root)};
+        for (unsigned i = 0; i < 5; ++i) {
+            const auto value = fixture.compute(OperationKind::kAdd, Fixture::type(8), {root, x});
+            ops.push_back(fixture.graph.valueDef(value));
+        }
+        separateNodes(fixture, ops);
+        run(fixture.design, "partition-nonsink", fixture.session,
+            {"-max-supernode-nodes=2", "-clone-shared=0", "-firrtl-nodes=prefer"});
+        // Equal links merge the first child with root. The remaining equal
+        // predecessor groups fill consecutive pairs; a full anchor advances.
+        for (unsigned i = 0; i < ops.size(); ++i) {
+            const auto first = ops[(i / 2) * 2];
+            require(execution(fixture.graph, ops[i]) == execution(fixture.graph, first),
+                "same-predecessor capacity changed the golden pairs");
+            require(execution(fixture.graph, ops[i]).back() ==
+                "sn_" + std::string(fixture.graph.symbolText(fixture.graph.operationSymbol(first))),
+                "same-predecessor merging changed first-member order");
+        }
+        require(stat(fixture.graph, "nodes") == 6 && stat(fixture.graph, "supernodes") == 3,
+            "same-predecessor capacity changed the golden group count");
+        capacity(fixture.graph, 2);
+    }
+    {
+        Fixture fixture;
+        const auto x = fixture.input("x", 8), y = fixture.input("y", 8);
+        fixture.convert(); fixture.split();
+        const auto a = fixture.compute(OperationKind::kXor, Fixture::type(8), {x, y});
+        const auto b = fixture.compute(OperationKind::kAnd, Fixture::type(8), {x, y});
+        const auto c = fixture.compute(OperationKind::kAdd, Fixture::type(8), {a, b});
+        const std::vector<grh::OperationId> ops{
+            fixture.graph.valueDef(a), fixture.graph.valueDef(b), fixture.graph.valueDef(c)};
+        separateNodes(fixture, ops);
+        run(fixture.design, "partition-nonsink", fixture.session,
+            {"-max-supernode-nodes=2", "-clone-shared=0", "-firrtl-nodes=prefer"});
+        // Pair order chooses A/C before B/C; quotient ordering must then put
+        // B before A/C without changing the first member of the A/C cluster.
+        require(execution(fixture.graph, ops[0]) == execution(fixture.graph, ops[2]) &&
+                execution(fixture.graph, ops[0]) != execution(fixture.graph, ops[1]),
+            "equal-weight link order changed the golden merge");
+        require(execution(fixture.graph, ops[0]).back() ==
+            "sn_" + std::string(fixture.graph.symbolText(fixture.graph.operationSymbol(ops[0]))),
+            "quotient reordering changed merged member order");
+        require(stat(fixture.graph, "nodes") == 3 && stat(fixture.graph, "supernodes") == 2,
+            "quotient reordering changed golden group count");
+        capacity(fixture.graph, 2);
+    }
 }
 
 void groupingAndFallback() {
@@ -127,7 +254,7 @@ void groupingAndFallback() {
     auto off = grh::Design::fromJsonString(source);
     run(off, "grhsim-partition-nonsink", fixture.session, {"-max-supernode-nodes=1", "-clone-shared=0", "-firrtl-nodes=off"});
     require(stat(*off.findGraph("top"), "firrtl-nodes") == 0 && stat(*off.findGraph("top"), "mffc-nodes") == 2, "off did not use MFFC");
-    run(fixture.design, "grhsim-simplify", fixture.session); run(fixture.design, "grhsim-partition-sink", fixture.session);
+    run(fixture.design, "grhsim-partition-sink", fixture.session);
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, fixture.graph);
     compare(reference, fixture.design, {}, {{{"x", 3}, {"y", 5}, {"enable", 1}}, {{"x", 7}, {"y", 2}, {"enable", 1}}}, "mixed-node-sources", &schedule);
 }
@@ -156,7 +283,7 @@ void sharedAndNonconvex() {
             require(owner(fixture.graph, ops[0]) == owner(fixture.graph, ops[1]), "shared region fragmented");
             require(owner(fixture.graph, ops[1]) != owner(fixture.graph, ops[2]) && owner(fixture.graph, ops[3]) != owner(fixture.graph, ops[4]), "overlap caused transitive union");
         }
-        run(fixture.design, "grhsim-simplify", fixture.session); run(fixture.design, "grhsim-partition-sink", fixture.session);
+        run(fixture.design, "grhsim-partition-sink", fixture.session);
         const auto& schedule = sim::requireSinkSchedule(&fixture.session, fixture.graph);
         compare(reference, fixture.design, {}, {{{"x", 3}, {"y", 5}, {"enable", 1}}, {{"x", 7}, {"y", 2}, {"enable", 1}}}, cycle ? "nonconvex-nodes" : "shared-nodes", &schedule);
     }
@@ -191,8 +318,14 @@ void cloneIntoExistingNode() {
     const auto right = fixture.compute(OperationKind::kAdd, Fixture::type(32), {inverted, x});
     fixture.task("display", {en, left, right});
     fixture.convert(); const auto reference = fixture.design.clone(); fixture.split();
-    for (const auto op : computation(fixture.graph)) tag(fixture.graph, op,
-        {key(std::string(fixture.graph.symbolText(fixture.graph.operationSymbol(op))))});
+    auto& tree = fixture.graph.getOrCreateSemanticTree("test", "top", "top");
+    for (const auto op : computation(fixture.graph)) {
+        const auto name = std::string(fixture.graph.symbolText(fixture.graph.operationSymbol(op)));
+        tag(fixture.graph, op, {key(name)});
+        const auto source = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, name);
+        fixture.graph.setOpSemanticIds(op, std::array{source});
+        fixture.graph.setValueSemanticIds(fixture.graph.opResults(op)[0], std::array{source});
+    }
     node::establishPolicy(fixture.graph);
     run(fixture.design, "grhsim-partition-nonsink", fixture.session,
         {"-max-supernode-nodes=1", "-firrtl-nodes=prefer", "-cost-model=bytes", "-max-clones=1"});
@@ -201,7 +334,13 @@ void cloneIntoExistingNode() {
     require(stat(fixture.graph, "nodes") == stat(fixture.graph, "firrtl-nodes") + stat(fixture.graph, "mffc-nodes") +
         stat(fixture.graph, "boundary-nodes"), "clone changed node count");
     capacity(fixture.graph, 1);
-    run(fixture.design, "grhsim-simplify", fixture.session); run(fixture.design, "grhsim-partition-sink", fixture.session);
+    for (const auto op : fixture.graph.operations())
+        if (sim::attribute<bool>(fixture.graph, op, "grhsim.nodeClone").value_or(false)) {
+            require(!fixture.graph.opSemanticIds(op).empty(), "partition clone lost operation SemanticId");
+            for (const auto value : fixture.graph.opResults(op))
+                require(!fixture.graph.valueSemanticIds(value).empty(), "partition clone lost value SemanticId");
+        }
+    run(fixture.design, "grhsim-partition-sink", fixture.session);
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, fixture.graph);
     compare(reference, fixture.design, {}, {{{"x", 3}, {"enable", 1}}, {{"x", 7}, {"enable", 1}},
         {{"x", 7}, {"enable", 0}}}, "node-count-clone", &schedule);
@@ -233,6 +372,6 @@ void arrayAndEffectBoundaries() {
 }
 
 int main() {
-    try { largeNodes(); nodeCountsAndReplay(); groupingAndFallback(); sharedAndNonconvex(); reconvergentMffc(); cloneIntoExistingNode(); arrayAndEffectBoundaries(); }
+    try { largeNodes(); semanticTreeNodes(); dagCensus(); nodeCountsAndReplay(); coarseningOrderGolden(); groupingAndFallback(); sharedAndNonconvex(); reconvergentMffc(); cloneIntoExistingNode(); arrayAndEffectBoundaries(); }
     catch (const std::exception& error) { std::cerr << "[grhsim-firrtl-nodes] " << error.what() << '\n'; return 1; }
 }

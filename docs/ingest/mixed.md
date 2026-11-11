@@ -212,7 +212,6 @@ External implementation annotations such as BlackBox records, source locations,
 and type, linking and semantic checks continue to apply.
 
 The default pipeline profile remains `full`; downstream defaults remain
-`XS_GRHSIM_FIRRTL_NODE_CSE=gsim` and `XS_GRHSIM_FIRRTL_NODES=auto`. An explicit
 functional bringup can disable source annotations together with both consumers:
 
 ```sh
@@ -220,7 +219,6 @@ XS_GRHSIM_PIPELINE_PROFILE=bringup make xs_firrtl_grhsim \
   XS_FIRRTL_INPUT=ptmp/xs/rtl/rtl/SimTop.fir \
   XS_FIRRTL_BUILD=ptmp/firrtl-ingest/functional-bringup \
   XS_FIRRTL_NODE_ANNOTATIONS=off \
-  XS_GRHSIM_FIRRTL_NODE_CSE=off \
   XS_GRHSIM_FIRRTL_NODES=off
 ```
 
@@ -230,10 +228,12 @@ the full profile. The two downstream settings disable source node CSE and
 nonsink source hints respectively; the upstream annotation switch alone does
 not select both downstream policies.
 
-The bringup ordinary GRH pipeline contains exactly seven stages, in order:
+The bringup ordinary GRH pipeline contains exactly nine stages, in order:
 `xmr-resolve`, `multidriven-guard`, `blackbox-guard`, `latch-transparent-read`,
-`hier-flatten`, `comb-loop-elim`, and `memory-init-check`. It omits ordinary GRH
-`simplify` and its two surrounding explicit `grh.verify` calls. Conversion still
+`hier-flatten`, `comb-loop-elim`, `split-static-array`, `dead-code-elim`, and
+`memory-init-check`. The static array split and independent DCE use
+`keep_declared_symbols=False`; other production passes retain their explicit declaration policy.
+The profile omits ordinary GRH `simplify` and its two surrounding explicit `grh.verify` calls. Conversion still
 runs complete structural verification before and after `grh-to-grhsim`; later
 GrhSIM optimization, partitioning and emit follow the shared pipeline.
 

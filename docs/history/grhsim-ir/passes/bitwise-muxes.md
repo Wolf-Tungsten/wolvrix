@@ -31,6 +31,5 @@ CPU emitter 发射纯按位表达式。无符号 bit 使用
 这使已经求出的 bit 数据选择能以算术执行；具体原生指令和收益仍由编译与
 测量确定，不能保证编译器永远不生成分支。
 
-变换后重建 CPU mapping。XiangShan 默认在 pack-bit-registers 之后执行；
 禁用寄存器打包时在 semantic pipeline 之后执行。JSON 按普通 semantic op
 往返，没有新增 mapping 字段。其他 backend 不支持此 op 时应显式报错。

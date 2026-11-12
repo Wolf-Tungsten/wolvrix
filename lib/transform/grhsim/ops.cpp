@@ -197,6 +197,10 @@ namespace {
         if (!isFire(graph, operands[0], !eventDriven) || !bit(graph, operands[1])) return "Invalid task fire/callCond";
         if (attribute<std::string>(graph, op, "name")->empty()) return "Task name is empty";
         if (attribute<std::string>(graph, op, "procKind")->empty()) return "Task process kind is empty";
+        if (attribute<std::string>(graph, op, kLiteralFormat) &&
+            (attribute<std::string>(graph, op, "name") != "write" ||
+             attribute<std::string>(graph, op, "firrtl.effectKind") != "printf"))
+            return "Literal task format requires a FIRRTL printf write";
         return {};
     }
 
@@ -363,7 +367,7 @@ namespace {
     constexpr AttrSchema writeAttrs[]{{"regSymbol", index<std::string>, true}, {"writerOrder", index<int64_t>, true}};
     constexpr AttrSchema latchAttrs[]{{"latchSymbol", index<std::string>, true}, {"writerOrder", index<int64_t>, true}};
     constexpr AttrSchema taskAttrs[]{{"name", index<std::string>, true}, {"procKind", index<std::string>, true},
-        {"hasTiming", index<bool>, true}, {"eventDriven", index<bool>, true}};
+        {"hasTiming", index<bool>, true}, {"eventDriven", index<bool>, true}, {kLiteralFormat, index<std::string>}};
     constexpr AttrSchema functionAttrs[]{{"name", index<std::string>, true}, {"effect", index<std::string>, true},
         {"sampleId", index<std::string>}, {"sampleScope", index<std::string>}, {"hasSideEffects", index<bool>}};
     constexpr AttrSchema dpiAttrs[]{{"targetImportSymbol", index<std::string>, true}, {"procKind", index<std::string>, true},
@@ -371,19 +375,19 @@ namespace {
     constexpr AttrSchema maskedAttrs[]{{"views", index<std::vector<int64_t>>}};
     constexpr AttrSchema historyAttrs[]{{"regSymbol", index<std::string>, true}, {"grhsim.outputEnd", index<bool>, true}};
     const OpDescriptor descriptors[]{
-        {kEdgeDetect, "grhsim.edge-detect", "grhsim", 1, OpEffect::History, false, false, 1, 1, 1, 1, edgeAttrs, edgeVerifier},
-        {kWrite, "grhsim.write", "grhsim", 1, OpEffect::WriteState, false, false, 3, 3, 0, 0, writeAttrs, writerVerifier},
-        {kWriteMask, "grhsim.writeMask", "grhsim", 1, OpEffect::WriteState, false, false, 4, 4, 0, 0, writeAttrs, writerVerifier},
-        {kWriteArray, "grhsim.writeArray", "grhsim", 1, OpEffect::WriteState, false, false, 4, any, 0, 0, writeAttrs, writerVerifier},
-        {kWriteArrayMask, "grhsim.writeArrayMask", "grhsim", 1, OpEffect::WriteState, false, false, 5, any, 0, 0, writeAttrs, writerVerifier},
-        {kFill, "grhsim.fill", "grhsim", 1, OpEffect::WriteState, false, false, 3, 3, 0, 0, writeAttrs, writerVerifier},
-        {kLatchWrite, "grhsim.latchWrite", "grhsim", 1, OpEffect::WriteState, false, false, 3, 3, 0, 0, latchAttrs, writerVerifier},
-        {kSystemTask, "grhsim.system-task", "grhsim", 1, OpEffect::External, false, false, 2, any, 0, 0, taskAttrs, taskVerifier},
-        {kSystemFunction, "grhsim.system-function", "grhsim", 1, OpEffect::External, true, true, 0, any, 1, 1, functionAttrs, functionVerifier, functionEffect},
-        {kDpiCall, "grhsim.dpi-call", "grhsim", 1, OpEffect::External, false, false, 2, any, 0, any, dpiAttrs, dpiVerifier},
-        {kBitSelect, "grhsim.bitSelect", "grhsim", 1, OpEffect::Pure, true, true, 3, 3, 1, 1, {}, bitSelectVerifier},
-        {kPrioritySelect, "grhsim.prioritySelect", "grhsim", 1, OpEffect::Pure, true, true, 7, 129, 1, 1, {}, priorityVerifier},
-        {kHistoryWrite, "grhsim.history-write", "grhsim", 1, OpEffect::History, false, false, 1, 1, 0, 0, historyAttrs, historyVerifier},
+        {kEdgeDetect, "grhsim.edge-detect", "grhsim", 2, OpEffect::History, false, false, 1, 1, 1, 1, edgeAttrs, edgeVerifier},
+        {kWrite, "grhsim.write", "grhsim", 2, OpEffect::WriteState, false, false, 3, 3, 0, 0, writeAttrs, writerVerifier},
+        {kWriteMask, "grhsim.writeMask", "grhsim", 2, OpEffect::WriteState, false, false, 4, 4, 0, 0, writeAttrs, writerVerifier},
+        {kWriteArray, "grhsim.writeArray", "grhsim", 2, OpEffect::WriteState, false, false, 4, any, 0, 0, writeAttrs, writerVerifier},
+        {kWriteArrayMask, "grhsim.writeArrayMask", "grhsim", 2, OpEffect::WriteState, false, false, 5, any, 0, 0, writeAttrs, writerVerifier},
+        {kFill, "grhsim.fill", "grhsim", 2, OpEffect::WriteState, false, false, 3, 3, 0, 0, writeAttrs, writerVerifier},
+        {kLatchWrite, "grhsim.latchWrite", "grhsim", 2, OpEffect::WriteState, false, false, 3, 3, 0, 0, latchAttrs, writerVerifier},
+        {kSystemTask, "grhsim.system-task", "grhsim", 2, OpEffect::External, false, false, 2, any, 0, 0, taskAttrs, taskVerifier},
+        {kSystemFunction, "grhsim.system-function", "grhsim", 2, OpEffect::External, true, true, 0, any, 1, 1, functionAttrs, functionVerifier, functionEffect},
+        {kDpiCall, "grhsim.dpi-call", "grhsim", 2, OpEffect::External, false, false, 2, any, 0, any, dpiAttrs, dpiVerifier},
+        {kBitSelect, "grhsim.bitSelect", "grhsim", 2, OpEffect::Pure, true, true, 3, 3, 1, 1, {}, bitSelectVerifier},
+        {kPrioritySelect, "grhsim.prioritySelect", "grhsim", 2, OpEffect::Pure, true, true, 7, 129, 1, 1, {}, priorityVerifier},
+        {kHistoryWrite, "grhsim.history-write", "grhsim", 2, OpEffect::History, false, false, 1, 1, 0, 0, historyAttrs, historyVerifier},
         {kMaskedOr, "grhsim.cpu.maskedOr", "grhsim.cpu", 1, OpEffect::Pure, true, true, 1, any, 1, 1, maskedAttrs, maskedOrVerifier}
     };
     const bool registered = [] { registerOpDescriptors(descriptors); return true; }();
@@ -498,6 +502,8 @@ std::string verifyGraph(const grh::Graph& graph)
     for (const OperationId op : graph.operations())
     {
         const OperationKind kind = graph.opKind(op);
+        if (kind != kSystemTask && has(op, kLiteralFormat))
+            return "Literal task format belongs only to grhsim.system-task";
         const bool declaration = kind == OperationKind::kRegister || kind == OperationKind::kLatch || kind == OperationKind::kDpicImport;
         if (kind == OperationKind::kRegister || kind == OperationKind::kLatch)
         {

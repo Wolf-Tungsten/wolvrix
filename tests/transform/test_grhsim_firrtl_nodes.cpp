@@ -346,6 +346,203 @@ void cloneIntoExistingNode() {
         {{"x", 7}, {"enable", 0}}}, "node-count-clone", &schedule);
 }
 
+void clockDomainIsolation() {
+    for (const std::string association : {"off", "legacy", "semantic"}) {
+        Fixture fixture; auto& graph = fixture.graph;
+        const auto clockA = fixture.input("clock_a"), clockB = fixture.input("clock_b");
+        const auto data = fixture.input("data", 8), enable = fixture.input("enable");
+        const auto index = fixture.input("index", 2);
+        const auto state = fixture.state("delayed_data", 8);
+        const auto memory = fixture.state("data_array", 32, {4});
+        const auto read = fixture.read(state), arrayRead = fixture.read(memory, {index});
+        const auto invertedClock = fixture.compute(OperationKind::kNot, Fixture::type(1), {clockA});
+        const auto invertedData = fixture.compute(OperationKind::kNot, Fixture::type(8), {data});
+        const auto plain = fixture.compute(OperationKind::kAdd, Fixture::type(8), {read, arrayRead});
+        const auto selected = fixture.compute(OperationKind::kMux, Fixture::type(8), {clockA, invertedData, data});
+        const auto first = fixture.task("display", {enable, selected, plain, clockA, clockB}, {"posedge", "posedge"});
+        const auto second = fixture.task("display", {enable, selected, clockA, clockB}, {"posedge", "posedge"});
+        const auto coldEffect = fixture.task("display", {enable, plain, invertedData});
+        fixture.task("display", {enable, invertedClock});
+        // Reading a state written by a clock must remain a data dependency.
+        fixture.write(OperationKind::kRegisterWritePort, state, {enable, data, clockA});
+        fixture.convert();
+        const auto fire = graph.opOperands(first)[0];
+        require(graph.opKind(graph.valueDef(fire)) == OperationKind::kOr,
+                "Clock isolation lost its multi-event fire join");
+        const auto alias = fixture.compute(OperationKind::kAssign, Fixture::type(1), {fire});
+        graph.replaceOperand(first, 0, alias); graph.replaceOperand(second, 0, alias);
+        const auto reference = fixture.design.clone();
+        fixture.split();
+        const std::array sameFamily{graph.valueDef(invertedClock), graph.valueDef(plain), graph.valueDef(alias)};
+        if (association == "legacy") {
+            for (const auto op : sameFamily) tag(graph, op, {key("mixed_clock_and_data")});
+            tag(graph, graph.valueDef(invertedData), {key("plain_transform")});
+            node::establishPolicy(graph);
+        } else if (association == "semantic") {
+            auto& tree = graph.getOrCreateSemanticTree("test", "top", "top");
+            const auto family = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "mixed_clock_and_data");
+            for (const auto op : sameFamily) graph.setOpSemanticIds(op, std::array{family});
+            const auto separate = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "plain_transform");
+            graph.setOpSemanticIds(graph.valueDef(invertedData), std::array{separate});
+        }
+        const auto source = json(fixture.design);
+        for (const std::string cost : {"legacy", "bytes"}) for (const bool clone : {false, true}) {
+            auto candidate = grh::Design::fromJsonString(source); auto& partitioned = *candidate.findGraph("top");
+            const auto execution = [&](grh::OperationId op) {
+                auto path = owner(partitioned, op);
+                require(path.size() == 4 && path[1] == "nonsink", "Clock isolation lost a nonsink operation");
+                path.resize(3); return path;
+            };
+            const auto costOption = "-cost-model=" + cost;
+            const auto hintOption = std::string("-firrtl-nodes=") + (association == "off" ? "off" : "prefer");
+            run(candidate, "grhsim-partition-nonsink", fixture.session,
+                {"-max-supernode-nodes=128", costOption, hintOption, clone ? "-clone-shared=1" : "-clone-shared=0"});
+            const auto clockOwner = execution(partitioned.valueDef(invertedClock));
+            const auto fireOwner = execution(partitioned.valueDef(alias));
+            const auto plainOwner = execution(partitioned.valueDef(plain));
+            require(clockOwner != plainOwner && fireOwner != plainOwner,
+                    "Clock/event source families or packing dragged unrelated data into the same owner");
+            require(execution(partitioned.valueDef(read)) != clockOwner &&
+                    execution(partitioned.valueDef(arrayRead)) != fireOwner,
+                    "State reads inherited a writer's clock domain");
+            require(execution(coldEffect) != clockOwner && execution(coldEffect) != fireOwner,
+                    "Effect-order scheduling arcs propagated the clock domain");
+            for (const auto op : partitioned.operations())
+                if (partitioned.opKind(op) == OperationKind::kNot && partitioned.opOperands(op)[0] == data)
+                    require(execution(op) != execution(partitioned.valueDef(selected)),
+                            "Boundary cloning put a plain data transform back in a clock owner");
+            require(stat(partitioned, "clock-roots") >= 4 && stat(partitioned, "clock-dependent-ops") >= 5 &&
+                    stat(partitioned, "clock-dependent-supernodes") > 0,
+                    "Clock isolation lacks its structural domain census");
+            if (clone) require(stat(partitioned, "clone-skip-clock") > 0,
+                               "Clock isolation fixture did not exercise a rejected cross-domain clone");
+            capacity(partitioned, 128);
+            const auto checkpoint = json(candidate);
+            run(candidate, "grhsim-partition-nonsink", fixture.session,
+                {"-max-supernode-nodes=128", costOption, hintOption, clone ? "-clone-shared=1" : "-clone-shared=0"});
+            require(json(candidate) == checkpoint, "Clock isolation replay changed the partition");
+            run(candidate, "grhsim-partition-sink", fixture.session);
+            const auto& schedule = sim::requireSinkSchedule(&fixture.session, partitioned);
+            compare(reference, candidate, {}, {
+                {{"clock_a", 0}, {"clock_b", 0}, {"data", 3}, {"enable", 1}, {"index", 0}},
+                {{"clock_a", 1}, {"clock_b", 0}, {"data", 3}, {"enable", 1}, {"index", 1}},
+                {{"clock_a", 0}, {"clock_b", 1}, {"data", 7}, {"enable", 1}, {"index", 2}},
+                {{"clock_a", 1}, {"clock_b", 1}, {"data", 7}, {"enable", 0}, {"index", 3}}},
+                "clock-isolation-" + association + "-" + cost + (clone ? "-clone" : "-no-clone"), &schedule);
+        }
+    }
+}
+
+void systemTaskCapacity() {
+    const auto execution = [](const grh::Graph& graph, grh::OperationId op) {
+        auto path = owner(graph, op);
+        require(path.size() == 4 && path[1] == "nonsink", "Task capacity lost an execution owner");
+        path.resize(3); return path;
+    };
+    const auto weightedCapacity = [](const grh::Graph& graph, unsigned limit) {
+        std::map<Owner, uint64_t> taskArgs;
+        for (const auto op : graph.operations()) {
+            const auto path = owner(graph, op);
+            if (path.size() != 4 || path[1] != "nonsink") continue;
+            auto& count = taskArgs[path];
+            if (graph.opKind(op) == sim::kSystemTask)
+                count += graph.opOperands(op).size() - 2 + bool(graph.getOperation(op).attr(sim::kLiteralFormat));
+        }
+        std::map<Owner, uint64_t> capacities;
+        for (const auto& [node, args] : taskArgs) {
+            auto execution = node; execution.resize(3);
+            capacities[execution] += std::min<uint64_t>(limit, std::max<uint64_t>(1, args / 16 + (args % 16 != 0)));
+        }
+        for (const auto& [execution, count] : capacities)
+            require(count <= limit, "SystemTask expansion exceeded weighted capacity");
+        capacity(graph, limit);
+    };
+    {
+        Fixture fixture; auto& graph = fixture.graph;
+        const auto enable = fixture.input("enable"), data = fixture.input("data", 8);
+        const std::array<unsigned, 5> counts{0, 16, 17, 33, 257};
+        std::vector<grh::OperationId> tasks;
+        for (const auto count : counts) {
+            const auto task = fixture.task("display", {enable});
+            for (unsigned i = 0; i < count; ++i) graph.addOperand(task, data);
+            tasks.push_back(task);
+        }
+        fixture.convert(); const auto reference = fixture.design.clone(); fixture.split();
+        const auto source = json(fixture.design);
+        const auto operationCount = graph.operations().size();
+        for (const std::string cost : {"legacy", "bytes"}) {
+            auto candidate = grh::Design::fromJsonString(source); auto& partitioned = *candidate.findGraph("top");
+            const auto model = "-cost-model=" + cost;
+            run(candidate, "partition-nonsink", fixture.session,
+                {"-max-supernode-nodes=4", "-clone-shared=0", model});
+            require(partitioned.operations().size() == operationCount, "Task budget changed the operation inventory");
+            require(stat(partitioned, "nodes") == 6 && stat(partitioned, "task-nodes") == 5 &&
+                    stat(partitioned, "task-args") == 323 && stat(partitioned, "task-weighted-nodes") == 3 &&
+                    stat(partitioned, "task-clamped-nodes") == 1 && stat(partitioned, "node-max-task-args") == 257 &&
+                    stat(partitioned, "node-capacity-units") == 12 && stat(partitioned, "supernode-max-capacity") == 4,
+                    "Task argument boundary or actual-node census changed");
+            weightedCapacity(partitioned, 4);
+            for (unsigned i = 0; i < tasks.size(); ++i) {
+                require(partitioned.opOperands(tasks[i]).size() == counts[i] + 2,
+                        "Task budget changed normalized operands");
+                if (i + 1 < tasks.size())
+                    require(execution(partitioned, tasks[i]) != execution(partitioned, tasks.back()),
+                            "Oversized task was not an indivisible exclusive node");
+            }
+            if (cost == "legacy") require(stat(partitioned, "coarsen-mode0-accepted") > 0,
+                                           "Task budget did not exercise chain coarsening");
+            else require(stat(partitioned, "coarsen-mode0-accepted") == 0 &&
+                         stat(partitioned, "coarsen-mode1-accepted") == 0 &&
+                         stat(partitioned, "coarsen-mode2-accepted") == 0,
+                         "Bytes task budget unexpectedly used greedy coarsening");
+            const auto checkpoint = json(candidate);
+            run(candidate, "partition-nonsink", fixture.session,
+                {"-max-supernode-nodes=4", "-clone-shared=0", model});
+            require(json(candidate) == checkpoint, "Task capacity replay changed its checkpoint");
+            auto old = grh::Design::fromJsonString(checkpoint);
+            old.findGraph("top")->setMetadata("grhsim.nonsinkConfig", std::string("v5/task-budget-absent"));
+            require(!run(old, "partition-nonsink", fixture.session,
+                {"-max-supernode-nodes=4", "-clone-shared=0", model}, false), "Old task-free configuration resumed");
+            run(candidate, "partition-sink", fixture.session);
+            const auto& schedule = sim::requireSinkSchedule(&fixture.session, partitioned);
+            compare(reference, candidate, {}, {{{"enable", 1}, {"data", 3}},
+                {{"enable", 0}, {"data", 7}}, {{"enable", 1}, {"data", 5}}}, "task-capacity-" + cost, &schedule);
+        }
+    }
+    {
+        // The sole task keeps its original effect order. Pure siblings share
+        // its fire producer, so mode 1 fills that producer and mode 2 must
+        // account for the task's weight when merging the remaining siblings.
+        Fixture fixture; auto& graph = fixture.graph;
+        const auto enable = fixture.input("enable"), data = fixture.input("data", 8);
+        const auto task = fixture.task("display", {enable});
+        for (unsigned i = 0; i < 33; ++i) graph.addOperand(task, data);
+        fixture.convert(); fixture.split();
+        const auto fire = graph.opOperands(task)[0];
+        std::vector<grh::OperationId> pure{graph.valueDef(fire)};
+        for (unsigned i = 0; i < 4; ++i) {
+            const auto value = fixture.compute(OperationKind::kNot, Fixture::type(1), {fire});
+            graph.setAttr(graph.valueDef(value), sim::kPartition, Owner{"general", "nonsink"});
+            pure.push_back(graph.valueDef(value));
+        }
+        const auto reference = fixture.design.clone();
+        for (unsigned i = 0; i < pure.size(); ++i) tag(graph, pure[i], {key("task-sibling-" + std::to_string(i))});
+        node::establishPolicy(graph);
+        run(fixture.design, "partition-nonsink", fixture.session,
+            {"-max-supernode-nodes=4", "-clone-shared=0", "-firrtl-nodes=prefer"});
+        require(stat(graph, "coarsen-mode1-accepted") > 0 && stat(graph, "coarsen-mode2-accepted") > 0,
+                "Task capacity did not exercise input and sibling coarsening");
+        require(stat(graph, "nodes") == 6 && stat(graph, "task-weighted-nodes") == 1 &&
+                stat(graph, "node-capacity-units") == 8, "Sibling coarsening changed activity nodes");
+        weightedCapacity(graph, 4);
+        require(execution(graph, task) != execution(graph, pure.front()), "Task overflowed its full predecessor cluster");
+        run(fixture.design, "partition-sink", fixture.session);
+        const auto& schedule = sim::requireSinkSchedule(&fixture.session, graph);
+        compare(reference, fixture.design, {}, {{{"enable", 1}, {"data", 3}},
+            {{"enable", 0}, {"data", 7}}}, "task-capacity-siblings", &schedule);
+    }
+}
+
 void arrayAndEffectBoundaries() {
     Fixture fixture;
     const auto x = fixture.graph.createValue(fixture.graph.internSymbol("x"), Fixture::type(32, {4}));
@@ -372,6 +569,6 @@ void arrayAndEffectBoundaries() {
 }
 
 int main() {
-    try { largeNodes(); semanticTreeNodes(); dagCensus(); nodeCountsAndReplay(); coarseningOrderGolden(); groupingAndFallback(); sharedAndNonconvex(); reconvergentMffc(); cloneIntoExistingNode(); arrayAndEffectBoundaries(); }
+    try { largeNodes(); semanticTreeNodes(); dagCensus(); nodeCountsAndReplay(); coarseningOrderGolden(); groupingAndFallback(); sharedAndNonconvex(); reconvergentMffc(); cloneIntoExistingNode(); clockDomainIsolation(); systemTaskCapacity(); arrayAndEffectBoundaries(); }
     catch (const std::exception& error) { std::cerr << "[grhsim-firrtl-nodes] " << error.what() << '\n'; return 1; }
 }

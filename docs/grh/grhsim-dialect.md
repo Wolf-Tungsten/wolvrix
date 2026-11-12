@@ -5,6 +5,11 @@ Operation, Value, LogicalType, use-def and JSON infrastructure. Their kinds and
 descriptors live in `transform/grhsim/ops.hpp` and its implementation; they are
 not members of the base GRH operator set. There is no second simulation graph.
 
+The `grhsim` dialect is version 2; base `grh` remains version 2 and
+`grhsim.cpu` remains version 1. Checkpoint loading requires an exact supported
+dialect version. Regenerate version-1 GrhSIM checkpoints from their base GRH
+input before using this version.
+
 Conversion, unpartitioned optimizations, Event/Output extraction, activity/
 sink partitioning and the C++ emitter form the production route. The independent
 IR and its APIs have been removed. See the [simulation workflow](../grhsim.md)
@@ -70,6 +75,35 @@ order. A return precedes output results. Counts, kind, scalar width and
 signedness are checked against the original GRH `kDpicImport`. Calls without
 events have constant-one fire and `eventDriven=false`; event-driven calls consume
 pulses. Guarding and held results remain part of execution semantics.
+
+`grhsim.system-task` optionally carries the string attribute
+`grhsim.literalFormat` for `name=write, firrtl.effectKind=printf` only. When
+present, it supplies the logical first formatting argument; all operands after
+`fire, callCond` are payload arguments. Attribute presence distinguishes an
+empty format from a task with no formatting argument. The ordinary String
+operand form remains valid, including dynamic and aliased formats.
+
+`grh-to-grhsim` extracts only a direct scalar String `constant` in that first
+argument position. Base GRH and SV emission retain the original representation:
+
+```text
+Before (base GRH):
+  fmt = constant {constValue="value=%0d\\n"} : String
+  systemTask(enable, fmt, value, clk) {
+      name=write, firrtl.effectKind=printf, eventEdge=[posedge]
+  }
+After grh-to-grhsim:
+  grhsim.system-task(fire, enable, value) {
+      name=write, firrtl.effectKind=printf,
+      grhsim.literalFormat="value=%0d\\n", ...
+  }
+```
+
+The task inherits the format operation/value semantic identities. A format
+constant is removed only if extracting these edges leaves it unused and it is
+neither a port nor a declaration/generate symbol anchor. This local cleanup
+does not remove other dead computations. Monitor, strobe and terminal tasks
+keep their original arguments.
 
 Known pure system functions can fold/CSE. Random functions have `effect=random`;
 other non-pure functions have `effect=external`. Explicit `hasSideEffects=true`

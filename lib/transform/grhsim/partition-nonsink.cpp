@@ -134,7 +134,9 @@ struct PredecessorEqual {
 };
 
 bool coarsen(Clusters& clusters, std::span<const Edge> edges, std::size_t nodeCount,
-             uint64_t limit, unsigned mode, bool phaseTiming, std::unique_ptr<Quotient>& quotient) {
+             std::span<const uint8_t> clockDomains, std::span<const uint32_t> capacities,
+             uint64_t limit, unsigned mode,
+             bool phaseTiming, std::unique_ptr<Quotient>& quotient) {
     auto previousPhase = phaseTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::array<uint64_t, 4> phaseMilliseconds{};
     const auto phase = [&](std::size_t index) {
@@ -162,7 +164,13 @@ bool coarsen(Clusters& clusters, std::span<const Edge> edges, std::size_t nodeCo
     std::vector<uint32_t> parents(clusters.size());
     std::iota(parents.begin(), parents.end(), 0);
     std::vector<uint64_t> weights(clusters.size());
-    for (uint32_t i = 0; i < clusters.size(); ++i) weights[i] = clusters[i].size();
+    std::vector<uint8_t> domains(clusters.size());
+    std::array<std::size_t, 2> domainCounts{};
+    for (uint32_t i = 0; i < clusters.size(); ++i) {
+        for (const auto node : clusters[i]) weights[i] += capacities[node];
+        domains[i] = clockDomains[clusters[i].front()];
+        ++domainCounts[domains[i]];
+    }
     const auto find = [&](uint32_t node) {
         while (parents[node] != node) { parents[node] = parents[parents[node]]; node = parents[node]; }
         return node;
@@ -170,7 +178,7 @@ bool coarsen(Clusters& clusters, std::span<const Edge> edges, std::size_t nodeCo
     bool changed = false;
     const auto merge = [&](uint32_t a, uint32_t b) {
         a = find(a); b = find(b);
-        if (a == b || weights[a] + weights[b] > limit) return false;
+        if (a == b || domains[a] != domains[b] || weights[a] + weights[b] > limit) return false;
         if (a > b) std::swap(a, b);
         parents[b] = a; weights[a] += weights[b]; changed = true;
         return true;
@@ -181,11 +189,11 @@ bool coarsen(Clusters& clusters, std::span<const Edge> edges, std::size_t nodeCo
     if (mode == 2) {
         // These spans borrow immutable rows of graph, which outlives both
         // grouping and merging. Hash-table iteration never determines order.
-        std::unordered_map<std::span<const uint32_t>, uint32_t, PredecessorHash, PredecessorEqual> groups;
-        groups.reserve(clusters.size());
+        std::array<std::unordered_map<std::span<const uint32_t>, uint32_t, PredecessorHash, PredecessorEqual>, 2> groups;
+        for (std::size_t domain = 0; domain < groups.size(); ++domain) groups[domain].reserve(domainCounts[domain]);
         predecessorGroups.resize(clusters.size(), absent);
         for (uint32_t i = 0; i < clusters.size(); ++i) if (!graph.predecessors[i].empty()) {
-            const auto [it, inserted] = groups.emplace(std::span<const uint32_t>(graph.predecessors[i]), anchors.size());
+            const auto [it, inserted] = groups[domains[i]].emplace(std::span<const uint32_t>(graph.predecessors[i]), anchors.size());
             if (inserted) anchors.push_back(i);
             else ++candidateCount;
             predecessorGroups[i] = it->second;
@@ -243,8 +251,9 @@ bool coarsen(Clusters& clusters, std::span<const Edge> edges, std::size_t nodeCo
     return true;
 }
 
-// The upper partitioner sees only Node DAG edges and unit node counts.
+// The upper partitioner sees only Node DAG edges and whole-node capacities.
 Clusters segment(const Clusters& clusters, std::span<const Edge> edges, std::size_t nodeCount,
+                 std::span<const uint8_t> clockDomains, std::span<const uint32_t> capacities,
                  uint64_t limit, uint64_t penalty, bool bytes) {
     const Quotient quotient(clusters, edges, nodeCount);
     std::vector<std::vector<ValueId>> incoming(clusters.size()), outgoing(clusters.size());
@@ -264,12 +273,16 @@ Clusters segment(const Clusters& clusters, std::span<const Edge> edges, std::siz
     }
     std::vector<uint64_t> prefix(clusters.size() + 1), cost(clusters.size() + 1, UINT64_MAX);
     std::vector<uint32_t> previous(clusters.size() + 1);
-    for (uint32_t i = 0; i < clusters.size(); ++i) prefix[i + 1] = prefix[i] + clusters[i].size();
+    for (uint32_t i = 0; i < clusters.size(); ++i) {
+        prefix[i + 1] = prefix[i];
+        for (const auto node : clusters[i]) prefix[i + 1] = addCost(prefix[i + 1], capacities[node]);
+    }
     cost[0] = 0;
     for (uint32_t end = 1; end <= clusters.size(); ++end) {
         uint64_t boundary = 0;
         for (uint32_t begin = end; begin > 0;) {
             --begin;
+            if (clockDomains[clusters[begin].front()] != clockDomains[clusters[end - 1].front()]) break;
             if (prefix[end] - prefix[begin] > limit) break;
             for (const auto value : incoming[begin]) {
                 auto& entry = values[value.index];
@@ -303,11 +316,16 @@ Clusters segment(const Clusters& clusters, std::span<const Edge> edges, std::siz
 
 struct NodeAnalysis {
     std::vector<std::vector<OperationId>> nodes;
+    std::vector<uint8_t> clockDomains;
+    std::vector<uint32_t> capacities;
     std::vector<Edge> edges;
     uint64_t coveredOps = 0, coveredWork = 0, multiMember = 0, families = 0;
     uint64_t hintedNodes = 0, sharedNodes = 0, mffcNodes = 0, boundaryNodes = 0;
     uint64_t conflictGroups = 0, conflictOps = 0, boundaryHints = 0;
     uint64_t semanticCoveredOps = 0, legacyCoveredOps = 0;
+    uint64_t clockRoots = 0, clockOps = 0;
+    uint64_t taskNodes = 0, taskArgs = 0, weightedTaskNodes = 0, clampedTaskNodes = 0;
+    uint64_t totalCapacity = 0, maxTaskArgs = 0;
 };
 
 // Normalize source associations before constructing MFFCs. Identical sets of
@@ -318,6 +336,15 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
     NodeAnalysis result;
     std::unordered_map<OperationId, uint32_t, OperationIdHash> index;
     for (uint32_t i = 0; i < topo.size(); ++i) index.emplace(topo[i], i);
+    std::unordered_set<ValueId, ValueIdHash> clockRoots;
+    for (const auto op : graph.operations()) if (graph.opKind(op) == kEdgeDetect) {
+        for (const auto value : graph.opOperands(op)) clockRoots.insert(value);
+        for (const auto value : graph.opResults(op)) clockRoots.insert(value);
+    }
+    result.clockRoots = clockRoots.size();
+    // Follow real operands only. State writer relationships and ordered-effect
+    // arcs constrain scheduling, but do not make an independent read a clock.
+    std::vector<uint8_t> clockDomains(topo.size());
     std::vector<Edge> edges;
     std::vector<std::vector<uint64_t>> members(topo.size());
     std::set<uint64_t> families;
@@ -357,6 +384,7 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
     std::vector<bool> boundary(topo.size());
     for (uint32_t i = 0; i < topo.size(); ++i) {
         const auto op = topo[i];
+        for (const auto value : graph.opResults(op)) clockDomains[i] |= clockRoots.contains(value);
         if (attribute<int64_t>(graph, op, "grhsim.activity").value_or(0) < 0)
             throw std::invalid_argument("Negative activity rate");
         boundary[i] = operationEffect(graph, op) != OpEffect::Pure ||
@@ -393,11 +421,13 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
         for (const auto input : graph.opOperands(op)) {
             const auto producer = graph.valueDef(input);
             const auto found = index.find(producer);
+            clockDomains[i] |= clockRoots.contains(input) || (found != index.end() && clockDomains[found->second]);
             const auto rate = producer ? attribute<int64_t>(graph, producer, "grhsim.activity").value_or(1) : 1;
             if (rate < 0) throw std::invalid_argument("Negative activity rate");
             edges.push_back({found == index.end() ? absent : found->second, i, input,
                 uint64_t(std::max<int64_t>(1, rate)), valueBytes(graph, input)});
         }
+        result.clockOps += clockDomains[i];
     }
     result.families = families.size();
     std::map<int64_t, uint32_t> effects;
@@ -409,11 +439,11 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
         previous = op;
     }
     Clusters candidates;
-    std::map<std::vector<uint64_t>, uint32_t> associated;
+    std::array<std::map<std::vector<uint64_t>, uint32_t>, 2> associated;
     for (uint32_t i = 0; i < topo.size(); ++i) {
         uint32_t group = candidates.size();
         if (!members[i].empty()) {
-            const auto [it, inserted] = associated.emplace(members[i], group);
+            const auto [it, inserted] = associated[clockDomains[i]].emplace(members[i], group);
             group = it->second;
         }
         if (group == candidates.size()) candidates.emplace_back();
@@ -448,13 +478,14 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
             }
         }
     }
-    associated.clear();
+    for (auto& groups : associated) groups.clear();
     std::vector<uint32_t> nodeOf(topo.size(), absent);
     std::vector<bool> hinted;
     for (uint32_t i = 0; i < topo.size(); ++i) if (!members[i].empty()) {
-        const auto [it, inserted] = associated.emplace(members[i], result.nodes.size());
+        const auto [it, inserted] = associated[clockDomains[i]].emplace(members[i], result.nodes.size());
         if (inserted) {
             result.nodes.emplace_back(); hinted.push_back(true); ++result.hintedNodes;
+            result.clockDomains.push_back(clockDomains[i]);
             result.sharedNodes += members[i].size() > 1;
         }
         nodeOf[i] = it->second;
@@ -470,6 +501,7 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
                 if (found == index.end()) { absorb = false; continue; }
                 const auto destination = nodeOf[found->second];
                 if (destination == absent || hinted[destination]) { absorb = false; continue; }
+                if (clockDomains[i] != result.clockDomains[destination]) absorb = false;
                 if (target == absent) target = destination;
                 else if (target != destination) absorb = false;
             }
@@ -478,12 +510,36 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
         if (target != absent && !hinted[target] && boundary[index.at(result.nodes[target].front())]) absorb = false;
         if (!absorb || target == absent) {
             target = result.nodes.size(); result.nodes.push_back({op}); hinted.push_back(false);
+            result.clockDomains.push_back(clockDomains[i]);
             if (boundary[i]) ++result.boundaryNodes; else ++result.mffcNodes;
         }
         nodeOf[i] = target;
     }
     for (auto& node : result.nodes) node.clear();
     for (uint32_t i = 0; i < topo.size(); ++i) result.nodes[nodeOf[i]].push_back(topo[i]);
+    // A task argument expands to a TaskArg initializer in generated C++.
+    // Charge this expansion without splitting or changing an activity node.
+    result.capacities.reserve(result.nodes.size());
+    for (const auto& node : result.nodes) {
+        uint64_t taskArgs = 0;
+        bool hasTask = false;
+        for (const auto op : node) if (graph.opKind(op) == kSystemTask) {
+            const auto operands = graph.opOperands(op);
+            if (operands.size() < 2) throw std::invalid_argument("System task requires fire and enable operands");
+            taskArgs = addCost(taskArgs, operands.size() - 2);
+            if (graph.opAttrRange(op).find(kLiteralFormat)) taskArgs = addCost(taskArgs, 1);
+            hasTask = true;
+        }
+        const auto capacity = std::max<uint64_t>(1, taskArgs / 16 + (taskArgs % 16 != 0));
+        const auto bounded = std::min<uint64_t>(capacity, options.maxSupernodeNodes);
+        result.capacities.push_back(static_cast<uint32_t>(bounded));
+        result.taskNodes += hasTask;
+        result.taskArgs = addCost(result.taskArgs, taskArgs);
+        result.weightedTaskNodes += bounded > 1;
+        result.clampedTaskNodes += capacity > bounded;
+        result.totalCapacity = addCost(result.totalCapacity, bounded);
+        result.maxTaskArgs = std::max(result.maxTaskArgs, taskArgs);
+    }
     for (auto edge : edges) {
         edge.source = edge.source == absent ? absent : nodeOf[edge.source];
         edge.target = nodeOf[edge.target];
@@ -493,16 +549,16 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
 }
 
 std::string config(const PartitionNonsinkOptions& options) {
-    return "v4/" + std::to_string(options.maxSupernodeNodes) + "/" + std::to_string(options.segmentPenalty) + "/" +
+    return "v6/" + std::to_string(options.maxSupernodeNodes) + "/" + std::to_string(options.segmentPenalty) + "/" +
         std::to_string(options.semanticNodes) + "/" + std::to_string(options.cloneShared) + "/" +
         std::to_string(options.cloneMaxFanout) + "/" + std::to_string(options.maxClones) + "/" +
-        std::to_string(options.cloneLossyCompare) + "/" + options.firrtlNodes + "/" + options.costModel + "/semantic-tree-mffc-v1";
+        std::to_string(options.cloneLossyCompare) + "/" + options.firrtlNodes + "/" + options.costModel + "/semantic-tree-mffc-clock-task-v1";
 }
 
-struct CloneStats { uint64_t count = 0, work = 0, costRejected = 0; };
+struct CloneStats { uint64_t count = 0, work = 0, costRejected = 0, clockRejected = 0; };
 
 CloneStats cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
-                     std::span<const OperationId> originals) {
+                     std::span<const OperationId> originals, const std::map<Owner, uint8_t>& clockOwners) {
     CloneStats stats;
     if (!options.cloneShared || options.maxClones == 0) return stats;
     const auto nonsink = [&](StringListView path) { return path.size() >= 4 && path[0] == "general" && path[1] == "nonsink"; };
@@ -514,6 +570,7 @@ CloneStats cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
     for (const auto op : originals) {
         if (!canCloneOperation(graph, op) || graph.opResults(op).size() != 1) continue;
         const auto originalOwner = owner(graph, op);
+        auto originalExecution = originalOwner; originalExecution.resize(3);
         const auto result = graph.opResults(op)[0];
         const auto type = graph.valueLogicalType(result);
         if (type.kind != ValueType::Logic || type.domain != LogicDomain::TwoState || !type.shape.empty() || type.width > 64) continue;
@@ -548,6 +605,11 @@ CloneStats cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
         for (const auto& [path, users] : destinations) {
             if (stats.count >= options.maxClones) return stats;
             auto execution = path; execution.resize(3);
+            // Do not reintroduce data-only work into an owner fired by a clock.
+            // Constants copied below are immutable and remain neutral.
+            if (clockOwners.at(originalExecution) != clockOwners.at(execution)) {
+                ++stats.costRejected; ++stats.clockRejected; continue;
+            }
             std::set<uint32_t> constants;
             uint64_t extra = work(graph, op);
             for (const auto input : args) {
@@ -654,6 +716,7 @@ PassResult PartitionNonsinkPass::run() {
         for (uint32_t i = 0; i < nodes.size(); ++i) clusters[i] = {i};
         if (!orderClusters(clusters, edges, nodes.size())) throw std::invalid_argument("Node contraction introduced a cycle");
         phase("initial-clusters-ordered");
+        std::array<uint64_t, 3> coarsenAccepted{};
         {
             // Reuse the quotient across modes and rounds only while clusters
             // stay unchanged; release it before segment builds its own.
@@ -661,25 +724,31 @@ PassResult PartitionNonsinkPass::run() {
             while (!clusters.empty() && options_.costModel == "legacy") {
                 const auto before = clusters.size();
                 for (unsigned mode = 0; mode < 3; ++mode)
-                    coarsen(clusters, edges, nodes.size(), options_.maxSupernodeNodes, mode, phaseTiming, quotient);
+                    coarsenAccepted[mode] += coarsen(clusters, edges, nodes.size(), analysis.clockDomains, analysis.capacities,
+                        options_.maxSupernodeNodes, mode, phaseTiming, quotient);
                 if (clusters.size() == before) break;
             }
         }
         phase("clusters-coarsened");
-        clusters = segment(clusters, edges, nodes.size(), options_.maxSupernodeNodes,
+        clusters = segment(clusters, edges, nodes.size(), analysis.clockDomains, analysis.capacities, options_.maxSupernodeNodes,
             options_.segmentPenalty, options_.costModel == "bytes");
         phase("clusters-segmented");
         result.changed = true;
+        std::map<Owner, uint8_t> clockOwners;
+        uint64_t clockSupernodes = 0;
         for (const auto& cluster : clusters) {
             const auto anchor = nodes[cluster.front()].front();
             const std::string key = "sn_" + std::string(graph->symbolText(graph->operationSymbol(anchor)));
+            const auto domain = analysis.clockDomains[cluster.front()];
+            clockOwners.emplace(Owner{"general", "nonsink", key}, domain);
+            clockSupernodes += domain;
             for (const auto node : cluster) {
                 const std::string nodeKey = "node_" + std::string(graph->symbolText(graph->operationSymbol(nodes[node].front())));
                 for (const auto op : nodes[node]) graph->setAttr(op, kPartition, Owner{"general", "nonsink", key, nodeKey});
             }
         }
         phase("partition-owners-written");
-        const auto cloneStats = cloneBoundaries(*graph, options_, topo);
+        const auto cloneStats = cloneBoundaries(*graph, options_, topo, clockOwners);
         phase("boundary-clones-materialized");
         uint64_t splitHints = 0, leafCount = 0, boundaryBytes = 0, comparedBytes = 0, multiSourceGroups = 0;
         std::map<std::string, std::set<Owner>> destinations;
@@ -760,20 +829,36 @@ PassResult PartitionNonsinkPass::run() {
         for (const auto& [key, weight] : leafWork) maxLeaf = std::max(maxLeaf, weight);
         for (const auto& [key, weight] : executionWork) maxExecution = std::max(maxExecution, weight);
         const std::string resolved = useHints ? "prefer" : "off";
-        uint64_t maxNodes = 0;
-        for (const auto& cluster : clusters) maxNodes = std::max<uint64_t>(maxNodes, cluster.size());
-        std::vector<std::string> stats{"semantic-tree-mffc-v1", "requested=" + options_.firrtlNodes,
+        uint64_t maxNodes = 0, maxCapacity = 0;
+        for (const auto& cluster : clusters) {
+            maxNodes = std::max<uint64_t>(maxNodes, cluster.size());
+            uint64_t capacity = 0;
+            for (const auto node : cluster) capacity += analysis.capacities[node];
+            maxCapacity = std::max(maxCapacity, capacity);
+        }
+        std::vector<std::string> stats{"semantic-tree-mffc-clock-task-v1", "requested=" + options_.firrtlNodes,
             "resolved=" + resolved, "cost=" + options_.costModel + "-node-v1",
             "covered-ops=" + std::to_string(analysis.coveredOps), "covered-work=" + std::to_string(analysis.coveredWork),
             "semantic-covered-ops=" + std::to_string(analysis.semanticCoveredOps),
             "legacy-covered-ops=" + std::to_string(analysis.legacyCoveredOps),
             "multi-member-ops=" + std::to_string(analysis.multiMember), "hint-families=" + std::to_string(analysis.families),
+            "clock-roots=" + std::to_string(analysis.clockRoots), "clock-dependent-ops=" + std::to_string(analysis.clockOps),
+            "clock-dependent-supernodes=" + std::to_string(clockSupernodes),
+            "task-nodes=" + std::to_string(analysis.taskNodes), "task-args=" + std::to_string(analysis.taskArgs),
+            "task-weighted-nodes=" + std::to_string(analysis.weightedTaskNodes),
+            "task-clamped-nodes=" + std::to_string(analysis.clampedTaskNodes),
+            "node-max-task-args=" + std::to_string(analysis.maxTaskArgs),
+            "node-capacity-units=" + std::to_string(analysis.totalCapacity),
             "firrtl-nodes=" + std::to_string(analysis.hintedNodes), "shared-nodes=" + std::to_string(analysis.sharedNodes),
             "mffc-nodes=" + std::to_string(analysis.mffcNodes), "boundary-nodes=" + std::to_string(analysis.boundaryNodes),
             "hint-conflict-groups=" + std::to_string(analysis.conflictGroups), "hint-conflict-ops=" + std::to_string(analysis.conflictOps),
             "hint-boundary-ops=" + std::to_string(analysis.boundaryHints), "split-hints=" + std::to_string(splitHints),
             "mixed-groups=" + std::to_string(multiSourceGroups), "nodes=" + std::to_string(leafCount),
             "supernodes=" + std::to_string(clusters.size()), "supernode-max-nodes=" + std::to_string(maxNodes),
+            "supernode-max-capacity=" + std::to_string(maxCapacity),
+            "coarsen-mode0-accepted=" + std::to_string(coarsenAccepted[0]),
+            "coarsen-mode1-accepted=" + std::to_string(coarsenAccepted[1]),
+            "coarsen-mode2-accepted=" + std::to_string(coarsenAccepted[2]),
             "node-data-edges=" + std::to_string(nodeDataEdges), "node-dependency-edges=" + std::to_string(nodeDependencyEdges),
             "supernode-data-edges=" + std::to_string(supernodeDataEdges),
             "supernode-dependency-edges=" + std::to_string(supernodeDependencyEdges),
@@ -783,11 +868,15 @@ PassResult PartitionNonsinkPass::run() {
             "persistent-bytes=" + std::to_string(boundaryBytes), "consumer-bytes=" + std::to_string(comparedBytes),
             "clone-ops=" + std::to_string(cloneStats.count), "clone-extra-work=" + std::to_string(cloneStats.work),
             "clone-skip-cost=" + std::to_string(cloneStats.costRejected),
+            "clone-skip-clock=" + std::to_string(cloneStats.clockRejected),
             "nonsink-ops=" + std::to_string(nonsinkOps), "total-work=" + std::to_string(totalWork),
             "node-max-work=" + std::to_string(maxLeaf), "supernode-max-work=" + std::to_string(maxExecution)};
         for (const auto& cluster : clusters) {
             const auto path = owner(*graph, nodes[cluster.front()].front());
             stats.push_back("supernode-nodes=" + path[2] + ":" + std::to_string(cluster.size()));
+            uint64_t capacity = 0;
+            for (const auto node : cluster) capacity += analysis.capacities[node];
+            stats.push_back("supernode-capacity=" + path[2] + ":" + std::to_string(capacity));
         }
         graph->setMetadata("grhsim.nonsinkHintStats", stats);
         if (!options_.report.empty()) {

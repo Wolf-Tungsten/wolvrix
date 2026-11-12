@@ -39,6 +39,8 @@ struct OpConversion {
     std::vector<EventInput> events;
     int64_t writerOrder = -1;
     std::vector<std::pair<std::size_t, LogicalType>> inputViews;
+    std::optional<std::string> literalFormat;
+    ValueId literalFormatValue;
 };
 
 struct EventKey {
@@ -429,6 +431,8 @@ PassResult GrhToGrhsimPass::run()
             const auto* descriptor = findOpDescriptor(kind);
             if (!descriptor || descriptor->dialect != "grh" || graph->opAttrRange(op).find(kPartition))
                 throw std::invalid_argument("Expected an unpartitioned base GRH graph");
+            if (graph->opAttrRange(op).find(kLiteralFormat))
+                throw std::invalid_argument("Base GRH must not carry grhsim.literalFormat");
             if (kind == OperationKind::kInstance || kind == OperationKind::kBlackbox ||
                 kind == OperationKind::kXMRRead || kind == OperationKind::kXMRWrite)
                 throw std::invalid_argument("grh-to-grhsim requires a fully expanded top graph");
@@ -520,6 +524,21 @@ PassResult GrhToGrhsimPass::run()
                 if (*kind == kSystemTask && (!graph->opResults(op).empty() ||
                     attribute<std::string>(*graph, op, "name").value_or("").empty()))
                     throw std::invalid_argument("System task requires a name and no results");
+                if (*kind == kSystemTask && args.size() > edges.size() + 1 &&
+                    attribute<std::string>(*graph, op, "name") == "write" &&
+                    attribute<std::string>(*graph, op, "firrtl.effectKind") == "printf")
+                {
+                    const auto format = args[1];
+                    const auto type = graph->valueLogicalType(format);
+                    const auto producer = graph->valueDef(format);
+                    if (type.kind == ValueType::String && type.shape.empty() && producer &&
+                        graph->opKind(producer) == OperationKind::kConstant &&
+                        graph->opOperands(producer).empty() && graph->opResults(producer).size() == 1)
+                    {
+                        conversion.literalFormat = attribute<std::string>(*graph, producer, "constValue").value();
+                        conversion.literalFormatValue = format;
+                    }
+                }
                 if (*kind == kDpiCall) {
                     if (const auto problem = verifyDpiSignature(*graph, op, 1, edges.size(), true); !problem.empty())
                         throw std::invalid_argument(problem);
@@ -823,6 +842,13 @@ PassResult GrhToGrhsimPass::run()
             {
                 for (std::size_t i = 0; i < conversion.events.size(); ++i)
                     graph->eraseOperand(op, graph->opOperands(op).size() - 1);
+                if (conversion.literalFormat)
+                {
+                    const auto format = conversion.literalFormatValue;
+                    inheritSemantic(*graph, op, {}, {graph->valueDef(format)}, {format});
+                    graph->setAttr(op, kLiteralFormat, *conversion.literalFormat);
+                    graph->eraseOperand(op, 1);
+                }
                 if (!fire)
                 {
                     if (!always) always = constant(*graph, pulseType, "1'h1");
@@ -872,6 +898,25 @@ PassResult GrhToGrhsimPass::run()
         phase("operation-rewrites-done");
         helperMetadata.publish(*graph);
         phase("helper-metadata-published");
+        // Only retire constants whose format edge was removed here. Preserve
+        // shared values, public ports and declaration/generate anchors.
+        std::unordered_set<uint32_t> anchoredSymbols;
+        for (const auto symbol : graph->declaredSymbols()) anchoredSymbols.insert(symbol.value);
+        for (const auto& group : graph->generateGroups())
+            for (const auto symbol : group.symbols) anchoredSymbols.insert(symbol.value);
+        std::unordered_set<ValueId, ValueIdHash> visitedFormats;
+        for (const auto& conversion : conversions)
+        {
+            const auto value = conversion.literalFormatValue;
+            if (!conversion.literalFormat || !visitedFormats.insert(value).second ||
+                !graph->valueUsers(value).empty() || graph->valueIsInput(value) ||
+                graph->valueIsOutput(value) || graph->valueIsInout(value)) continue;
+            const auto producer = graph->valueDef(value);
+            if (anchoredSymbols.contains(graph->valueSymbol(value).value) ||
+                anchoredSymbols.contains(graph->operationSymbol(producer).value)) continue;
+            if (!graph->eraseOp(producer) || !graph->eraseValue(value))
+                throw std::invalid_argument("Could not retire unused literal task format");
+        }
         graph->setMetadata("grhsim.logicDomain", std::string(toString(domain)));
         graph->setMetadata(kStage, std::string("converted"));
         phase("postverify-start");

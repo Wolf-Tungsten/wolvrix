@@ -8,11 +8,11 @@ namespace wolvrix::lib::emit::grhsim_detail {
 
 Code Code::line(std::string text, bool terminal) {
     if (text.find('\n') != std::string::npos) throw std::invalid_argument("C++ statement contains a newline");
-    return {std::move(text), {}, false, terminal, {}, {}};
+    return {std::move(text), {}, false, terminal, {}, {}, {}};
 }
 Code Code::block(std::string header, std::vector<Code> body) {
     if (header.find('\n') != std::string::npos) throw std::invalid_argument("C++ scope contains a newline");
-    return {std::move(header), std::move(body), true, false, {}, {}};
+    return {std::move(header), std::move(body), true, false, {}, {}, {}};
 }
 Code Code::commented(Code code, std::string comment) {
     code.comment = std::move(comment);
@@ -27,6 +27,40 @@ std::size_t Code::lines() const {
 namespace {
 using LocalIndex = std::map<std::string, std::size_t, std::less<>>;
 using Replacements = std::map<std::string, std::string, std::less<>>;
+
+bool numericSpillType(std::string_view type) {
+    if (type.starts_with("std::array<") && type.ends_with('>')) {
+        const auto comma = type.rfind(',');
+        if (comma == std::string_view::npos || comma <= 11) return false;
+        const auto count = type.substr(comma + 1, type.size() - comma - 2);
+        return !count.empty() && std::all_of(count.begin(), count.end(), [](char ch) {
+            return ch >= '0' && ch <= '9';
+        }) && numericSpillType(type.substr(11, comma - 11));
+    }
+    for (const auto prefix : {std::string_view("unsigned_BitInt("), std::string_view("_BitInt(")}) {
+        if (!type.starts_with(prefix) || !type.ends_with(')')) continue;
+        const auto width = type.substr(prefix.size(), type.size() - prefix.size() - 1);
+        return !width.empty() && std::all_of(width.begin(), width.end(), [](char ch) {
+            return ch >= '0' && ch <= '9';
+        });
+    }
+    for (const auto name : {"bool", "char", "signedchar", "unsignedchar", "short", "shortint",
+                           "unsignedshort", "unsignedshortint", "int", "unsigned", "unsignedint",
+                           "long", "longint", "unsignedlong", "unsignedlongint", "longlong",
+                           "longlongint", "unsignedlonglong", "unsignedlonglongint", "float", "double",
+                           "std::size_t", "std::ptrdiff_t", "std::uint8_t", "std::uint16_t", "std::uint32_t",
+                           "std::uint64_t", "std::int8_t", "std::int16_t", "std::int32_t", "std::int64_t"})
+        if (type == name) return true;
+    return false;
+}
+
+bool partLocalSpill(const Local& local) {
+    if (local.parameter || (!local.initializer.empty() && local.initializer != "{}")) return false;
+    std::string type;
+    type.reserve(local.type.size());
+    for (const char ch : local.type) if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') type += ch;
+    return numericSpillType(type);
+}
 
 // Comments may contain original HDL identifiers and source locations. Keep
 // them on one physical line and outside placeholder substitution/preprocessing.
@@ -130,6 +164,7 @@ bool hasTerminal(const Code& code) {
 void operationReferences(const std::vector<Code>& body, std::set<std::string>& result) {
     for (const auto& statement : body) {
         if (!statement.sourceOperation.empty()) result.insert(statement.sourceOperation);
+        result.insert(statement.sourceOperations.begin(), statement.sourceOperations.end());
         operationReferences(statement.body, result);
     }
 }
@@ -165,20 +200,27 @@ WrittenFunctions writeFunction(Function source, std::string_view className, std:
     parts.push_back({source.name, std::move(source.body)});
     const std::string frameType = "chunkFrame_" + source.name;
     std::vector<std::set<std::string>> refs;
+    std::vector<std::set<std::string>> localFrameRefs;
     std::set<std::string> shared, forcedFrame;
     LocalIndex localIndex;
     std::vector<std::size_t> sharedParameters;
     const auto analyze = [&] {
-        refs.assign(parts.size(), {}); shared = forcedFrame;
+        refs.assign(parts.size(), {}); shared.clear();
+        localFrameRefs.assign(parts.size(), {});
         localIndex.clear(); sharedParameters.clear();
         for (std::size_t i = 0; i < source.locals.size(); ++i) localIndex.emplace(source.locals[i].name, i);
-        std::map<std::string, std::size_t> counts;
+        struct Usage { std::size_t count = 0, part = 0; };
+        std::map<std::string, Usage> usage;
         for (std::size_t i = 0; i < parts.size(); ++i) {
             references(parts[i].body, localIndex, refs[i]);
-            for (const auto& name : refs[i]) ++counts[name];
+            for (const auto& name : refs[i]) {
+                auto& item = usage[name];
+                ++item.count;
+                item.part = i;
+            }
         }
         for (const auto& local : source.locals)
-            if (counts[local.name] > 1 || (local.parameter && !refs[0].contains(local.name) && counts[local.name]))
+            if (usage[local.name].count > 1 || (local.parameter && !refs[0].contains(local.name) && usage[local.name].count))
                 shared.insert(local.name);
         // A helper extracted from a loop can execute repeatedly. A local
         // initialized by the root must retain its value between these calls,
@@ -188,6 +230,16 @@ WrittenFunctions writeFunction(Function source, std::string_view className, std:
         if (returnControl) {
             shared.insert("chunk_returned");
             if (returnsValue) shared.insert("chunk_result");
+        }
+        for (const auto& name : forcedFrame) {
+            const auto& local = source.locals[localIndex.at(name)];
+            const auto& item = usage.at(name);
+            if (!source.localizePrivateNumericSpills || shared.contains(name) || item.count != 1 ||
+                !partLocalSpill(local)) {
+                shared.insert(name);
+                continue;
+            }
+            localFrameRefs[item.part].insert(name);
         }
         for (std::size_t i = 0; i < source.locals.size(); ++i)
             if (source.locals[i].parameter && shared.contains(source.locals[i].name)) sharedParameters.push_back(i);
@@ -203,8 +255,10 @@ WrittenFunctions writeFunction(Function source, std::string_view className, std:
         std::size_t lines = 3;
         if (index == 0 && !shared.empty()) ++lines;
         if (index == 0) lines += sharedParameters.size();
+        if (!localFrameRefs[index].empty()) ++lines;
         for (const auto& name : refs[index])
-            if (!shared.contains(name) && !source.locals[localIndex.at(name)].parameter) ++lines;
+            if (!shared.contains(name) && !localFrameRefs[index].contains(name) &&
+                !source.locals[localIndex.at(name)].parameter) ++lines;
         for (const auto& statement : parts[index].body) lines += statementLines(statementLines, statement, index != 0);
         return lines;
     };
@@ -218,18 +272,32 @@ WrittenFunctions writeFunction(Function source, std::string_view className, std:
         // shared, so this pass can conservatively split all oversized parts
         // before recomputing references for the whole function.
         for (const auto index : oversized) {
-            // Moving an indivisible statement into another helper does not reduce
-            // its private declarations. Spill these locals once when declarations
-            // alone prevent the body from fitting, rather than wrapping the same
-            // scope in an unbounded chain of helpers.
+            // Moving an indivisible statement cannot reduce its declarations.
+            // Group those locals once, then recompute liveness before deciding
+            // whether their aggregate needs the source-function lifetime.
             std::set<std::string> privateLocals;
             for (const auto& name : refs[index])
-                if (!shared.contains(name) && !source.locals[localIndex.at(name)].parameter)
+                if (!shared.contains(name) && !localFrameRefs[index].contains(name) &&
+                    !source.locals[localIndex.at(name)].parameter)
                     privateLocals.insert(name);
-            const auto frameLine = index == 0 && shared.empty() ? 1u : 0u;
-            if (!privateLocals.empty() && cost(index) - privateLocals.size() + frameLine <= maxLines) {
-                forcedFrame.insert(privateLocals.begin(), privateLocals.end());
-                continue;
+            if (!privateLocals.empty()) {
+                bool addLocal = false, addShared = false;
+                for (const auto& name : privateLocals) {
+                    const bool local = source.localizePrivateNumericSpills && partLocalSpill(source.locals[localIndex.at(name)]);
+                    addLocal |= local;
+                    addShared |= !local;
+                }
+                const auto localLine = addLocal && localFrameRefs[index].empty() ? 1u : 0u;
+                const auto sharedLine = index == 0 && shared.empty() && addShared ? 1u : 0u;
+                if (cost(index) - privateLocals.size() + localLine + sharedLine <= maxLines) {
+                    forcedFrame.insert(privateLocals.begin(), privateLocals.end());
+                    for (const auto& name : privateLocals) {
+                        if (source.localizePrivateNumericSpills && partLocalSpill(source.locals[localIndex.at(name)]))
+                            localFrameRefs[index].insert(name);
+                        else shared.insert(name);
+                    }
+                    continue;
+                }
             }
             auto& body = parts[index].body;
             // Extract a scope only when it cannot fit in one function. Splitting
@@ -257,6 +325,7 @@ WrittenFunctions writeFunction(Function source, std::string_view className, std:
                 const bool repeated = parts[index].repeated || scope.text.starts_with("for (") || scope.text.starts_with("while (");
                 std::vector<Code> inner = std::move(scope.body);
                 auto sourceOperations = parts[index].sourceOperations;
+                sourceOperations.insert(scope.sourceOperations.begin(), scope.sourceOperations.end());
                 if (!scope.sourceOperation.empty()) {
                     sourceOperations.insert(scope.sourceOperation);
                     // Preserve a tagged scope in both the controlling function
@@ -325,6 +394,25 @@ WrittenFunctions writeFunction(Function source, std::string_view className, std:
         // Only physical references are needed after the declaration is written.
         std::vector<Local>().swap(layout.physicalFields);
     }
+    std::vector<ValueStructLayout> localLayouts(parts.size());
+    std::vector<std::string> localInstances(parts.size());
+    for (std::size_t i = 0; i < parts.size(); ++i) if (!localFrameRefs[i].empty()) {
+        std::vector<Local> fields;
+        std::vector<std::size_t> indices;
+        indices.reserve(localFrameRefs[i].size());
+        for (const auto& name : localFrameRefs[i]) indices.push_back(localIndex.at(name));
+        std::sort(indices.begin(), indices.end());
+        fields.reserve(indices.size());
+        for (const auto index : indices) fields.push_back(source.locals[index]);
+        const auto type = "localFrame_" + parts[i].name;
+        auto& localLayout = localLayouts[i];
+        localLayout = source.readableFrame ? writeDirectValueLayout(type, fields) : writeValueLayout(type, fields);
+        result.frameDeclaration += localLayout.declaration;
+        std::vector<Local>().swap(localLayout.physicalFields);
+        auto& instance = localInstances[i];
+        instance = "localFrame";
+        while (localIndex.contains(instance)) instance += '_';
+    }
     if (!hasFrame) {
         // Split points are discovered before the final liveness fixpoint, so
         // helper calls were conservatively emitted with a frame argument.
@@ -359,6 +447,8 @@ WrittenFunctions writeFunction(Function source, std::string_view className, std:
             part.name + "(" + parameters + ")" + (source.isConst ? " const" : "") + "\n{\n";
         if (i == 0 && hasFrame) function.definition += "    " + frameType + " chunkFrame" +
             (source.zeroInitializeLocals || returnControl ? "{}" : "") + ";\n";
+        if (!localFrameRefs[i].empty()) function.definition += "    localFrame_" + part.name + " " +
+            localInstances[i] + (source.zeroInitializeLocals ? "{}" : "") + ";\n";
         Replacements names;
         for (const auto index : sharedParameters) if (i == 0) {
             const auto& local = source.locals[index];
@@ -373,8 +463,9 @@ WrittenFunctions writeFunction(Function source, std::string_view className, std:
         std::sort(usedLocals.begin(), usedLocals.end());
         for (const auto index : usedLocals) {
             const auto& local = source.locals[index];
-            names[local.name] = shared.contains(local.name) ? "chunkFrame." + layout.references.at(local.name) : local.name;
-            if (!shared.contains(local.name) && !local.parameter)
+            names[local.name] = shared.contains(local.name) ? "chunkFrame." + layout.references.at(local.name) :
+                localFrameRefs[i].contains(local.name) ? localInstances[i] + "." + localLayouts[i].references.at(local.name) : local.name;
+            if (!shared.contains(local.name) && !localFrameRefs[i].contains(local.name) && !local.parameter)
                 function.definition += "    " + local.type + " " + local.name +
                     (!source.zeroInitializeLocals && local.initializer == "{}" ? "" : local.initializer) +
                     ";" + inlineComment(local.comment) + "\n";

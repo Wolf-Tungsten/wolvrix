@@ -16,6 +16,7 @@
 #include <bit>
 #include <charconv>
 #include <chrono>
+#include <compare>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -46,8 +47,8 @@ const std::vector<std::string> namedStores{
     "smallSinkEnableBoundaryStore", "smallSinkPayloadBoundaryStore",
     "largeSinkEnableBoundaryStore", "largeSinkPayloadBoundaryStore",
     "prevEventStore", "eventActStore", "timeslotTriggerStore", "sampledStore",
-    "onceStore", "largeBeforeStore", "largeWholeBeforeStore",
-    "largeWholeDirtyStore", "memoryReadIndexStore", "memoryTouchedStore"};
+    "onceStore", "largeBeforeImageStore", "largeWholeBeforeStore",
+    "largeWholeDirtyStore"};
 
 class EmitPhaseTiming {
 public:
@@ -275,17 +276,49 @@ private:
     std::unordered_map<ValueId, std::size_t, grh::ValueIdHash> smallEnableOrdinal_;
     std::unordered_map<ValueId, std::set<std::size_t>, grh::ValueIdHash> fanout_;
     std::unordered_map<OperationId, std::set<std::size_t>, grh::OperationIdHash> stateFanout_;
+    // Ordinals identify exact schedule runs, never their shared partition owner.
+    std::vector<std::optional<std::size_t>> sinkRunOrdinal_;
+    struct SinkPackedMask { std::size_t word; std::uint64_t bits; };
+    struct SinkRunFanout {
+        std::vector<SinkPackedMask> masks;
+        std::size_t runCount = 0;
+        void insert(std::size_t ordinal) {
+            const auto word = ordinal / 64;
+            const auto bit = std::uint64_t{1} << (ordinal % 64);
+            // Analysis visits exact runs in ascending ordinal order. Keep only
+            // their packed masks, rather than a second subscriber set per source.
+            if (!masks.empty() && masks.back().word > word)
+                throw std::logic_error("CPU sink activity subscriptions are out of order");
+            if (masks.empty() || masks.back().word != word) masks.push_back({word, 0});
+            if (!(masks.back().bits & bit)) { masks.back().bits |= bit; ++runCount; }
+        }
+        std::size_t size() const { return runCount; }
+    };
+    std::unordered_map<ValueId, SinkRunFanout, grh::ValueIdHash> sinkValueFanout_;
+    std::unordered_map<OperationId, SinkRunFanout, grh::OperationIdHash> sinkTargetFanout_;
+    std::unordered_map<OperationId, SinkRunFanout, grh::OperationIdHash> sinkCurrentStateFanout_;
+    std::map<std::string, std::pair<std::size_t, std::size_t>> sinkRejections_;
+    std::unordered_set<ValueId, grh::ValueIdHash> sinkInputSources_, sinkPublicationSources_;
+    std::unordered_set<OperationId, grh::OperationIdHash> sinkCurrentStatePublicationSources_;
+    std::size_t sinkActivityRuns_ = 0, sinkActivityWriters_ = 0;
+    std::size_t sinkInputMaskSites_ = 0, sinkPublicationMaskSites_ = 0, sinkShadowMaskSites_ = 0;
+    std::size_t scalarShadowChangeMaskWriterSites_ = 0;
+    std::size_t sinkSmallCurrentPublicationMaskSites_ = 0, sinkLargeCurrentWriteMaskSites_ = 0;
+    std::size_t sinkJoinedFireRuns_ = 0, sinkCurrentStateRuns_ = 0;
+    std::size_t sinkPublicationMaskSitesBeforeGrouping_ = 0;
+    std::size_t publicationAggregationGroups_ = 0, publicationAggregationSites_ = 0;
+    std::size_t publicationAggregationSinkGroups_ = 0, publicationAggregationSinkSites_ = 0;
+    std::size_t writerBatches_ = 0, writerBatchesAllEligible_ = 0, writerBatchesWithActivityGuard_ = 0;
+    std::size_t writerBatchActivityMaskWords_ = 0, writerBatchActivityMaxMaskWords_ = 0;
+    std::size_t writerDispatchFireGroups_ = 0, writerDispatchFireBatches_ = 0, writerDispatchFireMaxEvents_ = 0;
+    static constexpr std::size_t privateMuxNodeLimit_ = 16, privateMuxDepthLimit_ = 8;
+    static constexpr std::size_t privateMuxByteLimit_ = 32768;
+    std::size_t privateMuxRegions_ = 0, privateMuxFoldedOps_ = 0;
+    std::size_t privateMuxMaxNodes_ = 0, privateMuxMaxDepth_ = 0;
     std::unordered_set<ValueId, grh::ValueIdHash> changePublications_, pulsePublications_;
     std::unordered_set<OperationId, grh::OperationIdHash> statePublications_;
     std::size_t nonsinkDataEdges_ = 0, nonsinkDependencyEdges_ = 0;
-    struct IndexedState {
-        int64_t cells = 0;
-        std::set<std::size_t> fullFanout;
-        std::map<std::size_t, std::vector<OperationId>> readers;
-    };
-    struct IndexedRead { OperationId state; int64_t count = 0; };
-    std::unordered_map<OperationId, IndexedState, grh::OperationIdHash> indexedStates_;
-    std::unordered_map<OperationId, IndexedRead, grh::OperationIdHash> indexedReads_;
+    std::size_t nonsinkEffectFireOwners_ = 0, nonsinkEffectFireEdges_ = 0;
     std::unordered_set<OperationId, grh::OperationIdHash> stateRound_;
     std::unordered_map<OperationId, std::size_t, grh::OperationIdHash> stateOrdinal_;
     std::unordered_set<OperationId, grh::OperationIdHash> wholeArrayStates_;
@@ -327,8 +360,19 @@ private:
         std::size_t emitted = 0;
         std::string dirty;
     };
+    struct PublicationKey {
+        // Analysis owns these immutable fanouts throughout function emission.
+        const std::set<std::size_t>* nonsinks;
+        std::span<const SinkPackedMask> sinks;
+        bool empty() const { return nonsinks->empty() && sinks.empty(); }
+        bool operator<(const PublicationKey& other) const {
+            if (const auto order = *nonsinks <=> *other.nonsinks; order != 0) return order < 0;
+            return std::lexicographical_compare(sinks.begin(), sinks.end(), other.sinks.begin(), other.sinks.end(),
+                [](const auto& a, const auto& b) { return a.word != b.word ? a.word < b.word : a.bits < b.bits; });
+        }
+    };
     bool groupPublications_ = false;
-    std::map<std::set<std::size_t>, PublicationGroup> publicationGroups_;
+    std::map<PublicationKey, PublicationGroup> publicationGroups_;
     std::set<ValueId, bool(*)(ValueId, ValueId)> packed_{[](ValueId a, ValueId b) { return a.index < b.index; }};
     std::set<std::string> localNames_;
     std::size_t temporary_ = 0;
@@ -352,6 +396,8 @@ private:
     std::string counterBinding(const std::filesystem::path& staging) const;
     std::string counterMetadata() const;
     std::string activationStats() const;
+    std::string sinkActivityStats() const;
+    std::string privateMuxStats() const;
     void codeMap(std::ostream& output, const std::vector<WrittenFunctions>& written,
                  const std::map<std::string, std::string>& sources) const;
     void countOperation(std::vector<Code>& code, OperationId op, std::string category = "operation") {
@@ -371,9 +417,6 @@ private:
     std::string valueDescription(ValueId value) const;
     std::string functionDescription(const Function& function, const Key& key) const;
     std::string captureName(OperationId op, std::optional<std::size_t> operand = {}) const;
-    std::string subscriptionName(OperationId op) const {
-        return readableNames_ ? name(op) + "_last_read_leaf" : "r" + std::to_string(op.index);
-    }
     std::string packedPrefix(ValueId id) const {
         return readableNames_ ? valueName(id) + "_packed_" : "packed" + std::to_string(id.index) + "_";
     }
@@ -389,15 +432,15 @@ private:
     std::string nextStateRef(OperationId state) const { return fieldRef("smallSinkStore", name(state), "smallSinkStoreNext"); }
     std::vector<OperationId> topological(const std::vector<OperationId>& ops) const;
     void analyze();
+    void analyzeNonsinkFireActivity();
+    void analyzeSinkActivity();
     void analyzeLargeCommitEnables();
     std::string largeCaptureSource(OperationId op, std::size_t argument) const {
         if (const auto found = largeCaptureLiterals_.find(op); found != largeCaptureLiterals_.end())
             if (!found->second.at(argument).empty()) return found->second[argument];
         return fieldRef("largeSinkPayloadBoundaryStore", captureName(op, argument));
     }
-    void analyzeIndexedReads();
     void activateState(std::vector<Code>& code, OperationId state);
-    void touchState(std::vector<Code>& code, OperationId state, const std::string& start, int64_t count);
     void analyzeSnapshotViews();
     void analyzeLeafPlans();
     void emitLeaves(std::vector<Code>& code, const std::string& destination, const LogicalType& target,
@@ -470,17 +513,27 @@ private:
                 const std::string& scalar, int64_t sourceWidth);
     std::string pack(std::vector<Code>& code, const std::string& source, const LogicalType& type, const std::string& destination);
     void activate(std::vector<Code>& code, const std::set<std::size_t>& fanout, std::optional<std::size_t> current = {});
-    void markState(std::vector<Code>& code, OperationId state);
+    void dirtySinkRuns(std::vector<Code>& code, std::span<const SinkPackedMask> masks, std::size_t& maskSites,
+                       std::string_view changeMask = {});
+    void markState(std::vector<Code>& code, OperationId state, std::string_view changeMask = {});
     bool operationIsElided(OperationId op) const;
     bool scalarPublication(ValueId value) const;
+    PublicationKey publicationKey(ValueId value) {
+        const auto found = sinkValueFanout_.find(value);
+        return {&fanout_[value], found == sinkValueFanout_.end() ? std::span<const SinkPackedMask>{} : found->second.masks};
+    }
     void beginPublications(std::vector<Code>& code, const std::vector<OperationId>& ops);
     void finishPublications(std::vector<Code>& code);
     void publish(std::vector<Code>& code, ValueId value, const std::string& source);
     void syncSmallBoundary(std::vector<Code>& code, ValueId value, const std::string& source);
     std::string fireExpression(ValueId value);
-    std::string expression(OperationId op, ValueId result, std::vector<Code>& code);
-    void operation(std::vector<Code>& code, OperationId op);
-    void writer(std::vector<Code>& code, OperationId op, bool commit);
+    using MuxSources = std::unordered_map<ValueId, std::string, grh::ValueIdHash>;
+    std::string expression(OperationId op, ValueId result, std::vector<Code>& code,
+                           const MuxSources* sources = nullptr);
+    void operation(std::vector<Code>& code, OperationId op, const MuxSources* sources = nullptr);
+    bool privateScalarMux(OperationId op) const;
+    void privateMuxRegion(std::vector<Code>& code, const std::vector<OperationId>& ops);
+    void writer(std::vector<Code>& code, OperationId op, bool commit, bool freshFire = false);
     void dpi(std::vector<Code>& code, OperationId op);
     void task(std::vector<Code>& code, OperationId op);
     void buildPhases();
@@ -701,10 +754,8 @@ void CpuStEmitContext::analyze() {
             stateOrdinal_.emplace(op, states_.size());
             states_.push_back(op);
             field(large(op) ? "largeSinkStore" : "smallSinkStore", cppType(type), op);
-            if (large(op)) {
-                if (writeActivation(op)) field("largeBeforeStore", "bool", op);
-                else field("largeBeforeStore", "std::map<std::size_t," + cppType(leafType(type)) + ">", op);
-            }
+            if (large(op) && !writeActivation(op))
+                field("largeBeforeImageStore", "std::map<std::size_t," + cppType(leafType(type)) + ">", op);
             continue;
         }
         if (kind == OperationKind::kDpicImport) continue;
@@ -883,8 +934,7 @@ void CpuStEmitContext::analyze() {
         else if (key == Key{"event"} || (key.size() == 3 && key[0] == "general")) stateRound_.insert(state);
     }
     phase("state-fanout");
-    analyzeIndexedReads();
-    phase("indexed-reads");
+    analyzeNonsinkFireActivity();
     analyzeSnapshotViews();
     phase("snapshot-views");
     for (const auto op : graph_.operations()) if (graph_.opKind(op) == OperationKind::kAssign)
@@ -954,7 +1004,180 @@ void CpuStEmitContext::analyze() {
     }
     phase("storage-references");
     analyzeLargeCommitEnables();
+    analyzeSinkActivity();
     phase("analyze-done");
+}
+
+void CpuStEmitContext::analyzeNonsinkFireActivity() {
+    // A held Or/Assign may remain true between consecutive edge pulses.
+    // Effect owners must subscribe to each leaf pulse, not only changes to
+    // the held join. Keep normal value publications and effect order intact.
+    std::unordered_map<ValueId, std::vector<ValueId>, grh::ValueIdHash> leaves;
+    const auto collect = [&](auto&& self, ValueId value) -> const std::vector<ValueId>& {
+        if (const auto found = leaves.find(value); found != leaves.end()) return found->second;
+        std::vector<ValueId> result;
+        const auto producer = graph_.valueDef(value);
+        if (!producer) throw std::logic_error("CPU effect fire has no producer");
+        const auto kind = graph_.opKind(producer);
+        if (kind == sim::kEdgeDetect) result.push_back(value);
+        else if (kind == OperationKind::kAssign || kind == OperationKind::kOr) {
+            for (const auto input : graph_.opOperands(producer)) {
+                const auto& source = self(self, input);
+                result.insert(result.end(), source.begin(), source.end());
+            }
+            std::sort(result.begin(), result.end(), [](ValueId a, ValueId b) { return a.index < b.index; });
+            result.erase(std::unique(result.begin(), result.end()), result.end());
+        } else if (kind != OperationKind::kConstant) {
+            throw std::logic_error("CPU effect fire has an invalid producer");
+        }
+        return leaves.emplace(value, std::move(result)).first->second;
+    };
+    std::vector<bool> effectOwners(nonsink_.size());
+    for (const auto& key : nonsink_) for (const auto op : members_.at(key)) {
+        const auto kind = graph_.opKind(op);
+        if (kind != sim::kDpiCall && kind != sim::kSystemTask) continue;
+        const auto ordinal = ordinal_.at(key);
+        const auto& pulses = collect(collect, graph_.opOperands(op)[0]);
+        if (!pulses.empty()) effectOwners[ordinal] = true;
+        for (const auto pulse : pulses)
+            nonsinkEffectFireEdges_ += fanout_[pulse].insert(ordinal).second;
+    }
+    nonsinkEffectFireOwners_ = std::count(effectOwners.begin(), effectOwners.end(), true);
+}
+
+void CpuStEmitContext::analyzeSinkActivity() {
+    sinkRunOrdinal_.resize(schedule_.generalRuns.size());
+    std::map<Key, const sim::SinkGroup*> groups;
+    for (const auto& group : schedule_.sinkGroups) groups.emplace(group.partitionKey, &group);
+    struct FireShape { bool grammar = false, hasEdge = false; };
+    std::unordered_map<ValueId, FireShape, grh::ValueIdHash> fireShapes;
+    const auto fireShape = [&](auto&& self, ValueId value) -> FireShape {
+        if (const auto found = fireShapes.find(value); found != fireShapes.end()) return found->second;
+        FireShape result;
+        const auto type = graph_.valueLogicalType(value);
+        const auto producer = graph_.valueDef(value);
+        if (producer && type.kind == grh::ValueType::Logic && type.width == 1 && type.shape.empty() &&
+            !type.isSigned && type.domain == grh::LogicDomain::TwoState) {
+            const auto kind = graph_.opKind(producer);
+            const auto args = graph_.opOperands(producer);
+            if (kind == sim::kEdgeDetect) result = {true, true};
+            else if (kind == OperationKind::kConstant) {
+                if (const auto text = sim::attribute<std::string>(graph_, producer, "constValue")) {
+                    const auto literal = slang::SVInt::fromString(*text).resize(1);
+                    result.grammar = !literal.hasUnknown() && literal.getRawPtr()[0] == 0;
+                }
+            } else if ((kind == OperationKind::kAssign && args.size() == 1) ||
+                       (kind == OperationKind::kOr && args.size() == 2)) {
+                result.grammar = true;
+                for (const auto arg : args) {
+                    const auto input = self(self, arg);
+                    result.grammar &= input.grammar;
+                    result.hasEdge |= input.hasEdge;
+                }
+            }
+        }
+        fireShapes.emplace(value, result);
+        return result;
+    };
+    const auto logicValue = [&](ValueId value) {
+        const auto type = graph_.valueLogicalType(value);
+        return type.kind == grh::ValueType::Logic && type.domain == grh::LogicDomain::TwoState;
+    };
+    for (std::size_t index = 0; index < schedule_.generalRuns.size(); ++index) {
+        const auto& run = schedule_.generalRuns[index];
+        const auto& group = *groups.at(run.partitionKey);
+        std::string rejection;
+        const auto reject = [&](std::string reason) { if (rejection.empty()) rejection = std::move(reason); };
+        if (run.partitionKey.size() != 3 || run.partitionKey[1] != "small-sink") reject("non-small-run");
+        const auto shape = group.fire ? fireShape(fireShape, group.fire) : FireShape{};
+        if (!shape.grammar || !shape.hasEdge) reject("unsupported-fire");
+        std::set<OperationId, bool(*)(OperationId, OperationId)> targets{
+            [](OperationId a, OperationId b) { return a.index < b.index; }};
+        std::set<ValueId, bool(*)(ValueId, ValueId)> frontier{
+            [](ValueId a, ValueId b) { return a.index < b.index; }};
+        std::set<OperationId, bool(*)(OperationId, OperationId)> currentStates{
+            [](OperationId a, OperationId b) { return a.index < b.index; }};
+        std::unordered_set<ValueId, grh::ValueIdHash> seen;
+        const auto visit = [&](auto&& self, ValueId value) -> void {
+            if (!rejection.empty() || !seen.insert(value).second) return;
+            if (!logicValue(value)) { reject("nonlogic-value"); return; }
+            const auto fire = fireShape(fireShape, value);
+            if (fire.grammar && fire.hasEdge) { reject("fire-as-data"); return; }
+            const auto producer = graph_.valueDef(value);
+            if (!producer || executionOwner(producer) != run.partitionKey) {
+                // A real snapshot/publication is the only supported invalidation
+                // route. Do not infer one for aliases, saved samples or views.
+                if (!storage_.contains(value) || snapshotViews_.contains(value) ||
+                    (!graph_.valueIsInput(value) && (!producer || !ordinal_.contains(executionOwner(producer)) ||
+                        operationIsElided(producer) || graph_.opResults(producer).size() != 1))) {
+                    reject("unpublished-frontier"); return;
+                }
+                if (producer && (graph_.opKind(producer) == sim::kDpiCall || graph_.opKind(producer) == sim::kSystemFunction)) {
+                    reject("sampled-frontier"); return;
+                }
+                frontier.insert(value);
+                return;
+            }
+            const auto effect = grh::operationEffect(graph_, producer);
+            if (effect == grh::OpEffect::ReadState) {
+                const auto kind = graph_.opKind(producer);
+                if (kind != OperationKind::kRegisterReadPort && kind != OperationKind::kRegisterReadArrayPort &&
+                    kind != OperationKind::kLatchReadPort) { reject("effectful-local"); return; }
+                const auto state = graph_.findOperation(attr(producer,
+                    kind == OperationKind::kLatchReadPort ? "latchSymbol" : "regSymbol"));
+                if (!state) { reject("unsupported-read-state"); return; }
+                const auto type = grh::stateLogicalType(graph_, state);
+                if (type.kind != grh::ValueType::Logic || type.domain != grh::LogicDomain::TwoState ||
+                    !attr(state, "grhsim.history").empty()) { reject("unsupported-read-state"); return; }
+                currentStates.insert(state);
+            } else if (effect != grh::OpEffect::Pure || graph_.opKind(producer) == sim::kSystemFunction) {
+                reject("effectful-local"); return;
+            }
+            if (identityElisions_.contains(producer) || leafElisions_.contains(producer) || leafPlans_.contains(producer)) {
+                reject("aliased-local"); return;
+            }
+            for (const auto result : graph_.opResults(producer)) {
+                if (!logicValue(result)) { reject("nonlogic-value"); return; }
+                const auto view = viewOnly_.find(result);
+                if (snapshotViews_.contains(result) || (view != viewOnly_.end() && view->second)) {
+                    reject("aliased-local"); return;
+                }
+                if (storage_.contains(result) || smallEnableBoundary_.contains(result) ||
+                    smallPayloadBoundary_.contains(result) || graph_.valueIsOutput(result) ||
+                    (waveform_ && graph_.isDeclaredSymbol(graph_.valueSymbol(result)))) {
+                    reject("observed-local"); return;
+                }
+            }
+            for (const auto arg : graph_.opOperands(producer)) self(self, arg);
+        };
+        for (const auto writer : run.orderedWriters) {
+            if (!rejection.empty()) break;
+            if (graph_.opKind(writer) == sim::kLatchWrite) { reject("latch-run"); break; }
+            const auto state = sim::writerTarget(graph_, writer);
+            const auto type = grh::stateLogicalType(graph_, state);
+            if (large(state) || type.kind != grh::ValueType::Logic || type.domain != grh::LogicDomain::TwoState ||
+                !attr(state, "grhsim.history").empty()) { reject("unsupported-target"); break; }
+            targets.insert(state);
+            const auto args = graph_.opOperands(writer);
+            if (args.empty() || args[0] != group.fire) { reject("writer-fire-mismatch"); break; }
+            for (std::size_t i = 1; i < args.size(); ++i) visit(visit, args[i]);
+        }
+        for (const auto guard : group.guards) visit(visit, guard);
+        if (!rejection.empty()) {
+            auto& counts = sinkRejections_[rejection];
+            ++counts.first; counts.second += run.orderedWriters.size();
+            continue;
+        }
+        const auto ordinal = sinkActivityRuns_++;
+        sinkRunOrdinal_[index] = ordinal;
+        sinkActivityWriters_ += run.orderedWriters.size();
+        sinkJoinedFireRuns_ += graph_.opKind(graph_.valueDef(group.fire)) != sim::kEdgeDetect;
+        sinkCurrentStateRuns_ += !currentStates.empty();
+        for (const auto value : frontier) sinkValueFanout_[value].insert(ordinal);
+        for (const auto state : targets) sinkTargetFanout_[state].insert(ordinal);
+        for (const auto state : currentStates) sinkCurrentStateFanout_[state].insert(ordinal);
+    }
+    phase("sink-activity-analysis");
 }
 
 void CpuStEmitContext::analyzeLargeCommitEnables() {
@@ -999,55 +1222,6 @@ void CpuStEmitContext::analyzeLargeCommitEnables() {
     }
     // Keep every original capture bit and coarse word probe. General must
     // return before LargeSink runs; a retry clears all bits before recapture.
-}
-
-void CpuStEmitContext::analyzeIndexedReads() {
-    // Subscriptions belong to the last executed read, including held samples.
-    // Only pure nonsink owners may lose a state-triggered activation; effects
-    // retain the original on-write scheduling even when their data is unchanged.
-    std::set<std::size_t> effectOwners;
-    for (const auto& [key, ops] : members_) if (ordinal_.contains(key))
-        for (const auto op : ops) if (grh::operationEffect(graph_, op) == grh::OpEffect::External) {
-            effectOwners.insert(ordinal_.at(key)); break;
-        }
-    std::unordered_map<OperationId, IndexedState, grh::OperationIdHash> candidates;
-    for (const auto op : graph_.operations()) {
-        const auto kind = graph_.opKind(op);
-        if (kind != OperationKind::kRegisterReadPort && kind != OperationKind::kRegisterReadArrayPort) continue;
-        const auto state = graph_.findOperation(attr(op, "regSymbol"));
-        const auto& key = executionOwner(op);
-        if (!large(state) || !writeActivation(state) || !ordinal_.contains(key)) continue;
-        const auto type = grh::stateLogicalType(graph_, state);
-        if (type.shape.empty()) continue;
-        const auto owner = ordinal_.at(key);
-        auto& plan = candidates[state];
-        plan.cells = type.width / type.leafWidth();
-        if (graph_.opOperands(op).empty() || effectOwners.contains(owner)) plan.fullFanout.insert(owner);
-        else plan.readers[owner].push_back(op);
-    }
-    for (const auto state : states_) {
-        const auto found = candidates.find(state);
-        if (found == candidates.end()) continue;
-        auto& plan = found->second;
-        for (const auto owner : stateFanout_[state])
-            if (!plan.readers.contains(owner)) plan.fullFanout.insert(owner);
-        for (const auto owner : plan.fullFanout) plan.readers.erase(owner);
-        if (plan.readers.empty() || plan.cells >= std::numeric_limits<int64_t>::max() - 1) continue;
-        // Two sentinels: N means an executed out-of-range read; N+1 means
-        // no sample yet and must conservatively match every valid write.
-        const auto indexType = unsignedType(std::bit_width(static_cast<uint64_t>(plan.cells + 1)));
-        for (const auto& [owner, reads] : plan.readers) for (const auto read : reads) {
-            int64_t count = plan.cells;
-            const auto args = graph_.opOperands(read);
-            const auto type = grh::stateLogicalType(graph_, state);
-            for (std::size_t i = 0; i < args.size(); ++i) count /= type.shape[i];
-            indexedReads_.emplace(read, IndexedRead{state, count});
-            field("memoryReadIndexStore", indexType, subscriptionName(read), sourceComments_ ?
-                  "last sampled leaf; N=invalid, N+1=not sampled; " + operationDescription(read) : std::string{});
-        }
-        field("memoryTouchedStore", "std::array<std::uint64_t," + std::to_string((plan.cells + 63) / 64) + ">", state);
-        indexedStates_.emplace(state, std::move(plan));
-    }
 }
 
 void CpuStEmitContext::analyzeSnapshotViews() {
@@ -1377,46 +1551,41 @@ void CpuStEmitContext::activate(std::vector<Code>& code, const std::set<std::siz
     }
 }
 
-void CpuStEmitContext::markState(std::vector<Code>& code, OperationId state) {
-    const auto ordinal = stateOrdinal_.at(state);
-    code.push_back(Code::line("dirtyStateFlags[" + std::to_string(ordinal / 8) + "] |= UINT8_C(" +
-        std::to_string(std::uint32_t{1} << (ordinal % 8)) + ");"));
+void CpuStEmitContext::dirtySinkRuns(std::vector<Code>& code, std::span<const SinkPackedMask> masks,
+                                   std::size_t& maskSites, std::string_view changeMask) {
+    for (const auto& [word, bits] : masks) {
+        const auto operand = (changeMask.empty() ? std::string{} : std::string(changeMask) + " & ") +
+            "UINT64_C(" + std::to_string(bits) + ")";
+        code.push_back(Code::line("sinkDirty[" + std::to_string(word) + "] |= " + operand + ";"));
+        ++maskSites;
+    }
 }
-void CpuStEmitContext::touchState(std::vector<Code>& code, OperationId state, const std::string& start, int64_t count) {
-    if (!indexedStates_.contains(state)) return;
-    const auto touched = fieldRef("memoryTouchedStore", name(state));
-    if (start == "0" && count == indexedStates_.at(state).cells)
-        code.push_back(Code::line(touched + ".fill(~UINT64_C(0));"));
-    else if (count == 1)
-        code.push_back(Code::line(touched + "[(" + start + ") / 64] |= UINT64_C(1) << ((" + start + ") % 64);"));
-    else code.push_back(Code::line("memory_touch_range(" + touched + ".data(), " + start + ", " + std::to_string(count) + ");"));
+
+void CpuStEmitContext::markState(std::vector<Code>& code, OperationId state, std::string_view changeMask) {
+    if (!changeMask.empty() && large(state))
+        throw std::logic_error("Conditional shadow mask requires small state");
+    const auto ordinal = stateOrdinal_.at(state);
+    const auto stateMask = (changeMask.empty() ? std::string{} :
+        "static_cast<std::uint8_t>(" + std::string(changeMask) + ") & ") +
+        "UINT8_C(" + std::to_string(std::uint32_t{1} << (ordinal % 8)) + ")";
+    code.push_back(Code::line("dirtyStateFlags[" + std::to_string(ordinal / 8) + "] |= " + stateMask + ";"));
+    // Small writers publish actual pending-shadow changes, either through a
+    // changed branch or a zero/all-ones per-writer mask.
+    // Include self: repeated owners contain distinct A/B/A priority runs.
+    if (const auto found = sinkTargetFanout_.find(state); found != sinkTargetFanout_.end())
+        dirtySinkRuns(code, found->second.masks, sinkShadowMaskSites_, changeMask);
+    // Large writes already changed current storage. Invalidate immediately:
+    // a later commit/allocation can interrupt before Publish is reached.
+    // Small writes only changed next, so their readers wait for Publish.
+    if (large(state))
+        if (const auto found = sinkCurrentStateFanout_.find(state); found != sinkCurrentStateFanout_.end()) {
+            dirtySinkRuns(code, found->second.masks, sinkLargeCurrentWriteMaskSites_);
+            sinkCurrentStatePublicationSources_.insert(state);
+        }
 }
 void CpuStEmitContext::activateState(std::vector<Code>& code, OperationId state) {
     statePublications_.insert(state);
-    const auto found = indexedStates_.find(state);
-    if (found == indexedStates_.end()) {
-        activate(code, stateFanout_[state], std::numeric_limits<std::size_t>::max());
-        return;
-    }
-    const auto& plan = found->second;
-    activate(code, plan.fullFanout, std::numeric_limits<std::size_t>::max());
-    const auto touched = fieldRef("memoryTouchedStore", name(state));
-    for (const auto& [owner, reads] : plan.readers) {
-        std::string condition;
-        for (const auto read : reads) {
-            if (!condition.empty()) condition += " || ";
-            const auto start = fieldRef("memoryReadIndexStore", subscriptionName(read));
-            const auto cells = std::to_string(plan.cells);
-            if (indexedReads_.at(read).count == 1)
-                condition += "(" + start + " > " + cells + " || (" + start + " < " + cells + " && (" + touched +
-                    "[" + start + " / 64] & (UINT64_C(1) << (" + start + " % 64)))))";
-            else condition += "memory_read_touched(" + touched + ".data(), " + start + ", " +
-                std::to_string(indexedReads_.at(read).count) + ", " + cells + ")";
-        }
-        std::vector<Code> hit;
-        activate(hit, {owner}, std::numeric_limits<std::size_t>::max());
-        code.push_back(Code::block("if (" + condition + ")", std::move(hit)));
-    }
+    activate(code, stateFanout_[state], std::numeric_limits<std::size_t>::max());
 }
 void CpuStEmitContext::syncSmallBoundary(std::vector<Code>& code, ValueId id, const std::string& source) {
     const auto sync = [&](const auto& boundaries) {
@@ -1457,35 +1626,54 @@ void CpuStEmitContext::beginPublications(std::vector<Code>& code, const std::vec
     }
     groupPublications_ = true;
     // Count actual publication sites, using the same elisions as operation().
-    // The complete fanout preserves both current- and next-round routing.
+    // Match both fanouts: equal nonsink consumers alone do not establish
+    // equal exact-run invalidation. Borrow analysis storage without copies.
     for (const auto op : ops) {
         if (operationIsElided(op)) continue;
         const auto results = graph_.opResults(op);
         if (results.size() == 1 && scalarPublication(results[0]))
-            ++publicationGroups_[fanout_[results[0]]].expected;
+            ++publicationGroups_[publicationKey(results[0])].expected;
     }
-    for (auto& [destinations, group] : publicationGroups_) {
-        if (destinations.empty() || group.expected < 2) continue;
+    for (auto& [key, group] : publicationGroups_) {
+        if (key.empty() || group.expected < 2) continue;
         group.dirty = temporary("bool", "publication_changed");
+        ++publicationAggregationGroups_;
+        publicationAggregationSites_ += group.expected;
+        if (!key.sinks.empty()) {
+            ++publicationAggregationSinkGroups_;
+            publicationAggregationSinkSites_ += group.expected;
+        }
         // This ordered assignment also initializes flags shared by chunks.
         code.push_back(Code::line(group.dirty + " = false;"));
     }
 }
 void CpuStEmitContext::finishPublications(std::vector<Code>& code) {
     if (!groupPublications_) return;
-    for (const auto& [destinations, group] : publicationGroups_) {
+    for (const auto& [key, group] : publicationGroups_) {
         if (group.emitted != group.expected)
             throw std::logic_error("CPU publication group site count mismatch in " + function_->name);
         if (group.dirty.empty()) continue;
         std::vector<Code> changed;
-        activate(changed, destinations, ordinal_.at(owner_));
+        activate(changed, *key.nonsinks, ordinal_.at(owner_));
+        dirtySinkRuns(changed, key.sinks, sinkPublicationMaskSites_);
         code.push_back(Code::block("if (" + group.dirty + ")", std::move(changed)));
     }
 }
 void CpuStEmitContext::publish(std::vector<Code>& code, ValueId id, const std::string& source) {
     const auto destination = storage_.contains(id) ? storage_.at(id) : read(id);
     if (!storage_.contains(id)) { copy(code, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id)); return; }
+    const auto sinkSubscribers = sinkValueFanout_.find(id);
+    if (sinkSubscribers != sinkValueFanout_.end()) {
+        sinkPublicationSources_.insert(id);
+        sinkPublicationMaskSitesBeforeGrouping_ += sinkSubscribers->second.masks.size();
+    }
+    const auto dirtySinks = [&](std::vector<Code>& changed) {
+        if (sinkSubscribers == sinkValueFanout_.end()) return;
+        dirtySinkRuns(changed, sinkSubscribers->second.masks, sinkPublicationMaskSites_);
+    };
     if (owner_ == Key{"event"} && sim::isFire(graph_, id)) {
+        if (sinkSubscribers != sinkValueFanout_.end())
+            throw std::logic_error("CPU sink activity subscribed to an event pulse");
         if (!fanout_[id].empty()) pulsePublications_.insert(id);
         // An event pulse activates its consumers when asserted, including
         // consecutive asserted rounds. Clearing it is not a data change.
@@ -1498,13 +1686,15 @@ void CpuStEmitContext::publish(std::vector<Code>& code, ValueId id, const std::s
     }
     if (!fanout_[id].empty()) changePublications_.insert(id);
     if (groupPublications_ && scalarPublication(id)) {
-        const auto& destinations = fanout_[id];
-        const auto found = publicationGroups_.find(destinations);
+        const auto key = publicationKey(id);
+        const auto found = publicationGroups_.find(key);
         if (found == publicationGroups_.end())
             throw std::logic_error("CPU publication group has an unexpected site in " + function_->name);
         auto& group = found->second;
         ++group.emitted;
-        if (destinations.empty() || !group.dirty.empty()) {
+        if (key.empty() || !group.dirty.empty()) {
+            // Compare before the original-position copy. Both complete
+            // fanouts flush together after this nonthrowing nonsink owner.
             if (!group.dirty.empty())
                 code.push_back(Code::line(group.dirty + " |= " + destination + " != " + source + ";"));
             copy(code, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id));
@@ -1513,6 +1703,7 @@ void CpuStEmitContext::publish(std::vector<Code>& code, ValueId id, const std::s
         }
     }
     std::vector<Code> changed;
+    dirtySinks(changed);
     copy(changed, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id));
     syncSmallBoundary(changed, id, destination);
     activate(changed, fanout_[id], ordinal_.contains(owner_) ? std::optional(ordinal_.at(owner_)) : std::nullopt);
@@ -1620,11 +1811,18 @@ void CpuStEmitContext::copy(std::vector<Code>& code, const std::string& destinat
     unpack(code, destination, target, scalar, sourceType.width);
 }
 
-std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::vector<Code>& code) {
+std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::vector<Code>& code,
+                                       const MuxSources* sources) {
     const auto kind = graph_.opKind(op);
     const auto args = graph_.opOperands(op);
     const auto type = scalarType(graph_.valueLogicalType(result));
-    const auto a = [&](std::size_t i) { return packed(args[i], code); };
+    const auto a = [&](std::size_t i) {
+        if (sources) {
+            const auto found = sources->find(args[i]);
+            if (found != sources->end()) return found->second;
+        }
+        return packed(args[i], code);
+    };
     const auto t = [&](std::size_t i) { return scalarType(graph_.valueLogicalType(args[i])); };
     const auto c = [&](std::size_t i) { return convert(a(i), t(i), type); };
     const auto number = [&](std::string_view name) { return sim::attribute<int64_t>(graph_, op, name).value(); };
@@ -1839,7 +2037,115 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
     throw std::invalid_argument("CPU operation is not implemented: " + std::string(grh::toString(kind)) + " at " + std::string(graph_.getOperation(op).symbolText()));
 }
 
-void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
+bool CpuStEmitContext::privateScalarMux(OperationId op) const {
+    if (graph_.opKind(op) != OperationKind::kMux ||
+        grh::operationEffect(graph_, op) != grh::OpEffect::Pure ||
+        operationIsElided(op) || leafPlans_.contains(op)) return false;
+    const auto args = graph_.opOperands(op), results = graph_.opResults(op);
+    if (args.size() != 3 || results.size() != 1) return false;
+    const auto scalar = [&](ValueId value) {
+        const auto type = graph_.valueLogicalType(value);
+        return type.kind == grh::ValueType::Logic && type.domain == grh::LogicDomain::TwoState &&
+            type.shape.empty() && type.width > 0 && type.width <= 64;
+    };
+    const auto result = results[0];
+    if (!scalar(result) || storage_.contains(result) || smallEnableBoundary_.contains(result) ||
+        smallPayloadBoundary_.contains(result) || snapshotViews_.contains(result) ||
+        graph_.valueIsOutput(result) ||
+        (waveform_ && graph_.isDeclaredSymbol(graph_.valueSymbol(result)))) return false;
+    return std::all_of(args.begin(), args.end(), scalar);
+}
+
+void CpuStEmitContext::privateMuxRegion(std::vector<Code>& code, const std::vector<OperationId>& ops) {
+    if (ops.empty()) return;
+    // Each region is a consecutive pure scalar-mux interval in one exact
+    // payload Demand. Values remain private; all writer applications follow it.
+    ++privateMuxRegions_;
+    struct Cost { std::size_t nodes = 1, depth = 1; };
+    std::unordered_map<OperationId, Cost, grh::OperationIdHash> costs;
+    std::unordered_set<OperationId, grh::OperationIdHash> deferred;
+    for (const auto op : ops) {
+        Cost cost;
+        const auto args = graph_.opOperands(op);
+        // Keep selectors materialized. Only a single data-operand occurrence
+        // can absorb its producer; two arms naming one value count as two uses.
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            const auto producer = graph_.valueDef(args[i]);
+            const auto child = costs.find(producer);
+            const auto uses = graph_.valueUsers(args[i]);
+            if (child == costs.end() || uses.size() != 1 || uses[0].operation != op ||
+                uses[0].operandIndex != i) continue;
+            const auto depth = std::max(cost.depth, child->second.depth + 1);
+            if (cost.nodes + child->second.nodes > privateMuxNodeLimit_ || depth > privateMuxDepthLimit_) continue;
+            deferred.insert(producer);
+            cost.nodes += child->second.nodes;
+            cost.depth = depth;
+        }
+        costs.emplace(op, cost);
+    }
+    MuxSources sources;
+    std::unordered_map<ValueId, Cost, grh::ValueIdHash> sourceCosts;
+    std::unordered_map<ValueId, std::vector<std::string>, grh::ValueIdHash> origins;
+    for (const auto op : ops) {
+        const auto args = graph_.opOperands(op);
+        const auto result = graph_.opResults(op)[0];
+        Cost actual;
+        for (const auto arg : args) if (const auto found = sourceCosts.find(arg); found != sourceCosts.end()) {
+            actual.nodes += found->second.nodes;
+            actual.depth = std::max(actual.depth, found->second.depth + 1);
+        }
+        privateMuxMaxNodes_ = std::max(privateMuxMaxNodes_, actual.nodes);
+        privateMuxMaxDepth_ = std::max(privateMuxMaxDepth_, actual.depth);
+        std::vector<std::string> fused;
+        for (const auto arg : args) if (const auto found = origins.find(arg); found != origins.end())
+            fused.insert(fused.end(), found->second.begin(), found->second.end());
+        if (deferred.contains(op)) {
+            OperationScope origin(currentOperation_, op);
+            CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index),
+                sourceComments_ ? operationDescription(op) : std::string{}};
+            // Execution counts retain the original topological demand point.
+            countOperation(code, op);
+            const auto first = code.size();
+            auto text = clean(expression(op, result, code, &sources), graph_.valueLogicalType(result));
+            if (code.size() != first) throw std::logic_error("Scalar mux fusion emitted prerequisite statements");
+            if (text.size() <= privateMuxByteLimit_) {
+                sources.emplace(result, std::move(text));
+                sourceCosts.emplace(result, actual);
+                ++privateMuxFoldedOps_;
+                fused.push_back("o" + std::to_string(op.index));
+                origins.emplace(result, std::move(fused));
+            } else {
+                // Long source names or casts must not make later expressions
+                // grow without a byte bound. Retain this original local.
+                code.push_back(Code::line(read(result) + " = " + text + ";"));
+                code.back().sourceOperations = std::move(fused);
+            }
+        } else {
+            operation(code, op, &sources);
+            // The actual assignment carries every folded operation through
+            // helper splitting and into the generated function's code map.
+            code.back().sourceOperations.insert(code.back().sourceOperations.end(), fused.begin(), fused.end());
+        }
+        for (const auto arg : args) { sources.erase(arg); sourceCosts.erase(arg); origins.erase(arg); }
+    }
+    if (!sources.empty()) throw std::logic_error("Scalar mux fusion left an unconsumed expression");
+}
+
+std::string CpuStEmitContext::privateMuxStats() const {
+    std::ostringstream out;
+    out << "{\n  \"schema\": \"grhsim-private-mux-fusion.v1\",\n"
+        << "  \"nonempty_regions\": " << privateMuxRegions_
+        << ",\n  \"folded_muxes\": " << privateMuxFoldedOps_
+        << ",\n  \"local_assignments_elided\": " << privateMuxFoldedOps_
+        << ",\n  \"max_expression_nodes\": " << privateMuxMaxNodes_
+        << ",\n  \"max_expression_depth\": " << privateMuxMaxDepth_
+        << ",\n  \"expression_node_limit\": " << privateMuxNodeLimit_
+        << ",\n  \"expression_depth_limit\": " << privateMuxDepthLimit_
+        << ",\n  \"deferred_expression_byte_limit\": " << privateMuxByteLimit_ << "\n}\n";
+    return out.str();
+}
+
+void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op, const MuxSources* sources) {
     OperationScope origin(currentOperation_, op);
     CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index), sourceComments_ ? operationDescription(op) : std::string{}};
     const auto kind = graph_.opKind(op);
@@ -1898,27 +2204,16 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
         const auto state = graph_.findOperation(attr(op, kind == OperationKind::kLatchReadPort ? "latchSymbol" : "regSymbol"));
         auto sourceType = grh::stateLogicalType(graph_, state);
         std::string source = stateRef(state), condition = "true";
-        const auto subscription = indexedReads_.find(op);
-        std::string flatStart = "0";
-        int64_t stride = sourceType.width / sourceType.leafWidth();
         for (std::size_t i = 0; i < args.size(); ++i) {
             const auto index = "static_cast<" + unsignedType(graph_.valueWidth(args[i])) + ">(" + readSource(args[i]) + ")";
             condition += " && " + index + " < " + std::to_string(sourceType.shape[i]);
             source += "[static_cast<std::size_t>(" + index + ")]";
-            stride /= sourceType.shape[i];
-            if (subscription != indexedReads_.end())
-                flatStart += " + static_cast<std::size_t>(" + index + ") * " + std::to_string(stride);
         }
         for (std::size_t i = 0; i < args.size(); ++i) sourceType.width /= sourceType.shape[i];
         sourceType.shape.erase(sourceType.shape.begin(), sourceType.shape.begin() + args.size());
         if (!args.empty()) {
             code.push_back(Code::line(destination + " = {};"));
             std::vector<Code> valid; copy(valid, destination, type, source, sourceType);
-            if (subscription != indexedReads_.end()) {
-                const auto slot = fieldRef("memoryReadIndexStore", subscriptionName(op));
-                code.push_back(Code::line(slot + " = " + std::to_string(indexedStates_.at(state).cells) + ";"));
-                valid.push_back(Code::line(slot + " = " + flatStart + ";"));
-            }
             code.push_back(Code::block("if (" + condition + ")", std::move(valid)));
         } else copy(code, destination, type, source, sourceType);
     } else if (kind == OperationKind::kSliceArray) {
@@ -1962,7 +2257,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
         code.push_back(Code::block("if (!" + fieldRef("sampledStore", this->name(op)) + ")", std::move(sample)));
         return;
     } else {
-        const auto text = expression(op, id, code);
+        const auto text = expression(op, id, code, sources);
         if (type.shape.empty()) code.push_back(Code::line(destination + " = " + clean(text, type) + ";"));
         else {
             const auto scalar = temporary(unsignedType(type.width), "packed_bits");
@@ -1973,7 +2268,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
     if (storage_.contains(id)) publish(code, id, destination);
 }
 
-void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool commit) {
+void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool commit, bool freshFire) {
     OperationScope origin(currentOperation_, op);
     CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index), sourceComments_ ?
         std::string(commit ? "commit captured writer; " : "sample writer; ") + operationDescription(op) : std::string{}};
@@ -1991,6 +2286,8 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
     const bool wholeArray = !type.shape.empty() && !indexed && !masked &&
         (kind == sim::kWrite || kind == sim::kFill) && dataType == type;
     const bool inPlace = large(state);
+    if (freshFire && (inPlace || commit || latch))
+        throw std::logic_error("Fresh writer fire requires an eligible clocked small run");
     const auto bit = inPlace && enableBitmap_ ?
         (commit ? largeCommitEnableOrdinal_.at(op) : largeWriteOrdinal_.at(op)) : 0;
     const std::string enableWord = "largeSinkEnableBoundaryStore.words[" + std::to_string(bit / 64) + "]";
@@ -2023,7 +2320,10 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
     const auto value = [&](std::size_t i) {
         return inPlace ? largeCaptureSource(op, i) : readSource(args[i], true);
     };
-    std::string condition = inPlace ? enableSlot : latch ? readSource(args[0]) : "(" + readSource(args[0]) + " && " + readSource(args[1]) + ")";
+    // Eligible runs use one fresh EventEdge/Or/Assign interpretation for both
+    // their outer probe and the actual write. A held OR snapshot can be stale.
+    std::string condition = inPlace ? enableSlot : latch ? readSource(args[0]) :
+        "(" + (freshFire ? fireExpression(args[0]) : readSource(args[0])) + " && " + readSource(args[1]) + ")";
     std::string start = "0";
     int64_t count = type.width / type.leafWidth();
     for (std::size_t i = 0; i < indexCount; ++i) {
@@ -2054,25 +2354,24 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
         std::vector<Code> whole;
         whole.push_back(Code::line("GRHSIM_PERF_COUNT(touchedWriteCount);"));
         if (!inPlace) {
-            whole.push_back(Code::line(wholeDestination + " = " + data + ";"));
-            markState(whole, state);
+            std::vector<Code> changedWrite{Code::line(wholeDestination + " = " + data + ";")};
+            markState(changedWrite, state);
+            whole.push_back(Code::block("if (" + wholeDestination + " != " + data + ")", std::move(changedWrite)));
         } else if (writeActivation(state)) {
-            touchState(whole, state, "0", type.width / type.leafWidth());
-            whole.push_back(Code::line(fieldRef("largeBeforeStore", name(state)) + " = true;"));
             whole.push_back(Code::line(wholeDestination + " = " + data + ";"));
             markState(whole, state);
         } else {
             const auto before = fieldRef("largeWholeBeforeStore", name(state));
             const auto dirty = fieldRef("largeWholeDirtyStore", name(state));
-            whole.push_back(Code::block("if (" + data + " != " + wholeDestination + ")", {
+            std::vector<Code> changedWhole{
                 Code::block("if (!" + dirty + ")", {
                     Code::line(before + " = " + wholeDestination + ";")
                 }),
                 Code::line(wholeDestination + " = " + data + ";"),
-                Code::line(dirty + " = true;"),
-                Code::line("dirtyStateFlags[" + std::to_string(stateOrdinal_.at(state) / 8) + "] |= UINT8_C(" +
-                    std::to_string(std::uint32_t{1} << (stateOrdinal_.at(state) % 8)) + ");")
-            }));
+                Code::line(dirty + " = true;")
+            };
+            markState(changedWhole, state);
+            whole.push_back(Code::block("if (" + data + " != " + wholeDestination + ")", std::move(changedWhole)));
         }
         code.push_back(Code::block("if (" + condition + ")", std::move(whole)));
         return;
@@ -2090,22 +2389,35 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
     std::vector<Code> write{Code::line(changed + " = " + replacement + ";"), Code::line("GRHSIM_PERF_COUNT(touchedWriteCount);")};
     if (inPlace) {
         if (writeActivation(state)) {
-            write.push_back(Code::line(fieldRef("largeBeforeStore", name(state)) + " = true;"));
             write.push_back(Code::line(destination + " = " + changed + ";"));
             markState(write, state);
         } else {
             std::vector<Code> changedWrite{
-                Code::line(fieldRef("largeBeforeStore", name(state)) + ".try_emplace(" + addressedRow + ", " + destination + ");"),
+                Code::line(fieldRef("largeBeforeImageStore", name(state)) + ".try_emplace(" + addressedRow + ", " + destination + ");"),
                 Code::line(destination + " = " + changed + ";")
             };
             markState(changedWrite, state);
             write.push_back(Code::block("if (" + changed + " != " + destination + ")", std::move(changedWrite)));
         }
-    } else {
+    } else if (freshFire && count == 1 && type.shape.empty() &&
+               type.kind == grh::ValueType::Logic && type.domain == grh::LogicDomain::TwoState &&
+               type.width > 0 && type.width <= 64) {
+        // Compare against the preceding writer's pending value before storing.
+        // Zero masks retain already dirty bits; every notification stays here.
+        const auto changeMask = temporary("std::uint64_t", "shadow_change_mask");
+        write.push_back(Code::line(changeMask + " = UINT64_C(0) - static_cast<std::uint64_t>(" +
+            changed + " != " + destination + ");"));
         write.push_back(Code::line(destination + " = " + changed + ";"));
-        markState(write, state);
+        markState(write, state, changeMask);
+        ++scalarShadowChangeMaskWriterSites_;
+    } else {
+        // The NBA shadow retains every earlier writer's value. A no-op
+        // against that shadow cannot change publication; a later restoring
+        // write still leaves the dirty bit from the earlier update intact.
+        std::vector<Code> changedWrite{Code::line(destination + " = " + changed + ";")};
+        markState(changedWrite, state);
+        write.push_back(Code::block("if (" + changed + " != " + destination + ")", std::move(changedWrite)));
     }
-    if (inPlace && writeActivation(state)) touchState(body, state, start, count);
     if (count == 1) body.insert(body.end(), std::make_move_iterator(write.begin()), std::make_move_iterator(write.end()));
     else body.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(count) + "; ++" + i + ")", std::move(write)));
     code.push_back(Code::block("if (" + condition + ")", std::move(body)));
@@ -2178,8 +2490,16 @@ void CpuStEmitContext::task(std::vector<Code>& code, OperationId op) {
     std::vector<Code> body;
     countOperation(body, op, "effect");
     std::string call = "system_task(" + quote(name) + ", {";
+    const auto literalFormat = sim::attribute<std::string>(graph_, op, sim::kLiteralFormat);
+    if (literalFormat) {
+        // Legacy constant getters construct std::string from a C string, so
+        // embedded NUL terminates the format even though the IR retains it.
+        const auto nul = literalFormat->find('\0');
+        const auto length = nul == std::string::npos ? literalFormat->size() : nul;
+        call += "TaskArg{'f', " + quote(*literalFormat) + ", " + std::to_string(length) + ", 0, false}";
+    }
     for (std::size_t i = 2; i < args.size(); ++i) {
-        if (i != 2) call += ",";
+        if (i != 2 || literalFormat) call += ",";
         const auto type = scalarType(graph_.valueLogicalType(args[i]));
         const auto source = packed(args[i], body, true);
         call += "TaskArg{'" + std::string(type.kind == grh::ValueType::Logic ? "l" : type.kind == grh::ValueType::Real ? "r" : "s") +
@@ -2206,6 +2526,10 @@ void CpuStEmitContext::buildPhases() {
             }
             const auto destination = read(port.value);
             std::vector<Code> changed{Code::line(destination + " = " + incoming + ";")};
+            if (const auto found = sinkValueFanout_.find(port.value); found != sinkValueFanout_.end()) {
+                sinkInputSources_.insert(port.value);
+                dirtySinkRuns(changed, found->second.masks, sinkInputMaskSites_);
+            }
             syncSmallBoundary(changed, port.value, destination);
             if (!fanout_[port.value].empty()) changePublications_.insert(port.value);
             activate(changed, fanout_[port.value]);
@@ -2259,6 +2583,9 @@ void CpuStEmitContext::buildPhases() {
                 for (const auto value : graph_.opResults(op))
                     if (graph_.valueLogicalType(value).kind != grh::ValueType::Logic) nonthrowingPrefix = false;
             }
+            // Pure numeric operations only borrow local buffers for immediate
+            // copies; no local address survives an extracted function part.
+            function.localizePrivateNumericSpills = nonthrowingPrefix;
             beginPublications(code, ops);
             for (const auto op : ops) operation(code, op);
             finishPublications(code);
@@ -2306,6 +2633,64 @@ void CpuStEmitContext::buildPhases() {
     phase("phase-active-dispatch");
     std::map<Key, const sim::SinkGroup*> sinkGroups;
     for (const auto& group : schedule_.sinkGroups) sinkGroups.emplace(group.partitionKey, &group);
+    using FireKey = std::vector<ValueId>;
+    std::unordered_map<ValueId, std::optional<FireKey>, grh::ValueIdHash> fireKeys;
+    const auto collectFireKey = [&](auto&& self, ValueId value) -> const std::optional<FireKey>& {
+        if (const auto found = fireKeys.find(value); found != fireKeys.end()) return found->second;
+        std::optional<FireKey> result;
+        const auto type = graph_.valueLogicalType(value);
+        const auto producer = graph_.valueDef(value);
+        if (producer && type.kind == grh::ValueType::Logic && type.domain == grh::LogicDomain::TwoState &&
+            type.width == 1 && type.shape.empty() && !type.isSigned) {
+            const auto kind = graph_.opKind(producer);
+            const auto args = graph_.opOperands(producer);
+            if (kind == sim::kEdgeDetect && executionOwner(producer) == Key{"event"} && storage_.contains(value))
+                result = FireKey{value};
+            else if (kind == OperationKind::kConstant) {
+                if (const auto text = sim::attribute<std::string>(graph_, producer, "constValue")) {
+                    const auto literal = slang::SVInt::fromString(*text).resize(1);
+                    if (!literal.hasUnknown() && literal.getRawPtr()[0] == 0) result.emplace();
+                }
+            } else if ((kind == OperationKind::kAssign && args.size() == 1) ||
+                       (kind == OperationKind::kOr && args.size() == 2)) {
+                result.emplace();
+                for (const auto arg : args) {
+                    const auto& input = self(self, arg);
+                    if (!input) { result.reset(); break; }
+                    result->insert(result->end(), input->begin(), input->end());
+                }
+                if (result) {
+                    std::sort(result->begin(), result->end(), [](ValueId a, ValueId b) { return a.index < b.index; });
+                    result->erase(std::unique(result->begin(), result->end()), result->end());
+                }
+            }
+        }
+        return fireKeys.emplace(value, std::move(result)).first->second;
+    };
+    // FunctionWriter emits frame/local declarations before the body guard.
+    // Only plain numeric locals may have their entire root call bypassed.
+    const auto trivialLocal = [](const Local& local) {
+        if (local.parameter || local.initializer != "{}") return false;
+        std::string_view type = local.type;
+        const auto decimal = [](std::string_view text) {
+            return !text.empty() && std::all_of(text.begin(), text.end(), [](char ch) { return ch >= '0' && ch <= '9'; });
+        };
+        constexpr std::string_view arrayPrefix = "std::array<";
+        while (type.starts_with(arrayPrefix)) {
+            const auto comma = type.rfind(',');
+            if (!type.ends_with('>') || comma == std::string_view::npos || comma < arrayPrefix.size() ||
+                !decimal(type.substr(comma + 1, type.size() - comma - 2))) return false;
+            type = type.substr(arrayPrefix.size(), comma - arrayPrefix.size());
+        }
+        constexpr std::string_view bitIntPrefix = "unsigned _BitInt(";
+        if (type.starts_with(bitIntPrefix)) {
+            const auto width = type.substr(bitIntPrefix.size(), type.size() - bitIntPrefix.size() - 1);
+            return type.ends_with(')') && decimal(width) && width.find_first_not_of('0') != std::string_view::npos;
+        }
+        return type == "bool" || type == "double" || type == "std::size_t" ||
+            type == "std::uint8_t" || type == "std::uint16_t" || type == "std::uint32_t" || type == "std::uint64_t" ||
+            type == "std::int8_t" || type == "std::int16_t" || type == "std::int32_t" || type == "std::int64_t";
+    };
     const auto smallEnableBit = [&](OperationId writerOp, const Key& key) -> std::optional<std::size_t> {
         if (key[1] != "small-sink") return {};
         const auto args = graph_.opOperands(writerOp);
@@ -2328,11 +2713,34 @@ void CpuStEmitContext::buildPhases() {
     std::size_t batchIndex = 0, batchRuns = 0;
     Function runBatch{"writer_run_batch0"};
     runBatch.zeroInitializeLocals = false;
+    runBatch.localizePrivateNumericSpills = true;
     std::vector<std::string> writerBatchNames;
+    std::vector<FireKey> writerBatchFireKeys;
+    FireKey batchFireKey;
+    bool batchFireKeyEligible = true;
     std::set<std::string> batchFires;
     bool batchUnclocked = false;
+    bool batchAllEligible = true;
+    std::map<std::size_t, std::uint64_t> batchActivityMasks;
     const auto finishBatch = [&] {
         if (batchRuns == 0) return;
+        ++writerBatches_;
+        if (batchAllEligible) {
+            ++writerBatchesAllEligible_;
+            std::string condition;
+            for (const auto& [word, mask] : batchActivityMasks) {
+                if (!condition.empty()) condition += " | ";
+                condition += "(sinkDirty[" + std::to_string(word) + "] & UINT64_C(" + std::to_string(mask) + "))";
+            }
+            // If all exact runs are clean, none can execute to dirty a later
+            // one. Read at this batch's original position, never at phase entry.
+            std::vector<Code> guarded;
+            guarded.push_back(Code::block("if (" + condition + ")", std::move(runBatch.body)));
+            runBatch.body = std::move(guarded);
+            ++writerBatchesWithActivityGuard_;
+            writerBatchActivityMaskWords_ += batchActivityMasks.size();
+            writerBatchActivityMaxMaskWords_ = std::max(writerBatchActivityMaxMaskWords_, batchActivityMasks.size());
+        }
         // Check stable event pulses before entering split writer helpers. A
         // guard inside every helper still fetches all of those helpers on
         // falling edges and NBA settling rounds. Never hoist payload enables:
@@ -2346,14 +2754,24 @@ void CpuStEmitContext::buildPhases() {
             runBatch.body = std::move(guarded);
         }
         const auto batchName = runBatch.name;
+        std::sort(batchFireKey.begin(), batchFireKey.end(), [](ValueId a, ValueId b) { return a.index < b.index; });
+        batchFireKey.erase(std::unique(batchFireKey.begin(), batchFireKey.end()), batchFireKey.end());
+        if (batchUnclocked || !batchFireKeyEligible || !std::all_of(runBatch.locals.begin(), runBatch.locals.end(), trivialLocal))
+            batchFireKey.clear();
+        writerBatchFireKeys.push_back(std::move(batchFireKey));
         addFunction(std::move(runBatch));
         writerBatchNames.push_back(batchName);
         ++batchIndex;
         batchRuns = 0;
         batchFires.clear();
+        batchFireKey.clear();
+        batchFireKeyEligible = true;
         batchUnclocked = false;
+        batchAllEligible = true;
+        batchActivityMasks.clear();
         runBatch = Function{"writer_run_batch" + std::to_string(batchIndex)};
         runBatch.zeroInitializeLocals = false;
+        runBatch.localizePrivateNumericSpills = true;
     };
     for (std::size_t index = 0; index < schedule_.generalRuns.size(); ++index) {
         if (timing_.enabled() && index % 16384 == 0) {
@@ -2364,10 +2782,19 @@ void CpuStEmitContext::buildPhases() {
         const auto batchFire = sinkGroups.at(run.partitionKey)->fire;
         const auto batchFireExpression = batchFire ? fireExpression(batchFire) : std::string{};
         if (batchFires.size() == 16 && batchFire && !batchFires.contains(batchFireExpression)) finishBatch();
-        if (batchFire) batchFires.insert(batchFireExpression);
+        if (batchFire) {
+            batchFires.insert(batchFireExpression);
+            const auto& key = collectFireKey(collectFireKey, batchFire);
+            if (!key) batchFireKeyEligible = false;
+            else batchFireKey.insert(batchFireKey.end(), key->begin(), key->end());
+        }
         else batchUnclocked = true;
+        if (const auto ordinal = sinkRunOrdinal_.at(index))
+            batchActivityMasks[*ordinal / 64] |= std::uint64_t{1} << (*ordinal % 64);
+        else batchAllEligible = false;
         Function runFunction{"writer_run" + std::to_string(index)};
         runFunction.zeroInitializeLocals = false;
+        bool privateNumericAddresses = true;
         bool hasObservedPayload = false;
         inFunction(runFunction, run.partitionKey, [&](auto& code) {
             std::set<uint32_t> seen;
@@ -2375,6 +2802,8 @@ void CpuStEmitContext::buildPhases() {
             std::function<void(ValueId)> visit = [&](ValueId value) {
                 const auto producer = graph_.valueDef(value);
                 if (!producer || executionOwner(producer) != run.partitionKey || !seen.insert(producer.index).second) return;
+                if (grh::operationEffect(graph_, producer) == grh::OpEffect::External)
+                    privateNumericAddresses = false;
                 for (const auto arg : graph_.opOperands(producer)) visit(arg);
                 cone.push_back(producer);
             };
@@ -2426,7 +2855,13 @@ void CpuStEmitContext::buildPhases() {
             const auto unconditionalPackedNames = packedNames_;
             EnableSet payloadEnables;
             std::vector<Code> sharedPayload;
+            std::vector<OperationId> muxRegion;
+            const auto flushMuxRegion = [&] {
+                privateMuxRegion(sharedPayload, muxRegion);
+                muxRegion.clear();
+            };
             const auto flushPayload = [&] {
+                flushMuxRegion();
                 if (sharedPayload.empty()) return;
                 std::string condition;
                 for (const auto& [index, enable] : payloadEnables)
@@ -2440,12 +2875,16 @@ void CpuStEmitContext::buildPhases() {
                 const auto& needed = demand.at(op);
                 if (needed.unconditional) { flushPayload(); continue; }
                 if (needed.enables != payloadEnables) flushPayload();
-                if (sharedPayload.empty()) {
+                if (sharedPayload.empty() && muxRegion.empty()) {
                     payloadEnables = needed.enables;
                     packed_ = unconditionalPacked;
                     packedNames_ = unconditionalPackedNames;
                 }
-                operation(sharedPayload, op);
+                if (sinkRunOrdinal_.at(index) && privateScalarMux(op)) muxRegion.push_back(op);
+                else {
+                    flushMuxRegion();
+                    operation(sharedPayload, op);
+                }
             }
             flushPayload();
             std::vector<Code> segment;
@@ -2467,7 +2906,7 @@ void CpuStEmitContext::buildPhases() {
                 auto& target = bit ? segment : enabled;
                 if (bit) segmentMasks[*bit / 64] |= std::uint64_t{1} << (*bit % 64);
                 std::vector<Code> payload;
-                writer(payload, writerOp, false);
+                writer(payload, writerOp, false, sinkRunOrdinal_.at(index).has_value());
                 if (std::find(group.guards.begin(), group.guards.end(), enable) != group.guards.end()) {
                     target.insert(target.end(), std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end()));
                     continue;
@@ -2485,6 +2924,7 @@ void CpuStEmitContext::buildPhases() {
                 code.push_back(Code::block("if (" + condition + ")", std::move(enabled)));
             }
         });
+        runBatch.localizePrivateNumericSpills &= privateNumericAddresses;
         runBatch.locals.insert(runBatch.locals.end(),
             std::make_move_iterator(runFunction.locals.begin()),
             std::make_move_iterator(runFunction.locals.end()));
@@ -2552,6 +2992,16 @@ void CpuStEmitContext::buildPhases() {
                     guard += (guard.empty() ? "" : " && ") + storage_.at(factor);
             }
         }
+        if (const auto ordinal = sinkRunOrdinal_.at(index)) {
+            const auto bit = std::uint64_t{1} << (*ordinal % 64);
+            const auto word = "sinkDirty[" + std::to_string(*ordinal / 64) + "]";
+            // Only successful completion establishes the fixed-bit transfer's
+            // clean invariant. An original fire/enable probe never clears it.
+            runBody.push_back(Code::line(word + " &= ~UINT64_C(" + std::to_string(bit) + ");"));
+            std::vector<Code> dirtyBody;
+            dirtyBody.push_back(Code::block("if (" + word + " & UINT64_C(" + std::to_string(bit) + "))", std::move(runBody)));
+            runBody = std::move(dirtyBody);
+        }
         if (guard.empty()) runBatch.body.insert(runBatch.body.end(),
             std::make_move_iterator(runBody.begin()), std::make_move_iterator(runBody.end()));
         else {
@@ -2569,7 +3019,7 @@ void CpuStEmitContext::buildPhases() {
     // max-function-lines and make the writer create pGeneral_chunkN with
     // an empty frame.  The initializer-list loop preserves the exact
     // static order while keeping the driver at a constant size.
-    const auto appendDispatch = [&](const std::vector<std::string>& names) {
+    const auto appendDispatch = [&](std::vector<Code>& body, std::span<const std::string> names) {
         if (names.empty()) return;
         std::string header = "for (const auto phase : {";
         for (std::size_t i = 0; i < names.size(); ++i) {
@@ -2577,10 +3027,36 @@ void CpuStEmitContext::buildPhases() {
             header += "&" + class_ + "::" + names[i];
         }
         header += "})";
-        general.body.push_back(Code::block(header, {Code::line("(this->*phase)();")}));
+        body.push_back(Code::block(header, {Code::line("(this->*phase)();")}));
     };
+    const auto activeCount = activeBatchNames.size();
     activeBatchNames.insert(activeBatchNames.end(), writerBatchNames.begin(), writerBatchNames.end());
-    appendDispatch(activeBatchNames);
+    const std::span<const std::string> dispatchNames = activeBatchNames;
+    std::size_t pending = 0;
+    for (std::size_t first = 0; first < writerBatchNames.size();) {
+        const auto& key = writerBatchFireKeys[first];
+        auto last = first + 1;
+        if (!key.empty())
+            while (last < writerBatchNames.size() && writerBatchFireKeys[last] == key) ++last;
+        if (!key.empty() && last - first >= 2) {
+            const auto begin = activeCount + first;
+            appendDispatch(general.body, dispatchNames.subspan(pending, begin - pending));
+            std::string condition;
+            for (const auto leaf : key)
+                condition += std::string(condition.empty() ? "" : " || ") + "(" + fireExpression(leaf) + ")";
+            std::vector<Code> calls;
+            appendDispatch(calls, dispatchNames.subspan(begin, last - first));
+            // Fresh event fields stay stable through General. Probe here,
+            // after the active prefix and every preceding writer root.
+            general.body.push_back(Code::block("if (" + condition + ")", std::move(calls)));
+            ++writerDispatchFireGroups_;
+            writerDispatchFireBatches_ += last - first;
+            writerDispatchFireMaxEvents_ = std::max(writerDispatchFireMaxEvents_, key.size());
+            pending = activeCount + last;
+        }
+        first = last;
+    }
+    appendDispatch(general.body, dispatchNames.subspan(pending));
     addFunction(std::move(general));
     phase("phase-general-writers");
 
@@ -2592,6 +3068,8 @@ void CpuStEmitContext::buildPhases() {
     std::size_t commitBatchIndex = 0, commitBatchRuns = 0;
     Function commitBatch{"commit_run_batch0"};
     commitBatch.zeroInitializeLocals = false;
+    // Writer commits copy numeric values into owned stores and map entries.
+    commitBatch.localizePrivateNumericSpills = true;
     std::vector<std::string> commitBatchNames;
     std::set<std::size_t> commitBatchWords;
     const auto finishCommitBatch = [&] {
@@ -2613,6 +3091,7 @@ void CpuStEmitContext::buildPhases() {
         commitBatchWords.clear();
         commitBatch = Function{"commit_run_batch" + std::to_string(commitBatchIndex)};
         commitBatch.zeroInitializeLocals = false;
+        commitBatch.localizePrivateNumericSpills = true;
     };
     for (std::size_t index = 0; index < schedule_.largeCommitRuns.size(); ++index) {
         if (timing_.enabled() && index % 16384 == 0)
@@ -2690,24 +3169,35 @@ void CpuStEmitContext::buildPhases() {
         Function dirtyBatch{"pPublish_dirty_batch" + std::to_string(batch)};
         dirtyBatch.zeroInitializeLocals = false;
         inFunction(dirtyBatch, {}, [&](auto& code) {
+            std::array<bool, publishBatchWords> snapshotWords;
+            snapshotWords.fill(true);
+            for (std::size_t ordinal = firstWord * 8; ordinal < std::min(states_.size(), lastWord * 8); ++ordinal) {
+                const auto type = grh::stateLogicalType(graph_, states_[ordinal]);
+                if (type.kind != grh::ValueType::Logic && type.kind != grh::ValueType::Real)
+                    snapshotWords[ordinal / 8 - firstWord] = false;
+            }
             std::vector<std::pair<std::size_t, std::vector<Code>>> dirtyCases;
             for (std::size_t ordinal = firstWord * 8; ordinal < std::min(states_.size(), lastWord * 8); ++ordinal) {
                 const auto state = states_[ordinal];
                 OperationScope origin(currentOperation_, state);
                 const auto index = stateOrdinal_.at(state);
+                const bool snapshotWord = snapshotWords[index / 8 - firstWord];
                 if (attr(state, "grhsim.history") == "output-end") {
                     // Keep the ordinal table dense.  Output-end history states do
                     // not publish, but their reserved bit still has to be
                     // consumed by the packed scan if a writer ever marks it.
-                    dirtyCases.emplace_back(index, std::vector<Code>{Code::line(
+                    std::vector<Code> body;
+                    if (!snapshotWord) body.push_back(Code::line(
                         "dirtyStateFlags[" + std::to_string(index / 8) + "] &= static_cast<std::uint8_t>(~UINT8_C(" +
-                        std::to_string(std::uint32_t{1} << (index % 8)) + "));")});
+                        std::to_string(std::uint32_t{1} << (index % 8)) + "));"));
+                    dirtyCases.emplace_back(index, std::move(body));
                     continue;
                 }
                 std::vector<Code> body;
-                body.push_back(Code::line("dirtyStateFlags[" + std::to_string(index / 8) + "] &= static_cast<std::uint8_t>(~UINT8_C(" +
+                if (!snapshotWord) body.push_back(Code::line("dirtyStateFlags[" + std::to_string(index / 8) + "] &= static_cast<std::uint8_t>(~UINT8_C(" +
                     std::to_string(std::uint32_t{1} << (index % 8)) + "));"));
-                const bool observed = !stateFanout_[state].empty() || stateRound_.contains(state);
+                const bool observed = !stateFanout_[state].empty() || stateRound_.contains(state) ||
+                    sinkCurrentStateFanout_.contains(state);
                 // A write-activated memory is an observable scheduling event even
                 // when this particular state currently has no value fanout.  Keep
                 // the extra fixed-point round so the activation semantics remain
@@ -2723,13 +3213,12 @@ void CpuStEmitContext::buildPhases() {
                 };
                 if (large(state)) {
                     const auto type = grh::stateLogicalType(graph_, state);
-                    const auto before = fieldRef("largeBeforeStore", name(state));
                     if (writeActivation(state)) {
-                        body.push_back(Code::block("if (" + before + ")", changed()));
-                        body.push_back(Code::line(before + " = false;"));
-                        if (indexedStates_.contains(state))
-                            body.push_back(Code::line(fieldRef("memoryTouchedStore", name(state)) + ".fill(0);"));
+                        auto stateChanged = changed();
+                        body.insert(body.end(), std::make_move_iterator(stateChanged.begin()),
+                            std::make_move_iterator(stateChanged.end()));
                     } else {
+                        const auto before = fieldRef("largeBeforeImageStore", name(state));
                         if (wholeArrayStates_.contains(state)) {
                             const auto wholeBefore = fieldRef("largeWholeBeforeStore", name(state));
                             const auto wholeDirty = fieldRef("largeWholeDirtyStore", name(state));
@@ -2748,6 +3237,12 @@ void CpuStEmitContext::buildPhases() {
                 } else {
                     auto stateChanged = changed();
                     stateChanged.push_back(Code::line(stateRef(state) + " = " + nextStateRef(state) + ";"));
+                    // Current-state readers invalidate only after the actual
+                    // publication, independently of pending-shadow competition.
+                    if (const auto found = sinkCurrentStateFanout_.find(state); found != sinkCurrentStateFanout_.end()) {
+                        dirtySinkRuns(stateChanged, found->second.masks, sinkSmallCurrentPublicationMaskSites_);
+                        sinkCurrentStatePublicationSources_.insert(state);
+                    }
                     body.push_back(Code::block("if (" + stateRef(state) + " != " + nextStateRef(state) + ")", std::move(stateChanged)));
                 }
                 CodeOrigin{body, 0, "o" + std::to_string(state.index), sourceComments_ ?
@@ -2755,20 +3250,29 @@ void CpuStEmitContext::buildPhases() {
                 dirtyCases.emplace_back(index, std::move(body));
             }
             // State dirty bits use the same flag-only discipline as gsim's
-            // activity bitmap.  Writers set a bit; publish scans packed bytes and
-            // clears each bit before publishing it.  There is no side queue whose
-            // ordering could diverge from the static state ordinal order.
+            // activity bitmap. Publish cannot set dirty bits. Logic/Real state
+            // publications cannot throw, so consume their byte once and test a
+            // local snapshot. String copies keep per-state clears so an exception
+            // preserves the unprocessed suffix. State ordinal order is unchanged.
             for (std::size_t word = firstWord; word < lastWord; ++word) {
                 std::vector<Code> wordBody;
+                const auto flags = "dirtyStateFlags[" + std::to_string(word) + "]";
+                std::string probe = flags;
+                if (snapshotWords[word - firstWord]) {
+                    probe = temporary("std::uint8_t", "dirty_flags");
+                    wordBody.push_back(Code::line(probe + " = " + flags + ";"));
+                    wordBody.push_back(Code::line(flags + " = 0;"));
+                }
                 const auto begin = word * 8;
                 const auto end = std::min(states_.size(), begin + 8);
                 for (std::size_t ordinal = begin; ordinal < end; ++ordinal) {
                     auto body = std::move(dirtyCases[ordinal - firstWord * 8].second);
+                    if (body.empty()) continue;
                     const auto bit = std::uint32_t{1} << (ordinal % 8);
-                    wordBody.push_back(Code::block("if (dirtyStateFlags[" + std::to_string(word) + "] & UINT8_C(" +
+                    wordBody.push_back(Code::block("if (" + probe + " & UINT8_C(" +
                         std::to_string(bit) + "))", std::move(body)));
                 }
-                code.push_back(Code::block("if (dirtyStateFlags[" + std::to_string(word) + "])" , std::move(wordBody)));
+                code.push_back(Code::block("if (" + flags + ")", std::move(wordBody)));
             }
         });
         const auto batchName = dirtyBatch.name;
@@ -2887,6 +3391,7 @@ void CpuStEmitContext::buildInit() {
                 std::to_string(bit) + ");"));
         }
         code.push_back(Code::line("dirtyStateFlags.fill(0);"));
+        code.push_back(Code::line("sinkDirty.fill(UINT64_MAX);"));
         code.push_back(Code::line("sampledStore = {};"));
         code.push_back(Code::line("timeslotTriggerStore = {};"));
         code.push_back(Code::line("onceStore = {};"));
@@ -2899,19 +3404,13 @@ void CpuStEmitContext::buildInit() {
         for (const auto& port : graph_.inputPorts()) resetPort(port);
         for (const auto& port : graph_.outputPorts()) resetPort(port);
         for (const auto& [store, fields] : fields_) {
-            if (store == "smallSinkStore" || store == "largeSinkStore" || store == "prevEventStore" || store == "largeBeforeStore") continue;
+            if (store == "smallSinkStore" || store == "largeSinkStore" || store == "prevEventStore" || store == "largeBeforeImageStore") continue;
             for (const auto& field : fieldLayouts_.at(store).physicalFields) {
                 const auto target = store + "." + field.name;
                 if (field.type == "std::string") code.push_back(Code::line(target + ".clear();"));
                 else if (field.type.find("std::string") != std::string::npos) code.push_back(Code::line(target + ".fill({});"));
                 else code.push_back(Code::line("std::memset(&" + target + ", 0, sizeof(" + target + "));"));
             }
-        }
-        for (const auto& [op, subscription] : indexedReads_) {
-            CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index), sourceComments_ ?
-                "initialize indexed-read subscription; " + operationDescription(op) : std::string{}};
-            code.push_back(Code::line(fieldRef("memoryReadIndexStore", subscriptionName(op)) + " = " +
-                std::to_string(indexedStates_.at(subscription.state).cells + 1) + ";"));
         }
         for (const auto state : states_) {
             OperationScope origin(currentOperation_, state);
@@ -2925,7 +3424,8 @@ void CpuStEmitContext::buildInit() {
                 code.push_back(Code::line(slot + " = {};")); continue;
             }
             code.push_back(Code::line("std::memset(&" + slot + ", 0, sizeof(" + slot + "));"));
-            if (large(state)) code.push_back(Code::line(fieldRef("largeBeforeStore", name(state)) + (writeActivation(state) ? " = false;" : ".clear();")));
+            if (large(state) && !writeActivation(state))
+                code.push_back(Code::line(fieldRef("largeBeforeImageStore", name(state)) + ".clear();"));
             const auto rows = type.width / element.width;
             std::vector<std::pair<int64_t, int64_t>> covered;
             bool dirty = false;
@@ -3019,33 +3519,6 @@ void CpuStEmitContext::buildInit() {
 void CpuStEmitContext::buildRuntime() {
     const auto line = [](std::string text) { return Code::line(std::move(text)); };
     const auto block = [](std::string text, std::vector<Code> body) { return Code::block(std::move(text), std::move(body)); };
-    if (!indexedStates_.empty()) {
-        Function touch{"memory_touch_range", "std::uint64_t *words, std::size_t first, std::size_t count"};
-        touch.locals = {{"std::uint64_t*", "words", "{}", true}, {"std::size_t", "first", "{}", true},
-            {"std::size_t", "count", "{}", true}, {"std::size_t", "word"}, {"std::size_t", "offset"},
-            {"std::size_t", "take"}, {"std::uint64_t", "bits"}};
-        touch.body = {block("while (@count@)", {
-            line("@word@ = @first@ / 64;"), line("@offset@ = @first@ % 64;"),
-            line("@take@ = std::min<std::size_t>(@count@, 64 - @offset@);"),
-            line("@bits@ = ~UINT64_C(0) >> (64 - @take@);"),
-            line("@words@[@word@] |= @bits@ << @offset@;"),
-            line("@first@ += @take@;"), line("@count@ -= @take@;")
-        })};
-        addFunction(std::move(touch));
-        Function intersects{"memory_read_touched", "const std::uint64_t *words, std::size_t first, std::size_t count, std::size_t cells", "bool"};
-        intersects.locals = {{"const std::uint64_t*", "words", "{}", true}, {"std::size_t", "first", "{}", true},
-            {"std::size_t", "count", "{}", true}, {"std::size_t", "cells", "{}", true},
-            {"std::size_t", "word"}, {"std::size_t", "offset"}, {"std::size_t", "take"}, {"std::uint64_t", "bits"}};
-        intersects.body = {block("if (@first@ >= @cells@)", {Code::line("return @first@ > @cells@;", true)}),
-            block("while (@count@)", {
-                line("@word@ = @first@ / 64;"), line("@offset@ = @first@ % 64;"),
-                line("@take@ = std::min<std::size_t>(@count@, 64 - @offset@);"),
-                line("@bits@ = ~UINT64_C(0) >> (64 - @take@);"),
-                block("if (@words@[@word@] & (@bits@ << @offset@))", {Code::line("return true;", true)}),
-                line("@first@ += @take@;"), line("@count@ -= @take@;")
-            }), Code::line("return false;", true)};
-        addFunction(std::move(intersects));
-    }
     Function random{"random_next", "std::uint64_t &rng", "std::uint64_t"};
     random.locals = {{"std::uint64_t", "z"}};
     random.body = {line("@z@ = (rng += UINT64_C(0x9e3779b97f4a7c15));"),
@@ -3126,14 +3599,14 @@ void CpuStEmitContext::buildRuntime() {
             line("@text@ = @left@ ? @text@ + @padding@ : @padding@ + @text@;")
         }), Code::line("return @text@;", true)
     }; addFunction(std::move(formatOne));
-    Function digits{"task_digits", "const std::string *format, std::size_t *position", "int"};
-    digits.locals = {{"const std::string*", "format", "{}", true}, {"std::size_t*", "position", "{}", true}, {"int", "number"}};
+    Function digits{"task_digits", "const std::string_view *format, std::size_t *position", "int"};
+    digits.locals = {{"const std::string_view*", "format", "{}", true}, {"std::size_t*", "position", "{}", true}, {"int", "number"}};
     digits.body = {block("while (*@position@ < @format@->size() && std::isdigit(static_cast<unsigned char>((*@format@)[*@position@])))", {
         line("if (@number@ > 1000000) throw std::runtime_error(\"task format width/precision exceeds limit\");"),
         line("@number@ = @number@ * 10 + ((*@format@)[*@position@] - '0');"), line("++*@position@;")
     }), Code::line("return @number@;", true)}; addFunction(std::move(digits));
-    Function spec{"task_spec", "const std::string *format, std::size_t *position, std::span<const TaskArg> args, std::size_t *argument", "std::string"};
-    spec.locals = {{"const std::string*", "format", "{}", true}, {"std::size_t*", "position", "{}", true},
+    Function spec{"task_spec", "const std::string_view *format, std::size_t *position, std::span<const TaskArg> args, std::size_t *argument", "std::string"};
+    spec.locals = {{"const std::string_view*", "format", "{}", true}, {"std::size_t*", "position", "{}", true},
         {"std::span<const TaskArg>", "args", "{}", true}, {"std::size_t*", "argument", "{}", true},
         {"bool", "left"}, {"bool", "zero"}, {"int", "width"}, {"int", "precision", "{-1}"}, {"char", "spec"}, {"std::string", "text"}};
     spec.body = {
@@ -3156,15 +3629,16 @@ void CpuStEmitContext::buildRuntime() {
     }; addFunction(std::move(spec));
     Function message{"task_message", "std::span<const TaskArg> args", "std::string"};
     message.locals = {{"std::span<const TaskArg>", "args", "{}", true}, {"std::string", "text"}, {"std::size_t", "i"},
-        {"std::size_t", "argument", "{1}"}, {"const std::string*", "format"}};
+        {"std::size_t", "argument", "{1}"}, {"std::string_view", "formatView"}, {"const std::string_view*", "format"}};
     message.body = {
-        block("if (!@args@.empty() && @args@[0].kind == 's')", {
-            line("@format@ = static_cast<const std::string*>(@args@[0].data);"),
+        block("if (!@args@.empty() && (@args@[0].kind == 's' || @args@[0].kind == 'f'))", {
+            line("@formatView@ = @args@[0].kind == 'f' ? std::string_view(static_cast<const char*>(@args@[0].data), @args@[0].bytes) : std::string_view(*static_cast<const std::string*>(@args@[0].data));"),
+            line("@format@ = &@formatView@;"),
             block("for (@i@ = 0; @i@ < @format@->size(); ++@i@)", {
                 line("@text@ += ((*@format@)[@i@] == '%') ? task_spec(@format@, &@i@, @args@, &@argument@) : std::string(1, (*@format@)[@i@]);")
             })
         }),
-        block("if (!@args@.empty() && @args@[0].kind != 's')", {
+        block("if (!@args@.empty() && @args@[0].kind != 's' && @args@[0].kind != 'f')", {
             block("for (@i@ = 0; @i@ < @args@.size(); ++@i@)", {
                 line("if (@i@) @text@.push_back(' ');"), line("@text@ += task_default(@args@[@i@]);")
             })
@@ -3492,7 +3966,6 @@ void CpuStEmitContext::codeMap(std::ostream& output, const std::vector<WrittenFu
             text("state_reference", stateRef(op));
             if (!large(op)) text("next_reference", nextStateRef(op));
         }
-        if (indexedReads_.contains(op)) text("subscription", fieldRef("memoryReadIndexStore", subscriptionName(op)));
         if (const auto bit = largeWriteOrdinal_.find(op); bit != largeWriteOrdinal_.end()) {
             json.writeProperty("enable_bit"); json.writeValue(uint64_t(bit->second));
             json.writeProperty("commit_enable_bit"); json.writeValue(uint64_t(largeCommitEnableOrdinal_.at(op)));
@@ -3507,7 +3980,6 @@ void CpuStEmitContext::codeMap(std::ostream& output, const std::vector<WrittenFu
             if (store == "smallSinkStore" && layout.references.contains(name(op)))
                 reference("smallSinkStoreNext", nextStateRef(op));
         }
-        if (indexedReads_.contains(op)) reference("memoryReadIndexStore", fieldRef("memoryReadIndexStore", subscriptionName(op)));
         if (largeWriteOrdinal_.contains(op)) {
             if (enableBitmap_) {
                 const auto bit = largeWriteOrdinal_.at(op);
@@ -3559,6 +4031,92 @@ void CpuStEmitContext::codeMap(std::ostream& output, const std::vector<WrittenFu
     output.put('\n');
 }
 
+std::string CpuStEmitContext::sinkActivityStats() const {
+    std::size_t valuePairs = 0, targetPairs = 0, maxValueFanout = 0, maxTargetFanout = 0;
+    std::size_t maxValueMasks = 0, maxTargetMasks = 0, rejectedRuns = 0, rejectedWriters = 0;
+    std::size_t currentPairs = 0, currentMaskWords = 0, maxCurrentFanout = 0, maxCurrentMasks = 0;
+    std::size_t smallCurrentStates = 0, largeCurrentStates = 0;
+    for (const auto& [value, targets] : sinkValueFanout_) {
+        if (!sinkInputSources_.contains(value) && !sinkPublicationSources_.contains(value))
+            throw std::logic_error("CPU sink activity frontier has no emitted change route for v" + std::to_string(value.index));
+        valuePairs += targets.size();
+        maxValueFanout = std::max(maxValueFanout, targets.size());
+        maxValueMasks = std::max(maxValueMasks, targets.masks.size());
+    }
+    for (const auto& [state, targets] : sinkTargetFanout_) {
+        targetPairs += targets.size();
+        maxTargetFanout = std::max(maxTargetFanout, targets.size());
+        maxTargetMasks = std::max(maxTargetMasks, targets.masks.size());
+    }
+    for (const auto& [state, targets] : sinkCurrentStateFanout_) {
+        currentPairs += targets.size();
+        currentMaskWords += targets.masks.size();
+        maxCurrentFanout = std::max(maxCurrentFanout, targets.size());
+        maxCurrentMasks = std::max(maxCurrentMasks, targets.masks.size());
+        (large(state) ? largeCurrentStates : smallCurrentStates)++;
+    }
+    for (const auto& [reason, counts] : sinkRejections_) {
+        rejectedRuns += counts.first; rejectedWriters += counts.second;
+    }
+    const auto words = (sinkActivityRuns_ + 63) / 64;
+    std::ostringstream out;
+    out << "{\n  \"schema\": \"grhsim-sink-activity-stats.v1\",\n  \"graph\": " << quote(graph_.symbol())
+        << ",\n  \"eligible_runs\": " << sinkActivityRuns_
+        << ",\n  \"eligible_writers\": " << sinkActivityWriters_
+        << ",\n  \"eligible_joined_fire_runs\": " << sinkJoinedFireRuns_
+        << ",\n  \"eligible_current_state_runs\": " << sinkCurrentStateRuns_
+        << ",\n  \"rejected_runs\": " << rejectedRuns
+        << ",\n  \"rejected_writers\": " << rejectedWriters
+        << ",\n  \"subscribed_values\": " << sinkValueFanout_.size()
+        << ",\n  \"unique_value_run_pairs\": " << valuePairs
+        << ",\n  \"subscribed_targets\": " << sinkTargetFanout_.size()
+        << ",\n  \"unique_target_run_pairs\": " << targetPairs
+        << ",\n  \"max_value_fanout\": " << maxValueFanout
+        << ",\n  \"max_target_fanout\": " << maxTargetFanout
+        << ",\n  \"max_value_mask_words\": " << maxValueMasks
+        << ",\n  \"max_target_mask_words\": " << maxTargetMasks
+        << ",\n  \"subscribed_current_states\": " << sinkCurrentStateFanout_.size()
+        << ",\n  \"subscribed_small_current_states\": " << smallCurrentStates
+        << ",\n  \"subscribed_large_current_states\": " << largeCurrentStates
+        << ",\n  \"unique_current_state_run_pairs\": " << currentPairs
+        << ",\n  \"current_state_mask_words\": " << currentMaskWords
+        << ",\n  \"max_current_state_fanout\": " << maxCurrentFanout
+        << ",\n  \"max_current_state_mask_words\": " << maxCurrentMasks
+        << ",\n  \"current_state_change_sources\": " << sinkCurrentStatePublicationSources_.size()
+        << ",\n  \"small_current_publication_mask_sites\": " << sinkSmallCurrentPublicationMaskSites_
+        << ",\n  \"large_current_write_mask_sites\": " << sinkLargeCurrentWriteMaskSites_
+        << ",\n  \"input_change_sources\": " << sinkInputSources_.size()
+        << ",\n  \"publication_change_sources\": " << sinkPublicationSources_.size()
+        << ",\n  \"input_change_mask_sites\": " << sinkInputMaskSites_
+        << ",\n  \"publication_change_mask_sites_before_grouping\": " << sinkPublicationMaskSitesBeforeGrouping_
+        << ",\n  \"publication_change_mask_sites\": " << sinkPublicationMaskSites_
+        << ",\n  \"publication_aggregation_groups\": " << publicationAggregationGroups_
+        << ",\n  \"publication_aggregation_sites\": " << publicationAggregationSites_
+        << ",\n  \"publication_aggregation_sink_groups\": " << publicationAggregationSinkGroups_
+        << ",\n  \"publication_aggregation_sink_sites\": " << publicationAggregationSinkSites_
+        << ",\n  \"shadow_change_mask_sites\": " << sinkShadowMaskSites_
+        << ",\n  \"scalar_shadow_change_mask_writer_sites\": " << scalarShadowChangeMaskWriterSites_
+        << ",\n  \"writer_batches\": " << writerBatches_
+        << ",\n  \"writer_batches_all_eligible\": " << writerBatchesAllEligible_
+        << ",\n  \"writer_batches_with_activity_guard\": " << writerBatchesWithActivityGuard_
+        << ",\n  \"writer_batch_activity_mask_words\": " << writerBatchActivityMaskWords_
+        << ",\n  \"writer_batch_activity_max_mask_words\": " << writerBatchActivityMaxMaskWords_
+        << ",\n  \"writer_dispatch_fire_groups\": " << writerDispatchFireGroups_
+        << ",\n  \"writer_dispatch_fire_batches\": " << writerDispatchFireBatches_
+        << ",\n  \"writer_dispatch_fire_max_events\": " << writerDispatchFireMaxEvents_
+        << ",\n  \"bitmap_words\": " << words
+        << ",\n  \"bitmap_bytes\": " << words * sizeof(std::uint64_t)
+        << ",\n  \"rejections\": {";
+    bool first = true;
+    for (const auto& [reason, counts] : sinkRejections_) {
+        out << (first ? "\n" : ",\n") << "    " << quote(reason) << ": {\"runs\": " << counts.first
+            << ", \"writers\": " << counts.second << '}';
+        first = false;
+    }
+    out << "\n  }\n}\n";
+    return out.str();
+}
+
 std::string CpuStEmitContext::activationStats() const {
     uint64_t valueEdges = 0, inputEdges = 0, constantEdges = 0, computeEdges = 0, pulseEdges = 0;
     uint64_t stateChangeEdges = 0, stateWriteEdges = 0;
@@ -3595,6 +4153,8 @@ std::string CpuStEmitContext::activationStats() const {
         << ",\n  \"compute_compute_change_activation_edges\": " << computeEdges
         << ",\n  \"unique_compute_compute_change_activation_edges\": " << computePairs.size()
         << ",\n  \"event_pulse_activation_edges\": " << pulseEdges
+        << ",\n  \"event_effect_owners\": " << nonsinkEffectFireOwners_
+        << ",\n  \"additional_effect_fire_activation_edges\": " << nonsinkEffectFireEdges_
         << ",\n  \"state_change_activation_edges\": " << stateChangeEdges
         << ",\n  \"state_write_activation_edges\": " << stateWriteEdges
         << ",\n  \"total_activation_edges\": " << valueEdges + pulseEdges + stateChangeEdges + stateWriteEdges
@@ -3672,7 +4232,7 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
         << "#else\n#define GRHSIM_PROFILE_CLOCK(aux) static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count())\n#define GRHSIM_PROFILE_UNIT \"nanoseconds\"\n#endif\n"
         << "static_assert(sizeof(unsigned _BitInt(65)) == 16 && alignof(unsigned _BitInt(65)) == 8);\n"
         << "class " << class_ << " {\npublic:\n";
-    std::set<std::string> memberNames{class_, "PerfCounters", "TaskArg", "activeCurrent", "activeNext", "dirtyStateFlags", "pending_", "cpu_rng", "perf_", "profileEnabled_", "snTimeTicks_", "snTimeFires_", "numeric_select"};
+    std::set<std::string> memberNames{class_, "PerfCounters", "TaskArg", "activeCurrent", "activeNext", "dirtyStateFlags", "sinkDirty", "pending_", "cpu_rng", "perf_", "profileEnabled_", "snTimeTicks_", "snTimeFires_", "numeric_select"};
     if (!counterSnapshot_.empty()) { memberNames.insert("opExecCounts_"); memberNames.insert("opExecEvals_"); }
     for (const auto& [store, fields] : fields_) memberNames.insert(store);
     for (const auto& name : functionNames_) memberNames.insert(name);
@@ -3705,6 +4265,7 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
     header << "    smallSinkStoreType smallSinkStoreNext{};\n"
         << "    std::array<std::uint8_t," << activeWords << "> activeCurrent{}, activeNext{};\n"
         << "    std::array<std::uint8_t," << dirtyWords << "> dirtyStateFlags{};\n"
+        << "    std::array<std::uint64_t," << (sinkActivityRuns_ + 63) / 64 << "> sinkDirty{};\n"
         << "    bool pending_ = false;\n    std::uint64_t cpu_rng = UINT64_C(0x6a09e667f3bcc909);\n"
         << "    PerfCounters perf_{};\n    bool profileEnabled_ = WOLVRIX_GRHSIM_SN_TIMING;\n"
         << "    std::array<std::uint64_t,(WOLVRIX_GRHSIM_SN_TIMING ? " << nonsink_.size() << " : 0)> snTimeTicks_{}, snTimeFires_{};\n";
@@ -3737,7 +4298,7 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
     std::string unitPath;
     std::ostringstream manifest;
     manifest << "{\n  \"emitter\": \"grhsim-cpu-st-cpp\",\n  \"top\": " << quote(graph_.symbol())
-        << ",\n  \"code_map\": \"code-map.json\",\n  \"activation_stats\": \"activation-stats.json\",\n  \"readable_names\": " << (readableNames_ ? "true" : "false")
+        << ",\n  \"code_map\": \"code-map.json\",\n  \"activation_stats\": \"activation-stats.json\",\n  \"sink_activity_stats\": \"sink-activity-stats.json\",\n  \"private_mux_stats\": \"private-mux-stats.json\",\n  \"readable_names\": " << (readableNames_ ? "true" : "false")
         << ",\n  \"source_comments\": " << (sourceComments_ ? "true" : "false")
         << ",\n  \"readable_frames\": " << (readableFrames_ ? "true" : "false")
         << ",\n  \"max_function_lines\": " << maxLines_ << ",\n  \"max_tu_bytes\": " << tuBytes_
@@ -3830,6 +4391,8 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
     }
     manifest << "\n}\n";
     save("activation-stats.json", activationStats());
+    save("sink-activity-stats.json", sinkActivityStats());
+    save("private-mux-stats.json", privateMuxStats());
     save("manifest.json", manifest.str());
     phase("manifest-and-activation-written");
     std::ostringstream make;

@@ -224,7 +224,8 @@ fallback for checkpoints without SemanticTree coverage. Their identity includes
 source unit, circuit, module, instance path and node name. Bundle field paths
 normalize to their source family; arrays
 retain shape. Roots are not required and origins never manufacture members.
-Identical membership sets form one execution node. A shared CSE operation with
+Identical membership sets within one clock-dependency class form one execution
+node. A shared CSE operation with
 multiple families receives one shared owner, distinct from the private
 regions of those families. Overlapping sets do not authorize transitive union
 or reconstruction by cloning.
@@ -251,11 +252,40 @@ root is kept alive or recreated. Owners become
 across rename/reindexing. Actual node and supernode quotients must be acyclic.
 Subsequent simplify operates within these actual execution owners.
 
+### Clock-dependent computation
+
+Before building nodes, the partitioner records every EventEdge input clock
+value and output pulse as a root. In nonsink topological order, an operation
+is clock-dependent when a result is a root, an operand is a root, or an operand
+comes from a clock-dependent nonsink producer. This follows real dataflow only:
+neither an ordered-effect arc nor the fact that a register has a clocked writer
+marks an otherwise independent state read. Dynamic read indices still carry
+their ordinary operand dependencies.
+
+The resulting boolean class is a hard boundary in source-family grouping,
+MFFC absorption, all greedy contractions and interval packing. For example,
+`not(input_clock)` and an independent `read(q) + data` cannot share a nonsink
+execution owner even if they have the same SemanticTree family. Similarly,
+an Event pulse OR and unrelated delayed register reads remain separate.
+State subscriptions, ordered-effect arcs and result publication fanout remain
+unchanged; only their destination owner keys change. A data publication still
+activates its real consumers, including a clock-dependent effect when needed;
+it does not activate an unrelated producer in the reverse direction.
+
+This class separates clock-dependent work from independent data. It does not
+separate individual clocks, raw clock levels from pulses, or effects from their
+necessary fire/enable checks. Event-driven DPI/task effects must still run at
+each fresh edge. Shared Or/Assign fire controls require the emitter's direct
+Event-leaf subscriptions so that a held true join does not hide a later edge.
+The partitioner stores its class in local byte vectors and an execution-owner
+lookup; it adds no operation attributes or runtime bitmap.
+
 ### Supernode construction
 
-The upper partitioner receives only Node DAG edges and unit node counts.
+The upper partitioner receives only Node DAG edges and whole-node capacities.
 Legacy mode coarsens chains/inputs/siblings with an acyclic quotient, then
-uses dynamic programming over topological intervals. Bytes mode skips greedy
+uses dynamic programming over topological intervals. Both steps refuse a
+merge across clock-dependency classes. Bytes mode skips greedy
 coarsening. Both minimize distinct incoming boundary values plus a per-group
 penalty: `sum(rate * payload) + segment-penalty`. Payload is 1 in legacy
 mode, or actual boundary bytes in bytes mode. A producer's nonnegative integer
@@ -272,23 +302,51 @@ content hashes only look up predecessor groups and never choose merge order.
 `WOLVRIX_SIMPLIFY_PHASE_TIMING` reports quotient, candidate, merge and reorder
 time for each coarsening attempt.
 
-A 180-op FIRRTL node, a 180-op MFFC node and a one-op node each cost one unit
-of capacity. Capacity K can hold K whole nodes; a K+1th node goes into another
-supernode. Compiler function/file limits remain independent emitter concerns.
+A 180-op FIRRTL node, a 180-op MFFC node and a one-op pure node each cost one
+unit of capacity. A node containing `grhsim.system-task` instead costs
+`max(1, ceil(totalTaskArgs / 16))`, capped at `max-supernode-nodes` so an
+indivisible large node can occupy a group by itself. `totalTaskArgs` sums each
+task's operand count minus two: operand 0 is the normalized fire, operand 1 is
+the user enable, and operands 2 onward each emit one C++ `TaskArg`. For example,
+`system-task(fire, enable, a)` costs 1, a task with 16 payload operands costs 1,
+and a task with 17 costs 2. Ordinary nodes retain capacity 1. Both greedy
+coarsening (all three modes) and interval segmentation sum these capacities;
+they never split a node, change its operands or reorder its effects.
+
+This bound addresses the measured v5 compile timeout. Clock/data isolation
+placed 128 existing log tasks, with 68,841 expanded `TaskArg` elements, into
+one 13,760,268-byte/400-line function. The same tasks previously occupied 39
+owners, the largest 642,716 bytes. Its TU was the sole unfinished object at
+the 330-second deadline; all other 406 objects completed by 143 seconds.
+At capacity 128 the new budget normally allows about 2,048 payload arguments
+per group; a single task larger than that remains legal and indivisible.
+The source grouping is the strongest explanation for the long tail; no LLVM
+pass timing was measured. Existing emitter line/file limits remain separate.
+
+`nodes`, `supernode-nodes` and `supernode-max-nodes` retain actual node counts.
+`task-args`, `task-nodes`, `task-weighted-nodes`, `task-clamped-nodes` and
+`node-max-task-args` describe the task expansion. `node-capacity-units`,
+`supernode-capacity` and `supernode-max-capacity` report the separate capacity
+budget. `coarsen-mode0-accepted` through `coarsen-mode2-accepted` count accepted
+coarsening attempts, not nodes or merges. The analysis stores one local
+`uint32_t` capacity per node and adds no per-operation attributes.
 
 ### Optional cloning and configuration
 
 One bounded optional clone round considers cheap scalar TwoState transforms
 whose varying input already reaches the destination execution group. Eligible
 not/assign and constant xor/add/sub operations, and optionally eq/ne, copy into
-an existing destination node. Supporting constants follow. Cloning adds ops,
+an existing destination node in the same clock-dependency class. In particular,
+a data-only transform is not copied into a clock-dependent owner merely because
+its input is already available there. Supporting constants remain neutral and
+follow an accepted clone. Cloning adds ops,
 not node count; it neither reconstructs FIRRTL expressions nor exceeds the
 separate clone-count/fanout limits. Actual dependency/schedule verification
 still applies. Cross-owner simplify cannot undo execution ownership.
 
 `grhsim.nonsinkConfig` is
-`v4/maxSupernodeNodes/segmentPenalty/semanticNodes/cloneShared/cloneMaxFanout/maxClones/cloneLossyCompare/firrtlNodes/costModel/semantic-tree-mffc-v1`.
-Old work limits, leaf fusion and pre-v4 completed checkpoints require
+`v6/maxSupernodeNodes/segmentPenalty/semanticNodes/cloneShared/cloneMaxFanout/maxClones/cloneLossyCompare/firrtlNodes/costModel/semantic-tree-mffc-clock-task-v1`.
+Old work limits, leaf fusion and completed checkpoints without clock separation or the task budget require
 an explicit restart at nonsink-sink-split. Thresholds are never converted from
 op/work units to node counts. Schema 1 source checkpoints require re-ingest.
 Python uses `max_supernode_nodes`; Make exposes

@@ -575,6 +575,97 @@ void testCallPreflightAndNonLogicState()
                 "non-logic default initialization lost");
     }
 }
+void testFirrtlLiteralFormats()
+{
+    grh::Design design;
+    auto& graph = design.createGraph("top");
+    design.markAsTop("top");
+    const grh::LogicalType stringType{grh::ValueType::String, 1, false, grh::LogicDomain::FourState, {}};
+    const auto enable = input(graph, "enable", logic(1));
+    const auto clock = input(graph, "clock", logic(1));
+    const auto data = input(graph, "data", logic(8));
+    const auto text = [&](std::string literal) { return constant(graph, stringType, std::move(literal)); };
+    const auto printfTask = [&](std::string_view symbol, grh::ValueId format, std::string name = "write", bool firrtl = true) {
+        const auto task = operation(graph, OperationKind::kSystemTask, symbol, {enable, format, data, clock});
+        graph.setAttr(task, "name", std::move(name));
+        graph.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
+        if (firrtl) graph.setAttr(task, "firrtl.effectKind", std::string("printf"));
+        return task;
+    };
+    const auto format = text("value=%0d %%\n");
+    const auto formatOp = graph.valueDef(format);
+    auto& tree = graph.getOrCreateSemanticTree("printf.fir", "Printf", "literal_formats");
+    const auto opId = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "format_op");
+    const auto valueId = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "format_value");
+    graph.setOpSemanticIds(formatOp, std::array{opId});
+    graph.setValueSemanticIds(format, std::array{valueId});
+    const auto task = printfTask("literal", format);
+    const auto empty = text("");
+    const auto emptyTask = printfTask("empty", empty);
+    const std::string nulText("before\0after=%0d", sizeof("before\0after=%0d") - 1);
+    const auto nul = text(nulText);
+    const auto nulTask = printfTask("nul", nul);
+    const auto shared = text("shared=%0d");
+    const auto sharedTask = printfTask("shared_literal", shared);
+    const auto sharedUser = printfTask("shared_display", shared, "display");
+    const auto port = text("port=%0d");
+    graph.bindOutputPort("format_port", port);
+    const auto portTask = printfTask("port_literal", port);
+    const auto declared = text("declared=%0d");
+    graph.setValueSymbol(declared, graph.internSymbol("declared_format"));
+    graph.addDeclaredSymbol(graph.valueSymbol(declared));
+    printfTask("declared_literal", declared);
+    const auto generated = text("generated=%0d");
+    const auto generatedOp = graph.valueDef(generated);
+    graph.setOpSymbol(generatedOp, graph.internSymbol("generated_format"));
+    const auto group = graph.addGenerateGroup(graph.internSymbol("gen"), graph.internSymbol("format"));
+    graph.addGenerateGroupSymbol(group, graph.operationSymbol(generatedOp));
+    printfTask("generated_literal", generated);
+    const auto aliasSource = text("alias=%0d");
+    const auto alias = graph.createValue(stringType);
+    operation(graph, OperationKind::kAssign, "format_alias", {aliasSource}, {alias});
+    const auto aliasTask = printfTask("alias_task", alias);
+    const auto dynamic = input(graph, "dynamic_format", stringType);
+    const auto dynamicTask = printfTask("dynamic_task", dynamic);
+    const auto ordinary = text("ordinary=%0d");
+    const auto ordinaryTask = printfTask("ordinary_task", ordinary, "write", false);
+    const auto fatal = text("fatal=%0d");
+    const auto fatalTask = printfTask("fatal_task", fatal, "fatal");
+    require(graph.opOperands(task)[1] == format && !graph.getOperation(task).attr(sim::kLiteralFormat),
+            "base GRH printf representation changed before conversion");
+    require(convert(design) && verifies(design), "FIRRTL literal format conversion failed");
+    require(sim::attribute<std::string>(graph, task, sim::kLiteralFormat) == "value=%0d %%\n" &&
+            graph.opOperands(task).size() == 3 && graph.opOperands(task)[1] == enable &&
+            graph.opOperands(task)[2] == data && sim::isFire(graph, graph.opOperands(task)[0]),
+            "literal format extraction changed payload, enable or fire");
+    require(sim::attribute<std::string>(graph, emptyTask, sim::kLiteralFormat) == std::string{} &&
+            sim::attribute<std::string>(graph, nulTask, sim::kLiteralFormat) == nulText,
+            "empty or embedded-NUL format bytes were lost");
+    const auto alive = [&](grh::ValueId value) {
+        const auto values = graph.values(); return std::find(values.begin(), values.end(), value) != values.end();
+    };
+    require(!alive(format) && !alive(empty) && !alive(nul), "unused extracted constants were retained");
+    require(alive(shared) && alive(port) && alive(declared) && alive(generated) && alive(aliasSource),
+            "format cleanup removed a shared value, port or symbol anchor");
+    const auto identities = graph.opSemanticIds(task);
+    require(std::find(identities.begin(), identities.end(), opId) != identities.end() &&
+            std::find(identities.begin(), identities.end(), valueId) != identities.end(),
+            "removed format provenance was not preserved on its task");
+    require(graph.opOperands(sharedUser)[2] == shared && graph.opOperands(sharedTask).size() == 3 &&
+            graph.opOperands(portTask).size() == 3, "shared/public literal extraction was skipped");
+    for (const auto unchanged : {aliasTask, dynamicTask, ordinaryTask, fatalTask})
+        require(!graph.getOperation(unchanged).attr(sim::kLiteralFormat) && graph.opOperands(unchanged).size() == 4,
+                "dynamic, aliased or non-printf-write task was rewritten");
+
+    grh::Design invalid;
+    auto& badGraph = invalid.createGraph("top"); invalid.markAsTop("top");
+    const auto one = constant(badGraph, logic(1), "1'h1");
+    const auto bad = operation(badGraph, OperationKind::kSystemTask, "bad", {one});
+    badGraph.setAttr(bad, "name", std::string("write"));
+    badGraph.setAttr(bad, sim::kLiteralFormat, std::string{});
+    const auto stamp = transform::DesignStamp::capture(badGraph);
+    require(!convert(invalid) && stamp.matches(badGraph), "reserved base format attribute mutated before rejection");
+}
 } // namespace
 
 int main()
@@ -588,6 +679,7 @@ int main()
         testFourStateAndUndriven();
         testFailuresAndFactory();
         testCallPreflightAndNonLogicState();
+        testFirrtlLiteralFormats();
     }
     catch (const std::exception& exception)
     {

@@ -27,6 +27,7 @@ inline constexpr grh::OperationKind kMaskedOr = static_cast<grh::OperationKind>(
 
 inline constexpr std::string_view kStage = "grhsim.stage";
 inline constexpr std::string_view kPartition = "grhsim.partition";
+inline constexpr std::string_view kLiteralFormat = "grhsim.literalFormat";
 
 template <typename T>
 std::optional<T> attribute(const grh::Graph& graph, grh::OperationId operation, std::string_view key)

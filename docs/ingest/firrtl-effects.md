@@ -13,6 +13,11 @@ Effects use ordinary GRH `kSystemTask` operands
 sample old state. Source ordering is retained through the existing scheduler.
 The condition includes enclosing when guards.
 
+The base GRH printf format remains an ordinary String constant operand.
+Simulation conversion can move a direct constant into the task's
+[`grhsim.literalFormat`](../grh/grhsim-dialect.md#tasks-functions-and-dpi)
+attribute before partitioning, preserving the frontend/SV operand contract.
+
 | FIRRTL | Task | Condition and arguments |
 | --- | --- | --- |
 | printf | write | guard & enable; format String and argument values. |

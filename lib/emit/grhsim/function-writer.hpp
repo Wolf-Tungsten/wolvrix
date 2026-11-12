@@ -12,7 +12,7 @@ namespace wolvrix::lib::emit::grhsim_detail {
 // A structured C++ text writer, not a computation or scheduling representation.
 // Scopes are extracted only at statement boundaries. Locals referred to by
 // several resulting functions live in that source function's chunkFrame.
-// Declaration-heavy indivisible statements can also spill locals to the frame.
+// Declaration-heavy indivisible statements can also spill locals to a frame.
 struct Code {
     std::string text;
     std::vector<Code> body;
@@ -20,6 +20,8 @@ struct Code {
     bool terminal = false;
     std::string comment;
     std::string sourceOperation;
+    // Operations folded into this statement still belong to its split helper.
+    std::vector<std::string> sourceOperations;
     static Code line(std::string text, bool terminal = false);
     static Code block(std::string header, std::vector<Code> body);
     // Documentation stays attached to the statement and does not affect its
@@ -68,6 +70,10 @@ struct Function {
     bool zeroInitializeLocals = true;
     std::string comment;
     bool readableFrame = false;
+    // The producer guarantees that private numeric local addresses never escape
+    // their executing part. Single-part declaration spills may then use a local
+    // aggregate; shared/repeated locals retain the source-function lifetime.
+    bool localizePrivateNumericSpills = false;
 };
 
 struct WrittenFunction {
@@ -87,7 +93,7 @@ struct WrittenFunctions {
 };
 
 // Local references in Code use @name@. They resolve either to a local or to a
-// chunkFrame field after splitting and liveness analysis have reached a fixpoint.
+// shared/local frame field after splitting and liveness reach a fixpoint.
 // Pass an owned function with std::move to consume its potentially large body.
 WrittenFunctions writeFunction(Function function, std::string_view className,
                                std::size_t maxLines);

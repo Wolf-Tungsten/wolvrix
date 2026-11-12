@@ -154,6 +154,60 @@ void testDpiContract()
     require(!verifies(design), "missing DPI inout result accepted");
 }
 
+void testLiteralFormatContract()
+{
+    grh::Design design;
+    auto& graph = design.createGraph("top"); design.markAsTop("top");
+    const grh::LogicalType bit{grh::ValueType::Logic, 1, false, grh::LogicDomain::TwoState, {}};
+    const auto one = constant(graph, bit, "1'h1");
+    const auto task = graph.createOperation(sim::kSystemTask, graph.internSymbol("literal"));
+    graph.addOperand(task, one); graph.addOperand(task, one);
+    graph.setAttr(task, "name", std::string("write"));
+    graph.setAttr(task, "procKind", std::string("always_comb"));
+    graph.setAttr(task, "hasTiming", false); graph.setAttr(task, "eventDriven", false);
+    graph.setAttr(task, "firrtl.effectKind", std::string("printf"));
+    graph.setAttr(task, sim::kLiteralFormat, std::string{});
+    graph.setMetadata(sim::kStage, std::string("converted"));
+    require(verifies(design), "empty literal printf format rejected");
+    graph.setAttr(task, sim::kLiteralFormat, int64_t{1});
+    require(!verifies(design), "non-string literal printf format accepted");
+    const std::string format("quote=\"\\ @ UTF-8:\xc3\xa9\0tail", sizeof("quote=\"\\ @ UTF-8:\xc3\xa9\0tail") - 1);
+    graph.setAttr(task, sim::kLiteralFormat, format);
+    for (const auto name : {"display", "fatal", "monitor", "strobe"}) {
+        graph.setAttr(task, "name", std::string(name));
+        require(!verifies(design), "literal format accepted for a non-write task");
+    }
+    graph.setAttr(task, "name", std::string("write"));
+    graph.eraseAttr(task, "firrtl.effectKind");
+    require(!verifies(design), "literal format accepted without FIRRTL printf provenance");
+    graph.setAttr(task, "firrtl.effectKind", std::string("printf"));
+    require(verifies(design), "legal literal printf format rejected");
+    const auto versions = grh::requiredDialects(graph);
+    require(versions.at("grh") == 2 && versions.at("grhsim") == 2,
+            "literal format changed the base GRH version or omitted the new dialect version");
+    wolvrix::lib::store::StoreJson serializer;
+    const auto checkpoint = serializer.storeToString(design);
+    require(checkpoint.has_value(), "literal printf checkpoint store failed");
+    auto restored = grh::Design::fromJsonString(*checkpoint);
+    auto& restoredGraph = *restored.findGraph("top");
+    require(verifies(restored) && sim::attribute<std::string>(restoredGraph,
+            restoredGraph.findOperation("literal"), sim::kLiteralFormat) == format,
+            "literal printf checkpoint lost format bytes");
+    auto oldVersion = *checkpoint;
+    const auto key = oldVersion.find("\"grhsim\"");
+    require(key != std::string::npos, "checkpoint omitted the grhsim dialect");
+    const auto version = oldVersion.find_first_not_of(" \t\r\n", oldVersion.find(':', key) + 1);
+    require(oldVersion[version] == '2', "checkpoint has an unexpected grhsim version");
+    oldVersion[version] = '1';
+    bool rejected = false;
+    try { grh::Design::fromJsonString(oldVersion); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "old grhsim version accepted without an explicit migration");
+    graph.eraseAttr(task, sim::kLiteralFormat);
+    const auto legacyFormat = constant(graph, {grh::ValueType::String, 1, false, grh::LogicDomain::TwoState, {}}, "%0d");
+    graph.addOperand(task, legacyFormat); graph.addOperand(task, one);
+    require(verifies(design), "legacy String operand task rejected by grhsim version 2");
+}
+
 void testDpiTypeNames()
 {
     for (const auto name : {"logic", "bit", "byte", "shortint", "int", "longint", "integer", "time"})
@@ -205,7 +259,7 @@ void testDpiTypeNames()
 
 int main()
 {
-    try { testContractsAndCheckpoint(); testDpiContract(); testDpiTypeNames(); }
+    try { testContractsAndCheckpoint(); testDpiContract(); testDpiTypeNames(); testLiteralFormatContract(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     return 0;
 }

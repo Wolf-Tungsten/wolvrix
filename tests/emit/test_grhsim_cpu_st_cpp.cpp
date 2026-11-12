@@ -203,8 +203,8 @@ void inspectOperationStorage(const std::filesystem::path& directory, const grh::
         }
     }
     for (const auto store : {"smallSinkStore", "largeSinkStore", "prevEventStore", "timeslotTriggerStore",
-                             "sampledStore", "onceStore", "largeBeforeStore", "largeWholeBeforeStore",
-                             "largeWholeDirtyStore", "memoryTouchedStore", "largeSinkEnableBoundaryStore"}) {
+                             "sampledStore", "onceStore", "largeBeforeImageStore", "largeWholeBeforeStore",
+                             "largeWholeDirtyStore", "largeSinkEnableBoundaryStore"}) {
         const auto begin = header.find(std::string("struct ") + store + "Type {");
         const auto end = begin == std::string::npos ? begin : header.find("    };", begin);
         if (begin == std::string::npos || end == std::string::npos) continue;
@@ -273,9 +273,8 @@ void inspectFunctions(const std::filesystem::path& directory, std::size_t budget
     require(!readFile(directory / "code-map.json").empty(), "Default emitter omitted the code map");
     if (readableDump) require(!readFile(directory / "grhsim.txt").empty(), "Default emitter omitted the readable graph");
     else require(!std::filesystem::exists(directory / "grhsim.txt"), "Readable dump opt-out was ignored");
-    require(header.find("pGeneral_chunk") == std::string::npos &&
-                header.find("chunkFrame_pGeneral") == std::string::npos,
-            "General phase driver contains computation chunks or a spill frame");
+    require(header.find("chunkFrame_pGeneral") == std::string::npos,
+            "General phase driver contains a spill frame");
     std::size_t recorded = 0, offset = 0;
     while ((offset = manifest.find("\"lines\":", offset)) != std::string::npos) { ++recorded; ++offset; }
     require(recorded == functions, "Manifest omitted a generated function");
@@ -507,6 +506,46 @@ void testChunkWriter() {
     require(std::any_of(externalCall.functions.begin(), externalCall.functions.end(), [](const auto& part) {
                 return part.definition.find("accept(chunkFrame);") != std::string::npos;
             }), "Removing an unused spill argument changed a source call");
+
+    Function privateSpill{"private_spill"};
+    std::string privateSum = "result = ";
+    for (unsigned i = 0; i < 20; ++i) {
+        const auto name = "private" + std::to_string(i);
+        privateSpill.locals.push_back({"std::uint64_t", name});
+        privateSum += (i ? " + @" : "@") + name + "@";
+    }
+    privateSpill.body = {Code::line(privateSum + ";")};
+    const auto legacyPrivate = writeFunction(privateSpill, "ChunkTest", 12);
+    require(legacyPrivate.functions.front().localReferences.at("private19") == "chunkFrame.private19",
+            "Generic callers localized spills without an address-lifetime contract");
+    privateSpill.localizePrivateNumericSpills = true;
+    for (const bool zero : {false, true}) {
+        privateSpill.zeroInitializeLocals = zero;
+        const auto local = writeFunction(privateSpill, "ChunkTest", 12);
+        require(local.functions.front().localReferences.at("private19") == "localFrame.private19" &&
+                    local.frameDeclaration.find("struct localFrame_private_spill") != std::string::npos &&
+                    local.frameDeclaration.find("chunkFrame_private_spill") == std::string::npos,
+                "Single-part numeric declaration spills escaped into a shared frame");
+        require(local.functions.front().definition.find(std::string("localFrame_private_spill localFrame") +
+                    (zero ? "{};" : ";")) != std::string::npos,
+                "Part-local aggregate lost the producer's initialization policy");
+        require(local.functions.front().lines <= 12, "Part-local aggregate exceeded the line budget");
+    }
+    privateSpill.locals.push_back({"std::string", "text"});
+    privateSpill.locals.push_back({"std::uint64_t", "explicitInit", "{7}"});
+    privateSpill.body.push_back(Code::line("result += @text@.size() + @explicitInit@;"));
+    const auto lifetimes = writeFunction(privateSpill, "ChunkTest", 12);
+    require(lifetimes.functions.front().localReferences.at("text") == "chunkFrame.text" &&
+                lifetimes.functions.front().localReferences.at("explicitInit") == "chunkFrame.explicitInit",
+            "Nontrivial or explicit initialization moved to a part-local aggregate");
+    function.localizePrivateNumericSpills = true;
+    const auto repeatedLocals = writeFunction(function, "ChunkTest", 12);
+    for (const auto& part : repeatedLocals.functions) {
+        const auto values = part.localReferences.find("values");
+        if (values != part.localReferences.end())
+            require(values->second.starts_with("chunkFrame."), "Repeated loop storage was initialized per helper call");
+        require(part.lines <= 12, "Repeated-loop frame accounting exceeded the line budget");
+    }
 }
 
 void testModels() {
@@ -655,6 +694,7 @@ void testChunkExecution() {
     inner.push_back(Code::line("last = @values@[@i@];"));
     function.body = {Code::block("for (@i@ = 0; @i@ < @values@.size(); ++@i@)", std::move(inner)),
                      Code::line("return @sum@;", true)};
+    function.localizePrivateNumericSpills = true;
     for (const auto budget : {16, 1024}) {
         const auto written = writeFunction(function, "ChunkTest", budget);
         std::string support = "class ChunkTest { public: unsigned record=0; std::uint64_t last=0;\n" + written.frameDeclaration;
@@ -669,6 +709,7 @@ void testChunkExecution() {
     // A single guarded statement can fit while its private declarations do
     // not. Repeated helper extraction must terminate and preserve initializers.
     Function declarations{"run"};
+    declarations.localizePrivateNumericSpills = true;
     std::string expression;
     for (unsigned i = 0; i < 20; ++i) {
         const auto name = "x" + std::to_string(i);
@@ -689,6 +730,43 @@ void testChunkExecution() {
         for (const auto& part : written.functions) support += part.definition;
         manualCase(fixture, "chunk-declarations-b" + std::to_string(budget), budget, support,
                    "ChunkTest test; test.run(); assert(test.result == 210); test.run(); assert(test.result == 210);");
+    }
+    // Independent guarded payloads force private declarations after splitting.
+    // Each helper must reinitialize its numeric aggregate on the next run.
+    Function localSpills{"run", "unsigned parity"};
+    localSpills.parameters = "unsigned parity";
+    localSpills.locals.push_back({"unsigned", "parity", "{}", true});
+    localSpills.localizePrivateNumericSpills = true;
+    for (unsigned group = 0; group < 8; ++group) {
+        std::string value;
+        for (unsigned i = 0; i < 18; ++i) {
+            const auto name = "local" + std::to_string(group) + "_" + std::to_string(i);
+            localSpills.locals.push_back({"std::uint64_t", name});
+            value += (i ? " + @" : "@") + name + "@";
+        }
+        const auto array = "array" + std::to_string(group);
+        localSpills.locals.push_back({"std::array<std::array<std::uint64_t,2>,2>", array});
+        localSpills.body.push_back(Code::block("if (@parity@ == " + std::to_string(group % 2) + ")", {
+            Code::line("++@local" + std::to_string(group) + "_0@;"),
+            Code::line("++@" + array + "@[1][1];"),
+            Code::line("result += " + value + " + @" + array + "@[1][1];")
+        }));
+    }
+    for (const auto budget : {24, 1024}) {
+        const auto written = writeFunction(localSpills, "ChunkTest", budget);
+        std::string support = "class ChunkTest { public: std::uint64_t result=0;\n" + written.frameDeclaration;
+        bool sawLocal = false;
+        for (const auto& part : written.functions) {
+            require(part.lines <= std::size_t(budget), "Part-local spill execution exceeded the line budget");
+            sawLocal |= part.definition.find("localFrame_") != std::string::npos;
+            support += part.declaration;
+        }
+        if (budget == 24) require(sawLocal, "Guarded payload fixture did not exercise private aggregate spills");
+        support += "};\n";
+        for (const auto& part : written.functions) support += part.definition;
+        manualCase(fixture, "chunk-private-numeric-b" + std::to_string(budget), budget, support,
+                   "ChunkTest test; for(unsigned epoch=0; epoch<3; ++epoch) { test.run(0); test.run(1); "
+                   "assert(test.result==16*(epoch+1)); }");
     }
     // Inline phases contain many independently oversized guarded scopes.
     // Splitting them together must preserve each initializer and early return.
@@ -1038,7 +1116,7 @@ for (unsigned epoch = 0; epoch < 2; ++epoch) {
                              "smallSinkEnableBoundaryStore", "smallSinkPayloadBoundaryStore",
                              "largeSinkEnableBoundaryStore", "largeSinkPayloadBoundaryStore", "prevEventStore",
                              "eventActStore", "timeslotTriggerStore", "sampledStore", "onceStore",
-                             "largeBeforeStore", "largeWholeBeforeStore", "largeWholeDirtyStore"}) {
+                             "largeBeforeImageStore", "largeWholeBeforeStore", "largeWholeDirtyStore"}) {
         const auto begin = header.find(std::string("struct ") + store + "Type {");
         if (begin == std::string::npos) continue;
         const auto end = header.find("    };", begin);
@@ -1106,6 +1184,131 @@ void testActivityBatchOrder() {
                     header.find("chunkFrame_pGeneral") == std::string::npos,
                 "Ordered activity dispatch created phase chunks or a phase frame");
     }
+}
+
+void testFirrtlLiteralFormats() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clock = fixture.input("clock"), enable = fixture.input("enable"), data = fixture.input("data", 8);
+    const auto letter = fixture.constant(8, "8'd90");
+    const auto literal = [&](std::string text, const std::vector<grh::ValueId>& payload) {
+        const auto format = fixture.compute(OperationKind::kConstant,
+            {grh::ValueType::String, 1, false, grh::LogicDomain::TwoState, {}}, {});
+        graph.setAttr(graph.valueDef(format), "constValue", std::move(text));
+        const auto task = graph.createOperation(OperationKind::kSystemTask);
+        for (const auto value : {enable, format}) graph.addOperand(task, value);
+        for (const auto value : payload) graph.addOperand(task, value);
+        graph.addOperand(task, clock);
+        graph.setAttr(task, "name", std::string("write"));
+        graph.setAttr(task, "firrtl.effectKind", std::string("printf"));
+        graph.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
+        return task;
+    };
+    literal("", {}); literal("", {data});
+    literal("%%|quote=\"\\ @\t\r\nUTF-8:\xc3\xa9\001|%0d/%04h/%c\n", {data, data, letter});
+    literal(std::string("NUL=%0d\0hidden=%0d", sizeof("NUL=%0d\0hidden=%0d") - 1), {data, data});
+    literal("\n", {});
+    std::string large(8192, 'L'); large += "|";
+    const std::vector<grh::ValueId> arguments(80, data);
+    for (std::size_t i = 0; i < arguments.size(); ++i) large += "%0d,";
+    large += "\n"; literal(large, arguments);
+    fixture.convert(); fixture.split(); fixture.partition();
+    for (const auto value : graph.values())
+        require(graph.valueType(value) != grh::ValueType::String, "literal printf retained String dataflow");
+    const std::string support = R"CPP(
+#include <cstdlib>
+#include <iostream>
+#include <new>
+#include <sstream>
+static bool forbidLiteralAllocations;
+void* operator new(std::size_t bytes) {
+    if(forbidLiteralAllocations) std::abort();
+    if(void* memory=std::malloc(bytes ? bytes : 1)) return memory;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory,std::size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory,std::size_t) noexcept { std::free(memory); }
+)CPP";
+    const std::string body = R"CPP(
+for(unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); model.clock=false; model.enable=false; model.data=42; model.eval();
+    forbidLiteralAllocations=true;
+    for(unsigned step=0;step<32;++step) {
+        model.clock=step&1; model.data=step; model.eval();
+    }
+    model.clock=false; model.enable=true; model.eval();
+    model.data=42; model.eval(); // No edge, including enabled consumers.
+    forbidLiteralAllocations=false;
+    std::ostringstream output; auto* previous=std::cout.rdbuf(output.rdbuf());
+    model.clock=true; model.eval();
+    std::cout.rdbuf(previous);
+    std::string expected="%|quote=\"\\ @\t\r\nUTF-8:\xc3\xa9\001|42/002a/Z\nNUL=42\n";
+    expected+=std::string(8192,'L')+"|";
+    for(unsigned i=0;i<80;++i) expected+="42,";
+    expected+='\n'; assert(output.str()==expected);
+    output.str(""); previous=std::cout.rdbuf(output.rdbuf());
+    model.eval(); std::cout.rdbuf(previous); assert(output.str().empty());
+}
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "firrtl-literal-formats-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, support, body, false);
+        const auto cpp = generatedCpp(artifact(label) / "model");
+        require(cpp.find("TaskArg{'f', \"\"") != std::string::npos &&
+                cpp.find("NUL=%0d\\000hidden=%0d\", 7, 0, false}") != std::string::npos &&
+                cpp.find("static const std::string") == std::string::npos,
+                "literal task did not use immutable bytes, empty presence or legacy NUL length");
+    }
+
+    Fixture interrupted; auto& interruptedGraph = interrupted.graph;
+    const auto interruptedClock = interrupted.input("clock"), interruptedEnable = interrupted.input("enable");
+    const auto orderedWrite = [&](const std::string& text) {
+        const auto format = interrupted.compute(OperationKind::kConstant,
+            {grh::ValueType::String, 1, false, grh::LogicDomain::TwoState, {}}, {});
+        interruptedGraph.setAttr(interruptedGraph.valueDef(format), "constValue", text);
+        const auto task = interrupted.task("write", {interruptedEnable, format, interruptedClock}, {"posedge"});
+        interruptedGraph.setAttr(task, "firrtl.effectKind", std::string("printf"));
+    };
+    orderedWrite("before\n");
+    const auto imported = interruptedGraph.createOperation(OperationKind::kDpicImport,
+        interruptedGraph.internSymbol("literal_format_interrupt"));
+    interruptedGraph.setAttr(imported, "argsName", std::vector<std::string>{});
+    interruptedGraph.setAttr(imported, "argsDirection", std::vector<std::string>{});
+    interruptedGraph.setAttr(imported, "argsWidth", std::vector<int64_t>{});
+    interruptedGraph.setAttr(imported, "argsSigned", std::vector<bool>{});
+    interruptedGraph.setAttr(imported, "hasReturn", false);
+    const auto call = interruptedGraph.createOperation(OperationKind::kDpicCall);
+    for (const auto value : {interruptedEnable, interruptedClock}) interruptedGraph.addOperand(call, value);
+    interruptedGraph.setAttr(call, "targetImportSymbol", std::string("literal_format_interrupt"));
+    interruptedGraph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+    orderedWrite("after\n");
+    interrupted.convert(); interrupted.split(); interrupted.partition();
+    const std::string interruptedSupport = R"CPP(
+#include <iostream>
+#include <sstream>
+static bool interruptLiteralFormat;
+extern "C" void literal_format_interrupt() {
+    if(interruptLiteralFormat) throw std::runtime_error("expected literal-format interruption");
+}
+)CPP";
+    const std::string interruptedBody = R"CPP(
+for(unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); model.enable=true; model.clock=false; model.eval();
+    std::ostringstream output; auto* previous=std::cout.rdbuf(output.rdbuf());
+    interruptLiteralFormat=true; model.clock=true; bool caught=false;
+    try { model.eval(); } catch(const std::runtime_error&) { caught=true; }
+    std::cout.rdbuf(previous); assert(caught && output.str()=="before\n");
+    model.init(); model.enable=true; model.clock=false; model.eval();
+    interruptLiteralFormat=false; output.str(""); previous=std::cout.rdbuf(output.rdbuf());
+    model.clock=true; model.eval(); std::cout.rdbuf(previous);
+    assert(output.str()=="before\nafter\n");
+}
+)CPP";
+    for (const auto budget : {16, 1024})
+        manualCase(interrupted, "firrtl-literal-interrupted-b" + std::to_string(budget), budget,
+                   interruptedSupport, interruptedBody, false);
 }
 
 void testEffectsAndCalls() {
@@ -1201,6 +1404,9 @@ void testDpiTriggerActivation() {
     fixture.write(OperationKind::kLatchWritePort, q2, {one, z, mask});
     graph.bindOutputPort("o", fixture.read(q)); graph.bindOutputPort("o2", fixture.read(q2));
     fixture.convert(); fixture.split(); fixture.partition();
+    const auto unclockedOwner = owner(graph, graph.valueDef(y)), clockedOwner = owner(graph, graph.valueDef(z));
+    require(unclockedOwner.size() == 4 && clockedOwner.size() == 4 && unclockedOwner[2] != clockedOwner[2],
+            "Unclocked DPI still shares the clocked DPI execution owner");
     const std::string support = R"CPP(
 static unsigned incCalls = 0, dblCalls = 0;
 extern "C" std::uint8_t trigger_inc(std::uint8_t x) { ++incCalls; return x + 1; }
@@ -1211,14 +1417,16 @@ for (unsigned epoch = 0; epoch < 3; ++epoch) {
     model.init(); incCalls = dblCalls = 0;
     model.eval(); assert(incCalls == 1 && dblCalls == 0 && model.o == 1);
     model.a = 1; model.eval(); assert(incCalls == 2 && model.o == 2);
-    model.d = 3; model.eval(); assert(incCalls == 3 && dblCalls == 0);
-    model.clk = true; model.eval(); assert(incCalls == 4 && dblCalls == 1 && model.o2 == 6);
-    model.clk = false; model.eval(); assert(incCalls == 4 && dblCalls == 1);
-    model.eval(); assert(incCalls == 4 && dblCalls == 1);
-    model.d = 4; model.eval(); assert(incCalls == 5 && dblCalls == 1);
-    model.clk = true; model.eval(); assert(incCalls == 6 && dblCalls == 2 && model.o2 == 8);
-    model.a = 255; model.eval(); assert(incCalls == 7 && dblCalls == 2 && model.o == 0);
-    model.eval(); assert(incCalls == 7 && dblCalls == 2);
+    // d and clk are not inputs to trigger_inc. A formerly shared owner
+    // dragged this unclocked call along with trigger_dbl's data and fire.
+    model.d = 3; model.eval(); assert(incCalls == 2 && dblCalls == 0);
+    model.clk = true; model.eval(); assert(incCalls == 2 && dblCalls == 1 && model.o2 == 6);
+    model.clk = false; model.eval(); assert(incCalls == 2 && dblCalls == 1);
+    model.eval(); assert(incCalls == 2 && dblCalls == 1);
+    model.d = 4; model.eval(); assert(incCalls == 2 && dblCalls == 1);
+    model.clk = true; model.eval(); assert(incCalls == 2 && dblCalls == 2 && model.o2 == 8);
+    model.a = 255; model.eval(); assert(incCalls == 3 && dblCalls == 2 && model.o == 0);
+    model.eval(); assert(incCalls == 3 && dblCalls == 2);
 }
 )CPP";
     for (const auto budget : {16, 1024}) manualCase(fixture, "dpi-trigger-b" + std::to_string(budget), budget, support, body);
@@ -1529,6 +1737,1726 @@ for(unsigned epoch=0;epoch<3;++epoch) {
         manualCase(fixture,"sink-published-b"+std::to_string(budget),budget,support,body,false);
 }
 
+void testSmallShadowWritePriority() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clock = fixture.input("ss_clock");
+    const auto enableA = fixture.input("ss_enable_a"), enableB = fixture.input("ss_enable_b");
+    const auto enableC = fixture.input("ss_enable_c"), address = fixture.input("ss_address", 3);
+    const auto dataA = fixture.input("ss_data_a", 8), dataB = fixture.input("ss_data_b", 8);
+    const auto dataC = fixture.input("ss_data_c", 8), mask = fixture.input("ss_mask", 8);
+    const auto one = fixture.constant(1, "1'b1");
+    const auto scalar = fixture.state("small_shadow_scalar", 8);
+    const auto whole = fixture.state("small_shadow_whole", 32, {4});
+    const auto indexed = fixture.state("small_shadow_indexed", 32, {4});
+    const auto gate = fixture.state("small_shadow_gate", 1);
+    const auto sampled = fixture.state("small_shadow_sampled", 8), derived = fixture.state("small_shadow_derived", 8);
+    const auto lowBit = [&](grh::ValueId value) {
+        const auto result = fixture.compute(OperationKind::kSliceStatic, Fixture::type(1), {value});
+        graph.setAttr(graph.valueDef(result), "sliceStart", int64_t{0});
+        graph.setAttr(graph.valueDef(result), "sliceEnd", int64_t{0});
+        return result;
+    };
+    const std::array<grh::ValueId, 3> enables{enableA, enableB, enableC}, data{dataA, dataB, dataC};
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        const auto payload = fixture.compute(OperationKind::kArrayCreate, Fixture::type(32, {4}),
+            {data[i], data[i], data[i], data[i]});
+        fixture.write(OperationKind::kRegisterWritePort, whole, {enables[i], payload, clock});
+        if (i != 2) {
+            fixture.write(OperationKind::kRegisterWritePort, scalar, {enables[i], data[i], clock});
+            fixture.write(OperationKind::kRegisterWriteArrayPort, indexed, {enables[i], address, data[i], clock});
+            fixture.write(OperationKind::kRegisterWritePort, gate, {enables[i], lowBit(data[i]), clock});
+        } else {
+            fixture.write(OperationKind::kRegisterWriteMaskPort, scalar, {enables[i], data[i], mask, clock});
+            fixture.write(OperationKind::kRegisterWriteArrayMaskPort, indexed, {enables[i], address, data[i], mask, clock});
+            fixture.write(OperationKind::kRegisterWriteMaskPort, gate, {enables[i], lowBit(data[i]), lowBit(mask), clock});
+        }
+    }
+    const auto scalarRead = fixture.read(scalar), gateRead = fixture.read(gate);
+    fixture.write(OperationKind::kRegisterWritePort, sampled, {one, scalarRead, clock});
+    fixture.write(OperationKind::kRegisterWritePort, derived, {one, scalarRead, gateRead});
+    for (const auto& [name, state] : std::vector<std::pair<std::string, grh::OperationId>>{
+            {"ss_scalar", scalar}, {"ss_whole", whole}, {"ss_indexed", indexed},
+            {"ss_gate", gate}, {"ss_sampled", sampled}, {"ss_derived", derived}})
+        graph.bindOutputPort(name, fixture.read(state));
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=4096"});
+    fixture.partition();
+    for (const auto state : {scalar, whole, indexed, gate, sampled, derived})
+        require(sim::attribute<std::string>(graph, state, "grhsim.statePolicy")==std::optional<std::string>("small-sink"),
+                "Small shadow regression lost its current/next state policy");
+    const std::string body = R"CPP(
+for (unsigned epoch=0; epoch<3; ++epoch) {
+    model.init(); unsigned value=0, whole=0, sampled=0, derived=0;
+    std::array<unsigned,4> cells{};
+    const auto check = [&] {
+        assert(model.ss_scalar==value && model.ss_gate==(value&1));
+        assert(model.ss_sampled==sampled && model.ss_derived==derived);
+        for (unsigned i=0;i<4;++i) assert(model.ss_whole[i]==whole && model.ss_indexed[i]==cells[i]);
+    };
+    model.eval(); check();
+    const auto pulse = [&](unsigned flags,unsigned a,unsigned b,unsigned c,unsigned bits,unsigned address) {
+        model.ss_clock=0; model.ss_enable_a=flags&1; model.ss_enable_b=(flags>>1)&1;
+        model.ss_enable_c=(flags>>2)&1; model.ss_data_a=a; model.ss_data_b=b;
+        model.ss_data_c=c; model.ss_mask=bits; model.ss_address=address; model.eval(); check();
+        const auto old=value; sampled=old;
+        if(flags&1) { value=a; whole=a; if(address<4) cells[address]=a; }
+        if(flags&2) { value=b; whole=b; if(address<4) cells[address]=b; }
+        if(flags&4) {
+            value=(value&(~bits&255))|(c&bits); whole=c;
+            if(address<4) cells[address]=(cells[address]&(~bits&255))|(c&bits);
+        }
+        if(!(old&1) && (value&1)) derived=value;
+        const auto rounds=model.perf_counters().totalRoundCount;
+        model.ss_clock=1; model.eval(); check();
+        const auto elapsed=model.perf_counters().totalRoundCount-rounds;
+        const auto writes=model.perf_counters().touchedWriteCount;
+        model.eval(); check(); assert(model.perf_counters().touchedWriteCount==writes);
+        return elapsed;
+    };
+    assert(pulse(7,0,0,0,0,0)==1); // Same-value writers and zero mask are no-ops.
+    assert(pulse(7,0,9,0,255,0)==1); // A/B/A restores current; no derived posedge.
+    pulse(7,0,7,7,255,0); // A/B/B keeps the pending value and raises the derived gate.
+    pulse(4,0,0,99,0,0); // Mask zero preserves scalar, gate and indexed state.
+    pulse(7,7,42,7,255,1); // Restoration to current after a different pending value.
+    pulse(7,7,40,40,255,2); // Derived gate falls; same-edge sample still sees old 7.
+    pulse(7,40,73,73,255,3); // New derived edge observes the committed value 73.
+    pulse(4,0,0,162,15,7); // Partial mask; out-of-range indexed write is ignored.
+}
+)CPP";
+    for (const auto budget : {16, 1024})
+        manualCase(fixture, "small-shadow-priority-b"+std::to_string(budget), budget, "", body, false);
+}
+
+// Bind execution oracles to real operation sites, independently of bitmap layout.
+void bindSinkActivitySites(const std::string& label,
+                           const std::vector<std::pair<std::string, std::string>>& requested,
+                           std::size_t runs, std::size_t targets, std::size_t maxTargetFanout,
+                           bool noPublicationFrontier = false) {
+    const auto directory = artifact(label) / "model";
+    const auto stats = readFile(directory / "sink-activity-stats.json");
+    const auto statistic = [&](std::string_view name) {
+        const auto position = stats.find("\"" + std::string(name) + "\"");
+        const auto colon = position == std::string::npos ? position : stats.find(':', position);
+        require(colon != std::string::npos, "Missing sink activity statistic " + std::string(name));
+        return std::stoull(stats.substr(colon + 1));
+    };
+    require(statistic("eligible_runs") == runs && statistic("eligible_writers") == runs &&
+                statistic("rejected_runs") == 0 && statistic("rejected_writers") == 0,
+            "Sink activity regression silently fell back to unconditional writers");
+    require(statistic("subscribed_targets") == targets && statistic("unique_target_run_pairs") == runs &&
+                statistic("max_target_fanout") == maxTargetFanout && statistic("bitmap_words") == 1 &&
+                statistic("input_change_sources") >= 3 && statistic("shadow_change_mask_sites") >= runs,
+            "Sink activity regression lost its input or competing-target invalidation routes");
+    if (noPublicationFrontier)
+        require(statistic("publication_change_sources") == 0,
+                "Initial sink dirtiness was masked by a nonsink constant publication");
+    const auto sites = mappedRecords(readFile(directory / "manifest.json"), "sites");
+    std::string declaration = "static const std::array<unsigned," + std::to_string(requested.size()) + "> activitySites{";
+    for (const auto& [operation, category] : requested) {
+        std::optional<unsigned> ordinal;
+        for (unsigned index = 0; index < sites.size(); ++index) {
+            const auto& site = sites[index];
+            if (site.find("\"operation\":\"" + operation + "\"") == std::string::npos ||
+                site.find("\"category\":\"" + category + "\"") == std::string::npos) continue;
+            require(!ordinal.has_value(), "Sink activity operation has multiple counter sites");
+            ordinal = index;
+        }
+        require(ordinal.has_value(), "Sink activity operation lacks its actual execution counter: " + operation);
+        declaration += std::to_string(*ordinal) + ",";
+    }
+    declaration += "};";
+    const auto path = artifact(label) / "driver.cpp";
+    auto driver = readFile(path);
+    const auto placeholder = "static const std::array<unsigned," + std::to_string(requested.size()) + "> activitySites{};";
+    const auto position = driver.find(placeholder);
+    require(position != std::string::npos, "Sink activity driver lost its counter declaration");
+    driver.replace(position, placeholder.size(), declaration);
+    std::ofstream(path) << driver;
+}
+
+std::string sinkActivityCounterSupport() {
+    return R"CPP(
+#include <vector>
+static const std::array<unsigned,6> activitySites{};
+static std::array<unsigned long long,6> activityCounts(GrhSIM_top& instance) {
+    auto* stream=std::fopen("activity-counts.tsv","w+"); assert(stream);
+    instance.dump_execution_counts(stream); std::rewind(stream); char line[256];
+    assert(std::fgets(line,sizeof(line),stream)); assert(std::fgets(line,sizeof(line),stream));
+    std::vector<unsigned long long> all;
+    while(std::fgets(line,sizeof(line),stream)) {
+        unsigned index; unsigned long long count;
+        if(std::sscanf(line,"%u\t%llu",&index,&count)!=2) break;
+        assert(index==all.size()); all.push_back(count);
+    }
+    std::fclose(stream); std::array<unsigned long long,6> selected{};
+    for(unsigned i=0;i<selected.size();++i) selected[i]=all.at(activitySites[i]);
+    return selected;
+}
+static void activityDelta(const std::array<unsigned long long,6>& before,
+                          const std::array<unsigned long long,6>& after,
+                          const std::array<unsigned,3>& expected) {
+    for(unsigned i=0;i<expected.size();++i) {
+        assert(after[i*2]==before[i*2]+expected[i]);
+        assert(after[i*2+1]==before[i*2+1]+expected[i]);
+    }
+}
+)CPP";
+}
+
+void testSmallSinkActivityExactRuns() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clockA = fixture.input("activity_clock_a"), clockB = fixture.input("activity_clock_b");
+    std::array<grh::ValueId,3> payloads;
+    std::array<grh::OperationId,3> states;
+    const std::array<std::string,3> names{"q", "peer", "extra"};
+    for (unsigned i = 0; i < names.size(); ++i) {
+        const auto data = fixture.input("activity_data_" + names[i], 8);
+        payloads[i] = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, data});
+        states[i] = fixture.state("activity_" + names[i], 8);
+        grh::setStateInitSpec(graph, states[i], {{grh::InitKind::Constant, "8'd" + std::to_string(17 + i * 2)}});
+        // Private true constants keep the first zero-data edge independent of
+        // any nonsink constant publication that could mask missing init bits.
+        const auto one = fixture.constant(1, "1'b1");
+        fixture.write(OperationKind::kRegisterWritePort, states[i], {one, payloads[i], i == 1 ? clockB : clockA});
+        graph.bindOutputPort("activity_" + names[i], fixture.read(states[i]));
+    }
+    run(fixture.design,"grh-to-grhsim",fixture.session);
+    fixture.split(); fixture.partition();
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session, graph);
+    require(schedule.generalRuns.size() == 3 && schedule.generalRuns[0].partitionKey == schedule.generalRuns[2].partitionKey &&
+                schedule.generalRuns[0].partitionKey != schedule.generalRuns[1].partitionKey,
+            "Sink activity exact-run regression lost its repeated A/B/A owner");
+    std::vector<std::pair<std::string,std::string>> sites;
+    for (unsigned i = 0; i < payloads.size(); ++i) {
+        const auto& run = schedule.generalRuns[i];
+        require(run.orderedWriters.size() == 1 && sim::writerTarget(graph, run.orderedWriters.front()) == states[i],
+                "Sink activity exact-run regression changed writer positions");
+        const auto enable = graph.valueDef(graph.opOperands(run.orderedWriters.front())[1]);
+        require(enable && graph.opKind(enable) == OperationKind::kConstant && owner(graph,enable) == run.partitionKey,
+                "Sink activity init regression lost its private true enable");
+        const auto payload = graph.valueDef(payloads[i]);
+        require(graph.opKind(payload) == OperationKind::kAdd && owner(graph, payload) == run.partitionKey,
+                "Sink activity exact-run regression lost its private counted Add");
+        sites.emplace_back(graph.symbolText(graph.operationSymbol(run.orderedWriters.front())), "writer-sample");
+        sites.emplace_back(graph.symbolText(graph.operationSymbol(payload)), "operation");
+    }
+    const std::string body = R"CPP(
+const auto evaluate = [&](GrhSIM_top& instance,unsigned clocks,std::array<unsigned,3> work,
+                          std::array<unsigned,3> values) {
+    const auto before=activityCounts(instance);
+    instance.activity_clock_a=clocks&1; instance.activity_clock_b=(clocks>>1)&1; instance.eval();
+    const auto after=activityCounts(instance); activityDelta(before,after,work);
+    assert(instance.activity_q==values[0] && instance.activity_peer==values[1] && instance.activity_extra==values[2]);
+    instance.eval(); assert(activityCounts(instance)==after);
+    assert(instance.activity_q==values[0] && instance.activity_peer==values[1] && instance.activity_extra==values[2]);
+};
+model.init();
+evaluate(model,0,{0,0,0},{17,19,21});
+// Zero data matches its input snapshot. Init must still execute both A runs.
+evaluate(model,1,{1,0,1},{0,19,0});
+evaluate(model,0,{0,0,0},{0,19,0}); evaluate(model,1,{0,0,0},{0,19,0});
+evaluate(model,2,{0,1,0},{0,0,0});
+evaluate(model,0,{0,0,0},{0,0,0}); evaluate(model,2,{0,0,0},{0,0,0});
+model.activity_data_extra=11;
+evaluate(model,0,{0,0,0},{0,0,0}); evaluate(model,1,{0,0,1},{0,0,22});
+// Changing q data without a fresh edge must retain its own exact run bit.
+model.activity_data_q=5; evaluate(model,1,{0,0,0},{0,0,22});
+evaluate(model,0,{0,0,0},{0,0,22}); evaluate(model,1,{1,0,0},{10,0,22});
+evaluate(model,0,{0,0,0},{10,0,22}); evaluate(model,3,{0,0,0},{10,0,22});
+// A second instance begins dirty while the first remains clean.
+GrhSIM_top other; other.init();
+evaluate(other,0,{0,0,0},{17,19,21}); evaluate(other,1,{1,0,1},{0,19,0});
+evaluate(model,0,{0,0,0},{10,0,22}); evaluate(model,1,{0,0,0},{10,0,22});
+evaluate(other,0,{0,0,0},{0,19,0}); evaluate(other,1,{0,0,0},{0,19,0});
+// Reinitializing only other must rerun its unchanged zero-data writers.
+other.activity_clock_a=0; other.activity_clock_b=0; other.init();
+evaluate(other,0,{0,0,0},{17,19,21}); evaluate(other,1,{1,0,1},{0,19,0});
+evaluate(model,0,{0,0,0},{10,0,22}); evaluate(model,1,{0,0,0},{10,0,22});
+)CPP";
+    for (const auto budget : {16,1024}) {
+        const auto label = "sink-activity-exact-runs-b" + std::to_string(budget);
+        manualCase(fixture,label,budget,sinkActivityCounterSupport(),body,false,{{"execution-counters","on"}});
+        bindSinkActivitySites(label,sites,3,3,1,true);
+    }
+}
+
+void testSmallSinkActivityCompetition() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clockA = fixture.input("activity_clock_a"), clockB = fixture.input("activity_clock_b");
+    const auto enableA = fixture.input("activity_enable_a"), enableC = fixture.input("activity_enable_c");
+    const auto one = fixture.constant(1, "1'b1");
+    const auto state = fixture.state("activity_q", 8);
+    grh::setStateInitSpec(graph, state, {{grh::InitKind::Constant,"8'd17"}});
+    std::array<grh::ValueId,3> payloads;
+    const std::array<std::string,3> names{"a", "b", "c"};
+    for (unsigned i = 0; i < names.size(); ++i) {
+        const auto data = fixture.input("activity_data_" + names[i], 8);
+        payloads[i] = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, data});
+        fixture.write(OperationKind::kRegisterWritePort,state,
+            {i == 0 ? enableA : i == 1 ? one : enableC,payloads[i],i == 1 ? clockB : clockA});
+    }
+    graph.bindOutputPort("activity_q",fixture.read(state));
+    fixture.convert(); fixture.split(); fixture.partition();
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session,graph);
+    require(schedule.generalRuns.size() == 3 && schedule.generalRuns[0].partitionKey != schedule.generalRuns[2].partitionKey,
+            "Sink activity competition regression lost its distinct writer priorities");
+    std::vector<std::pair<std::string,std::string>> sites;
+    for (unsigned i = 0; i < payloads.size(); ++i) {
+        const auto& run = schedule.generalRuns[i];
+        require(run.orderedWriters.size() == 1 && sim::writerTarget(graph,run.orderedWriters.front()) == state,
+                "Sink activity competition regression changed its shared target");
+        const auto payload = graph.valueDef(payloads[i]);
+        require(graph.opKind(payload) == OperationKind::kAdd && owner(graph,payload) == run.partitionKey,
+                "Sink activity competition regression lost its private counted Add");
+        sites.emplace_back(graph.symbolText(graph.operationSymbol(run.orderedWriters.front())),"writer-sample");
+        sites.emplace_back(graph.symbolText(graph.operationSymbol(payload)),"operation");
+    }
+    const std::string body = R"CPP(
+const auto evaluate = [&](GrhSIM_top& instance,unsigned clocks,std::array<unsigned,3> work,unsigned value) {
+    const auto before=activityCounts(instance);
+    const auto rounds=instance.perf_counters().totalRoundCount;
+    instance.activity_clock_a=clocks&1; instance.activity_clock_b=(clocks>>1)&1; instance.eval();
+    const auto elapsed=instance.perf_counters().totalRoundCount-rounds;
+    const auto after=activityCounts(instance); activityDelta(before,after,work);
+    assert(instance.activity_q==value); instance.eval();
+    assert(instance.activity_q==value && activityCounts(instance)==after); return elapsed;
+};
+model.init(); model.activity_enable_a=1;
+evaluate(model,0,{0,0,0},17); evaluate(model,1,{1,0,0},0);
+evaluate(model,0,{0,0,0},0); evaluate(model,1,{0,0,0},0);
+model.activity_data_a=4; evaluate(model,1,{0,0,0},0);
+evaluate(model,0,{0,0,0},0); evaluate(model,1,{1,0,0},8);
+model.activity_data_b=7; evaluate(model,0,{0,0,0},8);
+evaluate(model,2,{0,1,0},14); evaluate(model,0,{0,0,0},14);
+// B changed the shared target. Unchanged A must run at the next A edge.
+evaluate(model,1,{1,0,0},8); evaluate(model,0,{0,0,0},8);
+evaluate(model,2,{0,1,0},14); evaluate(model,0,{0,0,0},14);
+// A/B restores current B: both actual pending-shadow changes invalidate peers.
+for(unsigned repeat=0;repeat<3;++repeat) {
+    assert(evaluate(model,3,{1,1,0},14)==1);
+    evaluate(model,0,{0,0,0},14);
+}
+// Enable the third writer to exercise A/B/A restoration with counted payloads.
+model.activity_enable_c=1; model.activity_data_c=4;
+evaluate(model,0,{0,0,0},14); evaluate(model,3,{1,1,1},8);
+for(unsigned repeat=0;repeat<3;++repeat) {
+    evaluate(model,0,{0,0,0},8);
+    assert(evaluate(model,3,{1,1,1},8)==1);
+}
+// Neither a false enable nor a non-edge eval may discard pending work.
+model.activity_enable_a=0; model.activity_enable_c=0;
+model.activity_data_a=9; model.activity_data_c=11;
+evaluate(model,0,{0,0,0},8); evaluate(model,1,{0,0,0},8);
+evaluate(model,0,{0,0,0},8); evaluate(model,1,{0,0,0},8);
+model.activity_enable_a=1; evaluate(model,1,{0,0,0},8);
+evaluate(model,0,{0,0,0},8); evaluate(model,1,{1,0,0},18);
+evaluate(model,0,{0,0,0},18); evaluate(model,2,{0,1,0},14);
+evaluate(model,0,{0,0,0},14); evaluate(model,2,{0,0,0},14);
+// Separate instances carry separate dirty bits and counters through init.
+GrhSIM_top other; other.init(); other.activity_enable_a=1;
+evaluate(other,0,{0,0,0},17); evaluate(other,1,{1,0,0},0);
+evaluate(other,0,{0,0,0},0); evaluate(other,1,{0,0,0},0);
+evaluate(model,0,{0,0,0},14); evaluate(model,1,{1,0,0},18);
+evaluate(model,0,{0,0,0},18); evaluate(model,1,{0,0,0},18);
+other.activity_clock_a=0; other.activity_clock_b=0; other.init();
+other.activity_enable_a=1;
+evaluate(other,0,{0,0,0},17); evaluate(other,1,{1,0,0},0);
+evaluate(model,0,{0,0,0},18); evaluate(model,1,{0,0,0},18);
+)CPP";
+    for (const auto budget : {16,1024}) {
+        const auto label = "sink-activity-competition-b" + std::to_string(budget);
+        manualCase(fixture,label,budget,sinkActivityCounterSupport(),body,false,{{"execution-counters","on"}});
+        bindSinkActivitySites(label,sites,3,1,3);
+    }
+}
+
+void testSmallSinkActivityInterruptedFallback() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clock = fixture.input("fallback_clock"), fireClock = fixture.input("fallback_fire_clock");
+    const auto data = fixture.input("fallback_data",8), dummy = fixture.input("fallback_dummy");
+    const auto one = fixture.constant(1,"1'b1"), mask = fixture.constant(8,"8'd90");
+    const auto published = fixture.compute(OperationKind::kXor,Fixture::type(8),{data,mask});
+    const auto imported = graph.createOperation(OperationKind::kDpicImport,graph.internSymbol("sink_activity_throw_once"));
+    graph.setAttr(imported,"argsName",std::vector<std::string>{"published"});
+    graph.setAttr(imported,"argsDirection",std::vector<std::string>{"input"});
+    graph.setAttr(imported,"argsWidth",std::vector<int64_t>{8});
+    graph.setAttr(imported,"argsSigned",std::vector<bool>{false});
+    graph.setAttr(imported,"hasReturn",false);
+    const auto call = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(call,"targetImportSymbol",std::string("sink_activity_throw_once"));
+    graph.addOperand(call,one); graph.addOperand(call,published);
+    const auto payload = fixture.compute(OperationKind::kAdd,Fixture::type(8),{published,published});
+    const auto peer = fixture.state("fallback_peer",8), fireState = fixture.state("fallback_fire",1);
+    grh::setStateInitSpec(graph,peer,{{grh::InitKind::Constant,"8'd17"}});
+    fixture.write(OperationKind::kRegisterWritePort,peer,{one,payload,clock});
+    const auto fireWriter = fixture.write(OperationKind::kRegisterWritePort,fireState,{one,dummy,fireClock});
+    graph.bindOutputPort("fallback_peer",fixture.read(peer));
+    graph.bindOutputPort("fallback_fire",fixture.read(fireState));
+    run(fixture.design,"grh-to-grhsim",fixture.session);
+    // Fire used as payload must retain the original per-edge execution path.
+    graph.replaceOperand(fireWriter,2,graph.opOperands(fireWriter)[0]);
+    fixture.split();
+    run(fixture.design,"grhsim-partition-nonsink",fixture.session,{"-clone-shared=0"});
+    for (const auto op : {graph.valueDef(one),graph.valueDef(mask),graph.valueDef(published),call}) {
+        require(owner(graph,op).size()==4 && owner(graph,op)[1]=="nonsink",
+                "Interrupted sink activity fixture lost its publication source");
+        graph.setAttr(op,sim::kPartition,Owner{"general","nonsink","sink_activity_throw_source","source"});
+    }
+    run(fixture.design,"grhsim-partition-sink",fixture.session);
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session,graph);
+    require(schedule.generalRuns.size()==2,"Interrupted sink activity fixture lost its two exact runs");
+    grh::OperationId peerWriter;
+    for (const auto& run : schedule.generalRuns) for (const auto writer : run.orderedWriters)
+        if (sim::writerTarget(graph,writer)==peer) {
+            peerWriter=writer;
+            require(owner(graph,graph.valueDef(payload))==run.partitionKey,
+                    "Interrupted sink activity fixture lost its private counted Add");
+        }
+    require(bool(peerWriter),"Interrupted sink activity fixture lost its eligible peer writer");
+    const std::string support = R"CPP(
+static bool sinkActivityThrow;
+static unsigned sinkActivityCalls;
+extern "C" void sink_activity_throw_once(std::uint8_t published) {
+    assert(published==90 || published==93); ++sinkActivityCalls;
+    if(sinkActivityThrow) { sinkActivityThrow=false; throw std::runtime_error("expected sink activity interruption"); }
+}
+static const std::array<unsigned,3> fallbackSites{};
+static std::array<unsigned long long,3> fallbackCounts(GrhSIM_top& instance) {
+    auto* stream=std::fopen("fallback-counts.tsv","w+"); assert(stream);
+    instance.dump_execution_counts(stream); std::rewind(stream); char line[256];
+    assert(std::fgets(line,sizeof(line),stream) && std::fgets(line,sizeof(line),stream));
+    std::array<unsigned long long,3> counts{}; std::array<bool,3> found{};
+    while(std::fgets(line,sizeof(line),stream)) {
+        unsigned site; unsigned long long count;
+        if(std::sscanf(line,"%u\t%llu",&site,&count)!=2) continue;
+        for(unsigned i=0;i<counts.size();++i) if(site==fallbackSites[i]) { counts[i]=count; found[i]=true; }
+    }
+    std::fclose(stream); assert(found[0] && found[1] && found[2]); return counts;
+}
+)CPP";
+    const std::string body = R"CPP(
+for(unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); sinkActivityThrow=false; sinkActivityCalls=0;
+    const auto evaluate = [&](unsigned clocks,unsigned peerWork,unsigned fireWork,unsigned value) {
+        const auto before=fallbackCounts(model);
+        model.fallback_clock=clocks&1; model.fallback_fire_clock=(clocks>>1)&1; model.eval();
+        const auto after=fallbackCounts(model);
+        assert(after[0]==before[0]+peerWork && after[1]==before[1]+peerWork && after[2]==before[2]+fireWork);
+        assert(model.fallback_peer==value && model.fallback_fire==(fireWork || before[2]!=0));
+        model.eval(); assert(fallbackCounts(model)==after);
+    };
+    evaluate(0,0,0,17); assert(sinkActivityCalls==1);
+    evaluate(1,1,0,180); evaluate(0,0,0,180); evaluate(1,0,0,180);
+    // A rejected fire-as-data writer must execute at every fresh edge even
+    // when its stored state and all ordinary data inputs remain unchanged.
+    evaluate(0,0,0,180); evaluate(2,0,1,180);
+    evaluate(0,0,0,180); evaluate(2,0,1,180); evaluate(0,0,0,180);
+    const auto before=fallbackCounts(model); const auto calls=sinkActivityCalls;
+    model.fallback_data=7; model.fallback_clock=1; sinkActivityThrow=true; bool caught=false;
+    try { model.eval(); } catch(const std::runtime_error& error) {
+        caught=std::string(error.what())=="expected sink activity interruption";
+    }
+    assert(caught && sinkActivityCalls==calls+1 && model.fallback_peer==180);
+    assert(fallbackCounts(model)==before);
+    // Event consumed this posedge before the source threw. Retrying unchanged
+    // inputs must not replay it, but must preserve the newly dirtied peer.
+    model.eval(); assert(sinkActivityCalls==calls+1 && model.fallback_peer==180);
+    assert(fallbackCounts(model)==before);
+    evaluate(0,0,0,180); evaluate(1,1,0,186);
+    evaluate(0,0,0,186); evaluate(1,0,0,186);
+}
+)CPP";
+    for (const auto budget : {16,1024}) {
+        const auto label = "sink-activity-interrupted-fallback-b"+std::to_string(budget);
+        manualCase(fixture,label,budget,support,body,false,{{"execution-counters","on"}});
+        const auto directory = artifact(label)/"model";
+        const auto stats = readFile(directory/"sink-activity-stats.json");
+        require(stats.find("\"eligible_runs\": 1")!=std::string::npos &&
+                    stats.find("\"eligible_writers\": 1")!=std::string::npos &&
+                    stats.find("\"rejected_runs\": 1")!=std::string::npos &&
+                    stats.find("\"fire-as-data\": {\"runs\": 1, \"writers\": 1}")!=std::string::npos &&
+                    stats.find("\"publication_change_sources\": 2")!=std::string::npos,
+                "Interrupted sink activity regression lost its eligible peer or fire-as-data fallback");
+        const auto functions = mappedRecords(readFile(directory/"code-map.json"),"functions");
+        const auto root = [&](grh::OperationId op) {
+            const auto id="\"o"+std::to_string(op.index)+"\"";
+            for (const auto& function : functions) if (function.find(id)!=std::string::npos) {
+                std::smatch match;
+                require(std::regex_search(function,match,std::regex(R"REGEX("root_function":"([^"]+)")REGEX")),
+                        "Interrupted sink activity operation omitted its root");
+                return match[1].str();
+            }
+            throw std::runtime_error("Interrupted sink activity operation lost its generated function");
+        };
+        require(root(graph.valueDef(published))==root(call) && root(call).starts_with("sn_"),
+                "Interrupted sink activity publication no longer precedes the call in one nonsink owner");
+        const auto source = generatedCpp(directory);
+        const auto guard = source.find("if (smallSinkPayloadBoundaryStore."+mappedValue(directory,published)+" != ");
+        require(guard!=std::string::npos && source.substr(guard,source.find('}',guard)-guard).find("sinkDirty[")!=std::string::npos,
+                "Interrupted sink activity publication lost its immediate dirty route");
+        const std::array<std::pair<grh::OperationId,std::string>,3> requested{{
+            {peerWriter,"writer-sample"},{graph.valueDef(payload),"operation"},{fireWriter,"writer-sample"}}};
+        const auto sites = mappedRecords(readFile(directory/"manifest.json"),"sites");
+        std::string declaration="static const std::array<unsigned,3> fallbackSites{";
+        for (const auto& [op,category] : requested) {
+            std::optional<unsigned> ordinal;
+            const auto operation="\"operation\":\""+std::string(graph.symbolText(graph.operationSymbol(op)))+"\"";
+            for (unsigned i=0;i<sites.size();++i)
+                if (sites[i].find(operation)!=std::string::npos && sites[i].find("\"category\":\""+category+"\"")!=std::string::npos) {
+                    require(!ordinal,"Interrupted sink activity operation has duplicate counter sites"); ordinal=i;
+                }
+            require(ordinal.has_value(),"Interrupted sink activity operation lacks its actual counter site");
+            declaration+=std::to_string(*ordinal)+",";
+        }
+        declaration+="};";
+        const auto path = artifact(label)/"driver.cpp"; auto driver=readFile(path);
+        const std::string placeholder="static const std::array<unsigned,3> fallbackSites{};";
+        const auto position=driver.find(placeholder); require(position!=std::string::npos,"Missing fallback counter declaration");
+        driver.replace(position,placeholder.size(),declaration); std::ofstream(path)<<driver;
+    }
+}
+
+std::string batchActivityCounterSupport(std::size_t count) {
+    return "static const std::array<unsigned,"+std::to_string(count)+"> batchSites{};\n"+R"CPP(
+static auto batchCounts(GrhSIM_top& instance) {
+    auto* stream=std::fopen("batch-activity-counts.tsv","w+"); assert(stream);
+    instance.dump_execution_counts(stream); std::rewind(stream); char line[256];
+    assert(std::fgets(line,sizeof(line),stream) && std::fgets(line,sizeof(line),stream));
+    std::array<unsigned long long,batchSites.size()> counts{};
+    std::array<bool,batchSites.size()> found{};
+    while(std::fgets(line,sizeof(line),stream)) {
+        unsigned site; unsigned long long count;
+        if(std::sscanf(line,"%u\t%llu",&site,&count)!=2) continue;
+        for(unsigned i=0;i<counts.size();++i) if(site==batchSites[i]) { counts[i]=count; found[i]=true; }
+    }
+    std::fclose(stream); for(const auto present : found) assert(present); return counts;
+}
+)CPP";
+}
+
+void bindBatchActivityCounters(const std::string& label, const grh::Graph& graph,
+                              const std::vector<std::pair<grh::OperationId,std::string>>& requested) {
+    const auto directory=artifact(label)/"model";
+    const auto sites=mappedRecords(readFile(directory/"manifest.json"),"sites");
+    std::string declaration="static const std::array<unsigned,"+std::to_string(requested.size())+"> batchSites{";
+    for(const auto& [op,category] : requested) {
+        std::optional<unsigned> ordinal;
+        const auto operation="\"operation\":\""+std::string(graph.symbolText(graph.operationSymbol(op)))+"\"";
+        for(unsigned i=0;i<sites.size();++i)
+            if(sites[i].find(operation)!=std::string::npos && sites[i].find("\"category\":\""+category+"\"")!=std::string::npos) {
+                require(!ordinal,"Batch activity operation has duplicate counter sites"); ordinal=i;
+            }
+        require(ordinal.has_value(),"Batch activity operation lacks its actual counter site");
+        declaration+=std::to_string(*ordinal)+",";
+    }
+    declaration+="};";
+    const auto path=artifact(label)/"driver.cpp"; auto driver=readFile(path);
+    const auto placeholder="static const std::array<unsigned,"+std::to_string(requested.size())+"> batchSites{};";
+    const auto position=driver.find(placeholder); require(position!=std::string::npos,"Missing batch activity counter declaration");
+    driver.replace(position,placeholder.size(),declaration); std::ofstream(path)<<driver;
+}
+
+std::string batchActivityRoot(const std::filesystem::path& directory, grh::OperationId op) {
+    const auto functions=mappedRecords(readFile(directory/"code-map.json"),"functions");
+    const auto id="\"o"+std::to_string(op.index)+"\"";
+    for(const auto& function : functions) if(function.find(id)!=std::string::npos) {
+        std::smatch match;
+        require(std::regex_search(function,match,std::regex(R"REGEX("root_function":"([^"]+)")REGEX")),
+                "Batch activity operation omitted its root function");
+        return match[1].str();
+    }
+    throw std::runtime_error("Batch activity operation lost its generated function");
+}
+
+std::string batchActivityRootCpp(const std::filesystem::path& directory, const std::string& root) {
+    const auto functions=mappedRecords(readFile(directory/"code-map.json"),"functions");
+    std::string result;
+    for(const auto& function : functions) {
+        if(function.find("\"root_function\":\""+root+"\"")==std::string::npos) continue;
+        std::smatch match;
+        require(std::regex_search(function,match,std::regex(R"REGEX("name":"([^"]+)")REGEX")),"Batch helper omitted its name");
+        const auto name=match[1].str();
+        require(std::regex_search(function,match,std::regex(R"REGEX("source":"([^"]+)")REGEX")),"Batch helper omitted its source");
+        const auto cpp=readFile(directory/match[1].str());
+        const auto begin=cpp.find("GrhSIM_top::"+name+"(");
+        const auto end=begin==std::string::npos ? begin : cpp.find("\n}\n",begin);
+        require(begin!=std::string::npos && end!=std::string::npos,"Missing batch helper body");
+        result+=cpp.substr(begin,end-begin)+'\n';
+    }
+    require(!result.empty(),"Missing complete batch root source"); return result;
+}
+
+std::uint64_t batchActivityStatistic(const std::filesystem::path& directory,std::string_view name) {
+    const auto stats=readFile(directory/"sink-activity-stats.json");
+    const auto position=stats.find("\""+std::string(name)+"\"");
+    const auto colon=position==std::string::npos ? position : stats.find(':',position);
+    require(colon!=std::string::npos,"Missing batch activity statistic");
+    return std::stoull(stats.substr(colon+1));
+}
+
+struct WriterDispatchCall {
+    std::string name;
+    std::vector<std::string> guards;
+};
+
+// Follow actual split driver calls, retaining enclosing guards and loop order.
+std::vector<WriterDispatchCall> writerDispatchCalls(const std::filesystem::path& directory) {
+    std::map<std::string, std::string> bodies;
+    for (const auto& function : mappedRecords(readFile(directory / "code-map.json"), "functions")) {
+        if (function.find("\"root_function\":\"pGeneral\"") == std::string::npos) continue;
+        std::smatch match;
+        require(std::regex_search(function, match, std::regex(R"REGEX("name":"([^"]+)")REGEX")),
+                "General dispatch omitted a function name");
+        const auto name = match[1].str();
+        require(std::regex_search(function, match, std::regex(R"REGEX("source":"([^"]+)")REGEX")),
+                "General dispatch omitted a source file");
+        const auto cpp = readFile(directory / match[1].str());
+        const auto signature = cpp.find("GrhSIM_top::" + name + "(");
+        const auto begin = signature == std::string::npos ? signature : cpp.find("\n{\n", signature);
+        const auto end = begin == std::string::npos ? begin : cpp.find("\n}\n", begin + 3);
+        require(begin != std::string::npos && end != std::string::npos,
+                "General dispatch lacks its complete actual body");
+        bodies.emplace(name, cpp.substr(begin + 3, end - begin - 3));
+    }
+    std::vector<WriterDispatchCall> calls;
+    std::set<std::string> active;
+    const auto visit = [&](auto&& self, const std::string& name, std::vector<std::string> guards) -> void {
+        require(active.insert(name).second && bodies.contains(name), "Invalid recursive General driver helper");
+        const auto initialGuards = guards.size();
+        std::vector<bool> scopes;
+        std::istringstream lines(bodies.at(name));
+        std::string line;
+        while (std::getline(lines, line)) {
+            const auto begin = line.find_first_not_of(" \t");
+            if (begin == std::string::npos) continue;
+            line.erase(0, begin);
+            if (line.starts_with("//") || line.starts_with("/*")) continue;
+            if (line == "}") {
+                require(!scopes.empty(), "Unbalanced General dispatch scope");
+                if (scopes.back()) guards.pop_back();
+                scopes.pop_back();
+                continue;
+            }
+            const std::regex phase(R"REGEX(&GrhSIM_top::([A-Za-z_][A-Za-z0-9_]*))REGEX");
+            for (std::sregex_iterator it(line.begin(), line.end(), phase), end; it != end; ++it)
+                calls.push_back({(*it)[1].str(), guards});
+            std::smatch helper;
+            if (std::regex_match(line, helper, std::regex(R"REGEX((pGeneral_[A-Za-z0-9_]+)\(\);)REGEX")))
+                self(self, helper[1].str(), guards);
+            if (line.ends_with("{")) {
+                const bool conditional = line.starts_with("if (");
+                scopes.push_back(conditional);
+                if (conditional) guards.push_back(line);
+            }
+        }
+        require(scopes.empty() && guards.size() == initialGuards, "Unclosed General dispatch scope");
+        active.erase(name);
+    };
+    visit(visit, "pGeneral", {});
+    return calls;
+}
+
+void testWriterDispatchFreshFireGroups() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clockA = fixture.input("dispatch_clock_a"), clockB = fixture.input("dispatch_clock_b");
+    const auto clockC = fixture.input("dispatch_clock_c");
+    const auto raw = fixture.input("dispatch_raw"), gate = fixture.input("dispatch_gate");
+    const auto enable = fixture.compute(OperationKind::kAnd, Fixture::type(1), {raw, gate});
+    const auto data = fixture.input("dispatch_data", 8);
+    const auto target = fixture.state("dispatch_q", 8), fallback = fixture.state("dispatch_fallback", 8);
+    graph.setOpKind(fallback, OperationKind::kLatch);
+    grh::setStateInitSpec(graph, target, {{grh::InitKind::Constant, "8'd17"}});
+    std::vector<grh::OperationId> writers;
+    for (unsigned i = 0; i < 97; ++i) {
+        const auto offset = fixture.constant(8, "8'd" + std::to_string(i));
+        const auto payload = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, offset});
+        if (i == 64)
+            writers.push_back(fixture.write(OperationKind::kLatchWritePort, fallback,
+                {enable, payload, fixture.constant(8, "8'hff")}));
+        else
+            writers.push_back(fixture.write(OperationKind::kRegisterWritePort, target,
+                {enable, payload, clockA, clockB}, {"posedge", "posedge"}));
+    }
+    graph.bindOutputPort("dispatch_q", fixture.read(target));
+    graph.bindOutputPort("dispatch_fallback", fixture.read(fallback));
+    const auto imported = graph.createOperation(OperationKind::kDpicImport,
+        graph.internSymbol("dispatch_hold_join_false"));
+    graph.setAttr(imported, "argsName", std::vector<std::string>{"held"});
+    graph.setAttr(imported, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(imported, "argsWidth", std::vector<int64_t>{1});
+    graph.setAttr(imported, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(imported, "hasReturn", false);
+    const auto one = fixture.constant(1, "1'b1");
+    const auto call = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(call, "targetImportSymbol", std::string("dispatch_hold_join_false"));
+    graph.addOperand(call, one); graph.addOperand(call, one);
+    const auto edgeCarrier = fixture.state("dispatch_edge_carrier", 1);
+    const auto carrierWriter = fixture.write(OperationKind::kRegisterWritePort, edgeCarrier, {one, one, clockC});
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    const auto joined = graph.opOperands(writers.front())[0];
+    const auto edgeArgs = graph.opOperands(graph.valueDef(joined));
+    require(graph.opKind(graph.valueDef(joined)) == OperationKind::kOr && edgeArgs.size() == 2,
+            "Dispatch fixture lost its two fresh edge leaves");
+    const std::array<grh::ValueId, 2> edges{edgeArgs[0], edgeArgs[1]};
+    const auto edgeC = graph.opOperands(carrierWriter)[0];
+    // The carrier only supplies a genuine EventEdge, and remains the last
+    // singleton batch so a nonadjacent caller group cannot consume it.
+    const auto held = fixture.compute(OperationKind::kAssign, Fixture::type(1), {joined});
+    graph.replaceOperand(call, 2, held);
+    const auto zero = fixture.constant(1, "1'b0");
+    const auto fire = [&](grh::ValueId base, unsigned variant) {
+        auto result = base;
+        for (unsigned bit = 0; bit < 7; ++bit)
+            result = variant & (1u << bit) ? fixture.compute(OperationKind::kOr, Fixture::type(1), {zero, result}) :
+                fixture.compute(OperationKind::kOr, Fixture::type(1), {result, zero});
+        return fixture.compute(OperationKind::kAssign, Fixture::type(1), {result});
+    };
+    for (unsigned i = 0; i < writers.size(); ++i) {
+        if (i == 64) continue;
+        const auto source = i >= 48 && i < 64 ? edgeC : held;
+        const auto variant = i < 64 ? i : i - 65;
+        graph.replaceOperand(writers[i], 0, fire(source, variant));
+    }
+    fixture.split(); fixture.partition();
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session, graph);
+    require(schedule.generalRuns.size() == writers.size() + 1,
+            "Dispatch fixture lost its exact ordered writer runs");
+    for (unsigned i = 0; i < writers.size(); ++i)
+        require(schedule.generalRuns[i].orderedWriters == std::vector<grh::OperationId>{writers[i]},
+                "Dispatch fixture changed the A/other/A writer sequence");
+    require(owner(graph, graph.valueDef(enable)).size() == 4 &&
+                owner(graph, graph.valueDef(held)).size() == 4,
+            "Dispatch fixture lost its nonsink enable or held fire boundary");
+    std::vector<std::pair<grh::OperationId, std::string>> sites;
+    for (unsigned i = 0; i < writers.size(); ++i)
+        if (i != 64) sites.emplace_back(writers[i], "writer-sample");
+    const std::string support = batchActivityCounterSupport(sites.size()) + R"CPP(
+static GrhSIM_top* dispatchInstance;
+extern "C" void dispatch_hold_join_false(std::uint8_t) {
+    if (dispatchInstance) dispatchInstance->test_hold_dispatch_false();
+}
+)CPP";
+    const std::string body = R"CPP(
+model.init(); dispatchInstance=&model;
+unsigned previousClocks=0, expected=17, fallback=0;
+const auto step = [&](unsigned clocks,unsigned data,bool enabled) {
+    const auto before=batchCounts(model);
+    const bool freshAB=(clocks & ~previousClocks & 3)!=0;
+    const bool freshC=(clocks & ~previousClocks & 4)!=0;
+    model.dispatch_clock_a=clocks&1; model.dispatch_clock_b=(clocks>>1)&1;
+    model.dispatch_clock_c=(clocks>>2)&1; model.dispatch_data=data;
+    model.dispatch_raw=true; model.dispatch_gate=enabled; model.eval();
+    const auto after=batchCounts(model);
+    unsigned site=0;
+    for(unsigned i=0;i<97;++i) if(i!=64) {
+        const bool fires=i>=48 && i<64 ? freshC : freshAB;
+        assert(after[site]==before[site]+unsigned(enabled && fires)); ++site;
+    }
+    if(enabled && freshAB) expected=(data+47)&255;
+    if(enabled && freshC) expected=(data+63)&255;
+    if(enabled) fallback=(data+64)&255;
+    if(enabled && freshAB) expected=(data+96)&255;
+    assert(model.dispatch_q==expected && model.dispatch_fallback==fallback);
+    model.eval(); assert(batchCounts(model)==after && model.dispatch_q==expected && model.dispatch_fallback==fallback);
+    previousClocks=clocks;
+};
+step(0,1,false); step(1,2,true); step(2,3,true); // B rises while the held join stays logically true.
+step(2,4,true); step(0,5,true); step(4,6,true); // C alone bypasses both A/B groups.
+step(0,7,true); step(3,8,false); step(3,9,true); // Enable publication cannot manufacture an edge.
+step(0,10,true); step(7,11,true); // Final A/B group wins over the intervening C writes.
+step(0,12,false); step(1,13,true); // Nonsink changes enable before the live writer guards.
+dispatchInstance=nullptr;
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "writer-dispatch-fresh-fire-groups-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, support, body, false, {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        require(batchActivityStatistic(directory, "writer_batches") == 7 &&
+                    batchActivityStatistic(directory, "writer_dispatch_fire_groups") == 2 &&
+                    batchActivityStatistic(directory, "writer_dispatch_fire_batches") == 5 &&
+                    batchActivityStatistic(directory, "writer_dispatch_fire_max_events") == 2,
+                "Dispatch fixture did not retain its 16-fire splits and two separate canonical groups");
+        std::vector<std::string> roots;
+        for (unsigned i = 0; i < writers.size(); ++i) {
+            const auto root = batchActivityRoot(directory, writers[i]);
+            if (roots.empty() || roots.back() != root) roots.push_back(root);
+            const auto expected = i < 48 ? i / 16 : i <= 64 ? 3 : 4 + (i - 65) / 16;
+            require(roots.size() == expected + 1, "Dispatch fixture changed its original batch boundaries");
+        }
+        roots.push_back(batchActivityRoot(directory, carrierWriter));
+        require(roots.size() == 7 && roots[5] != roots[6], "Dispatch carrier lost its singleton fallback");
+        const auto calls = writerDispatchCalls(directory);
+        std::vector<std::string> actual;
+        bool sawWriter = false;
+        const auto firstEdge = "eventActStore." + mappedValue(directory, edges[0]);
+        const auto secondEdge = "eventActStore." + mappedValue(directory, edges[1]);
+        for (const auto& entry : calls) {
+            if (entry.name.starts_with("pGeneral_active_batch")) {
+                require(!sawWriter && entry.guards.empty(), "Nonsink dispatch moved behind a writer or fire guard");
+                continue;
+            }
+            require(entry.name.starts_with("writer_run_batch"), "Unknown General dispatch phase");
+            sawWriter = true; actual.push_back(entry.name);
+            const bool grouped = actual.size() <= 3 || actual.size() == 5 || actual.size() == 6;
+            if (grouped)
+                require(entry.guards.size() == 1 && entry.guards.front().find(firstEdge) != std::string::npos &&
+                            entry.guards.front().find(secondEdge) != std::string::npos &&
+                            entry.guards.front().find("nonSinkBoundaryStore.") == std::string::npos &&
+                            entry.guards.front().find("sinkDirty[") == std::string::npos,
+                        "Caller guard used a held fire, enable or stale activity snapshot");
+            else require(entry.guards.empty(), "Fallback/singleton batch entered an outer fire group");
+        }
+        require(actual == roots, "Caller fire groups changed the complete batch order");
+        auto header = readFile(directory / "grhsim_top.hpp");
+        const auto insertion = header.find("private:\n");
+        require(insertion != std::string::npos, "Dispatch fixture lacks a private model boundary");
+        header.insert(insertion, "    void test_hold_dispatch_false() { nonSinkBoundaryStore." +
+            mappedValue(directory, held) + " = false; }\n");
+        std::ofstream(directory / "grhsim_top.hpp") << header;
+        bindBatchActivityCounters(label, graph, sites);
+    }
+}
+
+void testWriterDispatchNontrivialLocalFallback() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clockA = fixture.input("dispatch_string_clock_a"), clockB = fixture.input("dispatch_string_clock_b");
+    const auto enable = fixture.input("dispatch_string_enable");
+    const auto selector = fixture.input("dispatch_string_select");
+    const auto data = fixture.input("dispatch_string_data", 8);
+    const auto target = fixture.state("dispatch_string_q", 8);
+    grh::setStateInitSpec(graph, target, {{grh::InitKind::Constant, "8'd17"}});
+    const grh::LogicalType stringType{grh::ValueType::String, 1, false, grh::LogicDomain::TwoState, {}};
+    std::vector<grh::OperationId> writers;
+    grh::ValueId stringMux;
+    for (unsigned i = 0; i < 80; ++i) {
+        grh::ValueId payload;
+        if (i == 40) {
+            const auto left = fixture.compute(OperationKind::kConstant, stringType, {});
+            const auto right = fixture.compute(OperationKind::kConstant, stringType, {});
+            graph.setAttr(graph.valueDef(left), "constValue", std::string(64, 'a'));
+            graph.setAttr(graph.valueDef(right), "constValue", std::string(64, 'b'));
+            stringMux = fixture.compute(OperationKind::kMux, stringType, {selector, left, right});
+            const auto equal = fixture.compute(OperationKind::kEq, Fixture::type(1), {stringMux, left});
+            payload = fixture.compute(OperationKind::kMux, Fixture::type(8),
+                {equal, fixture.constant(8, "8'd1"), fixture.constant(8, "8'd0")});
+        } else {
+            const auto offset = fixture.constant(8, "8'd" + std::to_string(i));
+            payload = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, offset});
+        }
+        writers.push_back(fixture.write(OperationKind::kRegisterWritePort, target,
+            {enable, payload, clockA, clockB}, {"posedge", "posedge"}));
+    }
+    graph.bindOutputPort("dispatch_string_q", fixture.read(target));
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    const auto joined = graph.opOperands(writers.front())[0];
+    const auto zero = fixture.constant(1, "1'b0");
+    for (unsigned i = 0; i < writers.size(); ++i) {
+        auto fire = joined;
+        for (unsigned bit = 0; bit < 7; ++bit)
+            fire = i & (1u << bit) ? fixture.compute(OperationKind::kOr, Fixture::type(1), {zero, fire}) :
+                fixture.compute(OperationKind::kOr, Fixture::type(1), {fire, zero});
+        graph.replaceOperand(writers[i], 0, fixture.compute(OperationKind::kAssign, Fixture::type(1), {fire}));
+    }
+    fixture.split(); fixture.partition();
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session, graph);
+    require(schedule.generalRuns.size() == writers.size() &&
+                owner(graph, graph.valueDef(stringMux)) == schedule.generalRuns[40].partitionKey,
+            "Nontrivial dispatch fixture lost its real private String local");
+    std::vector<std::pair<grh::OperationId, std::string>> sites;
+    for (const auto writer : writers) sites.emplace_back(writer, "writer-sample");
+    sites.emplace_back(graph.valueDef(stringMux), "operation");
+    const std::string body = R"CPP(
+model.init(); unsigned previousClocks=0, expected=17;
+const auto step = [&](unsigned clocks,unsigned data,bool select,bool enabled) {
+    const auto before=batchCounts(model);
+    const bool fires=(clocks & ~previousClocks & 3)!=0;
+    model.dispatch_string_clock_a=clocks&1; model.dispatch_string_clock_b=(clocks>>1)&1;
+    model.dispatch_string_enable=enabled; model.dispatch_string_select=select;
+    model.dispatch_string_data=data; model.eval(); const auto after=batchCounts(model);
+    for(unsigned i=0;i<after.size();++i)
+        assert(after[i]==before[i]+unsigned(fires && enabled));
+    if(fires && enabled) expected=(data+79)&255;
+    assert(model.dispatch_string_q==expected);
+    model.eval(); assert(batchCounts(model)==after && model.dispatch_string_q==expected);
+    previousClocks=clocks;
+};
+step(0,1,false,false); step(1,2,false,true); step(2,3,true,true);
+step(2,4,false,true); step(0,5,true,true); step(3,6,false,false);
+step(3,7,true,true); step(0,8,false,true); step(3,9,true,true);
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "writer-dispatch-nontrivial-local-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, batchActivityCounterSupport(sites.size()), body, false,
+            {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        require(batchActivityStatistic(directory, "writer_batches") == 5 &&
+                    batchActivityStatistic(directory, "writer_dispatch_fire_groups") == 2 &&
+                    batchActivityStatistic(directory, "writer_dispatch_fire_batches") == 4 &&
+                    batchActivityStatistic(directory, "writer_dispatch_fire_max_events") == 2,
+                "A nontrivial entry local did not split otherwise identical caller fire groups");
+        std::vector<std::string> roots;
+        for (unsigned i = 0; i < writers.size(); ++i) {
+            const auto root = batchActivityRoot(directory, writers[i]);
+            if (roots.empty() || roots.back() != root) roots.push_back(root);
+            require(roots.size() == i / 16 + 1, "Nontrivial dispatch changed the original 16-fire batch boundaries");
+        }
+        bool stringLocal = false;
+        for (const auto& function : mappedRecords(readFile(directory / "code-map.json"), "functions"))
+            if (function.find("\"root_function\":\"" + roots[2] + "\"") != std::string::npos)
+                for (const auto& local : mappedRecords(function, "locals"))
+                    stringLocal |= local.find("\"type\":\"std::string\"") != std::string::npos;
+        require(stringLocal, "Nontrivial dispatch fallback lacks an actual emitted std::string local");
+        std::vector<std::string> actual;
+        for (const auto& entry : writerDispatchCalls(directory)) {
+            if (entry.name.starts_with("pGeneral_active_batch")) {
+                require(actual.empty() && entry.guards.empty(), "Nontrivial fallback moved nonsink dispatch");
+                continue;
+            }
+            actual.push_back(entry.name);
+            require(actual.size() == 3 ? entry.guards.empty() : entry.guards.size() == 1,
+                    "Caller guard bypassed a nontrivial local or regrouped across its fallback");
+        }
+        require(actual == roots, "Nontrivial fallback changed original batch order");
+        bindBatchActivityCounters(label, graph, sites);
+    }
+}
+
+void testScalarShadowChangeMasks() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clockA = fixture.input("scm_clock_a"), clockB = fixture.input("scm_clock_b");
+    const auto enableA = fixture.input("scm_enable_a"), enableB = fixture.input("scm_enable_b");
+    const auto enableC = fixture.input("scm_enable_c"), restore = fixture.input("scm_restore");
+    const auto dataA = fixture.input("scm_data_a", 64), dataB = fixture.input("scm_data_b", 64);
+    const auto mask = fixture.input("scm_mask", 64);
+    const auto signedInput = [&](std::string_view name, int32_t width) {
+        auto type = Fixture::type(width);
+        type.isSigned = true;
+        const auto value = graph.createValue(graph.internSymbol(name), type);
+        graph.bindInputPort(name, value);
+        return value;
+    };
+    const auto signedA = signedInput("scm_signed_a", 7), signedB = signedInput("scm_signed_b", 3);
+    const auto convertBits = [&](grh::ValueId source, const grh::LogicalType& target) {
+        const auto input = graph.valueLogicalType(source);
+        if (input.width == target.width) return source;
+        const auto slice = [&](int32_t width, int64_t offset, const grh::LogicalType& type) {
+            const auto result = fixture.compute(OperationKind::kSliceStatic, type, {source});
+            graph.setAttr(graph.valueDef(result), "sliceStart", offset);
+            graph.setAttr(graph.valueDef(result), "sliceEnd", offset + width - 1);
+            return result;
+        };
+        if (input.width > target.width) return slice(target.width, 0, target);
+        const auto padding = target.width - input.width;
+        grh::ValueId high;
+        if (input.isSigned) {
+            const auto sign = slice(1, input.width - 1, Fixture::type(1));
+            high = fixture.compute(OperationKind::kReplicate, Fixture::type(padding), {sign});
+            graph.setAttr(graph.valueDef(high), "rep", int64_t{padding});
+        } else high = fixture.constant(padding, std::to_string(padding) + "'d0");
+        return fixture.compute(OperationKind::kConcat, target, {high, source});
+    };
+    const std::array<int32_t, 8> widths{1, 3, 7, 8, 17, 32, 63, 64};
+    std::vector<std::pair<grh::OperationId, std::string>> sites;
+    std::string checks;
+    std::size_t index = 0;
+    for (const bool isSigned : {false, true}) for (const auto width : widths) {
+        const auto suffix = std::string(isSigned ? "s" : "u") + std::to_string(width);
+        const auto state = fixture.state("scm_state_" + suffix, width);
+        auto type = Fixture::type(width);
+        type.isSigned = isSigned;
+        grh::setStateLogicalType(graph, state, type);
+        grh::setStateInitSpec(graph, state, {{grh::InitKind::Constant, std::to_string(width) + "'d1"}});
+        // Slice truncates; sign-bit replication plus concat extends. Assign
+        // is an equal-width view and is deliberately not used for conversion.
+        const auto payloadA = convertBits(isSigned ? signedA : dataA, type);
+        const auto payloadB = convertBits(isSigned ? signedB : dataB, type);
+        const auto current = fixture.read(state);
+        require(graph.valueLogicalType(current) == type,
+                "Scalar shadow change fixture lost the signed current-read type");
+        const auto payloadC = fixture.compute(OperationKind::kMux, type, {restore, current, payloadB});
+        const auto writeMask = convertBits(mask, Fixture::type(width));
+        const auto writerA = fixture.write(OperationKind::kRegisterWritePort, state, {enableA, payloadA, clockA});
+        const auto writerB = fixture.write(OperationKind::kRegisterWritePort, state, {enableB, payloadB, clockB});
+        const auto writerC = fixture.write(OperationKind::kRegisterWriteMaskPort, state, {enableC, payloadC, writeMask, clockA});
+        for (const auto writer : {writerA, writerB, writerC}) sites.emplace_back(writer, "writer-sample");
+        graph.bindOutputPort("scm_q_" + suffix, fixture.read(state));
+        checks += "assert(scmBits(static_cast<std::uint64_t>(instance.scm_q_" + suffix + ")," +
+            std::to_string(width) + ")==expected[" + std::to_string(index++) + "]);\n";
+    }
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    fixture.split();
+    fixture.partition();
+    const std::string support = batchActivityCounterSupport(sites.size()) + R"CPP(
+// Expected state comes from logical bits and ordered writes. This oracle
+// never constructs a change mask or reads emitter dirty bits/run masks.
+static std::uint64_t scmBits(std::uint64_t value,unsigned width) {
+    if(width==64) return value;
+    return value%(UINT64_C(1)<<width);
+}
+static std::uint64_t scmExtend(std::uint64_t raw,unsigned sourceWidth,unsigned targetWidth,bool isSigned) {
+    const auto source=scmBits(raw,sourceWidth);
+    const bool sign=isSigned && ((source>>(sourceWidth-1))%2!=0);
+    std::uint64_t result=0;
+    for(unsigned bit=0;bit<targetWidth;++bit) {
+        const bool value=bit<sourceWidth ? (source>>bit)%2!=0 : sign;
+        if(value) result+=UINT64_C(1)<<bit;
+    }
+    return result;
+}
+static std::uint64_t scmReplace(std::uint64_t pending,std::uint64_t payload,std::uint64_t mask,unsigned width) {
+    std::uint64_t result=0;
+    for(unsigned bit=0;bit<width;++bit) {
+        const auto selected=(mask>>bit)%2 ? payload : pending;
+        if((selected>>bit)%2) result+=UINT64_C(1)<<bit;
+    }
+    return result;
+}
+)CPP";
+    const std::string body = R"CPP(
+const std::array<unsigned,8> widths{1,3,7,8,17,32,63,64};
+for(unsigned epoch=0;epoch<2;++epoch) {
+    model.scm_clock_a=model.scm_clock_b=0;
+    model.init(); std::array<std::uint64_t,16> expected; expected.fill(1);
+    unsigned previous=0;
+    const auto evaluate=[&](GrhSIM_top& instance,unsigned clocks,bool enableA,bool enableB,bool enableC,
+                            bool restore,std::uint64_t dataA,std::uint64_t dataB,
+                            std::uint64_t signedA,std::uint64_t signedB,std::uint64_t mask,
+                            std::array<int,3> work=std::array<int,3>{-1,-1,-1}) {
+        const auto before=batchCounts(instance);
+        const bool risingA=(clocks&1) && !(previous&1),risingB=(clocks&2) && !(previous&2);
+        const auto current=expected;
+        for(unsigned i=0;i<expected.size();++i) {
+            const auto width=widths[i%widths.size()]; const bool isSigned=i>=widths.size();
+            const auto a=scmExtend(isSigned?signedA:dataA,isSigned?7:64,width,isSigned);
+            const auto b=scmExtend(isSigned?signedB:dataB,isSigned?3:64,width,isSigned);
+            if(risingA && enableA) expected[i]=a;
+            if(risingB && enableB) expected[i]=b;
+            if(risingA && enableC) expected[i]=scmReplace(expected[i],restore?current[i]:b,mask,width);
+        }
+        instance.scm_clock_a=clocks&1; instance.scm_clock_b=(clocks>>1)&1;
+        instance.scm_enable_a=enableA; instance.scm_enable_b=enableB; instance.scm_enable_c=enableC;
+        instance.scm_restore=restore; instance.scm_data_a=dataA; instance.scm_data_b=dataB;
+        instance.scm_signed_a=static_cast<decltype(instance.scm_signed_a)>(signedA);
+        instance.scm_signed_b=static_cast<decltype(instance.scm_signed_b)>(signedB);
+        instance.scm_mask=mask; instance.eval(); previous=clocks;
+        const auto after=batchCounts(instance);
+        if(!risingA && !risingB) assert(after==before);
+        // These three real manifest sites belong to unsigned8's A/B/A writers.
+        // Other widths do not assume an identical pattern of dirty activity.
+        for(unsigned writer=0;writer<3;++writer) if(work[writer]>=0)
+            assert(after[9+writer]==before[9+writer]+work[writer]);
+)CPP" + checks + R"CPP(
+        instance.eval(); assert(batchCounts(instance)==after);
+)CPP" + checks + R"CPP(
+    };
+    const auto pulse=[&](bool restore,std::uint64_t a,std::uint64_t b,std::uint64_t sa,std::uint64_t sb,
+                         std::uint64_t mask,std::array<int,3> work=std::array<int,3>{-1,-1,-1}) {
+        evaluate(model,0,true,true,true,restore,a,b,sa,sb,mask);
+        evaluate(model,3,true,true,true,restore,a,b,sa,sb,mask,work);
+    };
+    // C equals pending B: its zero change must preserve B's publication and
+    // the earlier target invalidation, including the next unchanged A edge.
+    pulse(false,0,2,0,2,UINT64_MAX,{1,1,1});
+    pulse(false,0,2,0,2,UINT64_MAX,{1,1,1});
+    pulse(false,0,2,0,2,UINT64_MAX,{1,1,1});
+    // A also equals pending/current B, so it must leave clean peers clean.
+    pulse(false,2,2,2,2,UINT64_MAX,{1,0,0});
+    // B changes next; C restores old current. Hold is an ordered write.
+    pulse(true,2,3,2,3,UINT64_MAX,{0,1,1});
+    evaluate(model,0,true,true,true,true,2,3,2,3,UINT64_MAX);
+    evaluate(model,1,true,true,true,true,2,3,2,3,UINT64_MAX,{1,0,0});
+    // A disabled writer and a zero data mask cannot erase B's dirty mark.
+    evaluate(model,0,false,true,true,true,2,4,2,4,0);
+    evaluate(model,3,false,true,true,true,2,4,2,4,0,{0,1,1});
+    const std::array<std::uint64_t,8> patterns{0,1,UINT64_MAX,UINT64_C(0x8000000000000000),
+        UINT64_C(0x0123456789abcdef),UINT64_C(0xfedcba9876543210),
+        UINT64_C(0xaaaaaaaaaaaaaaaa),UINT64_C(0x5555555555555555)};
+    for(unsigned step=0;step<192;++step) {
+        const auto a=patterns[step%patterns.size()],b=patterns[(step/3+3)%patterns.size()];
+        const auto mask=patterns[(step/5+1)%patterns.size()];
+        // Negative 7/3-bit inputs extend into17/32/63/64; all clock values,
+        // disabled writers and mixed/zero/full masks retain ordered semantics.
+        evaluate(model,step%4,step%7!=0,step%5!=0,step%3!=0,step%6>=3,
+                 a,b,step%128,(step+4)%8,mask);
+    }
+}
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "scalar-shadow-change-mask-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, support, body, false, {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        require(batchActivityStatistic(directory, "scalar_shadow_change_mask_writer_sites") == sites.size() &&
+                    batchActivityStatistic(directory, "eligible_writers") == sites.size() &&
+                    batchActivityStatistic(directory, "rejected_writers") == 0,
+                "Scalar shadow change fixture did not exercise every native scalar mask route");
+        bindBatchActivityCounters(label, graph, sites);
+    }
+}
+
+void testSinkActivityBatchCompetition() {
+    Fixture fixture; auto& graph=fixture.graph;
+    const auto clock=fixture.input("batch_clock");
+    const auto state=fixture.state("batch_q",8);
+    grh::setStateInitSpec(graph,state,{{grh::InitKind::Constant,"8'd17"}});
+    std::vector<grh::ValueId> payloads;
+    for(unsigned i=0;i<130;++i) {
+        const auto data=fixture.input("batch_data_"+std::to_string(i),8);
+        const auto payload=fixture.compute(OperationKind::kAdd,Fixture::type(8),{data,data});
+        payloads.push_back(payload);
+        fixture.write(OperationKind::kRegisterWritePort,state,{fixture.constant(1,"1'b1"),payload,clock});
+    }
+    graph.bindOutputPort("batch_q",fixture.read(state));
+    // Keep each true enable private so init is the only initial dirty source.
+    run(fixture.design,"grh-to-grhsim",fixture.session); fixture.split(); fixture.partition();
+    const auto& schedule=sim::requireSinkSchedule(&fixture.session,graph);
+    require(schedule.generalRuns.size()==130,"Batch competition lost its exact priority runs");
+    std::vector<grh::OperationId> writers;
+    std::vector<std::pair<grh::OperationId,std::string>> sites;
+    for(unsigned i=0;i<130;++i) {
+        const auto& run=schedule.generalRuns[i];
+        require(run.orderedWriters.size()==1 && sim::writerTarget(graph,run.orderedWriters.front())==state,
+                "Batch competition lost ordered writes to one target");
+        const auto writer=run.orderedWriters.front(); writers.push_back(writer);
+        const auto payload=graph.valueDef(graph.opOperands(writer)[2]);
+        require(graph.opKind(payload)==OperationKind::kAdd && owner(graph,payload)==run.partitionKey,
+                "Batch competition lost its private counted payload");
+        sites.emplace_back(writer,"writer-sample"); sites.emplace_back(payload,"operation");
+    }
+    const std::string body=R"CPP(
+model.init();
+const auto step = [&](bool clock,unsigned work,unsigned value) {
+    const auto before=batchCounts(model); const auto rounds=model.perf_counters().totalRoundCount;
+    model.batch_clock=clock; model.eval(); const auto after=batchCounts(model);
+    for(unsigned i=0;i<130;++i) {
+        const unsigned expected=work==2 ? i==0 : work;
+        assert(after[2*i]==before[2*i]+expected && after[2*i+1]==before[2*i+1]+expected);
+    }
+    assert(model.batch_q==value); const auto elapsed=model.perf_counters().totalRoundCount-rounds;
+    model.eval(); assert(batchCounts(model)==after); return elapsed;
+};
+step(false,0,17); step(true,1,0);
+step(false,0,0); step(true,0,0);
+model.batch_data_0=1; step(false,0,0);
+// Only run0 is dirty at General entry. It writes 2; run1 restores 0.
+// The live later batch must observe target invalidation and run128/run129.
+for(unsigned repeat=0;repeat<3;++repeat) {
+    assert(step(true,1,0)==1);
+    step(false,0,0);
+}
+model.batch_data_0=0; step(false,0,0); step(true,2,0);
+step(false,0,0); step(true,0,0);
+)CPP";
+    for(const auto budget : {16,1024}) {
+        const auto label="sink-activity-batch-competition-b"+std::to_string(budget);
+        manualCase(fixture,label,budget,batchActivityCounterSupport(sites.size()),body,false,{{"execution-counters","on"}});
+        const auto directory=artifact(label)/"model";
+        require(batchActivityStatistic(directory,"eligible_runs")==130 && batchActivityStatistic(directory,"rejected_runs")==0 &&
+                    batchActivityStatistic(directory,"scalar_shadow_change_mask_writer_sites")==130 &&
+                    batchActivityStatistic(directory,"bitmap_words")==3 && batchActivityStatistic(directory,"max_target_fanout")==130 &&
+                    batchActivityStatistic(directory,"publication_change_sources")==0 &&
+                    batchActivityStatistic(directory,"writer_batches")==2 &&
+                    batchActivityStatistic(directory,"writer_batches_all_eligible")==2 &&
+                    batchActivityStatistic(directory,"writer_batches_with_activity_guard")==2 &&
+                    batchActivityStatistic(directory,"writer_batch_activity_mask_words")==3 &&
+                    batchActivityStatistic(directory,"writer_batch_activity_max_mask_words")==2,
+                "Batch competition silently lost eligibility or its three activity words");
+        const auto first=batchActivityRoot(directory,writers[0]),last=batchActivityRoot(directory,writers[128]);
+        require(first.starts_with("writer_run_batch") && last.starts_with("writer_run_batch") && first!=last &&
+                    batchActivityRoot(directory,writers[127])==first && batchActivityRoot(directory,writers[129])==last,
+                "Batch competition lost the original 128-run split");
+        const auto a=batchActivityRootCpp(directory,first),b=batchActivityRootCpp(directory,last);
+        require(a.find("if ((sinkDirty[0] & UINT64_C(18446744073709551615)) | (sinkDirty[1] & UINT64_C(18446744073709551615)))")!=std::string::npos &&
+                    b.find("if ((sinkDirty[2] & UINT64_C(3)))")!=std::string::npos,
+                "Batch competition lost its exact cross-word coarse masks");
+        bindBatchActivityCounters(label,graph,sites);
+    }
+}
+
+void testNonsinkClockIsolation() {
+    for (const unsigned nodes : {1u, 128u}) for (const bool clone : {false, true}) {
+        Fixture fixture; auto& graph = fixture.graph;
+        const auto clockA = fixture.input("cold_clock_a"), clockB = fixture.input("cold_clock_b");
+        const auto enable = fixture.input("cold_enable"), data = fixture.input("cold_data", 8);
+        const auto payload = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, data});
+        const auto inverted = fixture.compute(OperationKind::kLogicNot, Fixture::type(1), {clockA});
+        const auto call = [&](const std::string& name, grh::ValueId clock) {
+            const auto imported = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol(name));
+            graph.setAttr(imported, "argsName", std::vector<std::string>{"data", "inverted"});
+            graph.setAttr(imported, "argsDirection", std::vector<std::string>{"input", "input"});
+            graph.setAttr(imported, "argsWidth", std::vector<int64_t>{8, 1});
+            graph.setAttr(imported, "argsSigned", std::vector<bool>{false, false});
+            graph.setAttr(imported, "hasReturn", false);
+            const auto op = graph.createOperation(OperationKind::kDpicCall);
+            graph.setAttr(op, "targetImportSymbol", name);
+            graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+            for (const auto value : {enable, payload, inverted, clock}) graph.addOperand(op, value);
+            return op;
+        };
+        const auto first = call("cold_capture_a", clockA), second = call("cold_capture_b", clockB);
+        run(fixture.design, "grh-to-grhsim", fixture.session);
+        const auto fireA = graph.opOperands(first)[0], fireB = graph.opOperands(second)[0];
+        const auto joined = fixture.compute(OperationKind::kOr, Fixture::type(1), {fireA, fireB});
+        const auto alias = fixture.compute(OperationKind::kAssign, Fixture::type(1), {joined});
+        graph.replaceOperand(first, 0, alias); graph.replaceOperand(second, 0, alias);
+        graph.setAttr(first, "grhsim.effectOrder", int64_t{0});
+        graph.setAttr(second, "grhsim.effectOrder", int64_t{1});
+        fixture.split();
+        run(fixture.design, "grhsim-partition-nonsink", fixture.session,
+            {"-max-supernode-nodes=" + std::to_string(nodes), "-clone-shared=" + std::to_string(clone)});
+        run(fixture.design, "grhsim-partition-sink", fixture.session);
+        const auto dataOwner = owner(graph, graph.valueDef(payload)), firstOwner = owner(graph, first),
+            secondOwner = owner(graph, second), invertedOwner = owner(graph, graph.valueDef(inverted));
+        require(dataOwner.size() == 4 && firstOwner.size() == 4 && secondOwner.size() == 4 && invertedOwner.size() == 4 &&
+                    dataOwner[2] != firstOwner[2] && dataOwner[2] != secondOwner[2] && dataOwner[2] != invertedOwner[2],
+                "Clock activity still shares an owner with unrelated data");
+        unsigned adds = 0;
+        for (const auto op : graph.operations()) adds += graph.opKind(op) == OperationKind::kAdd;
+        require(adds == 1, "Cold data was cloned into a clock owner");
+        if (nodes == 1 && !clone) require(owner(graph, first)[2] != owner(graph, second)[2] &&
+                    owner(graph, first)[2] != owner(graph, graph.valueDef(alias))[2],
+                "Pulse regression needs separate join and effect owners");
+        const std::string support = batchActivityCounterSupport(1) + R"CPP(
+static unsigned coldCallsA, coldCallsB, coldLastData, coldLastInvert;
+static bool coldThrow;
+static std::vector<unsigned> coldOrder;
+extern "C" void cold_capture_a(std::uint8_t data,std::uint8_t inverted) {
+    ++coldCallsA; coldLastData=data; coldLastInvert=inverted; coldOrder.push_back(1);
+    if (coldThrow) { coldThrow=false; throw std::runtime_error("cold test interruption"); }
+}
+extern "C" void cold_capture_b(std::uint8_t data,std::uint8_t inverted) {
+    ++coldCallsB; coldLastData=data; coldLastInvert=inverted; coldOrder.push_back(2);
+}
+)CPP";
+        const std::string body = R"CPP(
+model.init(); model.cold_enable=true; model.cold_data=5; model.eval();
+auto count=batchCounts(model)[0]; assert(count==1 && coldCallsA==0 && coldCallsB==0);
+const auto evaluate = [&](unsigned clocks,unsigned dataWork,bool fires,unsigned value) {
+    const auto before=batchCounts(model)[0]; const auto a=coldCallsA, b=coldCallsB;
+    coldOrder.clear(); model.cold_clock_a=clocks&1; model.cold_clock_b=(clocks>>1)&1; model.eval();
+    assert(batchCounts(model)[0]==before+dataWork);
+    assert(coldCallsA==a+unsigned(fires) && coldCallsB==b+unsigned(fires));
+    if (fires) {
+        assert((coldOrder==std::vector<unsigned>{1,2}));
+        assert(coldLastData==value && coldLastInvert==unsigned(!(clocks&1)));
+    } else assert(coldOrder.empty());
+    model.eval(); assert(batchCounts(model)[0]==before+dataWork && coldCallsA==a+unsigned(fires) && coldCallsB==b+unsigned(fires));
+};
+evaluate(1,0,true,10); evaluate(0,0,false,0);
+evaluate(2,0,true,10); evaluate(0,0,false,0);
+evaluate(3,0,true,10); evaluate(0,0,false,0);
+model.cold_data=9; evaluate(0,1,false,0); evaluate(3,0,true,18);
+model.cold_enable=false; evaluate(0,0,false,0); evaluate(1,0,false,0);
+model.cold_enable=true; evaluate(1,0,false,0); evaluate(0,0,false,0);
+const auto a=coldCallsA, b=coldCallsB; const auto stable=batchCounts(model)[0];
+coldThrow=true; model.cold_clock_b=true;
+bool interrupted=false; try { model.eval(); } catch (const std::runtime_error&) { interrupted=true; }
+assert(interrupted && coldCallsA==a+1 && coldCallsB==b && batchCounts(model)[0]==stable);
+model.eval(); assert(coldCallsA==a+1 && coldCallsB==b && batchCounts(model)[0]==stable);
+evaluate(0,0,false,0); evaluate(3,0,true,18);
+model.init(); model.cold_enable=true; model.cold_data=9; model.eval();
+assert(batchCounts(model)[0]==1); evaluate(1,0,true,18);
+)CPP";
+        for (const unsigned budget : {16u, 1024u}) {
+            const auto label = "nonsink-clock-isolation-n" + std::to_string(nodes) +
+                "-c" + std::to_string(clone) + "-b" + std::to_string(budget);
+            manualCase(fixture, label, budget, support, body, false, {{"execution-counters", "on"}});
+            bindBatchActivityCounters(label, graph, {{graph.valueDef(payload), "operation"}});
+        }
+    }
+}
+
+void testSinkActivityJoinedFire() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clockA = fixture.input("joined_clock_a"), clockB = fixture.input("joined_clock_b");
+    const auto enable = fixture.input("joined_enable"), data = fixture.input("joined_data", 8);
+    const auto one = fixture.constant(1, "1'b1");
+    const auto payload = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, data});
+    const auto state = fixture.state("joined_q", 8), peer = fixture.state("joined_peer", 8);
+    grh::setStateInitSpec(graph, state, {{grh::InitKind::Constant, "8'd17"}});
+    const auto writer = fixture.write(OperationKind::kRegisterWritePort, state,
+        {enable, payload, clockA, clockB}, {"posedge", "posedge"});
+    const auto peerWriter = fixture.write(OperationKind::kRegisterWritePort, peer,
+        {enable, data, clockA, clockB}, {"posedge", "posedge"});
+    const auto imported = graph.createOperation(OperationKind::kDpicImport,
+        graph.internSymbol("activity_hold_join_false"));
+    graph.setAttr(imported, "argsName", std::vector<std::string>{"fire"});
+    graph.setAttr(imported, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(imported, "argsWidth", std::vector<int64_t>{1});
+    graph.setAttr(imported, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(imported, "hasReturn", false);
+    const auto call = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(call, "targetImportSymbol", std::string("activity_hold_join_false"));
+    graph.addOperand(call, one); graph.addOperand(call, enable);
+    graph.bindOutputPort("joined_q", fixture.read(state));
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    const auto joined = graph.opOperands(writer)[0];
+    require(graph.opKind(graph.valueDef(joined)) == OperationKind::kOr,
+            "Joined activity fixture lost its two EventEdge leaves");
+    const auto alias = fixture.compute(OperationKind::kAssign, Fixture::type(1), {joined});
+    graph.replaceOperand(writer, 0, alias); graph.replaceOperand(peerWriter, 0, alias);
+    graph.replaceOperand(call, 2, alias);
+    fixture.split(); fixture.partition();
+    require(owner(graph, graph.valueDef(alias)).size() == 4 && owner(graph, graph.valueDef(alias))[1] == "nonsink",
+            "Joined activity fixture lost its held shared Assign snapshot");
+    const std::vector<std::pair<grh::OperationId, std::string>> sites{
+        {writer, "writer-sample"}, {graph.valueDef(payload), "operation"}};
+    const std::string support = batchActivityCounterSupport(sites.size()) + R"CPP(
+static GrhSIM_top* joinedInstance;
+extern "C" void activity_hold_join_false(std::uint8_t) {
+    // Test-only perturbation of the held snapshot, after its computation and
+    // before writer application. The current EventEdge leaves remain intact.
+    if (joinedInstance) joinedInstance->test_hold_join_false();
+}
+)CPP";
+    const std::string body = R"CPP(
+const auto evaluate = [&](GrhSIM_top& instance,unsigned clocks,unsigned work,unsigned value) {
+    joinedInstance=&instance; const auto before=batchCounts(instance);
+    instance.joined_clock_a=clocks&1; instance.joined_clock_b=(clocks>>1)&1; instance.eval();
+    const auto after=batchCounts(instance);
+    assert(after[0]==before[0]+work && after[1]==before[1]+work && instance.joined_q==value);
+    instance.eval(); assert(batchCounts(instance)==after && instance.joined_q==value);
+};
+model.init(); model.joined_enable=true; model.joined_data=5;
+evaluate(model,0,0,17); evaluate(model,1,1,10);
+evaluate(model,0,0,10); evaluate(model,1,0,10);
+evaluate(model,2,0,10); // B is a fresh edge while A falls; stable data stays clean.
+model.joined_data=7; evaluate(model,2,0,10);
+evaluate(model,0,0,10); evaluate(model,2,1,14);
+evaluate(model,0,0,14); evaluate(model,3,0,14);
+model.joined_data=9; evaluate(model,3,0,14);
+evaluate(model,0,0,14); evaluate(model,3,1,18); // Simultaneous edges apply once.
+model.joined_enable=false; model.joined_data=11;
+evaluate(model,0,0,18); evaluate(model,1,0,18);
+model.joined_enable=true; evaluate(model,1,0,18);
+evaluate(model,0,0,18); evaluate(model,1,1,22);
+GrhSIM_top other; other.init(); other.joined_enable=true;
+evaluate(other,0,0,17); evaluate(other,2,1,0);
+evaluate(model,0,0,22); evaluate(model,2,0,22);
+other.joined_clock_a=other.joined_clock_b=false; other.init(); other.joined_enable=true;
+evaluate(other,0,0,17); evaluate(other,3,1,0);
+evaluate(model,0,0,22); evaluate(model,3,0,22);
+joinedInstance=nullptr;
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "sink-activity-joined-fire-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, support, body, false, {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        require(batchActivityStatistic(directory, "eligible_joined_fire_runs") != 0 &&
+                    batchActivityStatistic(directory, "eligible_writers") == 2 &&
+                    batchActivityStatistic(directory, "rejected_writers") == 0,
+                "Joined activity silently retained fallback writers");
+        auto header = readFile(directory / "grhsim_top.hpp");
+        const auto member = "nonSinkBoundaryStore." + mappedValue(directory, alias);
+        require(header.find(mappedValue(directory, alias)) != std::string::npos,
+                "Joined activity lacks its real held fire snapshot");
+        const auto insertion = header.find("private:\n");
+        require(insertion != std::string::npos, "Joined activity lacks its private boundary");
+        // The fixture-only method changes access, without changing production
+        // emission or replacing any writer/computation/dispatch statement.
+        header.insert(insertion, "    void test_hold_join_false() { " + member + " = false; }\n");
+        std::ofstream(directory / "grhsim_top.hpp") << header;
+        bindBatchActivityCounters(label, graph, sites);
+    }
+}
+
+void testSinkActivityJoinedCompetition() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clockA = fixture.input("joined_comp_clock_a"), clockB = fixture.input("joined_comp_clock_b");
+    const auto target = fixture.state("joined_comp_q", 8);
+    grh::setStateInitSpec(graph, target, {{grh::InitKind::Constant, "8'd17"}});
+    std::array<grh::ValueId, 3> payloads;
+    std::array<grh::OperationId, 3> writers;
+    const std::array<std::string, 3> names{"a", "b", "c"};
+    for (unsigned i = 0; i < names.size(); ++i) {
+        const auto enable = fixture.input("joined_comp_enable_" + names[i]);
+        const auto data = fixture.input("joined_comp_data_" + names[i], 8);
+        payloads[i] = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, data});
+        writers[i] = fixture.write(OperationKind::kRegisterWritePort, target,
+            {enable, payloads[i], clockA, clockB}, {"posedge", "posedge"});
+    }
+    graph.bindOutputPort("joined_comp_q", fixture.read(target));
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    const auto joined = graph.opOperands(writers[0])[0];
+    const auto alias = fixture.compute(OperationKind::kAssign, Fixture::type(1), {joined});
+    for (const auto writer : writers) graph.replaceOperand(writer, 0, alias);
+    fixture.split(); fixture.partition();
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session, graph);
+    require(schedule.generalRuns.size() == 3, "Joined competition lost distinct A/B/A priority runs");
+    std::vector<std::pair<std::string, std::string>> sites;
+    for (unsigned i = 0; i < writers.size(); ++i) {
+        require(owner(graph, graph.valueDef(payloads[i])) == schedule.generalRuns[i].partitionKey,
+                "Joined competition lost a private payload");
+        sites.emplace_back(graph.symbolText(graph.operationSymbol(writers[i])), "writer-sample");
+        sites.emplace_back(graph.symbolText(graph.operationSymbol(graph.valueDef(payloads[i]))), "operation");
+    }
+    const std::string body = R"CPP(
+model.init(); model.joined_comp_enable_a=true;
+model.joined_comp_data_a=4; model.joined_comp_data_b=7; model.joined_comp_data_c=4;
+const auto evaluate = [&](unsigned clocks,std::array<unsigned,3> work,unsigned value) {
+    const auto before=activityCounts(model);
+    model.joined_comp_clock_a=clocks&1; model.joined_comp_clock_b=(clocks>>1)&1; model.eval();
+    const auto after=activityCounts(model); activityDelta(before,after,work);
+    assert(model.joined_comp_q==value);
+    model.eval(); assert(activityCounts(model)==after && model.joined_comp_q==value);
+};
+evaluate(0,{0,0,0},17); evaluate(1,{1,0,0},8);
+evaluate(0,{0,0,0},8); evaluate(2,{0,0,0},8);
+model.joined_comp_enable_b=model.joined_comp_enable_c=true;
+evaluate(0,{0,0,0},8); evaluate(3,{0,1,1},8);
+for (unsigned edge : {1u,2u,3u}) {
+    evaluate(0,{0,0,0},8); evaluate(edge,{1,1,1},8);
+}
+model.joined_comp_enable_b=model.joined_comp_enable_c=false;
+evaluate(0,{0,0,0},8); evaluate(3,{1,0,0},8);
+evaluate(0,{0,0,0},8); evaluate(1,{0,0,0},8);
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "sink-activity-joined-competition-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, sinkActivityCounterSupport(), body, false, {{"execution-counters", "on"}});
+        bindSinkActivitySites(label, sites, 3, 1, 3);
+        require(batchActivityStatistic(artifact(label) / "model", "eligible_joined_fire_runs") == 3,
+                "Joined competition retained a non-activity fallback");
+    }
+}
+
+void testSinkActivityCurrentReads() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto readClock = fixture.input("current_read_clock"), writeClock = fixture.input("current_write_clock");
+    const auto selfClock = fixture.input("current_self_clock");
+    const auto writeEnable = fixture.input("current_write_enable"), readIndex = fixture.input("current_read_index", 8);
+    const auto writeIndex = fixture.input("current_write_index", 8), writeData = fixture.input("current_write_data", 8);
+    const auto modeEnable = fixture.input("current_mode_enable"), modeData = fixture.input("current_mode_data", 8);
+    const auto modeCancel = fixture.input("current_mode_cancel");
+    const auto selfEnable = fixture.input("current_self_enable");
+    const auto one = fixture.constant(8, "8'd1");
+    const auto source = fixture.state("current_source", 1024, {128});
+    const auto mode = fixture.state("current_mode", 8), target = fixture.state("current_q", 8);
+    const auto feedback = fixture.state("current_feedback", 8);
+    grh::setStateInitSpec(graph, source, {{grh::InitKind::Fill, "8'd7"}});
+    grh::setStateInitSpec(graph, mode, {{grh::InitKind::Constant, "8'd1"}});
+    grh::setStateInitSpec(graph, target, {{grh::InitKind::Constant, "8'd17"}});
+    fixture.write(OperationKind::kRegisterWriteArrayPort, source, {writeEnable, writeIndex, writeData, writeClock});
+    fixture.write(OperationKind::kRegisterWritePort, mode, {modeEnable, modeData, writeClock});
+    fixture.write(OperationKind::kRegisterWritePort, mode, {modeCancel, fixture.constant(8, "8'd0"), writeClock});
+    fixture.write(OperationKind::kRegisterWritePort, mode, {modeCancel, modeData, writeClock});
+    const auto modeRead = fixture.read(mode);
+    const auto localEnable = fixture.compute(OperationKind::kSliceStatic, Fixture::type(1), {modeRead});
+    graph.setAttr(graph.valueDef(localEnable), "sliceStart", int64_t{0});
+    graph.setAttr(graph.valueDef(localEnable), "sliceEnd", int64_t{0});
+    const auto offset = fixture.compute(OperationKind::kLShr, Fixture::type(8), {modeRead, one});
+    const auto index = fixture.compute(OperationKind::kAdd, Fixture::type(8), {readIndex, offset});
+    const auto read = fixture.read(source, {index});
+    const auto payload = fixture.compute(OperationKind::kAdd, Fixture::type(8), {read, fixture.constant(8, "8'd0")});
+    const auto writer = fixture.write(OperationKind::kRegisterWritePort, target, {localEnable, payload, readClock});
+    const auto increment = fixture.compute(OperationKind::kAdd, Fixture::type(8), {fixture.read(feedback), one});
+    fixture.write(OperationKind::kRegisterWritePort, feedback, {selfEnable, increment, selfClock});
+    graph.bindOutputPort("current_q", fixture.read(target));
+    graph.bindOutputPort("current_feedback", fixture.read(feedback));
+    run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split(); fixture.partition();
+    require(owner(graph, graph.valueDef(read)).size() == 3 && owner(graph, graph.valueDef(read))[1] == "small-sink",
+            "Current-read activity lost its private large source read");
+    const std::vector<std::pair<grh::OperationId, std::string>> sites{
+        {writer, "writer-sample"}, {graph.valueDef(payload), "operation"}};
+    const std::string body = R"CPP(
+const auto evaluate = [&](GrhSIM_top& instance,unsigned clocks,unsigned work,unsigned value) {
+    const auto before=batchCounts(instance);
+    instance.current_read_clock=clocks&1; instance.current_write_clock=(clocks>>1)&1;
+    instance.current_self_clock=(clocks>>2)&1; instance.eval();
+    const auto after=batchCounts(instance);
+    assert(after[0]==before[0]+work && after[1]==before[1]+work && instance.current_q==value);
+    instance.eval(); assert(batchCounts(instance)==after && instance.current_q==value);
+};
+model.init(); evaluate(model,0,0,17); evaluate(model,1,1,7);
+evaluate(model,0,0,7); evaluate(model,1,0,7);
+model.current_read_index=2; evaluate(model,1,0,7);
+evaluate(model,0,0,7); evaluate(model,1,1,7);
+model.current_write_enable=true; model.current_write_index=2; model.current_write_data=9;
+evaluate(model,0,0,7); evaluate(model,2,0,7);
+model.current_write_enable=false; evaluate(model,0,0,7); evaluate(model,1,1,9);
+evaluate(model,0,0,9); evaluate(model,1,0,9);
+model.current_mode_enable=true; model.current_mode_data=0;
+evaluate(model,0,0,9); evaluate(model,3,0,9);
+model.current_mode_enable=false; evaluate(model,0,0,9); evaluate(model,1,0,9);
+model.current_mode_enable=true; model.current_mode_data=1;
+evaluate(model,0,0,9); evaluate(model,2,0,9);
+model.current_mode_enable=false; evaluate(model,0,0,9); evaluate(model,1,1,9);
+// Make the reader dirty without changing its final index. Both phases must
+// sample old current before the large write invalidates the later edge.
+model.current_read_index=3; evaluate(model,0,0,9);
+model.current_read_index=2; evaluate(model,0,0,9);
+model.current_write_enable=true; model.current_write_data=11;
+evaluate(model,3,1,9);
+model.current_write_enable=false; evaluate(model,0,0,9); evaluate(model,1,1,11);
+// The same current-state read controls enable and a dynamic array index.
+model.current_mode_enable=true; model.current_mode_data=3;
+evaluate(model,0,0,11); evaluate(model,2,0,11);
+model.current_mode_enable=false; evaluate(model,0,0,11); evaluate(model,1,1,7);
+model.current_mode_enable=true; model.current_mode_data=1;
+evaluate(model,0,0,7); evaluate(model,2,0,7);
+model.current_mode_enable=false; evaluate(model,0,0,7); evaluate(model,1,1,11);
+// Small next-shadow A/B/A cancellation leaves current and its reader clean.
+model.current_mode_cancel=true; evaluate(model,0,0,11); evaluate(model,2,0,11);
+model.current_mode_cancel=false; evaluate(model,0,0,11); evaluate(model,1,0,11);
+model.current_read_index=255; evaluate(model,1,0,11);
+evaluate(model,0,0,11); evaluate(model,1,1,0);
+model.current_read_index=2; evaluate(model,1,0,0);
+evaluate(model,0,0,0); evaluate(model,1,1,11);
+model.current_self_enable=true;
+for (unsigned value=1; value<=4; ++value) {
+    evaluate(model,0,0,11); evaluate(model,4,0,11); assert(model.current_feedback==value);
+}
+model.current_self_enable=false; evaluate(model,0,0,11); evaluate(model,4,0,11);
+assert(model.current_feedback==4);
+GrhSIM_top other; other.init(); evaluate(other,0,0,17); evaluate(other,1,1,7);
+evaluate(model,0,0,11); evaluate(model,1,0,11);
+other.current_read_clock=other.current_write_clock=false; other.init();
+evaluate(other,0,0,17); evaluate(other,1,1,7);
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "sink-activity-current-reads-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, batchActivityCounterSupport(sites.size()), body, false,
+                   {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        require(batchActivityStatistic(directory, "eligible_current_state_runs") >= 2 &&
+                    batchActivityStatistic(directory, "subscribed_small_current_states") == 2 &&
+                    batchActivityStatistic(directory, "subscribed_large_current_states") == 1 &&
+                    batchActivityStatistic(directory, "small_current_publication_mask_sites") >= 2 &&
+                    batchActivityStatistic(directory, "large_current_write_mask_sites") != 0,
+                "Current-read fixture lost actual source-state invalidation routes");
+        bindBatchActivityCounters(label, graph, sites);
+    }
+}
+
+void testSinkActivityLargeCurrentInterrupted() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto readClock = fixture.input("partial_read_clock"), writeClock = fixture.input("partial_write_clock");
+    const auto enable = fixture.input("partial_write_enable"), dataA = fixture.input("partial_data_a", 8);
+    const auto dataB = fixture.input("partial_data_b", 8), one = fixture.constant(1, "1'b1");
+    const auto zero = fixture.constant(8, "8'd0"), first = fixture.constant(8, "8'd1");
+    const auto source = fixture.state("partial_source", 1024, {128}), target = fixture.state("partial_q", 8);
+    fixture.write(OperationKind::kRegisterWriteArrayPort, source, {enable, zero, dataA, writeClock});
+    fixture.write(OperationKind::kRegisterWriteArrayPort, source, {enable, first, dataB, writeClock});
+    const auto payload = fixture.read(source, {zero});
+    const auto writer = fixture.write(OperationKind::kRegisterWritePort, target, {one, payload, readClock});
+    graph.bindOutputPort("partial_q", fixture.read(target));
+    graph.bindOutputPort("partial_tail", fixture.read(source, {first}));
+    run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split(); fixture.partition();
+    const std::vector<std::pair<grh::OperationId, std::string>> sites{
+        {writer, "writer-sample"}, {graph.valueDef(payload), "operation"}};
+    const std::string support = R"CPP(
+#include <cstdlib>
+#include <new>
+static unsigned partialAllocations;
+static bool partialAllocationArmed;
+void* operator new(std::size_t bytes) {
+    if (partialAllocationArmed && ++partialAllocations==2) throw std::bad_alloc();
+    if (auto* result=std::malloc(bytes ? bytes : 1)) return result;
+    throw std::bad_alloc();
+}
+
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer,std::size_t) noexcept { std::free(pointer); }
+)CPP" + batchActivityCounterSupport(sites.size());
+    const std::string body = R"CPP(
+for (unsigned epoch=0; epoch<2; ++epoch) {
+    model.partial_read_clock=model.partial_write_clock=false; model.partial_write_enable=false;
+    model.init(); model.eval();
+    model.partial_read_clock=true; model.eval(); assert(model.partial_q==0);
+    model.partial_read_clock=false; model.eval();
+    const auto clean=batchCounts(model);
+    model.partial_read_clock=true; model.eval(); assert(batchCounts(model)==clean);
+    model.partial_read_clock=false; model.eval();
+    model.partial_write_enable=true; model.partial_data_a=9; model.partial_data_b=17;
+    model.partial_write_clock=true; partialAllocations=0; partialAllocationArmed=true;
+    bool caught=false; try { model.eval(); } catch (const std::bad_alloc&) { caught=true; }
+    partialAllocationArmed=false;
+    assert(caught && partialAllocations==2 && model.partial_q==0 && batchCounts(model)==clean);
+    // The first current store completed, but Publish never ran. A new reader
+    // edge must see it immediately; the consumed write edge must not replay.
+    model.partial_read_clock=true; model.eval();
+    assert(model.partial_q==9 && model.partial_tail==0);
+    const auto after=batchCounts(model);
+    assert(after[0]==clean[0]+1 && after[1]==clean[1]+1);
+    model.eval(); assert(batchCounts(model)==after && model.partial_q==9 && model.partial_tail==0);
+    model.partial_read_clock=false; model.eval(); model.partial_read_clock=true; model.eval();
+    assert(batchCounts(model)==after && model.partial_q==9);
+}
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "sink-activity-large-current-interrupted-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, support, body, false,
+                   {{"execution-counters", "on"}, {"mem-write-activate", "on-change"}});
+        const auto directory = artifact(label) / "model";
+        require(batchActivityStatistic(directory, "subscribed_large_current_states") == 1 &&
+                    batchActivityStatistic(directory, "large_current_write_mask_sites") == 2 &&
+                    batchActivityStatistic(directory, "small_current_publication_mask_sites") == 0,
+                "Interrupted current reader lacks both immediate store invalidations");
+        bindBatchActivityCounters(label, graph, sites);
+    }
+}
+
+void testSinkActivityWholeCurrentWrites() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto readClock = fixture.input("whole_read_clock"), writeClock = fixture.input("whole_write_clock");
+    const auto enable = fixture.input("whole_write_enable"), cancel = fixture.input("whole_cancel_enable");
+    const auto data = graph.createValue(graph.internSymbol("whole_write_data"), Fixture::type(1024, {128}));
+    graph.bindInputPort("whole_write_data", data);
+    const auto one = fixture.constant(1, "1'b1"), zero = fixture.constant(8, "8'd0");
+    const auto fill = fixture.constant(1024, "1024'h" + std::string(256, 'd'), {128});
+    const auto source = fixture.state("whole_source", 1024, {128}), target = fixture.state("whole_q", 8);
+    grh::setStateInitSpec(graph, source, {{grh::InitKind::Fill, "8'd3"}});
+    grh::setStateInitSpec(graph, target, {{grh::InitKind::Constant, "8'd17"}});
+    fixture.write(OperationKind::kRegisterWritePort, source, {enable, data, writeClock});
+    fixture.write(OperationKind::kRegisterWritePort, source, {cancel, fill, writeClock});
+    fixture.write(OperationKind::kRegisterWritePort, source, {cancel, data, writeClock});
+    const auto payload = fixture.read(source, {zero});
+    const auto writer = fixture.write(OperationKind::kRegisterWritePort, target, {one, payload, readClock});
+    graph.bindOutputPort("whole_q", fixture.read(target));
+    run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split(); fixture.partition();
+    const std::vector<std::pair<grh::OperationId, std::string>> sites{
+        {writer, "writer-sample"}, {graph.valueDef(payload), "operation"}};
+    const std::string body = R"CPP(
+model.init();
+const auto evaluate = [&](unsigned clocks,unsigned work,unsigned value) {
+    const auto before=batchCounts(model);
+    model.whole_read_clock=clocks&1; model.whole_write_clock=(clocks>>1)&1; model.eval();
+    const auto after=batchCounts(model);
+    assert(after[0]==before[0]+work && after[1]==before[1]+work && model.whole_q==value);
+    model.eval(); assert(batchCounts(model)==after && model.whole_q==value);
+};
+evaluate(0,0,17); evaluate(1,1,3); evaluate(0,0,3); evaluate(1,0,3);
+model.whole_write_enable=true; model.whole_write_data.fill(9);
+evaluate(0,0,3); evaluate(2,0,3);
+model.whole_write_enable=false; evaluate(0,0,3); evaluate(1,1,9);
+evaluate(0,0,9); evaluate(1,0,9);
+// A same-value whole store follows the original activation policy.
+model.whole_write_enable=true; evaluate(0,0,9); evaluate(2,0,9);
+model.whole_write_enable=false; evaluate(0,0,9); evaluate(1,WHOLE_ONWRITE,9);
+// Large current A/B/A stores conservatively invalidate even with no net change.
+model.whole_cancel_enable=true; evaluate(0,0,9); evaluate(2,0,9);
+model.whole_cancel_enable=false; evaluate(0,0,9); evaluate(1,1,9);
+evaluate(0,0,9); evaluate(1,0,9);
+)CPP";
+    for (const auto budget : {16, 1024}) for (const std::string policy : {"on-change", "on-write"}) {
+        const auto label = "sink-activity-whole-current-b" + std::to_string(budget) + "-" + policy;
+        const auto support = "#define WHOLE_ONWRITE " + std::string(policy == "on-write" ? "1\n" : "0\n") +
+            batchActivityCounterSupport(sites.size());
+        manualCase(fixture, label, budget, support, body, false,
+                   {{"execution-counters", "on"}, {"mem-write-activate", policy}});
+        const auto directory = artifact(label) / "model";
+        require(batchActivityStatistic(directory, "subscribed_large_current_states") == 1 &&
+                    batchActivityStatistic(directory, "large_current_write_mask_sites") == 3 &&
+                    batchActivityStatistic(directory, "small_current_publication_mask_sites") == 0,
+                "Whole-array current reader lacks an immediate store invalidation");
+        bindBatchActivityCounters(label, graph, sites);
+    }
+}
+
+void testSinkActivityBatchMasksAndFallback() {
+    Fixture fixture; auto& graph=fixture.graph;
+    std::vector<grh::ValueId> clocks;
+    std::vector<grh::OperationId> states;
+    for(unsigned i=0;i<34;++i) clocks.push_back(fixture.input("batch_clock_"+std::to_string(i)));
+    for(unsigned i=0;i<33;++i) {
+        const auto data=fixture.input("batch_data_"+std::to_string(i),8);
+        const auto payload=fixture.compute(OperationKind::kAdd,Fixture::type(8),{data,data});
+        const auto state=fixture.state("batch_q_"+std::to_string(i),8); states.push_back(state);
+        grh::setStateInitSpec(graph,state,{{grh::InitKind::Constant,"8'd"+std::to_string(i+17)}});
+        fixture.write(OperationKind::kRegisterWritePort,state,{fixture.constant(1,"1'b1"),payload,clocks[i]});
+        graph.bindOutputPort("batch_q_"+std::to_string(i),fixture.read(state));
+    }
+    const auto fallback=fixture.state("batch_fallback",1);
+    const auto fallbackWriter=fixture.write(OperationKind::kRegisterWritePort,fallback,
+        {fixture.constant(1,"1'b1"),fixture.input("batch_unused"),clocks.back()});
+    graph.bindOutputPort("batch_fallback",fixture.read(fallback));
+    run(fixture.design,"grh-to-grhsim",fixture.session);
+    graph.replaceOperand(fallbackWriter,2,graph.opOperands(fallbackWriter)[0]);
+    fixture.split(); fixture.partition();
+    const auto& schedule=sim::requireSinkSchedule(&fixture.session,graph);
+    require(schedule.generalRuns.size()==34,"Batch masks lost their distinct fire runs");
+    std::vector<grh::OperationId> writers;
+    std::vector<std::pair<grh::OperationId,std::string>> sites;
+    for(unsigned i=0;i<33;++i) {
+        const auto& run=schedule.generalRuns[i];
+        require(run.orderedWriters.size()==1 && sim::writerTarget(graph,run.orderedWriters.front())==states[i],
+                "Batch masks changed original run positions");
+        const auto writer=run.orderedWriters.front(); writers.push_back(writer);
+        const auto payload=graph.valueDef(graph.opOperands(writer)[2]);
+        require(graph.opKind(payload)==OperationKind::kAdd && owner(graph,payload)==run.partitionKey,
+                "Batch masks lost their private counted payload");
+        sites.emplace_back(writer,"writer-sample"); sites.emplace_back(payload,"operation");
+    }
+    sites.emplace_back(fallbackWriter,"writer-sample");
+    std::string support=batchActivityCounterSupport(sites.size());
+    support+="static void batchClocks(GrhSIM_top& instance,bool value) {\n";
+    std::string checks="static void batchOutputs(GrhSIM_top& instance,unsigned updated,unsigned value,bool initialized,bool fired) {\n";
+    for(unsigned i=0;i<34;++i) support+="instance.batch_clock_"+std::to_string(i)+"=value;\n";
+    for(unsigned i=0;i<33;++i) checks+="assert(instance.batch_q_"+std::to_string(i)+"==(initialized ? "+
+        std::to_string(i+17)+" : updated=="+std::to_string(i)+" ? value : 0));\n";
+    support+="}\n"+checks+"assert(instance.batch_fallback==fired);\n}\n";
+    const std::string body=R"CPP(
+model.init(); bool fired=false;
+const auto step = [&](bool clock,unsigned selected,unsigned work,unsigned value,bool initial=false) {
+    const auto before=batchCounts(model); batchClocks(model,clock); model.eval(); const auto after=batchCounts(model);
+    for(unsigned i=0;i<33;++i) {
+        const unsigned expected=clock && (selected==99 || selected==i);
+        assert(after[2*i]==before[2*i]+expected && after[2*i+1]==before[2*i+1]+expected);
+    }
+    assert(after[66]==before[66]+(clock ? 1 : 0)); fired|=clock;
+    batchOutputs(model,work,value,initial,fired); model.eval(); assert(batchCounts(model)==after);
+};
+step(false,98,98,0,true); step(true,99,98,0);
+step(false,98,98,0); step(true,98,98,0);
+// Only the final eligible bit is dirty. The first two batches share its word,
+// and their exact coarse masks must exclude it (checked in generated shape).
+model.batch_data_32=7; step(false,98,98,0); step(true,32,32,14);
+step(false,98,32,14); step(true,98,32,14);
+model.batch_data_32=0; model.batch_data_16=3;
+step(false,98,32,14); // Output remains old until the next legitimate edges.
+// Two dirty runs reside in different batches but the same activity word.
+const auto before=batchCounts(model); batchClocks(model,true); model.eval(); const auto after=batchCounts(model);
+for(unsigned i=0;i<33;++i) {
+    const unsigned expected=i==16 || i==32;
+    assert(after[2*i]==before[2*i]+expected && after[2*i+1]==before[2*i+1]+expected);
+}
+assert(after[66]==before[66]+1); batchOutputs(model,16,6,false,true);
+step(false,98,16,6); step(true,98,16,6);
+)CPP";
+    for(const auto budget : {16,1024}) {
+        const auto label="sink-activity-batch-masks-fallback-b"+std::to_string(budget);
+        manualCase(fixture,label,budget,support,body,false,{{"execution-counters","on"}});
+        const auto directory=artifact(label)/"model";
+        require(batchActivityStatistic(directory,"eligible_runs")==33 && batchActivityStatistic(directory,"rejected_runs")==1 &&
+                    batchActivityStatistic(directory,"bitmap_words")==1 && batchActivityStatistic(directory,"publication_change_sources")==0 &&
+                    batchActivityStatistic(directory,"writer_batches")==3 &&
+                    batchActivityStatistic(directory,"writer_batches_all_eligible")==2 &&
+                    batchActivityStatistic(directory,"writer_batches_with_activity_guard")==2 &&
+                    batchActivityStatistic(directory,"writer_batch_activity_mask_words")==2 &&
+                    batchActivityStatistic(directory,"writer_batch_activity_max_mask_words")==1,
+                "Batch masks silently lost eligible or fallback runs");
+        require(readFile(directory/"sink-activity-stats.json").find("\"fire-as-data\": {\"runs\": 1, \"writers\": 1}")!=std::string::npos,
+                "Mixed batch lost its actual fire-as-data fallback");
+        const auto a=batchActivityRoot(directory,writers[0]),b=batchActivityRoot(directory,writers[16]),c=batchActivityRoot(directory,writers[32]);
+        require(a!=b && a!=c && b!=c && batchActivityRoot(directory,writers[15])==a &&
+                    batchActivityRoot(directory,writers[31])==b && batchActivityRoot(directory,fallbackWriter)==c,
+                "Batch masks changed the original 16-fire splits or flushed around eligibility");
+        const auto first=batchActivityRootCpp(directory,a),second=batchActivityRootCpp(directory,b),mixed=batchActivityRootCpp(directory,c);
+        require(first.find("if ((sinkDirty[0] & UINT64_C(65535)))")!=std::string::npos &&
+                    second.find("if ((sinkDirty[0] & UINT64_C(4294901760)))")!=std::string::npos,
+                "Shared-word batches probed activity bits outside their exact run masks");
+        require(mixed.find("if ((sinkDirty[")==std::string::npos &&
+                    mixed.find("if (sinkDirty[0] & UINT64_C(4294967296))")!=std::string::npos,
+                "Mixed fallback batch gained a coarse activity gate or lost the eligible inner gate");
+        bindBatchActivityCounters(label,graph,sites);
+    }
+}
+
 void testSparsePhaseDispatch() {
     Fixture fixture;
     auto& graph = fixture.graph;
@@ -1645,6 +3573,12 @@ void testSparsePhaseDispatch() {
         std::string sources;
         for (const auto& entry : std::filesystem::directory_iterator(directory))
             if (entry.path().extension() == ".cpp") sources += readFile(entry.path());
+        const std::string clearByte = "dirtyStateFlags[0] = 0;";
+        const auto clearPosition = sources.find(clearByte);
+        require(sources.find("dirty_flags") != std::string::npos && clearPosition != std::string::npos &&
+                    sources.find(clearByte, clearPosition + clearByte.size()) == std::string::npos &&
+                    sources.find("dirtyStateFlags[0] &=") == std::string::npos,
+                "Sparse publish must snapshot its activity byte and clear it once before dispatch");
         const auto begin = sources.find("void GrhSIM_top::writer_run_batch0()\n{");
         require(begin != std::string::npos, "Sparse fixture has no writer batch entry");
         const auto end = sources.find("\n}\n", begin);
@@ -2905,8 +4839,23 @@ void testSharedPayloadEnableSets() {
         graph.setAttr(graph.valueDef(value), "test.sharedRole", role);
         return value;
     };
+    std::vector<std::pair<grh::OperationId, std::string>> sharedCones;
     for (const bool large : {false, true}) {
         const std::string prefix = large ? "large" : "small";
+        // Construct an actually shared DAG. Separate equivalent shaped roots
+        // are not merged by common-expr, and cannot use a union-demand oracle.
+        const auto root = tag(fixture.compute(OperationKind::kXor, Fixture::type(16, {2}),
+                                              {data, fixture.read(source)}), prefix + "/root");
+        const auto slice = [&](unsigned offset, const std::string& role) {
+            const auto value = tag(fixture.compute(OperationKind::kSliceStatic, Fixture::type(12), {root}), prefix + '/' + role);
+            graph.setAttr(graph.valueDef(value), "sliceStart", int64_t{offset});
+            graph.setAttr(graph.valueDef(value), "sliceEnd", int64_t{offset + 11});
+            return value;
+        };
+        const auto ab = slice(0, "ab"), bc = slice(4, "bc");
+        for (const auto value : {root, ab, bc})
+            sharedCones.emplace_back(graph.valueDef(value), large ? "large-sink" : "small-sink");
+        std::array<grh::ValueId,3> payloads;
         for (unsigned writer = 0; writer < 4; ++writer) {
             const auto width = writer == 3 ? 8 : 12;
             const auto state = fixture.state("sets_" + prefix + std::to_string(writer), large ? width * 8 : width,
@@ -2916,20 +4865,13 @@ void testSharedPayloadEnableSets() {
                                     prefix + "/enable" + std::to_string(writer));
             grh::ValueId payload;
             if (writer < 3) {
-                const auto root = tag(fixture.compute(OperationKind::kXor, Fixture::type(16, {2}),
-                                                      {data, fixture.read(source)}), prefix + "/root");
-                const auto slice = [&](unsigned offset, const std::string& role) {
-                    const auto value = tag(fixture.compute(OperationKind::kSliceStatic, Fixture::type(12), {root}), prefix + '/' + role);
-                    graph.setAttr(graph.valueDef(value), "sliceStart", int64_t{offset});
-                    graph.setAttr(graph.valueDef(value), "sliceEnd", int64_t{offset + 11});
-                    return value;
-                };
                 if (writer == 0) payload = tag(fixture.compute(OperationKind::kXor, Fixture::type(12),
-                                                               {slice(0, "ab"), maskA}), prefix + "/a");
+                                                               {ab, maskA}), prefix + "/a");
                 else if (writer == 1) payload = tag(fixture.compute(OperationKind::kXor, Fixture::type(12),
-                                                                    {slice(0, "ab"), slice(4, "bc")}), prefix + "/b");
+                                                                    {ab, bc}), prefix + "/b");
                 else payload = tag(fixture.compute(OperationKind::kXor, Fixture::type(12),
-                                                    {slice(4, "bc"), maskC}), prefix + "/c");
+                                                    {bc, maskC}), prefix + "/c");
+                payloads[writer] = payload;
             } else {
                 payload = tag(fixture.compute(OperationKind::kAdd, Fixture::type(8), {observedData, seven}), prefix + "/observed");
                 graph.setValueSymbol(payload, graph.internSymbol("sets_" + prefix + "_observed"));
@@ -2939,6 +4881,12 @@ void testSharedPayloadEnableSets() {
                           state, {enable, payload, clockA});
             graph.bindOutputPort("sets_" + prefix + std::to_string(writer), fixture.read(state));
         }
+        require(graph.opOperands(graph.valueDef(ab))[0]==root && graph.opOperands(graph.valueDef(bc))[0]==root &&
+                    graph.opOperands(graph.valueDef(payloads[0]))[0]==ab &&
+                    graph.opOperands(graph.valueDef(payloads[1]))[0]==ab &&
+                    graph.opOperands(graph.valueDef(payloads[1]))[1]==bc &&
+                    graph.opOperands(graph.valueDef(payloads[2]))[0]==bc,
+                "Shared enable-set fixture must share producers across A, B and C");
     }
     const auto priority = fixture.state("sets_priority", 12);
     fixture.write(OperationKind::kRegisterWritePort, priority, {priorityA, priorityData, clockB});
@@ -2948,6 +4896,10 @@ void testSharedPayloadEnableSets() {
     run(fixture.design, "grh-to-grhsim", fixture.session);
     run(fixture.design, "grhsim-split-event-and-output", fixture.session);
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=8"});
+    // The generic split keeps multi-writer sharing in nonsink. Exercise the
+    // emitter's legal sink-local shared DAG explicitly, before scheduling.
+    for (const auto& [op, category] : sharedCones)
+        graph.setAttr(op, sim::kPartition, Owner{"general", category});
     run(fixture.design, "grhsim-partition-nonsink", fixture.session);
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
     std::map<std::string, std::string> siteNames;
@@ -3727,7 +5679,7 @@ void testIndexedMemoryWake() {
                 "Indexed wake fixture read is not an executable nonsink");
         readers.insert(path);
     }
-    require(readers.size()==3, "Indexed wake fixture merged independent read subscriptions");
+    require(readers.size()==3, "Indexed wake fixture merged independent read owners");
     const std::string body = R"CPP(
 for (unsigned epoch=0; epoch<3; ++epoch) {
     model.init(); std::array<unsigned,96> expected{};
@@ -3750,34 +5702,32 @@ for (unsigned epoch=0; epoch<3; ++epoch) {
         model.iw_enable=flags&1; model.iw_middle=(flags>>1)&1; model.iw_last=(flags>>2)&1;
         model.iw_row_write=(flags>>3)&1; model.iw_whole=(flags>>4)&1;
         model.iw_middle_data=value^0xff; model.iw_last_data=value; model.eval(); check();
-        const auto before=indexedWakeCounts(model); const auto old=expected; std::array<bool,96> touched{};
+        const auto before=indexedWakeCounts(model); const auto old=expected;
+        const bool wrote=((flags&7) && r<8 && c<12) || ((flags&8) && r<8) || (flags&16);
         if(r<8 && c<12) {
             const unsigned i=r*12+c;
-            if(flags&1) { expected[i]=(expected[i]&(~bits&255))|(value&bits); touched[i]=true; }
-            if(flags&2) { expected[i]=value^0xff; touched[i]=true; }
-            if(flags&4) { expected[i]=(expected[i]&(~bits&255))|(value&bits); touched[i]=true; }
+            if(flags&1) expected[i]=(expected[i]&(~bits&255))|(value&bits);
+            if(flags&2) expected[i]=value^0xff;
+            if(flags&4) expected[i]=(expected[i]&(~bits&255))|(value&bits);
         }
-        if((flags&8) && r<8) for(unsigned i=0;i<12;++i) { expected[r*12+i]=i+71; touched[r*12+i]=true; }
-        if(flags&16) for(unsigned i=0;i<96;++i) { expected[i]=i+17; touched[i]=true; }
+        if((flags&8) && r<8) for(unsigned i=0;i<12;++i) expected[r*12+i]=i+71;
+        if(flags&16) for(unsigned i=0;i<96;++i) expected[i]=i+17;
         model.iw_clock=1; model.eval(); check(); const auto after=indexedWakeCounts(model);
-        std::array<bool,3> hit{};
-        if(model.iw_a_row<8 && model.iw_a_col<12) hit[0]=touched[static_cast<unsigned>(model.iw_a_row)*12+model.iw_a_col];
-        const auto br=static_cast<unsigned>(static_cast<std::uint8_t>(model.iw_b_row));
-        if(br<8 && model.iw_b_col<12) hit[1]=touched[br*12+model.iw_b_col];
-        if(model.iw_read_row<8) for(unsigned i=0;i<12;++i) hit[2]=hit[2]||touched[model.iw_read_row*12+i];
-        for(unsigned i=0;i<3;++i) assert(after[i]-before[i]==(indexedWakeOnWrite?hit[i]:(old!=expected)));
+        // Every valid on-write commit activates all readers, including a read
+        // of an unrelated or currently invalid address, as in gsim.
+        for(unsigned i=0;i<3;++i) assert(after[i]-before[i]==(indexedWakeOnWrite?wrote:(old!=expected)));
         const auto settled=after; model.eval(); assert(indexedWakeCounts(model)==settled); check();
     };
-    pulse(6,3,19,255,1); // All three subscriptions are unrelated.
+    pulse(6,3,19,255,1); // All three readers use unrelated addresses.
     pulse(1,1,0,255,1); pulse(1,1,9,0,1); // Same value and zero mask still touch.
     pulse(1,1,7,255,1); pulse(1,1,7,255,7); // A/B/A cancellation.
     pulse(2,2,9,255,1); pulse(5,2,13,255,1);
-    pulse(5,3,21,255,1); pulse(5,4,22,255,1); // Row 5 spans touched bits 60..71, including both words.
+    pulse(5,3,21,255,1); pulse(5,4,22,255,1); // Partial row crosses leaf 63/64.
     pulse(15,1,99,255,1); pulse(1,15,99,255,1);
     pulse(5,0,0,255,8); pulse(0,0,0,255,16); // Partial-row and whole writes.
     model.iw_clock=0; model.iw_a_row=(static_cast<unsigned _BitInt(128)>(1)<<80)|1;
     model.iw_b_row=-1; model.iw_read_row=8; model.eval(); check();
-    pulse(1,1,201,255,1); // Invalid reads cannot retain a valid subscription.
+    pulse(1,1,201,255,1); // Invalid readers still execute after a valid write.
     model.iw_clock=0; model.iw_a_row=1; model.iw_b_row=2; model.iw_read_row=5; model.eval(); check();
     pulse(1,1,202,255,1); pulse(5,3,91,255,1);
     const auto before=indexedWakeCounts(model); model.iw_extra=33; model.eval(); check();
@@ -3791,6 +5741,12 @@ for (unsigned epoch=0; epoch<3; ++epoch) {
             const auto label="indexed-wake-"+mode+"-"+bitmap+"-b"+std::to_string(budget);
             manualCase(fixture,label,budget,"static constexpr bool indexedWakeOnWrite="+std::string(mode=="on-write"?"true;\n":"false;\n")+indexedWakeSupport,
                        body,false,{{"execution-counters","on"},{"mem-enable-bitmap",bitmap},{"mem-write-activate",mode}});
+            const auto header=readFile(artifact(label)/"model/grhsim_top.hpp");
+            for (const auto removed : {"largeBeforeStore", "memoryReadIndexStore", "memoryTouchedStore", "memory_read_touched", "memory_touch_range"})
+                require(header.find(removed)==std::string::npos,"On-write reader activation retained obsolete bookkeeping");
+            const auto mapState=mappedOperation(artifact(label)/"model",memory);
+            require((header.find("std::map<std::size_t,std::uint8_t> "+mapState+";")!=std::string::npos)==(mode=="on-change"),
+                    "Large before-images must be limited to on-change states");
             indexedWakeSites(label,{"indexed_wake_read_a","indexed_wake_read_b","indexed_wake_read_row","indexed_wake_extra_fanout"});
         }
 }
@@ -3882,9 +5838,8 @@ void testIndexedMemoryWakeTemporal() {
             const auto label="indexed-wake-temporal-"+mode+"-"+bitmap+"-b"+std::to_string(budget);
             writeCase(fixture,reference,inputs,label,budget,4096,
                 {{"execution-counters","on"},{"mem-enable-bitmap",bitmap},{"mem-write-activate",mode}});
-            require(mode!="on-write" || readFile(artifact(label)/"model/grhsim_top.hpp").find(
-                        " "+mappedOperation(artifact(label)/"model",graph.valueDef(selective))+"_last_read_leaf;")!=std::string::npos,
-                    "Indexed wake fallback fixture omitted its selective subscription plan");
+            require(readFile(artifact(label)/"model/grhsim_top.hpp").find("_last_read_leaf")==std::string::npos,
+                    "Indexed temporal fixture retained read subscription storage");
             const auto path=artifact(label)/"driver.cpp";
             auto driver=readFile(path);
             const std::string marker="const auto iwBefore=indexedWakeCounts(model);\n";
@@ -4007,6 +5962,7 @@ void testGroupedNonsinkPublications() {
     }
     const auto singleton = binary(OperationKind::kXor, 8, headLow, constant(8, 90, "source"), "source");
     const auto payload = binary(OperationKind::kAdd, 8, headLow, constant(8, 7, "source"), "source");
+    const auto emptyPayload = binary(OperationKind::kAdd, 8, headLow, constant(8, 19, "source"), "source");
 
     // These owners each have two matching scalar publications, but one also
     // handles String and the other External. They must retain ordinary
@@ -4048,6 +6004,14 @@ void testGroupedNonsinkPublications() {
         fixture.write(OperationKind::kRegisterWritePort, state, {enabled, payload, clock});
         graph.bindOutputPort("group_small" + std::to_string(copy), fixture.read(state));
     }
+    // Two large consumers keep this value in nonsink, with neither ordinary
+    // nonsink fanout nor small-sink activity subscribers.
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        const auto name = "group_large" + std::to_string(copy);
+        const auto state = fixture.state(name,8192,{1024});
+        fixture.write(OperationKind::kRegisterFillPort,state,{one,emptyPayload,clock});
+        graph.bindOutputPort(name,fixture.read(state,{fixture.constant(10,"0")}));
+    }
     run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split();
     run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-clone-shared=0"});
     // Fix only the activity partition, after the ordinary extraction has
@@ -4076,8 +6040,13 @@ void testGroupedNonsinkPublications() {
     for (const auto& values : {firstGroup, secondGroup}) for (const auto value : values)
         require(fanout(value) == (values.size() == firstGroup.size() ? fanoutA : fanoutB),
                 "Grouped-publication fixture split a complete fanout group");
-    require(fanout(payload).empty() && fanout(singleton).size() == 1,
+    require(fanout(payload).empty() && fanout(emptyPayload).empty() && fanout(singleton).size() == 1,
             "Grouped-publication fixture lost empty or singleton fanout");
+    require(graph.valueUsers(emptyPayload).size() == 2,
+            "Grouped-publication empty payload lost its two large consumers");
+    for (const auto& use : graph.valueUsers(emptyPayload))
+        require(sim::isWriter(graph.opKind(use.operation)) && owner(graph,use.operation)[1] == "large-sink",
+                "Grouped-publication empty payload acquired a sink activity subscriber");
     const std::string support = R"CPP(
 extern "C" std::uint8_t group_publication_effect(std::uint8_t input, const char* text) {
     assert(std::string(text) == "publication"); return input + 11;
@@ -4103,7 +6072,7 @@ const std::array<std::array<unsigned,4>,14> steps{{
     {1543,1549,1537,1537}, {1543,1549,1537,1538}, {1799,1805,1793,1794}
 }};
 for (unsigned epoch=0;epoch<3;++epoch) {
-    model.init(); bool initialized=false; std::array<unsigned,4> previous{}; unsigned small=0;
+    model.init(); bool initialized=false; std::array<unsigned,4> previous{}; unsigned small=0,large=0;
     for (const auto& step : steps) {
         model.group_clock=false; model.group_head=step[0]; model.group_middle=step[1];
         model.group_tail=step[2]; model.group_other=step[3];
@@ -4119,11 +6088,14 @@ for (unsigned epoch=0;epoch<3;++epoch) {
         assert(after[0]==before[0]+changedA && after[1]==before[1]+changedB);
         assert(model.group_sum_a==a && model.group_sum_b==b && model.group_sum_c==c);
         assert(model.group_small0==small && model.group_small1==small);
+        assert(model.group_large0==large && model.group_large1==large);
         // A clean call following a dirty call must not reuse the old flag.
         model.eval(); assert(groupPublicationCounts(model)==after);
         model.group_clock=true; model.eval();
         if (low[3]&1) small=(low[0]+7)&255;
+        large=(low[0]+19)&255;
         assert(model.group_small0==small && model.group_small1==small);
+        assert(model.group_large0==large && model.group_large1==large);
         assert(model.group_sum_a0==a && model.group_sum_a1==a);
         assert(model.group_sum_b0==b && model.group_sum_b1==b);
         assert(model.group_sum_c0==c && model.group_sum_c1==c);
@@ -4169,8 +6141,14 @@ for (unsigned epoch=0;epoch<3;++epoch) {
                  {enabled,"smallSinkEnableBoundaryStore"}, {singleton,"nonSinkBoundaryStore"}})
             require(source.find("if ("+store+"."+mappedValue(directory,value)+" != ")!=std::string::npos,
                     "Packed enable or singleton publication lost its ordinary change guard");
-        require(source.find("if (smallSinkPayloadBoundaryStore."+mappedValue(directory,payload)+" != ")==std::string::npos,
-                "Empty-fanout publication retained a redundant comparison");
+        const auto payloadGuard = source.find("if (smallSinkPayloadBoundaryStore."+mappedValue(directory,payload)+" != ");
+        require(payloadGuard!=std::string::npos &&
+                    source.substr(payloadGuard,source.find('}',payloadGuard)-payloadGuard).find("sinkDirty[")!=std::string::npos,
+                "Empty ordinary fanout lost the comparison required by its sink subscribers");
+        const auto emptyBoundary = "nonSinkBoundaryStore."+mappedValue(directory,emptyPayload);
+        require(source.find(emptyBoundary+" = ")!=std::string::npos &&
+                    source.find("if ("+emptyBoundary+" != ")==std::string::npos,
+                "Publication without ordinary or sink subscribers retained a redundant comparison");
         for (const auto op : {call, graph.valueDef(text)}) {
             const auto root = location(op).second;
             for (const auto& function : functions) {
@@ -4198,6 +6176,187 @@ for (unsigned epoch=0;epoch<3;++epoch) {
         driver.replace(begin,placeholder.size(),"static const std::array<unsigned,2> groupPublicationSites{"+
             std::to_string(ordinals.at("group_consumer_a"))+","+std::to_string(ordinals.at("group_consumer_b"))+"};");
         std::ofstream(path)<<driver;
+    }
+}
+
+void testCompletePublicationKeys() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    std::vector<std::pair<grh::OperationId,std::string>> placements;
+    const auto place = [&](grh::ValueId value, const std::string& key) {
+        placements.emplace_back(graph.valueDef(value),key); return value;
+    };
+    const auto constant = [&](unsigned value) {
+        return place(fixture.constant(8,"8'd"+std::to_string(value)),"source");
+    };
+    std::array<std::array<grh::ValueId,2>,3> pairs;
+    for (unsigned group=0;group<3;++group) {
+        const auto input=fixture.input("complete_data_"+std::to_string(group),8);
+        for (unsigned i=0;i<2;++i)
+            pairs[group][i]=place(fixture.compute(OperationKind::kAdd,Fixture::type(8),
+                {input,constant(4*group+2*i+1)}),"source");
+    }
+    const auto addConsumer = [&](grh::ValueId a,grh::ValueId b) {
+        return place(fixture.compute(OperationKind::kAdd,Fixture::type(16),{a,b}),"consumer");
+    };
+    const auto consumer=addConsumer(addConsumer(pairs[0][0],pairs[0][1]),
+                                    addConsumer(pairs[1][0],pairs[1][1]));
+    graph.bindOutputPort("complete_sum",consumer);
+    std::vector<grh::OperationId> writers;
+    const auto writePair = [&](unsigned group,unsigned clock) {
+        const auto data=fixture.compute(OperationKind::kAdd,Fixture::type(8),{pairs[group][0],pairs[group][1]});
+        const auto name="complete_q_"+std::to_string(writers.size());
+        const auto state=fixture.state(name,8);
+        const auto writer=fixture.write(OperationKind::kRegisterWritePort,state,
+            {fixture.constant(1,"1'b1"),data,fixture.input("complete_clock_"+std::to_string(clock))});
+        graph.bindOutputPort(name,fixture.read(state)); writers.push_back(writer);
+    };
+    writePair(0,0); writePair(1,1); writePair(2,2); writePair(2,3);
+    const auto observedClock=fixture.input("complete_clock_4");
+    for (unsigned i=0;i<2;++i) {
+        const auto state=fixture.state("complete_observed_"+std::to_string(i),16);
+        fixture.write(OperationKind::kRegisterWritePort,state,{fixture.constant(1,"1'b1"),consumer,observedClock});
+        graph.bindOutputPort("complete_observed_"+std::to_string(i),fixture.read(state));
+    }
+    run(fixture.design,"grh-to-grhsim",fixture.session); fixture.split();
+    run(fixture.design,"grhsim-partition-nonsink",fixture.session,{"-clone-shared=0"});
+    for (const auto& [op,key] : placements) {
+        const auto path=owner(graph,op);
+        require(path.size()==4 && path[0]=="general" && path[1]=="nonsink",
+                "Complete-key fixture lost its original nonsink publication");
+        graph.setAttr(op,sim::kPartition,Owner{"general","nonsink","complete_"+key,"node_"+key});
+    }
+    run(fixture.design,"grhsim-partition-sink",fixture.session,{"-enable-guard-min-size=0"});
+    const auto& schedule=sim::requireSinkSchedule(&fixture.session,graph);
+    require(schedule.generalRuns.size()==5,"Complete-key fixture lost its five exact clock runs");
+    const auto nonsinkFanout = [&](grh::ValueId value) {
+        std::set<Owner> result;
+        auto source=owner(graph,graph.valueDef(value)); source.resize(3);
+        for (const auto& use : graph.valueUsers(value)) {
+            auto target=owner(graph,use.operation);
+            if (target.size()!=4 || target[1]!="nonsink") continue;
+            target.resize(3); if (target!=source) result.insert(std::move(target));
+        }
+        return result;
+    };
+    const auto ordinary=nonsinkFanout(pairs[0][0]);
+    require(ordinary.size()==1 && nonsinkFanout(pairs[0][1])==ordinary &&
+                nonsinkFanout(pairs[1][0])==ordinary && nonsinkFanout(pairs[1][1])==ordinary &&
+                nonsinkFanout(pairs[2][0]).empty() && nonsinkFanout(pairs[2][1]).empty(),
+            "Complete-key fixture lost equal NS fanouts or empty-NS sink publications");
+    std::array<std::uint64_t,3> sinkMasks{};
+    std::vector<std::pair<grh::OperationId,std::string>> sites;
+    for (unsigned i=0;i<writers.size();++i) {
+        std::optional<std::size_t> runOrdinal;
+        for (std::size_t run=0;run<schedule.generalRuns.size();++run)
+            if (std::find(schedule.generalRuns[run].orderedWriters.begin(),schedule.generalRuns[run].orderedWriters.end(),writers[i])!=
+                schedule.generalRuns[run].orderedWriters.end()) runOrdinal=run;
+        require(runOrdinal.has_value(),"Complete-key writer lost its exact run");
+        sinkMasks[i<2 ? i : 2] |= std::uint64_t{1} << *runOrdinal;
+        const auto payload=graph.valueDef(graph.opOperands(writers[i])[2]);
+        require(graph.opKind(payload)==OperationKind::kAdd && owner(graph,payload)==schedule.generalRuns[*runOrdinal].partitionKey,
+                "Complete-key fixture lost its private counted payload");
+        sites.emplace_back(writers[i],"writer-sample"); sites.emplace_back(payload,"operation");
+    }
+    require(sinkMasks[0]!=sinkMasks[1] && (sinkMasks[0]&sinkMasks[1])==0 &&
+                (sinkMasks[2]&(sinkMasks[0]|sinkMasks[1]))==0,
+            "Equal NS fanouts no longer have distinct sink destinations");
+    sites.emplace_back(graph.valueDef(consumer),"operation");
+    const std::string body=R"CPP(
+for(unsigned epoch=0;epoch<2;++epoch) {
+    model.init(); bool initialized=false; std::array<unsigned,3> previous{};
+    std::array<unsigned,4> held{};
+    for(const auto data : std::array<std::array<unsigned,3>,6>{{{0,0,0},{0,0,0},{1,0,0},{1,2,0},{1,2,3},{4,5,3}}}) {
+        model.complete_clock_0=false; model.complete_clock_1=false; model.complete_clock_2=false;
+        model.complete_clock_3=false; model.complete_clock_4=false;
+        model.complete_data_0=data[0]; model.complete_data_1=data[1]; model.complete_data_2=data[2];
+        const auto before=batchCounts(model); model.eval(); const auto low=batchCounts(model);
+        const bool changedA=!initialized || data[0]!=previous[0];
+        const bool changedB=!initialized || data[1]!=previous[1];
+        const bool changedC=!initialized || data[2]!=previous[2];
+        for(unsigned i=0;i<8;++i) assert(low[i]==before[i]);
+        assert(low[8]==before[8]+(changedA||changedB));
+        assert(model.complete_sum==2*data[0]+2*data[1]+16);
+        assert(model.complete_q_0==held[0] && model.complete_q_1==held[1]);
+        assert(model.complete_q_2==held[2] && model.complete_q_3==held[3]);
+        model.eval(); assert(batchCounts(model)==low);
+        model.complete_clock_0=true; model.complete_clock_1=true; model.complete_clock_2=true;
+        model.complete_clock_3=true; model.complete_clock_4=true; model.eval();
+        const auto high=batchCounts(model);
+        for(unsigned i=0;i<4;++i) {
+            const bool changed=i==0 ? changedA : i==1 ? changedB : changedC;
+            assert(high[2*i]==low[2*i]+changed && high[2*i+1]==low[2*i+1]+changed);
+        }
+        assert(high[8]==low[8]);
+        held={2*data[0]+4,2*data[1]+12,2*data[2]+20,2*data[2]+20};
+        assert(model.complete_q_0==held[0] && model.complete_q_1==held[1]);
+        assert(model.complete_q_2==held[2] && model.complete_q_3==held[3]);
+        assert(model.complete_observed_0==model.complete_sum && model.complete_observed_1==model.complete_sum);
+        model.eval(); assert(batchCounts(model)==high); initialized=true; previous=data;
+    }
+}
+)CPP";
+    for (const auto budget : {16,1024}) {
+        const auto label="complete-publication-keys-b"+std::to_string(budget);
+        manualCase(fixture,label,budget,batchActivityCounterSupport(sites.size()),body,false,{{"execution-counters","on"}});
+        const auto directory=artifact(label)/"model";
+        require(batchActivityStatistic(directory,"eligible_runs")==5 && batchActivityStatistic(directory,"rejected_runs")==0 &&
+                    batchActivityStatistic(directory,"publication_aggregation_groups")==3 &&
+                    batchActivityStatistic(directory,"publication_aggregation_sites")==6 &&
+                    batchActivityStatistic(directory,"publication_aggregation_sink_groups")==3 &&
+                    batchActivityStatistic(directory,"publication_aggregation_sink_sites")==6 &&
+                    batchActivityStatistic(directory,"publication_change_mask_sites_before_grouping")==7 &&
+                    batchActivityStatistic(directory,"publication_change_mask_sites")==4,
+                "Complete-key aggregation lost exact groups, sites or single-flush mask savings");
+        const auto sourceRoot=batchActivityRoot(directory,graph.valueDef(pairs[0][0]));
+        const auto cpp=batchActivityRootCpp(directory,sourceRoot);
+        const auto map=readFile(directory/"code-map.json");
+        const auto primary = [&](grh::ValueId value) {
+            const auto prefix="{\"value_id\":\"v"+std::to_string(value.index)+"\",";
+            for (const auto& record : mappedRecords(map,"values")) if (record.starts_with(prefix))
+                for (const auto& storage : mappedRecords(record,"storage")) {
+                    std::smatch match;
+                    if (storage.find("\"role\":\"primary\"")!=std::string::npos &&
+                        std::regex_search(storage,match,std::regex(R"REGEX("reference":"([^"]+)")REGEX"))) return match[1].str();
+                }
+            throw std::runtime_error("Complete-key source lost its primary snapshot");
+        };
+        const auto flagFor = [&](grh::ValueId value) {
+            require(batchActivityRoot(directory,graph.valueDef(value))==sourceRoot,
+                    "Complete-key source publications no longer share one owner");
+            const auto term=" |= "+primary(value)+" != ";
+            const auto position=cpp.find(term);
+            require(position!=std::string::npos && cpp.find(term,position+term.size())==std::string::npos,
+                    "Complete-key publication lacks exactly one original-position comparison");
+            auto begin=cpp.rfind('\n',position); begin=begin==std::string::npos ? 0 : begin+1;
+            while (begin<position && (cpp[begin]==' ' || cpp[begin]=='\t')) ++begin;
+            return cpp.substr(begin,position-begin);
+        };
+        std::array<std::string,3> flags;
+        for (unsigned group=0;group<3;++group) {
+            flags[group]=flagFor(pairs[group][0]);
+            require(!flags[group].empty() && flags[group]==flagFor(pairs[group][1]),
+                    "Equal complete destinations did not share one dirty flag");
+        }
+        require(flags[0]!=flags[1] && flags[0]!=flags[2] && flags[1]!=flags[2],
+                "Different sink destinations were merged by their equal NS fanout");
+        const auto consumerRoot=batchActivityRoot(directory,graph.valueDef(consumer));
+        require(consumerRoot.starts_with("sn_"),"Complete-key consumer lost its nonsink activity bit");
+        const auto ordinal=std::stoul(consumerRoot.substr(3));
+        const auto activation="activeCurrent["+std::to_string(ordinal/8)+"] |= UINT8_C("+
+            std::to_string(std::uint32_t{1}<<(ordinal%8))+");";
+        for (unsigned group=0;group<3;++group) {
+            const auto guard="if ("+flags[group]+")";
+            const auto begin=cpp.find(guard);
+            const auto end=begin==std::string::npos ? begin : cpp.find('}',begin);
+            require(begin!=std::string::npos && end!=std::string::npos && cpp.find(guard,begin+guard.size())==std::string::npos,
+                    "Complete-key group did not have exactly one activation flush");
+            const auto flush=cpp.substr(begin,end-begin);
+            require(flush.find("sinkDirty[0] |= UINT64_C("+std::to_string(sinkMasks[group])+");")!=std::string::npos &&
+                        (group==2 ? flush.find("activeCurrent[")==std::string::npos : flush.find(activation)!=std::string::npos),
+                    "Complete-key flush lost its exact NS/sink destination set");
+        }
+        bindBatchActivityCounters(label,graph,sites);
     }
 }
 
@@ -5046,6 +7205,250 @@ for(unsigned epoch=0; epoch<3; ++epoch) {
     }
 }
 
+void testPrivateScalarMuxFusion() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clock = fixture.input("fuse_clock"), enable = fixture.input("fuse_enable");
+    const auto c0 = fixture.input("fuse_c0"), c1 = fixture.input("fuse_c1"), c2 = fixture.input("fuse_c2");
+    const auto a = fixture.input("fuse_a",8), b = fixture.input("fuse_b",8);
+    const auto wideA = fixture.input("fuse_wide_a",16), wideB = fixture.input("fuse_wide_b",16);
+    auto signed3 = Fixture::type(3); signed3.isSigned = true;
+    auto signed7 = Fixture::type(7); signed7.isSigned = true;
+    const auto narrow = graph.createValue(graph.internSymbol("fuse_signed3"),signed3);
+    graph.bindInputPort("fuse_signed3",narrow);
+    std::array<grh::ValueId,4> chain;
+    chain[0] = fixture.compute(OperationKind::kMux,signed3,{c0,narrow,a});
+    chain[1] = fixture.compute(OperationKind::kMux,signed7,{c1,chain[0],b});
+    chain[2] = fixture.compute(OperationKind::kMux,Fixture::type(16),{c2,chain[1],wideA});
+    chain[3] = fixture.compute(OperationKind::kMux,Fixture::type(16),{c0,chain[2],wideB});
+    const auto saved = fixture.state("fuse_saved",16);
+    const auto writer = fixture.write(OperationKind::kRegisterWritePort,saved,{enable,chain[3],clock});
+    graph.bindOutputPort("fuse_saved",fixture.read(saved));
+    // A real multi-use DAG stays materialized even when both consumers are
+    // private muxes in this same demand region.
+    const auto shared = fixture.compute(OperationKind::kMux,Fixture::type(8),{c0,a,b});
+    const auto left = fixture.compute(OperationKind::kMux,Fixture::type(8),{c1,shared,b});
+    const auto right = fixture.compute(OperationKind::kMux,Fixture::type(8),{c2,shared,a});
+    const auto sum = fixture.compute(OperationKind::kAdd,Fixture::type(8),{left,right});
+    const auto other = fixture.state("fuse_multi",8);
+    const auto otherWriter = fixture.write(OperationKind::kRegisterWritePort,other,{enable,sum,clock});
+    graph.bindOutputPort("fuse_multi",fixture.read(other));
+    run(fixture.design,"grh-to-grhsim",fixture.session); fixture.split(); fixture.partition();
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session,graph);
+    require(schedule.generalRuns.size()==1 && schedule.generalRuns[0].orderedWriters.size()==2,
+            "Scalar mux fixture lost its exact shared-enable writer run");
+    std::vector<std::pair<grh::OperationId,std::string>> sites;
+    for (const auto value : chain) {
+        require(graph.opKind(graph.valueDef(value))==OperationKind::kMux &&
+                    owner(graph,graph.valueDef(value))==schedule.generalRuns[0].partitionKey,
+                "Scalar mux fixture lost its private mux chain");
+        sites.emplace_back(graph.valueDef(value),"operation");
+    }
+    for (const auto value : {shared,left,right,sum}) sites.emplace_back(graph.valueDef(value),"operation");
+    sites.emplace_back(writer,"writer-sample"); sites.emplace_back(otherWriter,"writer-sample");
+    require(graph.valueUsers(shared).size()==2,"Scalar mux multi-use negative lost an operand occurrence");
+    const std::string body = R"CPP(
+for (unsigned epoch=0;epoch<2;++epoch) {
+    model.init(); unsigned held=0, heldMulti=0;
+#if FUSION_COUNTERS
+    std::array<unsigned long long,10> expected{};
+#endif
+    for (unsigned selectors=0;selectors<8;++selectors) for (unsigned pattern=0;pattern<8;++pattern) {
+        model.fuse_clock=false; model.fuse_enable=(selectors+pattern)%3!=0;
+        model.fuse_c0=selectors&1; model.fuse_c1=selectors&2; model.fuse_c2=selectors&4;
+        model.fuse_a=(pattern*37+selectors)&255; model.fuse_b=(pattern*53+91)&255;
+        model.fuse_wide_a=(pattern*11113+selectors*313)&65535;
+        model.fuse_wide_b=(pattern*7531+0xa55a)&65535;
+        model.fuse_signed3=static_cast<std::int8_t>(pattern);
+#if FUSION_COUNTERS
+        const auto before=batchCounts(model); assert(before==expected);
+#endif
+        model.eval(); assert(model.fuse_saved==held && model.fuse_multi==heldMulti);
+#if FUSION_COUNTERS
+        assert(batchCounts(model)==before);
+#endif
+        if (model.fuse_enable) {
+            const auto first=model.fuse_c0 ? fusionBits(unsigned(model.fuse_signed3),3,false,3)
+                                           : fusionBits(model.fuse_a,8,false,3);
+            const auto second=model.fuse_c1 ? fusionBits(first,3,true,7) : fusionBits(model.fuse_b,8,false,7);
+            const auto third=model.fuse_c2 ? fusionBits(second,7,true,16) : model.fuse_wide_a;
+            held=model.fuse_c0 ? third : model.fuse_wide_b;
+            const auto shared=model.fuse_c0 ? model.fuse_a : model.fuse_b;
+            heldMulti=((model.fuse_c1 ? shared : model.fuse_b)+(model.fuse_c2 ? shared : model.fuse_a))&255;
+#if FUSION_COUNTERS
+            for (auto& count : expected) ++count;
+#endif
+        }
+        model.fuse_clock=true; model.eval();
+        assert(model.fuse_saved==held && model.fuse_multi==heldMulti);
+#if FUSION_COUNTERS
+        assert(batchCounts(model)==expected);
+#endif
+        model.eval(); assert(model.fuse_saved==held && model.fuse_multi==heldMulti);
+#if FUSION_COUNTERS
+        assert(batchCounts(model)==expected);
+#endif
+    }
+}
+)CPP";
+    const std::string commonSupport = R"CPP(
+static unsigned fusionBits(unsigned value,unsigned sourceWidth,bool sign,unsigned resultWidth) {
+    const auto mask=(1u<<sourceWidth)-1; value&=mask;
+    if (sign && sourceWidth<resultWidth && ((value>>(sourceWidth-1))&1)) value|=~mask;
+    return value&((1u<<resultWidth)-1);
+}
+)CPP";
+    for (const auto budget : {16,1024}) for (const bool counters : {false,true}) {
+        const auto label="private-scalar-mux-fusion-"+std::string(counters ? "counters" : "plain")+"-b"+std::to_string(budget);
+        const auto support=std::string("#define FUSION_COUNTERS ")+(counters ? "1\n" : "0\n")+commonSupport+
+            (counters ? batchActivityCounterSupport(sites.size()) : std::string{});
+        manualCase(fixture,label,budget,support,body,false,{{"execution-counters",counters ? "on" : "off"}});
+        const auto directory=artifact(label)/"model";
+        require(batchActivityStatistic(directory,"eligible_runs")==1 && batchActivityStatistic(directory,"rejected_runs")==0,
+                "Scalar mux fixture no longer enters the optimization's eligible scope");
+        const auto functions=mappedRecords(readFile(directory/"code-map.json"),"functions");
+        const auto hasLocal = [&](grh::ValueId value) {
+            const auto marker="\"name\":\""+mappedValue(directory,value)+"\"";
+            for (const auto& function : functions)
+                for (const auto& local : mappedRecords(function,"locals")) if (local.find(marker)!=std::string::npos) return true;
+            return false;
+        };
+        for (unsigned i=0;i<3;++i)
+            require(!hasLocal(chain[i]),"Fused intermediate still has a local or frame field");
+        require(hasLocal(shared),"Multi-use mux was duplicated instead of materialized");
+        const auto finalId="\"o"+std::to_string(graph.valueDef(chain.back()).index)+"\"";
+        bool provenance=false;
+        for (const auto& function : functions) {
+            const auto start=function.find("\"operations\":["), end=function.find(']',start);
+            require(start!=std::string::npos && end!=std::string::npos,"Mux function omitted its operation provenance");
+            const auto operations=function.substr(start,end-start);
+            if (operations.find(finalId)==std::string::npos) continue;
+            bool complete=true;
+            for (const auto value : chain)
+                complete &= operations.find("\"o"+std::to_string(graph.valueDef(value).index)+"\"")!=std::string::npos;
+            provenance |= complete;
+        }
+        require(provenance,"Final mux expression lost a folded producer's operation provenance");
+        const auto cpp=generatedCpp(directory), name=mappedValue(directory,chain.back());
+        const auto start=cpp.find(name+" = ");
+        require(start!=std::string::npos,"Final mux assignment disappeared");
+        const auto expression=cpp.substr(start,cpp.find(';',start)-start);
+        std::size_t selects=0, position=0;
+        while ((position=expression.find("numeric_select(",position))!=std::string::npos) { ++selects; position+=15; }
+        require(selects==4,"Scalar fusion did not preserve all four eager numeric_select calls");
+        if (counters) bindBatchActivityCounters(label,graph,sites);
+    }
+}
+
+void testPrivateScalarMuxFusionDepthCutoff() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clock=fixture.input("cutoff_clock"), enable=fixture.input("cutoff_enable");
+    const auto a=fixture.input("cutoff_a",16), b=fixture.input("cutoff_b",16);
+    std::array<grh::ValueId,20> chain;
+    std::string setSelectors;
+    for (unsigned i=0;i<chain.size();++i) {
+        const auto port="cutoff_c"+std::to_string(i);
+        const auto selector=fixture.input(port);
+        chain[i]=fixture.compute(OperationKind::kMux,Fixture::type(16),
+            {selector,i==0 ? a : chain[i-1],i&1 ? a : b});
+        setSelectors+="model."+port+"=(selectors>>"+std::to_string(i)+")&1u;\n";
+    }
+    const auto state=fixture.state("cutoff_saved",16);
+    const auto writer=fixture.write(OperationKind::kRegisterWritePort,state,{enable,chain.back(),clock});
+    graph.bindOutputPort("cutoff_saved",fixture.read(state));
+    run(fixture.design,"grh-to-grhsim",fixture.session); fixture.split(); fixture.partition();
+    const auto& schedule=sim::requireSinkSchedule(&fixture.session,graph);
+    require(schedule.generalRuns.size()==1 && schedule.generalRuns[0].orderedWriters==std::vector{writer},
+            "Mux cutoff fixture lost its single exact writer run");
+    for (unsigned i=0;i<chain.size();++i) {
+        require(graph.opKind(graph.valueDef(chain[i]))==OperationKind::kMux &&
+                    owner(graph,graph.valueDef(chain[i]))==schedule.generalRuns[0].partitionKey &&
+                    graph.valueUsers(chain[i]).size()==1,
+                "Mux cutoff fixture lost a private single-use mux");
+        if (i+1<chain.size()) {
+            const auto use=graph.valueUsers(chain[i])[0];
+            require(use.operation==graph.valueDef(chain[i+1]) && use.operandIndex==1,
+                    "Mux cutoff chain no longer links through one data operand");
+        }
+    }
+    const std::string support=R"CPP(
+static unsigned cutoffReference(unsigned selectors,unsigned a,unsigned b) {
+    // Every false selector overwrites the earlier value. The last overwrite
+    // wins; all true selectors retain a. No emitter grouping is modeled here.
+    unsigned expected=a;
+    for (unsigned stage=0;stage<20;++stage)
+        if (((selectors>>stage)&1u)==0) expected=stage&1 ? a : b;
+    return expected&65535u;
+}
+)CPP";
+    const std::string body=R"CPP(
+std::array<unsigned,44> choices{0xfffffu,0u,0x55555u,0xaaaaau};
+for (unsigned bit=0;bit<20;++bit) {
+    choices[4+2*bit]=0xfffffu^(1u<<bit); choices[5+2*bit]=1u<<bit;
+}
+for (unsigned epoch=0;epoch<2;++epoch) {
+    model.init(); unsigned held=0;
+    for (unsigned index=0;index<choices.size();++index) for (unsigned pattern=0;pattern<8;++pattern) {
+        const auto selectors=choices[index];
+        const bool enabled=(index+pattern+epoch)%3!=0;
+        model.cutoff_clock=false; model.cutoff_enable=enabled;
+        model.cutoff_a=(pattern*19073+index*197+epoch*11)&65535u;
+        model.cutoff_b=(pattern*7321+index*3907+epoch*97+0x5aa5u)&65535u;
+)CPP"+setSelectors+R"CPP(
+        model.eval(); model.eval(); assert(model.cutoff_saved==held);
+        if (enabled) held=cutoffReference(selectors,model.cutoff_a,model.cutoff_b);
+        model.cutoff_clock=true; model.eval(); assert(model.cutoff_saved==held);
+        model.eval(); model.eval(); assert(model.cutoff_saved==held);
+        // Payload and enable changes without another edge cannot write state.
+        model.cutoff_a^=65535u; model.cutoff_b^=0xaaaau; model.cutoff_enable=!enabled;
+        model.eval(); assert(model.cutoff_saved==held);
+    }
+}
+)CPP";
+    for (const auto budget : {16,1024}) {
+        const auto label="private-scalar-mux-cutoff-b"+std::to_string(budget);
+        manualCase(fixture,label,budget,support,body,false);
+        const auto directory=artifact(label)/"model";
+        require(batchActivityStatistic(directory,"eligible_runs")==1 && batchActivityStatistic(directory,"rejected_runs")==0,
+                "Mux cutoff fixture no longer enters one eligible run");
+        const auto stats=readFile(directory/"private-mux-stats.json");
+        const auto statistic = [&](std::string_view name) {
+            const auto position=stats.find("\""+std::string(name)+"\"");
+            const auto colon=position==std::string::npos ? position : stats.find(':',position);
+            require(colon!=std::string::npos,"Missing mux cutoff statistic");
+            return std::stoull(stats.substr(colon+1));
+        };
+        require(statistic("nonempty_regions")==1 && statistic("folded_muxes")==17 &&
+                    statistic("local_assignments_elided")==17 && statistic("max_expression_nodes")==8 &&
+                    statistic("max_expression_depth")==8,
+                "Twenty-mux chain did not hit the exact depth-8 partition");
+        const auto functions=mappedRecords(readFile(directory/"code-map.json"),"functions");
+        std::array<bool,20> locals{};
+        std::array<std::string,20> ids;
+        for (unsigned i=0;i<chain.size();++i) {
+            const auto marker="\"name\":\""+mappedValue(directory,chain[i])+"\"";
+            ids[i]="\"o"+std::to_string(graph.valueDef(chain[i]).index)+"\"";
+            for (const auto& function : functions)
+                for (const auto& local : mappedRecords(function,"locals"))
+                    locals[i]=locals[i] || local.find(marker)!=std::string::npos;
+            require(locals[i]==(i==7 || i==15 || i==19),
+                    "Mux cutoff retained an unexpected local/frame root or lost a required root");
+        }
+        for (const auto [begin,end] : std::array<std::pair<unsigned,unsigned>,3>{{{0,7},{8,15},{16,19}}}) {
+            bool complete=false;
+            for (const auto& function : functions) {
+                const auto start=function.find("\"operations\":["), stop=function.find(']',start);
+                require(start!=std::string::npos && stop!=std::string::npos,"Mux cutoff function lost its operation list");
+                const auto operations=function.substr(start,stop-start);
+                if (operations.find(ids[end])==std::string::npos) continue;
+                bool group=true;
+                for (unsigned i=begin;i<=end;++i) group &= operations.find(ids[i])!=std::string::npos;
+                complete |= group;
+            }
+            require(complete,"Mux cutoff root lost an original operation in its expression segment");
+        }
+    }
+}
+
 void testNumericSelects() {
     Fixture fixture; auto& graph = fixture.graph;
     const auto choose0 = fixture.input("select_c0"), choose1 = fixture.input("select_c1"), choose2 = fixture.input("select_c2");
@@ -5449,8 +7852,9 @@ int main() {
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     // Boundary-role and bitmap cases are appended after the common models.
     // Append after testModels initializes the generated execution Makefile.
-    try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testArrayViewsAndWide(); testContiguousArrayImages(); testPackedBoolUnpack(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }
+    // Literal-format cases join the same generated-model execution target.
+    try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testFirrtlLiteralFormats(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testArrayViewsAndWide(); testContiguousArrayImages(); testPackedBoolUnpack(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
-    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testLeafAssemblyConstants(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testImmutableConstantSources(); testLargeCaptureMetadata(); testLargeLatchCaptures(); testLargeCaptureInterruptedConstants(); testNumericSelects(); testNarrowConstantLogicalShifts(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
+    try { testNonsinkClockIsolation(); testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSmallShadowWritePriority(); testSmallSinkActivityExactRuns(); testSmallSinkActivityCompetition(); testSmallSinkActivityInterruptedFallback(); testWriterDispatchFreshFireGroups(); testWriterDispatchNontrivialLocalFallback(); testScalarShadowChangeMasks(); testSinkActivityBatchCompetition(); testSinkActivityBatchMasksAndFallback(); testSinkActivityJoinedFire(); testSinkActivityJoinedCompetition(); testSinkActivityCurrentReads(); testSinkActivityLargeCurrentInterrupted(); testSinkActivityWholeCurrentWrites(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testLeafAssemblyConstants(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testCompletePublicationKeys(); testImmutableConstantSources(); testLargeCaptureMetadata(); testLargeLatchCaptures(); testLargeCaptureInterruptedConstants(); testPrivateScalarMuxFusion(); testPrivateScalarMuxFusionDepthCutoff(); testNumericSelects(); testNarrowConstantLogicalShifts(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

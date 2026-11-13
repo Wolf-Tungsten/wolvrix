@@ -820,74 +820,19 @@ int main()
     {
         namespace grh = wolvrix::lib::grh;
         grh::Design design;
-        auto& graph = design.createGraph("semantic");
-        auto& tree = graph.getOrCreateSemanticTree("unit", "circuit", "semantic");
-        const auto liveDeclaration = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "live");
-        const auto inputDeclaration = tree.addNode(tree.root(), grh::SemanticNodeKind::Declaration, "input");
-        const auto declaredDeclaration = tree.addNode(tree.root(), grh::SemanticNodeKind::Declaration, "declared");
-        const auto deadDeclaration = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "dead");
-
-        const auto liveConst = makeConst(graph, "semantic_live", "semantic_live_op", 1, false, "1'b1");
-        graph.setValueSemanticIds(liveConst, std::span<const grh::SemanticId>(&liveDeclaration, 1));
-        const auto liveOp = graph.valueDef(liveConst);
-        graph.setOpSemanticIds(liveOp, std::span<const grh::SemanticId>(&liveDeclaration, 1));
-        const auto out = graph.createValue(graph.internSymbol("semantic_out"), 1, false);
-        graph.bindOutputPort("semantic_out", out);
-        graph.setValueSemanticIds(out, std::span<const grh::SemanticId>(&liveDeclaration, 1));
-        const auto assign = graph.createOperation(grh::OperationKind::kAssign, graph.internSymbol("semantic_assign"));
-        graph.addOperand(assign, liveConst);
-        graph.addResult(assign, out);
-        graph.setOpSemanticIds(assign, std::span<const grh::SemanticId>(&liveDeclaration, 1));
-
-        const auto input = graph.createValue(graph.internSymbol("semantic_input"), 1, false);
-        graph.bindInputPort("semantic_input", input);
-        graph.setValueSemanticIds(input, std::span<const grh::SemanticId>(&inputDeclaration, 1));
-        const auto kept = makeConst(graph, "semantic_keep", "semantic_keep_op", 1, false, "1'b0");
-        graph.addDeclaredSymbol(graph.lookupSymbol("semantic_keep"));
-        graph.setValueSemanticIds(kept, std::span<const grh::SemanticId>(&declaredDeclaration, 1));
-        graph.setOpSemanticIds(graph.valueDef(kept), std::span<const grh::SemanticId>(&declaredDeclaration, 1));
-
-        const auto deadConst = makeConst(graph, "semantic_dead", "semantic_dead_op", 1, false, "1'b0");
-        const auto deadTmp = graph.createValue(graph.internSymbol("semantic_dead_tmp"), 1, false);
-        const auto deadNot = graph.createOperation(grh::OperationKind::kNot, graph.internSymbol("semantic_dead_not"));
-        graph.addOperand(deadNot, deadConst);
-        graph.addResult(deadNot, deadTmp);
-        for (const auto value : {deadConst, deadTmp})
-            graph.setValueSemanticIds(value, std::span<const grh::SemanticId>(&deadDeclaration, 1));
-        for (const auto op : {graph.valueDef(deadConst), deadNot})
-            graph.setOpSemanticIds(op, std::span<const grh::SemanticId>(&deadDeclaration, 1));
-
+        auto &graph = design.createGraph("semantic");
+        auto &tree = graph.getOrCreateSemanticTree("unit", "circuit", "semantic");
+        const auto node = tree.addNode(tree.root(), "dead");
+        const auto value = makeConst(graph, "dead", "dead_op", 1, false, "1'b0");
+        graph.setOpSemanticIds(graph.valueDef(value), std::span<const grh::SemanticId>(&node, 1));
+        const auto stamp = wolvrix::lib::transform::DesignStamp::capture(graph);
         PassManager manager;
-        manager.options().keepDeclaredSymbols = true;
-        auto pass = std::make_unique<DeadCodeElimPass>();
-        const auto* passState = pass.get();
-        manager.addPass(std::move(pass));
+        manager.addPass(std::make_unique<DeadCodeElimPass>());
         PassDiagnostics diagnostics;
         const auto result = manager.run(design, diagnostics);
-        if (!result.success || diagnostics.hasError() || !result.changed)
-            return fail("SemanticTree DCE failed");
-        if (graph.findOperation("semantic_dead_op") || graph.findOperation("semantic_dead_not") ||
-            graph.findValue("semantic_dead") || graph.findValue("semantic_dead_tmp"))
-            return fail("SemanticTree DCE retained the dead cone");
-        if (!graph.findOperation("semantic_live_op") || !graph.findOperation("semantic_keep_op") ||
-            !graph.findValue("semantic_input"))
-            return fail("SemanticTree DCE removed a live or declared entity");
-        if (tree.contains(deadDeclaration) || tree.size() != 4)
-            return fail("SemanticTree DCE did not reclaim the dead source subtree");
-        if (tree.path(liveDeclaration) != std::vector<std::string>{"semantic", "live"} ||
-            tree.path(inputDeclaration) != std::vector<std::string>{"semantic", "input"} ||
-            tree.path(declaredDeclaration) != std::vector<std::string>{"semantic", "declared"})
-            return fail("SemanticTree DCE changed a surviving source path");
-        if (passState->stats().semanticNodesRemoved != 1 || passState->stats().opsRemoved != 2)
-            return fail("SemanticTree DCE reported incorrect deletion counts");
-
-        PassManager second;
-        second.options().keepDeclaredSymbols = true;
-        second.addPass(std::make_unique<DeadCodeElimPass>());
-        PassDiagnostics secondDiagnostics;
-        const auto secondResult = second.run(design, secondDiagnostics);
-        if (!secondResult.success || secondResult.changed || secondDiagnostics.hasError())
-            return fail("SemanticTree DCE is not idempotent");
+        if (result.success || result.changed || !diagnostics.hasError() || !stamp.matches(graph) ||
+            diagnostics.messages().front().message.find("F28 SemanticTree") == std::string::npos)
+            return fail("DCE must reject unsupported F28 Node evolution before deleting IR");
     }
 
     return 0;

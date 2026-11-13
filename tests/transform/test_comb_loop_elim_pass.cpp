@@ -215,175 +215,31 @@ namespace
         return 0;
     }
 
-    int test_semantic_loop_split()
+    int test_semantic_loop_split(bool twoState = false)
     {
-        wolvrix::lib::grh::Design design;
-        auto& graph = design.createGraph("g_semantic");
-        auto& tree = graph.getOrCreateSemanticTree("unit", "circuit", "g_semantic");
-        std::vector<wolvrix::lib::grh::SemanticId> semanticIds;
-        for (int index = 0; index < 300; ++index)
-        {
-            semanticIds.push_back(tree.addNode(tree.root(),
-                wolvrix::lib::grh::SemanticNodeKind::Declaration, "s" + std::to_string(index)));
+        using namespace wolvrix::lib::grh;
+        Design design;
+        auto &graph = design.createGraph("g_semantic");
+        auto &tree = graph.getOrCreateSemanticTree("unit", "circuit", "g_semantic");
+        const auto node = tree.addNode(tree.root(), "value");
+        const auto value = makeValue(graph, "value", 1);
+        if (twoState) {
+            auto type = graph.valueLogicalType(value);
+            type.domain = LogicDomain::TwoState;
+            graph.setValueLogicalType(value, type);
         }
-
-        for (int index = 0; index < 3; ++index)
-        {
-            const auto deadValue = makeValue(graph, "dead" + std::to_string(index), 1);
-            const auto deadOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant);
-            graph.addResult(deadOp, deadValue);
-            if (!graph.eraseOp(deadOp) || !graph.eraseValue(deadValue))
-                return fail("Failed to create serialization-ID tombstones");
-        }
-
-        const auto mask = makeValue(graph, "mask", 6);
-        const auto ext = makeValue(graph, "ext", 4);
-        graph.bindInputPort("mask", mask);
-        graph.bindInputPort("ext", ext);
-        const auto y = makeValue(graph, "y", 6);
-        const auto x = makeValue(graph, "x", 6);
-        const auto mid = makeValue(graph, "mid", 2);
-        const auto xorOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
-                                                 graph.internSymbol("xor_y_mask"));
-        graph.addOperand(xorOp, y);
-        graph.addOperand(xorOp, mask);
-        graph.addResult(xorOp, x);
-        makeSliceStatic(graph, x, mid, 1, 2, "slice_x_mid");
-        makeConcat(graph, "concat_y", {mid, ext}, y);
-        std::size_t sourceGroup = 0;
-        for (const auto op : graph.operations())
-        {
-            graph.setOpSemanticIds(op, std::span<const wolvrix::lib::grh::SemanticId>(
-                semanticIds.data() + sourceGroup * 100, 100));
-            ++sourceGroup;
-        }
-
-        const auto artifact = std::filesystem::path(WOLF_SV_TEST_ARTIFACT_DIR) /
-                              "comb_loop_semantic_fragments.json";
-        CombLoopElimOptions options;
-        options.fragmentMapPath = artifact.string();
+        const auto op = graph.createOperation(OperationKind::kNot);
+        graph.addOperand(op, value);
+        graph.addResult(op, value);
+        graph.setOpSemanticIds(op, std::span<const SemanticId>(&node, 1));
+        const auto stamp = wolvrix::lib::transform::DesignStamp::capture(graph);
         PassManager manager;
-        manager.addPass(std::make_unique<CombLoopElimPass>(options));
-        PassDiagnostics diags;
-        const auto result = manager.run(design, diags);
-        if (!result.success || !result.changed || diags.hasError())
-        {
-            return fail("Expected semantic false-loop split to succeed");
-        }
-
-        auto semanticGroup = [&](std::span<const wolvrix::lib::grh::SemanticId> ids) {
-            if (ids.size() != 100) return -1;
-            for (int group = 0; group < 3; ++group)
-            {
-                bool matches = true;
-                for (std::size_t index = 0; index < ids.size(); ++index)
-                {
-                    if (ids[index] != semanticIds[static_cast<std::size_t>(group) * 100 + index])
-                    {
-                        matches = false;
-                        break;
-                    }
-                }
-                if (matches) return group;
-            }
-            return -1;
-        };
-        std::array<bool, 3> seenGroups{false, false, false};
-        for (const auto op : graph.operations())
-        {
-            const int group = semanticGroup(graph.opSemanticIds(op));
-            if (group < 0) return fail("Loop-split operation mixed or lost source SemanticIds");
-            seenGroups[static_cast<std::size_t>(group)] = true;
-        }
-        for (const auto value : graph.values())
-        {
-            if (!graph.valueSemanticIds(value).empty() && semanticGroup(graph.valueSemanticIds(value)) < 0)
-            {
-                return fail("Loop-split value mixed or lost source SemanticIds");
-            }
-        }
-        for (bool seen : seenGroups)
-        {
-            if (!seen) return fail("Loop-split operation lost an original SemanticId group");
-        }
-
-        wolvrix::lib::store::StoreDiagnostics storeDiagnostics;
-        wolvrix::lib::store::StoreJson emitter(&storeDiagnostics);
-        wolvrix::lib::store::StoreOptions storeOptions;
-        storeOptions.topOverrides = {"g_semantic"};
-        const auto checkpoint = emitter.storeToString(design, storeOptions);
-        if (!checkpoint || storeDiagnostics.hasError())
-        {
-            std::string message = "Failed to store the semantic-loop checkpoint";
-            for (const auto& diagnostic : storeDiagnostics.messages())
-                message += "\n" + diagnostic.message;
-            return fail(message);
-        }
-        auto restored = wolvrix::lib::grh::Design::fromJsonString(*checkpoint);
-        auto& serialGraph = *restored.findGraph("g_semantic");
-        std::ifstream input(artifact);
-        if (!input) return fail("Expected fragment map JSON export");
-        const std::regex recordPattern(
-            R"re(\{"graph": "g_semantic", "sourceValue": ([0-9]+), "sourceOperation": ([0-9]+), "sourceSemanticIds": \[([0-9, ]*)\], "fragmentValue": ([0-9]+), "lo": (-?[0-9]+), "hi": (-?[0-9]+)\},?)re");
-        auto findValue = [&](uint64_t index) {
-            for (const auto value : serialGraph.values()) if (value.index == index) return value;
-            return wolvrix::lib::grh::ValueId::invalid();
-        };
-        auto findOperation = [&](uint64_t index) {
-            for (const auto op : serialGraph.operations()) if (op.index == index) return op;
-            return wolvrix::lib::grh::OperationId::invalid();
-        };
-        std::unordered_map<uint64_t, std::vector<std::pair<int64_t, int64_t>>> coverage;
-        std::size_t records = 0;
-        for (std::string line; std::getline(input, line); )
-        {
-            std::smatch match;
-            if (!std::regex_search(line, match, recordPattern)) continue;
-            ++records;
-            const auto sourceValue = findValue(std::stoull(match[1]));
-            const auto sourceOp = findOperation(std::stoull(match[2]));
-            const auto fragmentValue = findValue(std::stoull(match[4]));
-            if (!sourceValue.valid() || !sourceOp.valid() || !fragmentValue.valid())
-                return fail("Fragment map contains an unresolved entity");
-            std::vector<wolvrix::lib::grh::SemanticId> sourceSemantics;
-            std::string text = match[3];
-            for (std::size_t cursor = 0; cursor < text.size(); )
-            {
-                while (cursor < text.size() && (text[cursor] == ' ' || text[cursor] == ',')) ++cursor;
-                if (cursor == text.size()) break;
-                const std::size_t end = text.find(',', cursor);
-                sourceSemantics.push_back(static_cast<wolvrix::lib::grh::SemanticId>(
-                    std::stoul(text.substr(cursor, end - cursor))));
-                if (end == std::string::npos) break;
-                cursor = end + 1;
-            }
-            const int group = semanticGroup(sourceSemantics);
-            if (group < 0 || semanticGroup(serialGraph.opSemanticIds(sourceOp)) != group)
-                return fail("Fragment map does not preserve the source operation group");
-            const auto fragmentSemantics = serialGraph.valueSemanticIds(fragmentValue);
-            if (!std::equal(fragmentSemantics.begin(), fragmentSemantics.end(),
-                            sourceSemantics.begin(), sourceSemantics.end()))
-                return fail("Fragment value does not inherit its source SemanticIds");
-            const int64_t low = std::stoll(match[5]);
-            const int64_t high = std::stoll(match[6]);
-            if (low < 0 || high < low || serialGraph.getValue(fragmentValue).width() != high - low + 1)
-                return fail("Fragment map has an invalid bit range");
-            coverage[sourceValue.index].emplace_back(low, high);
-        }
-        if (records == 0) return fail("Fragment map is empty");
-        for (auto &[sourceIndex, ranges] : coverage)
-        {
-            const auto sourceValue = findValue(sourceIndex);
-            std::sort(ranges.begin(), ranges.end());
-            int64_t next = 0;
-            for (const auto [low, high] : ranges)
-            {
-                if (low != next) return fail("Fragment map has a gap or overlap");
-                next = high + 1;
-            }
-            if (next != serialGraph.getValue(sourceValue).width())
-                return fail("Fragment map does not cover the source value");
-        }
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+        PassDiagnostics diagnostics;
+        const auto result = manager.run(design, diagnostics);
+        if (result.success || result.changed || !diagnostics.hasError() || !stamp.matches(graph) ||
+            diagnostics.messages().front().message.find("F28 SemanticTree") == std::string::npos)
+            return fail("comb-loop-elim must reject unsupported F28 Nodes before mutation");
         return 0;
     }
 
@@ -1781,6 +1637,7 @@ int main()
     if (int rc = test_instance_boundary(true); rc != 0) return rc;
     if (int rc = test_instance_boundary_keeps_local_loop(); rc != 0) return rc;
     if (int rc = test_semantic_loop_split(); rc != 0) return rc;
+    if (int rc = test_semantic_loop_split(true); rc != 0) return rc;
     if (int rc = test_false_loop_fixed(true); rc != 0) return rc;
     if (int rc = test_false_loop_fixed(); rc != 0)
     {

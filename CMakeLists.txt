@@ -170,6 +170,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/latch_transparent_read.cpp
     lib/transform/slice_index_const.cpp
     lib/transform/split_static_array.cpp
+    lib/transform/node_evolution.cpp
     lib/transform/mux_tree_fold.cpp
     lib/transform/register_write_normalize.cpp
     lib/transform/strip_debug.cpp
@@ -924,6 +925,8 @@ foreach(test_name firrtl-node-attributes firrtl-parser firrtl-comb firrtl-aggreg
     )
     register_test_exe(${test_name})
 endforeach()
+
+add_test(NAME firrtl-semantic-abi COMMAND $<TARGET_FILE:ingest-mixed> --f28-abi)
 
 add_executable(inspect-firrtl app/inspect_firrtl.cpp)
 target_link_libraries(inspect-firrtl PRIVATE wolvrix-lib)

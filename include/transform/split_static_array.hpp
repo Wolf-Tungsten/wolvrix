@@ -6,6 +6,14 @@
 namespace wolvrix::lib::transform
 {
 
+    struct SplitStaticArrayOptions
+    {
+        // Empty disables diagnostics. Multi-graph runs require {graph} in path.
+        std::string traceNodeEvolution;
+        std::string traceInputSha256;
+        bool traceSourceEndpoints = false;
+    };
+
     class SplitStaticArrayPass : public Pass
     {
     public:
@@ -35,17 +43,22 @@ namespace wolvrix::lib::transform
         };
 
         SplitStaticArrayPass();
+        explicit SplitStaticArrayPass(SplitStaticArrayOptions options);
 
         PassResult run() override;
         bool preservesDialects() const noexcept override { return true; }
         std::unique_ptr<Pass> cloneGraphKernel() const override
         {
-            return std::make_unique<SplitStaticArrayPass>();
+            // A traced run writes graph files in the coordinator, preventing
+            // collisions when selecting more than one graph.
+            return options_.traceNodeEvolution.empty() ?
+                std::make_unique<SplitStaticArrayPass>(options_) : nullptr;
         }
 
         const Stats &stats() const noexcept { return stats_; }
 
     private:
+        SplitStaticArrayOptions options_;
         Stats stats_;
     };
 

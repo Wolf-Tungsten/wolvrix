@@ -57,8 +57,8 @@ int main()
     child.bindInputPort("a", childA);
     child.bindOutputPort("y", childY);
     child.bindInoutPort("io", childIoIn, childIoOut, childIoOe);
-    child.createValue(child.internSymbol("leaf_r"), 1, false);
-    child.createValue(child.internSymbol("leaf_w"), 1, false);
+    const auto childRead = child.createValue(child.internSymbol("leaf_r"), 1, false);
+    const auto childWrite = child.createValue(child.internSymbol("leaf_w"), 1, false);
 
     const auto topA = top.createValue(top.internSymbol("a"), 1, false);
     const auto topY = top.createValue(top.internSymbol("y"), 1, false);
@@ -93,6 +93,18 @@ int main()
                             top.internSymbol("_op_test_xmr_write"));
     top.addOperand(xmrWrite, writeValue);
     top.setAttr(xmrWrite, "xmrPath", std::string("u_child.leaf_w"));
+
+    auto& childTree = child.getOrCreateSemanticTree("fixture", "Circuit", "child");
+    const auto childReadNode = childTree.addNode(childTree.root(), "leaf_r");
+    const auto childWriteNode = childTree.addNode(childTree.root(), "leaf_w");
+    child.setValueSemanticIds(childRead, std::span<const wolvrix::lib::grh::SemanticId>(&childReadNode, 1));
+    child.setValueSemanticIds(childWrite, std::span<const wolvrix::lib::grh::SemanticId>(&childWriteNode, 1));
+    auto& topTree = top.getOrCreateSemanticTree("fixture", "Circuit", "top");
+    const auto readNode = topTree.addNode(topTree.root(), "read");
+    const auto writeNode = topTree.addNode(topTree.root(), "write");
+    top.setValueSemanticIds(readValue, std::span<const wolvrix::lib::grh::SemanticId>(&readNode, 1));
+    top.setOpSemanticIds(xmrRead, std::span<const wolvrix::lib::grh::SemanticId>(&readNode, 1));
+    top.setOpSemanticIds(xmrWrite, std::span<const wolvrix::lib::grh::SemanticId>(&writeNode, 1));
 
     PassManager manager;
     manager.addPass(std::make_unique<XmrResolvePass>());
@@ -146,6 +158,15 @@ int main()
     {
         return fail("Inout results were reordered by XMR resolve");
     }
+    if (!top.validateSemanticTree().empty() || !child.validateSemanticTree().empty())
+        return fail("XMR port insertion left invalid Node members or anchors");
+    const auto anchors = child.semanticNodeAnchors(childWriteNode);
+    const auto members = child.semanticNodeOperations(childWriteNode);
+    if (anchors.size() != 1 || anchors.front() != child.findValue("leaf_w") ||
+        members.size() != 1 || child.opKind(members.front()) != wolvrix::lib::grh::OperationKind::kAssign)
+        return fail("plain XMR write did not move the target Node anchor and assign membership");
+    if (top.semanticNodeAnchors(readNode).size() != 1 || !top.valueSemanticIds(readValue).empty())
+        return fail("XMR read retained its obsolete anchor");
 
     return 0;
 }

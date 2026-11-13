@@ -11,6 +11,7 @@ ingest::IngestResult source(std::string_view name, ingest::FirrtlInitPolicy poli
     ingest::IngestRequest request;
     request.sources.push_back({ingest::SourceLanguage::Firrtl, fixtures / (std::string(name) + ".fir"), "state"});
     request.firrtl.invalidPolicy = ingest::FirrtlInvalidPolicy::Zero; request.firrtl.initPolicy = policy;
+    request.firrtl.nodeAnnotations = false;
     return ingest::readSources(request);
 }
 void compare(const grh::Design& candidate, const grh::Design& reference, bool rename) {
@@ -30,7 +31,7 @@ void compare(const grh::Design& candidate, const grh::Design& reference, bool re
     if (rename) firrtl_state_test::renameTrace(check); else firrtl_state_test::priorityTrace(check);
 }
 void constantStateIndexBounds() {
-    auto result = text("constant-state-index-bounds", R"FIR(    input clk : Clock
+    auto result = unannotatedText("constant-state-index-bounds", R"FIR(    input clk : Clock
     input i : UInt<2>
     output exactOut : UInt<4>
     output rowOut : UInt<4>[2]
@@ -91,11 +92,11 @@ void typesAndPolicies() {
     require(grh::stateLogicalType(graph, reg).shape == std::vector<int64_t>{4}, "register shape lost");
     require(grh::stateLogicalType(graph, reg).domain == grh::LogicDomain::FourState, "state domain silently projected");
     require(grh::stateInitSpec(graph, reg).at(0).value == "32'bx", "default state init is not indeterminate");
-    auto requestDefault = text("state-default", "    input clk : Clock\n    regreset r : UInt<4>, clk, UInt<1>(0), UInt<4>(7)\n");
+    auto requestDefault = unannotatedText("state-default", "    input clk : Clock\n    regreset r : UInt<4>, clk, UInt<1>(0), UInt<4>(7)\n");
     require(requestDefault.success(), diagnostics(requestDefault));
     auto& defaultGraph = *requestDefault.design->findGraph("top");
     require(grh::stateInitSpec(defaultGraph, defaultGraph.findOperation("r")).at(0).value == "4'bx", "regreset value used as initial value");
-    auto inferred = text("state-inferred", "    input clk : Clock\n    input arst : AsyncReset\n    output y : UInt<7>\n    wire rst : Reset\n    connect rst, arst\n    regreset r : UInt, clk, rst, UInt<7>(65)\n    connect y, r\n");
+    auto inferred = unannotatedText("state-inferred", "    input clk : Clock\n    input arst : AsyncReset\n    output y : UInt<7>\n    wire rst : Reset\n    connect rst, arst\n    regreset r : UInt, clk, rst, UInt<7>(65)\n    connect y, r\n");
     require(inferred.success(), diagnostics(inferred));
     auto& inf = *inferred.design->findGraph("top");
     require(grh::stateLogicalType(inf, inf.findOperation("r")).width == 7, "reset value did not constrain register width");
@@ -103,7 +104,7 @@ void typesAndPolicies() {
     for (const auto op : inf.operations()) if (grh::isRegisterWritePortKind(inf.opKind(op)))
         async |= std::get<std::vector<std::string>>(*inf.getOperation(op).attr("eventEdge")).size() == 2;
     require(async, "abstract reset inference did not reach writer events");
-    auto scoped = text("state-scoped", R"FIR(    input clk : Clock
+    auto scoped = unannotatedText("state-scoped", R"FIR(    input clk : Clock
     input sel : UInt<1>
     when sel :
       reg r : UInt<4>, clk
@@ -119,13 +120,13 @@ void typesAndPolicies() {
     scope.eval({{"clk", 0}, {"sel", 0}});
     auto observation = scope.eval({{"clk", 1}, {"sel", 0}});
     require(slang::SVInt::fromString(observation.states.at("r")).as<uint64_t>() == 9, "enclosing declaration condition incorrectly gates state");
-    auto self = text("state-self-reset", "    input clk : Clock\n    input rst : UInt<1>\n    output y : UInt<4>\n    regreset r : UInt<4>, clk, rst, r\n    connect r, UInt<4>(5)\n    connect y, r\n");
+    auto self = unannotatedText("state-self-reset", "    input clk : Clock\n    input rst : UInt<1>\n    output y : UInt<4>\n    regreset r : UInt<4>, clk, rst, r\n    connect r, UInt<4>(5)\n    connect y, r\n");
     require(self.success(), diagnostics(self));
     run(*self.design, std::make_unique<tx::GrhVerifyPass>());
     grhsim_test::Oracle hold(*self.design->findGraph("top"));
     hold.eval({{"clk", 1}, {"rst", 0}}); hold.eval({{"clk", 0}, {"rst", 1}});
     require(slang::SVInt::fromString(hold.eval({{"clk", 1}}).outputs.at("y")).as<uint64_t>() == 5, "self reset did not sample old state");
-    auto signedState = text("state-signed", R"FIR(    input clk : Clock
+    auto signedState = unannotatedText("state-signed", R"FIR(    input clk : Clock
     input en : UInt<1>
     input data : SInt<3>
     output y : SInt<6>
@@ -148,7 +149,7 @@ void typesAndPolicies() {
     connect y, r
 )FIR";
     for (const auto policy : {ingest::FirrtlInvalidPolicy::Unknown, ingest::FirrtlInvalidPolicy::Zero}) {
-        auto inv = text("state-invalid", invalidBody, policy); require(inv.success(), diagnostics(inv));
+        auto inv = unannotatedText("state-invalid", invalidBody, policy); require(inv.success(), diagnostics(inv));
         auto& graph = *inv.design->findGraph("top"); bool found = false;
         for (const auto op : graph.operations()) if (graph.opKind(op) == OperationKind::kConstant)
             found |= std::get<std::string>(*graph.getOperation(op).attr("constValue")) == (policy == ingest::FirrtlInvalidPolicy::Unknown ? "4'bx" : "4'b0");
@@ -158,12 +159,12 @@ void typesAndPolicies() {
         oracle.eval({{"clk", 1}, {"en", 0}}); oracle.eval({{"clk", 0}, {"en", 1}});
         require(slang::SVInt::fromString(oracle.eval({{"clk", 1}}).outputs.at("y")).as<uint64_t>() == 0, "invalid write did not override earlier data");
     }
-    auto empty = text("state-empty", "    input clk : Clock\n    reg r : UInt<0>[3], clk\n    reg e : UInt<4>[0], clk\n");
+    auto empty = unannotatedText("state-empty", "    input clk : Clock\n    reg r : UInt<0>[3], clk\n    reg e : UInt<4>[0], clk\n");
     require(empty.success(), diagnostics(empty));
     require(count(*empty.design->findGraph("top"), OperationKind::kRegister) == 0, "zero-width state materialized");
-    auto asyncConst = text("state-const-reset-input", "    input clk : Clock\n    input rst : AsyncReset\n    input data : const UInt<4>\n    regreset r : UInt<4>, clk, rst, data\n");
+    auto asyncConst = unannotatedText("state-const-reset-input", "    input clk : Clock\n    input rst : AsyncReset\n    input data : const UInt<4>\n    regreset r : UInt<4>, clk, rst, data\n");
     require(asyncConst.success(), diagnostics(asyncConst));
-    auto aggregateReset = text("state-constant-wire-reset", R"FIR(    input clk : Clock
+    auto aggregateReset = unannotatedText("state-constant-wire-reset", R"FIR(    input clk : Clock
     input arst : AsyncReset
     output y : UInt<8>[2]
     wire value : UInt<8>[2]
@@ -178,7 +179,7 @@ void typesAndPolicies() {
     aggregate.eval({{"clk", 0}, {"arst", 0}});
     require(slang::SVInt::fromString(aggregate.eval({{"arst", 1}}).outputs.at("y")).as<uint64_t>() == 0x0b07,
         "aggregate constant wire reset did not fire asynchronously");
-    auto invalidReset = text("state-invalid-wire-reset", R"FIR(    input clk : Clock
+    auto invalidReset = unannotatedText("state-invalid-wire-reset", R"FIR(    input clk : Clock
     input arst : AsyncReset
     output y : {valid : UInt<1>, data : UInt<8>}[2]
     wire value : {valid : UInt<1>, data : UInt<8>}[2]
@@ -203,7 +204,7 @@ void typesAndPolicies() {
     require(slang::SVInt::fromString(invalidOutput.at("y__DOT__valid")).as<uint64_t>() == 0 &&
             slang::SVInt::fromString(invalidOutput.at("y__DOT__data")).hasUnknown(),
         "invalid constant async reset lost defined fields or unknown data");
-    auto fieldReset = text("state-constant-field-reset", R"FIR(    input clk : Clock
+    auto fieldReset = unannotatedText("state-constant-field-reset", R"FIR(    input clk : Clock
     input arst : AsyncReset
     input d : UInt<8>
     output y : UInt<8>

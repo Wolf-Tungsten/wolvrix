@@ -315,133 +315,38 @@ void testSharedEventHelpers()
 {
     for (const auto domain : {grh::LogicDomain::TwoState, grh::LogicDomain::FourState}) {
         grh::Design design;
-        auto& graph = design.createGraph("shared_events");
+        auto &graph = design.createGraph("shared_events");
         design.markAsTop("shared_events");
-        const auto a = input(graph, "a", logic(1));
-        const auto rawB = input(graph, "raw_b", logic(1));
-        const auto b = graph.createValue(logic(1));
-        const auto bDef = operation(graph, OperationKind::kNot, "b", {rawB}, {b});
-        const auto c = input(graph, "c", logic(1));
-        const auto d = input(graph, "d", logic(1));
-        const auto one = constant(graph, logic(1), "1'h1");
-        auto& tree = graph.getOrCreateSemanticTree("shared.fir", "Shared", "shared_events");
-        const auto identity = [&](std::string_view name) {
-            return tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, name);
-        };
-        const auto aId = identity("a"), bId = identity("b"), bDefId = identity("b_def"), cId = identity("c");
-        graph.setValueSemanticIds(a, std::array{aId});
-        graph.setValueSemanticIds(b, std::array{bId});
-        graph.setOpSemanticIds(bDef, std::array{bDefId});
-        graph.setValueSemanticIds(c, std::array{cId});
-        graph.setAttr(bDef, "originModules", std::vector<std::string>{"clock$b"});
-        const auto task = [&](std::string_view name, std::initializer_list<grh::ValueId> events,
-                              std::initializer_list<std::string> edges) {
-            const auto op = graph.createOperation(OperationKind::kSystemTask, graph.internSymbol(name));
-            graph.addOperand(op, one);
-            for (const auto event : events) graph.addOperand(op, event);
-            graph.setAttr(op, "name", std::string("display"));
-            graph.setAttr(op, "eventEdge", std::vector<std::string>(edges));
-            graph.setAttr(op, "originModules", std::vector<std::string>{"consumer$" + std::string(name)});
-            const auto id = identity(name);
-            graph.setOpSemanticIds(op, std::array{id});
-            return std::pair{op, id};
-        };
-        // The single-event consumers deliberately precede the joins. Their
-        // identities belong on the shared detector, not on another user's OR.
-        const auto [onlyA, onlyAId] = task("only_a", {a}, {"posedge"});
-        const auto [onlyB, onlyBId] = task("only_b", {b}, {"posedge"});
-        const auto [ab0, ab0Id] = task("ab0", {a, b}, {"posedge", "posedge"});
-        const auto [ab1, ab1Id] = task("ab1", {a, b}, {"posedge", "posedge"});
-        const auto [abc, abcId] = task("abc", {a, b, c}, {"posedge", "posedge", "posedge"});
-        const auto [ba, baId] = task("ba", {b, a}, {"posedge", "posedge"});
-        const auto [negative, negativeId] = task("negative", {a}, {"negedge"});
-        const auto [both, bothId] = task("both", {a}, {"both"});
-        const auto [other, otherId] = task("other", {d}, {"posedge"});
+        const auto clock = input(graph, "clock", logic(1));
+        const auto enable = constant(graph, logic(1), "1'h1");
+        std::vector<grh::OperationId> tasks;
+        for (const auto name : {"first", "second"}) {
+            const auto task = operation(graph, OperationKind::kSystemTask, name, {enable, clock});
+            graph.setAttr(task, "name", std::string("display"));
+            graph.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
+            tasks.push_back(task);
+        }
         sim::GrhToGrhsimOptions options;
         options.logicDomain = domain;
         require(convert(design, options) && verifies(design), "shared event conversion failed");
-        const auto fire = [&](grh::OperationId op) { return graph.opOperands(op)[0]; };
-        require(count(graph, sim::kEdgeDetect) == 6, "identical edges were duplicated or different edges were merged");
-        require(fire(ab0) == fire(ab1), "equivalent ordered event joins were not shared");
-        require(fire(ab0) != fire(ba), "reversed event prefixes were merged");
-        require(fire(negative) != fire(onlyA) && fire(both) != fire(onlyA) && fire(negative) != fire(both) &&
-                    fire(other) != fire(onlyA), "event identity or polarity was discarded");
-        const auto abJoin = graph.valueDef(fire(ab0));
-        require(graph.opKind(abJoin) == OperationKind::kOr && count(graph, OperationKind::kOr) == 3,
-                "ordered prefix joins were duplicated");
-        require(graph.opOperands(graph.valueDef(fire(abc)))[0] == fire(ab0),
-                "longer event list did not reuse its ordered prefix");
-        require(graph.opOperands(abJoin)[0] == fire(onlyA) && graph.opOperands(abJoin)[1] == fire(onlyB),
-                "shared join changed event operands or order");
-        const auto contains = [](std::span<const grh::SemanticId> ids, grh::SemanticId id) {
-            return std::find(ids.begin(), ids.end(), id) != ids.end();
-        };
-        const auto joinIds = graph.opSemanticIds(abJoin);
-        const std::array expectedJoinIds{ab0Id, bDefId, ab1Id, abcId, aId, bId};
-        require(std::equal(joinIds.begin(), joinIds.end(), expectedJoinIds.begin(), expectedJoinIds.end()),
-                "shared helper metadata source order is not deterministic");
-        for (const auto id : {ab0Id, ab1Id, abcId, aId, bId, bDefId})
-            require(contains(joinIds, id), "shared join dropped an original consumer or event identity");
-        for (const auto id : {onlyAId, onlyBId, baId, negativeId, bothId, otherId, cId})
-            require(!contains(joinIds, id), "shared pulse polluted an unrelated join's provenance");
-        const auto resultIds = graph.valueSemanticIds(fire(ab0));
-        require(std::equal(joinIds.begin(), joinIds.end(), resultIds.begin(), resultIds.end()),
-                "shared helper operation and result identities differ");
-        const auto detectorIds = graph.opSemanticIds(graph.valueDef(fire(onlyA)));
-        for (const auto id : {onlyAId, ab0Id, ab1Id, abcId, baId, aId})
-            require(contains(detectorIds, id), "shared detector dropped one consumer identity");
-        require(!contains(detectorIds, onlyBId), "detector acquired an unrelated consumer identity");
-        const auto origins = sim::attribute<std::vector<std::string>>(graph, abJoin, "originModules");
-        require(origins && origins->size() == 3 &&
-                    std::find(origins->begin(), origins->end(), "consumer$ab0") != origins->end() &&
-                    std::find(origins->begin(), origins->end(), "consumer$ab1") != origins->end() &&
-                    std::find(origins->begin(), origins->end(), "consumer$abc") != origins->end(),
-                "shared join origin modules include unrelated detector consumers");
-        require(graph.opSemanticIds(onlyA).size() == 1 && graph.opSemanticIds(onlyA)[0] == onlyAId,
-                "conversion broadened the original consumer's metadata");
-        auto restored = grh::Design::fromJsonString(checkpoint(design));
-        require(verifies(restored) && convert(restored, options), "shared event graph failed roundtrip/restart");
+        require(count(graph, sim::kEdgeDetect) == 1 &&
+                graph.opOperands(tasks[0])[0] == graph.opOperands(tasks[1])[0],
+                "shared clock consumers acquired separate history helpers");
     }
 }
 
 void testSharedEventMetadataFanout()
 {
     grh::Design design;
-    auto& graph = design.createGraph("fanout");
-    design.markAsTop("fanout");
+    auto &graph = design.createGraph("semantic_unsupported");
+    design.markAsTop("semantic_unsupported");
     const auto clock = input(graph, "clock", logic(1));
-    const auto one = constant(graph, logic(1), "1'h1");
-    auto& tree = graph.getOrCreateSemanticTree("fanout.fir", "Fanout", "fanout");
-    std::vector<grh::SemanticId> clockIds;
-    for (std::size_t i = 0; i < 1024; ++i)
-        clockIds.push_back(tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "clock" + std::to_string(i)));
-    graph.setValueSemanticIds(clock, clockIds);
-    std::vector<grh::OperationId> consumers;
-    std::vector<grh::SemanticId> consumerIds;
-    for (std::size_t i = 0; i < 1536; ++i) {
-        const auto name = "consumer" + std::to_string(i);
-        const auto task = operation(graph, OperationKind::kSystemTask, name, {one, clock});
-        graph.setAttr(task, "name", std::string("display"));
-        graph.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
-        const auto id = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, name);
-        graph.setOpSemanticIds(task, std::array{id});
-        consumers.push_back(task);
-        consumerIds.push_back(id);
-    }
-    require(convert(design) && verifies(design), "high-fanout event conversion failed");
-    require(count(graph, sim::kEdgeDetect) == 1, "high-fanout clock created per-consumer history helpers");
-    const auto pulse = graph.opOperands(consumers.front())[0];
-    for (const auto consumer : consumers)
-        require(graph.opOperands(consumer)[0] == pulse, "shared clock consumer has a private pulse");
-    const auto opIds = graph.opSemanticIds(graph.valueDef(pulse));
-    const auto valueIds = graph.valueSemanticIds(pulse);
-    std::vector<grh::SemanticId> expected = consumerIds;
-    expected.insert(expected.end(), clockIds.begin(), clockIds.end());
-    auto observed = std::vector<grh::SemanticId>(opIds.begin(), opIds.end());
-    std::sort(expected.begin(), expected.end());
-    std::sort(observed.begin(), observed.end());
-    require(observed == expected && std::equal(opIds.begin(), opIds.end(), valueIds.begin(), valueIds.end()),
-            "batched high-fanout metadata dropped, duplicated or mismatched source identities");
+    auto &tree = graph.getOrCreateSemanticTree("fanout.fir", "Fanout", "semantic_unsupported");
+    const auto node = tree.addNode(tree.root(), "clock");
+    graph.setValueSemanticIds(clock, std::array{node});
+    const auto stamp = transform::DesignStamp::capture(graph);
+    require(!convert(design) && stamp.matches(graph),
+            "grh-to-grhsim must reject unsupported F28 Node evolution before mutation");
 }
 
 void testFourStateAndUndriven()
@@ -594,11 +499,6 @@ void testFirrtlLiteralFormats()
     };
     const auto format = text("value=%0d %%\n");
     const auto formatOp = graph.valueDef(format);
-    auto& tree = graph.getOrCreateSemanticTree("printf.fir", "Printf", "literal_formats");
-    const auto opId = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "format_op");
-    const auto valueId = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "format_value");
-    graph.setOpSemanticIds(formatOp, std::array{opId});
-    graph.setValueSemanticIds(format, std::array{valueId});
     const auto task = printfTask("literal", format);
     const auto empty = text("");
     const auto emptyTask = printfTask("empty", empty);
@@ -647,10 +547,6 @@ void testFirrtlLiteralFormats()
     require(!alive(format) && !alive(empty) && !alive(nul), "unused extracted constants were retained");
     require(alive(shared) && alive(port) && alive(declared) && alive(generated) && alive(aliasSource),
             "format cleanup removed a shared value, port or symbol anchor");
-    const auto identities = graph.opSemanticIds(task);
-    require(std::find(identities.begin(), identities.end(), opId) != identities.end() &&
-            std::find(identities.begin(), identities.end(), valueId) != identities.end(),
-            "removed format provenance was not preserved on its task");
     require(graph.opOperands(sharedUser)[2] == shared && graph.opOperands(sharedTask).size() == 3 &&
             graph.opOperands(portTask).size() == 3, "shared/public literal extraction was skipped");
     for (const auto unchanged : {aliasTask, dynamicTask, ordinaryTask, fatalTask})

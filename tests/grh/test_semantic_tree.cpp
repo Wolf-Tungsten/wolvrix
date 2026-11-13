@@ -1,7 +1,7 @@
 #include "core/grh.hpp"
 
+#include <algorithm>
 #include <iostream>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -10,306 +10,176 @@
 using namespace wolvrix::lib::grh;
 
 namespace {
-
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
-
-void requirePath(const SemanticTree& tree, SemanticId id,
-                 const std::vector<std::string>& expected) {
-    require(tree.path(id) == expected, "unexpected semantic path");
+void valid(const Graph& graph) {
+    const auto errors = graph.validateSemanticTree();
+    if (!errors.empty()) throw std::runtime_error(errors.front());
+}
+void attach(Graph& graph, OperationId op, ValueId value, SemanticId node) {
+    graph.setOpSemanticIds(op, std::span<const SemanticId>(&node, 1));
+    graph.setValueSemanticIds(value, std::span<const SemanticId>(&node, 1));
 }
 
-void testOrderedSemanticUnion() {
+void testPathsAndFlatten() {
+    SemanticTree tree("unit", "circuit", "Top");
+    const auto instance = tree.addPath(tree.root(), "u.core");
+    const auto bundle = tree.addPath(instance, "bundle");
+    require(tree.addPath(instance, "bundle") == bundle, "same Path was duplicated");
+    const auto node = tree.addNode(bundle, "data[0]\\x");
+    const auto empty = tree.addNode(tree.root(), "input");
+    const auto orphan = tree.addPath(tree.root(), "orphan");
+    tree.addPath(orphan, "unused");
+    require(tree.size() == 2 && tree.pathCount() == 5, "Path and Node counts are mixed");
+    const std::vector<std::string> tokens{"Top", "u.core", "bundle", "data[0]\\x"};
+    require(tree.path(node) == tokens, "leaf path differs");
+    tree.pruneEmptyPaths();
+    require(tree.size() == 2 && tree.contains(empty) && tree.pathCount() == 3,
+            "path pruning removed an empty-op Node");
+    const auto qualified = tree.qualifiedName(node);
+    tree.flatten();
+    require(tree.isFlat() && tree.namesFlattened() && tree.pathCount() == 1,
+            "flatten retained internal Paths");
+    require(tree.node(node).parent == tree.root() && tree.name(node) == qualified,
+            "flatten changed Node identity or qualifier");
+    require(tree.path(node) == tokens, "flatten name did not preserve reversible path tokens");
+    tree.flatten();
+    require(tree.name(node) == qualified, "flatten escaped an already flattened name twice");
+    const std::vector<std::string> prefix{"outer.unit"};
+    require(tree.qualifiedName(node, prefix) == "outer\\.unit." + qualified,
+            "qualifiedName re-escaped an existing flattened name");
+}
+
+void testSparseImportAndAppend() {
+    SemanticTree source("unit", "circuit", "Child");
+    source.importPath(20, source.root(), "bundle");
+    source.importNode(80, 20, "payload");
+    source.importNode(3, source.root(), "input");
+    require(source.nodeIds() == std::vector<SemanticId>({3, 80}), "sparse Node enumeration differs");
+    SemanticTree target("unit", "circuit", "Top");
+    const auto map = target.appendTree(source, target.root(), "u");
+    require(map.nodeIds.size() == 81 && map.nodeIds[80] && map.nodeIds[3],
+            "append lacks explicit sparse Node mapping");
+    require(target.path(map.nodeIds[80]) == std::vector<std::string>({"Top", "u", "bundle", "payload"}),
+            "appended Node path differs");
+    require(target.operations(map.nodeIds[80]).empty(), "append copied graph-local member references");
+    source.flatten();
+    const auto flatMap = target.appendTree(source, target.root(), "v");
+    target.flatten();
+    require(target.name(flatMap.nodeIds[80]) == "v.bundle.payload", "copy of flattened source escaped qualifiers twice");
+}
+
+void testMembershipAndLifecycle() {
     Design design;
-    auto& graph = design.createGraph("ordered_union");
-    auto& tree = graph.getOrCreateSemanticTree("unit", "circuit", "ordered_union");
-    std::vector<SemanticId> all;
-    for (std::size_t i = 0; i < 4096; ++i)
-        all.push_back(tree.addNode(tree.root(), SemanticNodeKind::Declaration, "s" + std::to_string(i)));
-    for (const std::size_t count : {1u, 31u, 63u, 64u, 127u, 4096u}) {
-        std::vector<SemanticId> before, incoming;
-        for (std::size_t i = count; i-- > 0;)
-            if (i % 2 == 0) before.push_back(all[i]);
-        before.push_back(before.front());
-        for (std::size_t i = 0; i < count; ++i) {
-            incoming.push_back(all[i]);
-            incoming.push_back(all[i]);
-        }
-        auto expected = before;
-        std::set<SemanticId> seen(before.begin(), before.end());
-        for (const SemanticId id : incoming)
-            if (seen.insert(id).second) expected.push_back(id);
-        const auto value = graph.createTemporaryValue(1, false);
-        const auto op = graph.createTemporaryOperation(OperationKind::kNot);
-        const auto source = graph.createTemporaryValue(1, false);
-        graph.setValueSemanticIds(value, before);
-        graph.setOpSemanticIds(op, before);
-        graph.setValueSemanticIds(source, incoming);
-        auto& clone = design.cloneGraph("ordered_union", "union_clone");
-        graph.addValueSemanticIds(value, graph.valueSemanticIds(source));
-        graph.addOpSemanticIds(op, graph.valueSemanticIds(source));
-        graph.addValueSemanticIds(value, graph.valueSemanticIds(value));
-        graph.addOpSemanticIds(op, graph.opSemanticIds(op));
-        const auto valueIds = graph.valueSemanticIds(value);
-        const auto opIds = graph.opSemanticIds(op);
-        require(std::equal(valueIds.begin(), valueIds.end(), expected.begin(), expected.end()),
-                "value union changed duplicate or first-seen SemanticId order");
-        require(std::equal(opIds.begin(), opIds.end(), expected.begin(), expected.end()),
-                "operation union changed duplicate or first-seen SemanticId order");
-        const auto cloneValue = clone.values()[clone.values().size() - 2];
-        const auto cloneOp = clone.operations().back();
-        const auto cloneValueIds = clone.valueSemanticIds(cloneValue);
-        const auto cloneOpIds = clone.opSemanticIds(cloneOp);
-        require(std::equal(cloneValueIds.begin(), cloneValueIds.end(), before.begin(), before.end()) &&
-                    std::equal(cloneOpIds.begin(), cloneOpIds.end(), before.begin(), before.end()),
-                "semantic union mutated a cloned graph");
-        const auto freshValue = graph.createTemporaryValue(1, false);
-        const auto freshOp = graph.createTemporaryOperation(OperationKind::kNot);
-        graph.addValueSemanticIds(freshValue, graph.valueSemanticIds(source));
-        graph.addOpSemanticIds(freshOp, graph.valueSemanticIds(source));
-        const std::vector<SemanticId> firstSeen(all.begin(), all.begin() + count);
-        const auto freshValueIds = graph.valueSemanticIds(freshValue);
-        const auto freshOpIds = graph.opSemanticIds(freshOp);
-        require(std::equal(freshValueIds.begin(), freshValueIds.end(), firstSeen.begin(), firstSeen.end()) &&
-                    std::equal(freshOpIds.begin(), freshOpIds.end(), firstSeen.begin(), firstSeen.end()),
-                "empty target union changed incoming first-seen order");
-        const auto sourceIds = graph.valueSemanticIds(source);
-        require(std::equal(sourceIds.begin(), sourceIds.end(), incoming.begin(), incoming.end()),
-                "semantic union changed the borrowed source list");
-        require(design.deleteGraph("union_clone"), "failed to remove union clone");
-    }
+    auto& graph = design.createGraph("Top");
+    auto& tree = graph.getOrCreateSemanticTree("unit", "circuit", "Top");
+    const auto lhs = tree.addNode(tree.root(), "lhs");
+    const auto rhs = tree.addNode(tree.root(), "rhs");
+    const auto input = tree.addNode(tree.root(), "input");
+    const auto deadValue = graph.createTemporaryValue(8, false);
+    const auto deadOp = graph.createTemporaryOperation(OperationKind::kNot);
+    const auto value = graph.createTemporaryValue(8, false);
+    const auto op = graph.createTemporaryOperation(OperationKind::kNot);
+    graph.addResult(op, value);
+    const std::vector<SemanticId> owners{lhs, rhs, lhs};
+    graph.setOpSemanticIds(op, owners);
+    graph.setValueSemanticIds(value, owners);
+    require(graph.opSemanticIds(op).size() == 2 && graph.valueSemanticIds(value).size() == 2,
+            "Node membership is not a set");
+    require(tree.operations(lhs).size() == 1 && tree.operations(rhs).size() == 1,
+            "one operation cannot belong to multiple Nodes");
+    require(graph.semanticNodeOperations(lhs) == std::vector<OperationId>{op} &&
+            graph.semanticNodeAnchors(lhs) == std::vector<ValueId>{value}, "typed Node members differ");
+    const auto port = graph.createTemporaryValue(8, false);
+    graph.bindInputPort("input", port);
+    graph.setValueSemanticIds(port, std::span<const SemanticId>(&input, 1));
+    require(tree.operations(input).empty() && tree.anchors(input).size() == 1, "input Node needs artificial ops");
+    graph.setOpSemanticIds(op, std::span<const SemanticId>(&rhs, 1));
+    require(tree.operations(lhs).empty() && tree.operations(rhs).size() == 1, "replace membership left old owners");
+    graph.addOpSemanticIds(op, owners);
+    graph.addValueSemanticIds(value, graph.valueSemanticIds(value));
+    valid(graph);
+    auto& clone = design.cloneGraph("Top", "Clone");
+    valid(clone);
+    require(clone.semanticTree()->operations(lhs).size() == 1, "clone doubled memberships");
+    graph.setOpSemanticIds(op, {});
+    require(clone.semanticTree()->operations(lhs).size() == 1, "source edit mutated clone Node members");
+    attach(graph, op, value, rhs);
+    require(graph.eraseOp(deadOp) && graph.eraseValue(deadValue), "failed to create compaction holes");
+    graph.compact();
+    valid(graph);
+    require(tree.contains(lhs) && tree.contains(rhs) && tree.contains(input), "compact renumbered Node IDs");
+    const auto liveOp = graph.semanticNodeOperations(rhs).front();
+    const auto liveValue = graph.semanticNodeAnchors(rhs).front();
+    require(liveOp.index == 1 && liveValue.index == 1, "compact left stale member references");
+    require(graph.eraseOp(liveOp), "failed to erase Node operation");
+    require(tree.operations(rhs).empty(), "eraseOp left stale forward membership");
+    require(graph.eraseValue(liveValue), "failed to erase Node anchor");
+    require(tree.anchors(rhs).empty(), "eraseValue left stale forward membership");
+    graph.pruneSemanticTree();
+    require(tree.size() == 3 && tree.contains(lhs), "prune deleted a named empty Node");
+    valid(graph);
 }
 
+void testRemapAndLargeSharedSet() {
+    Design design;
+    auto& source = design.createGraph("Source");
+    auto& sourceTree = source.getOrCreateSemanticTree("unit", "circuit", "Source");
+    std::vector<SemanticId> nodes;
+    for (int i = 0; i < 4096; ++i) nodes.push_back(sourceTree.addNode(sourceTree.root(), "s" + std::to_string(i)));
+    const auto value = source.createTemporaryValue(1, false);
+    const auto op = source.createTemporaryOperation(OperationKind::kNot);
+    source.addResult(op, value);
+    source.setOpSemanticIds(op, nodes);
+    source.setValueSemanticIds(value, nodes);
+    valid(source);
+    auto& target = design.createGraph("Target");
+    auto& targetTree = target.getOrCreateSemanticTree("unit", "circuit", "Target");
+    const auto map = target.appendSemanticTree(source, targetTree.root(), "u");
+    const auto targetValue = target.createTemporaryValue(1, false);
+    const auto targetOp = target.createTemporaryOperation(OperationKind::kNot);
+    target.addResult(targetOp, targetValue);
+    require(target.remapValueBlockSemantics(source, std::span<const ValueId>(&value, 1),
+        std::span<const ValueId>(&targetValue, 1), map.nodeIds) == 1, "anchor remap count differs");
+    require(target.remapOperationBlockSemantics(source, std::span<const OperationId>(&op, 1),
+        std::span<const OperationId>(&targetOp, 1), map.nodeIds) == 1, "operation remap count differs");
+    require(targetTree.operations(map.nodeIds[nodes.back()]).size() == 1, "block remap skipped forward members");
+    valid(target);
+    targetTree.flatten();
+    valid(target);
+}
+
+void testValidationAndView() {
+    Design design;
+    auto& graph = design.createGraph("Top");
+    auto& tree = graph.getOrCreateSemanticTree("unit", "circuit", "Top");
+    const auto node = tree.addNode(tree.root(), "wire");
+    const std::vector<int64_t> shape{2};
+    const auto from = graph.createTemporaryValue(8, false, ValueType::Logic, shape);
+    const auto to = graph.createTemporaryValue(8, false);
+    graph.setValueSemanticIds(from, std::span<const SemanticId>(&node, 1));
+    const auto view = graph.replaceAllUsesWithView(from, to);
+    require(view != to && tree.operations(node).size() == 1, "new shape view has no Node operation membership");
+    valid(graph);
+    tree.addNode(tree.root(), "wire");
+    require(!graph.validateSemanticTree().empty(), "duplicate named leaves passed validation");
+}
 } // namespace
 
 int main() {
     try {
-        testOrderedSemanticUnion();
         static_assert(std::is_trivially_copyable_v<SemanticNode>);
-        static_assert(sizeof(SemanticId) == sizeof(uint32_t));
-        Design design;
-        auto& child = design.createGraph("child");
-        auto& childTree = child.getOrCreateSemanticTree("unit", "circuit", "child");
-        const auto declaration = childTree.addNode(childTree.root(), SemanticNodeKind::Declaration, "n");
-        const std::vector<std::string> fields{"bits", "data"};
-        const auto leaf = childTree.addFieldPath(declaration, fields);
-        const auto childValue = child.createTemporaryValue(8, false);
-        const auto childOp = child.createTemporaryOperation(OperationKind::kNot);
-        child.addResult(childOp, childValue);
-        child.setValueSemanticIds(childValue, std::span<const SemanticId>(&leaf, 1));
-        const std::vector<SemanticId> childOpSources{declaration, leaf};
-        child.setOpSemanticIds(childOp, childOpSources);
-
-        auto& top = design.createGraph("top");
-        auto& topTree = top.getOrCreateSemanticTree("unit", "circuit", "top");
-        const auto core0 = top.appendSemanticTree(child, topTree.root(), "core0");
-        const auto core1 = top.appendSemanticTree(child, topTree.root(), "core1");
-        const auto core0Leaf = core0 + leaf - 1;
-        const auto core1Leaf = core1 + leaf - 1;
-        require(core0 != core1 && core0Leaf != core1Leaf,
-                "copied trees share a semantic leaf");
-        require(topTree.size() == 1 + childTree.size() * 2,
-                "appendTree did not deep-copy every source node");
-        requirePath(topTree, core0Leaf, {"top", "core0", "n", "bits", "data"});
-        requirePath(topTree, core1Leaf, {"top", "core1", "n", "bits", "data"});
-        bool emptyRootRejected = false;
-        try {
-            (void)top.appendSemanticTree(child, topTree.root(), "");
-        } catch (const std::invalid_argument&) {
-            emptyRootRejected = true;
-        }
-        require(emptyRootRejected, "empty instance root name was accepted");
-
-        const auto topValue = top.createTemporaryValue(8, false);
-        const auto topOp = top.createTemporaryOperation(OperationKind::kNot);
-        top.addResult(topOp, topValue);
-        require(top.remapOperationBlockSemantics(child, std::span<const OperationId>(&childOp, 1),
-                                                 std::span<const OperationId>(&topOp, 1), core0) == 1 &&
-                top.remapValueBlockSemantics(child, std::span<const ValueId>(&childValue, 1),
-                                             std::span<const ValueId>(&topValue, 1), core0) == 1,
-                "block semantic remap failed");
-        const auto alias = top.createTemporaryValue(8, false);
-        top.setValueSemanticIds(alias, std::span<const SemanticId>(&core1Leaf, 1));
-        top.replaceAllUses(topValue, alias);
-        require(top.valueSemanticIds(alias).size() == 2,
-                "replaceAllUses did not merge direct source associations");
-        const auto replacement = top.createTemporaryValue(8, false);
-        top.replaceResult(topOp, 0, replacement);
-        require(top.valueSemanticIds(replacement).size() == 1 &&
-                top.valueSemanticIds(replacement)[0] == core0Leaf,
-                "replaceResult lost the previous result source");
-
-        auto& outer = design.createGraph("outer");
-        auto& outerTree = outer.getOrCreateSemanticTree("unit", "circuit", "outer");
-        const auto copiedTop = outer.appendSemanticTree(top, outerTree.root(), "nested");
-        const auto outerLeaf = copiedTop + core0Leaf - 1;
-        requirePath(outerTree, outerLeaf, {"outer", "nested", "core0", "n", "bits", "data"});
-        require(outerTree.size() == 1 + topTree.size(), "second copy did not copy the complete tree");
-
-        require(design.deleteGraph("child"), "failed to delete source graph");
-        requirePath(topTree, top.opSemanticIds(topOp)[1], {"top", "core0", "n", "bits", "data"});
-        top.compact();
-        const auto compactedOp = top.operations().front();
-        const auto compactedValue = top.values().front();
-        require(top.opSemanticIds(compactedOp).size() == 2 &&
-                top.opSemanticIds(compactedOp)[1] == core0Leaf &&
-                top.valueSemanticIds(compactedValue)[0] == core0Leaf,
-                "compact changed semantic associations");
-
-        auto& clone = design.cloneGraph("top", "clone");
-        require(clone.semanticTree() && clone.semanticTree()->size() == topTree.size(),
-                "clone lost SemanticTree nodes");
-        require(clone.semanticTree() != top.semanticTree(), "clone shares its SemanticTree");
-        require(clone.opSemanticIds(clone.operations().front()).size() == 2 &&
-                clone.valueSemanticIds(clone.values().front())[0] == core0Leaf,
-                "clone lost semantic associations");
-        requirePath(*clone.semanticTree(), clone.valueSemanticIds(clone.values().front())[0],
-                    {"top", "core0", "n", "bits", "data"});
-
-        auto& shared = design.createGraph("shared");
-        auto& sharedTree = shared.getOrCreateSemanticTree("unit", "circuit", "shared");
-        std::vector<SemanticId> wide;
-        for (int index = 0; index < 300; ++index) {
-            wide.push_back(sharedTree.addNode(sharedTree.root(), SemanticNodeKind::Declaration,
-                                              "n" + std::to_string(index)));
-        }
-        const auto sharedFirst = shared.createTemporaryOperation(OperationKind::kNot);
-        const auto sharedSecond = shared.createTemporaryOperation(OperationKind::kNot);
-        shared.setOpSemanticIds(sharedFirst, wide);
-        shared.setOpSemanticIds(sharedSecond, wide);
-        require(shared.payloadStats().semanticIds == wide.size() &&
-                shared.payloadStats().semanticLists == 1,
-                "identical multi-ID lists were not interned");
-        for (const auto op : shared.operations()) {
-            const auto ids = shared.opSemanticIds(op);
-            require(std::equal(ids.begin(), ids.end(), wide.begin(), wide.end()),
-                    "interning changed an operation SemanticId list");
-        }
-        shared.compact();
-        require(shared.payloadStats().semanticIds == wide.size() &&
-                shared.payloadStats().semanticLists == 1,
-                "compact discarded shared SemanticId storage");
-        auto& sharedClone = design.cloneGraph("shared", "shared_clone");
-        require(sharedClone.payloadStats().semanticIds == wide.size() &&
-                sharedClone.payloadStats().semanticLists == 1,
-                "clone discarded shared SemanticId storage");
-        for (const auto op : sharedClone.operations()) {
-            const auto ids = sharedClone.opSemanticIds(op);
-            require(std::equal(ids.begin(), ids.end(), wide.begin(), wide.end()),
-                    "clone changed a shared SemanticId list");
-        }
-
-        auto& aliasGraph = design.createGraph("alias");
-        auto& aliasTree = aliasGraph.getOrCreateSemanticTree("unit", "circuit", "alias");
-        const SemanticId aliasId = aliasTree.addNode(aliasTree.root(), SemanticNodeKind::Declaration, "n");
-        const auto aliasOp = aliasGraph.createTemporaryOperation(OperationKind::kNot);
-        aliasGraph.setOpSemanticIds(aliasOp, std::span<const SemanticId>(&aliasId, 1));
-        for (int iteration = 0; iteration < 1024; ++iteration) {
-            aliasGraph.setOpSemanticIds(aliasOp, aliasGraph.opSemanticIds(aliasOp));
-            require(aliasGraph.opSemanticIds(aliasOp).size() == 1 &&
-                    aliasGraph.opSemanticIds(aliasOp).front() == aliasId,
-                    "aliased singleton SemanticId was corrupted during growth");
-        }
-
-        auto& bounded = design.createGraph("bounded");
-        auto& boundedTree = bounded.getOrCreateSemanticTree("unit", "circuit", "bounded");
-        std::vector<SemanticId> boundedIds;
-        for (int index = 0; index < 5064; ++index) {
-            boundedIds.push_back(boundedTree.addNode(boundedTree.root(), SemanticNodeKind::Declaration,
-                                                     "n" + std::to_string(index)));
-        }
-        for (std::size_t index = 0; index + 64 < boundedIds.size(); ++index) {
-            const std::vector<SemanticId> ids(boundedIds.begin() + index, boundedIds.begin() + index + 64);
-            const auto firstOp = bounded.createTemporaryOperation(OperationKind::kNot);
-            const auto secondOp = bounded.createTemporaryOperation(OperationKind::kNot);
-            bounded.setOpSemanticIds(firstOp, ids);
-            bounded.setOpSemanticIds(secondOp, ids);
-        }
-        require(bounded.payloadStats().semanticLists <= 4096,
-                "SemanticId list cache exceeded its bound");
-        require(bounded.payloadStats().semanticIds == 320000,
-                "hot SemanticId list was not shared near cache eviction");
-        const auto boundedOps = bounded.operations();
-        for (std::size_t index = 0; index < 5000; ++index) {
-            for (const auto op : {boundedOps[index * 2], boundedOps[index * 2 + 1]}) {
-                const auto ids = bounded.opSemanticIds(op);
-                require(std::equal(ids.begin(), ids.end(), boundedIds.begin() + index),
-                        "cache eviction corrupted an older SemanticId list");
-            }
-        }
-
-        auto& pruned = design.createGraph("pruned");
-        auto& prunedTree = pruned.getOrCreateSemanticTree("unit", "circuit", "pruned");
-        const auto instance = prunedTree.addNode(prunedTree.root(), SemanticNodeKind::Module, "core0");
-        const auto instanceDeclaration = prunedTree.addNode(
-            prunedTree.root(), SemanticNodeKind::Declaration, "core0");
-        (void)instanceDeclaration;
-        prunedTree.addNode(instance, SemanticNodeKind::Declaration, "dead");
-        const auto live = prunedTree.addNode(instance, SemanticNodeKind::Declaration, "live");
-        const auto liveField = prunedTree.addNode(live, SemanticNodeKind::Field, "bits");
-        prunedTree.addNode(prunedTree.root(), SemanticNodeKind::Declaration, "orphan");
-        const auto input = pruned.createTemporaryValue(8, false);
-        pruned.bindInputPort("input", input);
-        pruned.setValueSemanticIds(input, std::span<const SemanticId>(&liveField, 1));
-        const auto pruneStats = pruned.pruneSemanticTree();
-        require(pruneStats.removedNodes == 2 && pruneStats.retainedNodes == 5 &&
-                pruneStats.retainedIndirectNodes == 3 && pruneStats.semanticIds == 1,
-                "SemanticTree pruning retained the wrong nodes");
-        require(prunedTree.size() == 5 && pruned.valueSemanticIds(input).size() == 1,
-                "SemanticTree pruning left an invalid input association");
-        requirePath(prunedTree, pruned.valueSemanticIds(input).front(),
-                    {"pruned", "core0", "live", "bits"});
-        requirePath(prunedTree, 2, {"pruned", "core0"});
-        requirePath(prunedTree, 3, {"pruned", "core0"});
-        const auto revisionAfterPrune = design.revision();
-        const auto noOpPruneStats = pruned.pruneSemanticTree();
-        require(noOpPruneStats.removedNodes == 0 && design.revision() == revisionAfterPrune,
-                "idempotent SemanticTree pruning changed the graph");
-        pruned.compact();
-        requirePath(prunedTree, pruned.valueSemanticIds(input).front(),
-                    {"pruned", "core0", "live", "bits"});
-
-        auto& lists = design.createGraph("lists");
-        auto& listTree = lists.getOrCreateSemanticTree("unit", "circuit", "lists");
-        listTree.addNode(listTree.root(), SemanticNodeKind::Declaration, "dead");
-        std::vector<SemanticId> listIds;
-        for (int index = 0; index < 62; ++index) {
-            listIds.push_back(listTree.addNode(listTree.root(), SemanticNodeKind::Declaration,
-                                               "n" + std::to_string(index)));
-        }
-        listIds.push_back(listIds[0]);
-        listIds.push_back(listIds[1]);
-        const auto listFirst = lists.createTemporaryOperation(OperationKind::kNot);
-        const auto listSecond = lists.createTemporaryOperation(OperationKind::kNot);
-        lists.setOpSemanticIds(listFirst, listIds);
-        lists.setOpSemanticIds(listSecond, listIds);
-        require(lists.payloadStats().semanticIds == 64 && lists.payloadStats().semanticLists == 1,
-                "long-list fixture did not share its source storage");
-        const auto listPruneStats = lists.pruneSemanticTree();
-        require(listPruneStats.removedNodes == 1 && listPruneStats.semanticIds == 128,
-                "long-list pruning removed the wrong source count");
-        std::vector<SemanticId> expectedListIds;
-        expectedListIds.reserve(listIds.size());
-        for (const SemanticId id : listIds) expectedListIds.push_back(id - 1);
-        for (const auto op : {listFirst, listSecond}) {
-            const auto ids = lists.opSemanticIds(op);
-            require(std::equal(ids.begin(), ids.end(), expectedListIds.begin()),
-                    "long-list pruning changed order or duplicates");
-        }
-        const auto listThird = lists.createTemporaryOperation(OperationKind::kNot);
-        lists.setOpSemanticIds(listThird, expectedListIds);
-        require(lists.payloadStats().semanticIds == 64 && lists.payloadStats().semanticLists == 1,
-                "long-list hash was not rebuilt after pruning");
-        lists.compact();
-        for (const auto op : lists.operations()) {
-            const auto ids = lists.opSemanticIds(op);
-            require(std::equal(ids.begin(), ids.end(), expectedListIds.begin()),
-                    "compact corrupted a pruned long list");
-        }
+        static_assert(sizeof(SemanticEntityRef) == 8);
+        testPathsAndFlatten();
+        testSparseImportAndAppend();
+        testMembershipAndLifecycle();
+        testRemapAndLargeSharedSet();
+        testValidationAndView();
+        std::cout << "semantic tree tests passed\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "[grh-semantic-tree] " << error.what() << '\n';
+        std::cerr << error.what() << '\n';
         return 1;
     }
 }

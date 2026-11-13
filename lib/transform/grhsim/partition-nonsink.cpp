@@ -350,30 +350,19 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
     std::set<uint64_t> families;
     ingest::node::NodeKeyInterner legacyFamilies;
     const auto* semanticTree = graph.semanticTree();
-    std::vector<SemanticId> semanticFamilies(semanticTree ? semanticTree->size() + 1 : 0);
-    if (semanticTree) for (SemanticId id = 1; id <= semanticTree->size(); ++id) {
-        const auto& node = semanticTree->node(id);
-        if (node.kind == SemanticNodeKind::Field || node.kind == SemanticNodeKind::Element)
-            semanticFamilies[id] = semanticFamilies[node.parent];
-        else if (node.kind == SemanticNodeKind::Declaration || node.kind == SemanticNodeKind::Expression)
-            semanticFamilies[id] = id;
-    }
     std::unordered_set<uint32_t> anchors;
     std::vector<bool> semanticAnchors(topo.size());
     if (options.semanticNodes) {
         for (const auto symbol : graph.declaredSymbols()) anchors.insert(symbol.value);
         for (const auto& group : graph.generateGroups()) for (const auto symbol : group.symbols) anchors.insert(symbol.value);
         if (semanticTree) {
-            const auto declaration = [&](SemanticId id) {
-                const auto family = semanticFamilies.at(id);
-                return family && semanticTree->node(family).kind == SemanticNodeKind::Declaration;
-            };
+            const auto leaf = [&](SemanticId id) { return semanticTree->contains(id); };
             for (uint32_t i = 0; i < topo.size(); ++i) {
-                // A declaration result is a boundary; its internal expression
-                // operations merely carry provenance and are not all anchors.
+                // Value anchors mark Node boundaries; op membership marks the
+                // implementation set and does not itself create a boundary.
                 for (const auto value : graph.opResults(topo[i])) {
                     if (std::any_of(graph.valueSemanticIds(value).begin(),
-                                    graph.valueSemanticIds(value).end(), declaration)) {
+                                    graph.valueSemanticIds(value).end(), leaf)) {
                         semanticAnchors[i] = true;
                         break;
                     }
@@ -391,7 +380,10 @@ NodeAnalysis buildNodes(const Graph& graph, std::span<const OperationId> topo,
             attribute<int64_t>(graph, op, "grhsim.effectOrder").has_value();
         if (semanticTree) {
             const auto addSemantic = [&](std::span<const SemanticId> ids) {
-                for (const auto id : ids) if (const auto family = semanticFamilies.at(id)) members[i].push_back(family);
+                for (const auto id : ids) {
+                    if (!semanticTree->contains(id)) throw std::invalid_argument("partition has invalid SemanticTree Node ID");
+                    members[i].push_back(id);
+                }
             };
             addSemantic(graph.opSemanticIds(op));
             if (members[i].empty())

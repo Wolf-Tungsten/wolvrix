@@ -2,8 +2,10 @@
 #include "../transform/grhsim_oracle.hpp"
 #include "ingest/sv.hpp"
 #include "../../lib/ingest/mixed.hpp"
+#include "transform/hier_flatten.hpp"
 
 #include <tuple>
+#include <unordered_set>
 
 namespace {
 using namespace firrtl_test;
@@ -184,9 +186,13 @@ circuit External :
     auto cloned = first.design->clone(); first = {}; second = {};
     require(!ingest::svSourceManager(owners), "multiple SV SourceManagers must not alias their buffer IDs");
     tx::SessionStore session; pass(cloned, session, "hier-flatten");
-    const auto records = node::inspect(*cloned.findGraph("top")); require(!records.nodes.empty(), "cloned mixed source lost node identities");
-    require(std::any_of(records.nodes.begin(), records.nodes.end(), [](const auto& record) {
-        return node::parseKey(record.key).instancePath.size() >= 3;
+    const auto& flattened = *cloned.findGraph("top");
+    require(flattened.semanticTree(), "cloned mixed source lost its SemanticTree");
+    require(std::any_of(flattened.operations().begin(), flattened.operations().end(), [&](const auto operation) {
+        const auto sources = flattened.opSemanticIds(operation);
+        return std::any_of(sources.begin(), sources.end(), [&](const auto source) {
+            return flattened.semanticTree()->path(source).size() >= 3;
+        });
     }), "flatten collapsed a mixed hierarchy into a single node path component");
     auto specialized = ingest::specializeModule(good, {ingest::SourceLanguage::Firrtl, "fir", "top", {}});
     require(specialized.success(), diagnostics(specialized));
@@ -532,11 +538,17 @@ endmodule
         const auto& graph = *result.design->findGraph(name);
         if (!graph.metadata("ingest.link.kind")) continue;
         if (graph.inputPortValue("r__DOT__enable")) {
+            require(graph.metadata("ingest.link.implementationModule") == grh::AttributeValue(std::string("single")),
+                "ABI adapter lost its actual SV implementation module");
+            require(graph.metadata("ingest.link.sourceModule") == grh::AttributeValue(std::string("Single")),
+                "ABI adapter lost its original FIRRTL external module");
             require(std::ranges::equal(graph.valueShape(graph.inputPortValue("r__DOT__enable")), single.shape),
                 "scalarized binding erased the singleton array shape");
             ++adapters;
         }
         if (graph.inputPortValue("io__DOT__data")) {
+            require(graph.metadata("ingest.link.implementationModule") == grh::AttributeValue(std::string("nested")),
+                "nested ABI adapter lost its actual implementation module");
             require(std::ranges::equal(graph.valueShape(graph.inputPortValue("io__DOT__data")), nested.shape),
                 "scalarized binding erased the multidimensional array shape");
             require(count(graph, OperationKind::kSliceArray) && count(graph, OperationKind::kArrayCreate),
@@ -589,6 +601,197 @@ const unsigned nested=((a^8)<<24)|((b^4)<<16)|((a^3^2)<<8)|(b^5^1);
 const unsigned plain=((b^128)<<24)|((a^64)<<16)|((b^7^32)<<8)|(a^11^16);
 assert(m.nestedData==nested);assert(m.plainData==plain);}}
 )CPP");
+}
+void semanticAbi() {
+    const auto fixtures = std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR);
+    ingest::IngestRequest request;
+    request.logLevel = wolvrix::lib::LogLevel::Off;
+    request.firrtl.nodeAnnotations = true;
+    request.sources = {{ingest::SourceLanguage::Firrtl, fixtures / "f28-abi-ports.fir", "f28-abi"},
+                       {ingest::SourceLanguage::SystemVerilog, fixtures / "f28-abi-ports.sv", "f28-sv"}};
+    auto result = ingest::readSources(request);
+    require(result.success(), diagnostics(result));
+    const auto nodeNamed = [](const grh::Graph& graph, std::string_view name) {
+        require(graph.semanticTree(), "ABI graph has no SemanticTree");
+        grh::SemanticId found = 0;
+        for (const auto id : graph.semanticTree()->nodeIds()) {
+            if (graph.semanticTree()->qualifiedName(id) != name) continue;
+            require(!found, "ABI boundary Node was duplicated");
+            found = id;
+        }
+        require(found, "missing ABI boundary Node: " + std::string(name));
+        return found;
+    };
+    const auto roundtrip = [](const grh::Design& design) {
+        wolvrix::lib::store::StoreOptions options;
+        options.jsonMode = wolvrix::lib::store::JsonPrintMode::PrettyCompact;
+        options.emitSourceLocations = true;
+        wolvrix::lib::store::StoreJson store;
+        const auto json = store.storeToString(design, options);
+        require(json.has_value(), "ABI SemanticTree store failed");
+        auto restored = grh::Design::fromJsonString(*json);
+        const auto second = store.storeToString(restored, options);
+        require(second && *second == *json, "ABI SemanticTree v5 roundtrip changed references");
+        return restored;
+    };
+    std::size_t adapters = 0, implementations = 0;
+    for (const auto& [name, graph] : result.design->graphs()) {
+        if (graph->metadata("ingest.sourceModule") == grh::AttributeValue(std::string("F28ScalarImplementation"))) {
+            ++implementations;
+            require(!graph->semanticTree(), "SV implementation acquired a FIRRTL SemanticTree");
+            for (const auto operation : graph->operations())
+                require(graph->opSemanticIds(operation).empty(), "SV implementation op acquired FIRRTL membership");
+            for (const auto value : graph->values())
+                require(graph->valueSemanticIds(value).empty(), "SV implementation value acquired FIRRTL anchors");
+        }
+        if (graph->metadata("ingest.link.kind") != grh::AttributeValue(std::string("adapter"))) continue;
+        ++adapters;
+        require(graph->validateSemanticTree().empty() && graph->semanticTree()->size() == 4,
+                "ABI adapter does not have exactly its declared FIRRTL port Nodes");
+        const auto names = graph->metadata("firrtl.semanticPortNames");
+        const auto nodes = graph->metadata("firrtl.semanticPortNodes");
+        require(names && nodes && std::get<std::vector<std::string>>(*names).size() == 4 &&
+                std::get<std::vector<int64_t>>(*nodes).size() == 4,
+                "ABI formal map omitted an elided endpoint");
+        std::map<std::string, grh::SemanticId> byPort;
+        for (std::size_t i = 0; i < 4; ++i)
+            byPort.emplace(std::get<std::vector<std::string>>(*names)[i],
+                           static_cast<grh::SemanticId>(std::get<std::vector<int64_t>>(*nodes)[i]));
+        for (const auto& port : {"r__DOT__data", "r__DOT__reply"}) {
+            const auto value = graph->findValue(port);
+            require(value.valid() && graph->semanticNodeAnchors(byPort.at(port)) == std::vector<grh::ValueId>{value},
+                    "ABI Node anchor is not exactly the actual FIRRTL formal value");
+        }
+        for (const auto& port : {"ignored", "empty"})
+            require(!graph->findValue(port) && graph->semanticNodeAnchors(byPort.at(port)).empty() &&
+                    graph->semanticNodeOperations(byPort.at(port)).empty(),
+                    "ABI elided endpoint acquired fabricated circuitry or a value anchor");
+        for (const auto value : graph->values())
+            if (value != graph->findValue("r__DOT__data") && value != graph->findValue("r__DOT__reply"))
+                require(graph->valueSemanticIds(value).empty(), "ABI internal physical value became a formal anchor");
+        require(count(*graph, OperationKind::kConstant) == 1 && count(*graph, OperationKind::kSliceArray) == 1 &&
+                count(*graph, OperationKind::kArrayCreate) == 1 && count(*graph, OperationKind::kAssign) == 2,
+                "ABI fixture does not exercise singleton split/reassembly and both signed views");
+        for (const auto operation : graph->operations()) {
+            const auto owners = graph->opSemanticIds(operation);
+            const auto source = graph->opSrcLoc(operation);
+            require(!owners.empty() && source && source->line && source->pass == "ingest-firrtl-abi",
+                    "ABI helper/transport lacks native membership or source location");
+            if (graph->opKind(operation) == OperationKind::kInstance)
+                require(owners.size() == 2 &&
+                        std::find(owners.begin(), owners.end(), byPort.at("r__DOT__data")) != owners.end() &&
+                        std::find(owners.begin(), owners.end(), byPort.at("r__DOT__reply")) != owners.end(),
+                        "ABI implementation transport does not reference exactly its physical formal port Nodes");
+            else
+                require(owners.size() == 1 && owners.front() == byPort.at(source->note),
+                        "ABI helper is not a member of its actual FIRRTL port Node");
+        }
+        nodeNamed(*graph, "r.data");
+        nodeNamed(*graph, "r.reply");
+    }
+    require(adapters == 2 && implementations == 2,
+            "ABI repeated instances or parameter specializations changed definition identity");
+    auto restored = roundtrip(*result.design);
+    for (const bool globalPlan : {false, true}) {
+        auto design = restored.clone();
+        tx::HierFlattenOptions options;
+        options.useGlobalPlan = globalPlan;
+        require(node_test::run(design, std::make_unique<tx::HierFlattenPass>(options)), "ABI flatten failed");
+        const auto& top = *design.findGraph("F28AbiPorts");
+        require(top.validateSemanticTree().empty() && top.semanticTree()->isFlat() && top.semanticTree()->size() == 16,
+                "ABI flatten duplicated placeholders or retained wrapper-only Nodes");
+        std::unordered_set<grh::SemanticId> endpoints;
+        for (const auto& instance : {"first", "second", "third"}) {
+            for (const auto& port : {"r.data", "r.reply", "ignored", "empty"}) {
+                const auto node = nodeNamed(top, std::string(instance) + "." + port);
+                require(endpoints.insert(node).second, "different ABI instances share a Node identity");
+                const auto anchors = top.semanticNodeAnchors(node);
+                require(anchors.size() == (std::string_view(port).starts_with("r.") ? 1 : 0),
+                        "ABI flatten lost the original logical formal anchor");
+            }
+        }
+        std::size_t glue = 0, svBody = 0;
+        for (const auto operation : top.operations()) {
+            const auto source = top.opSrcLoc(operation);
+            if (source && source->pass == "ingest-firrtl-abi") {
+                ++glue;
+                const auto owners = top.opSemanticIds(operation);
+                require(owners.size() == 1 && endpoints.contains(owners.front()),
+                        "relocated ABI glue is not owned by its explicit source endpoint");
+            } else if (source && std::filesystem::path(source->file).filename() == "f28-abi-ports.sv") {
+                ++svBody;
+                require(top.opSemanticIds(operation).empty(), "flatten absorbed real SV implementation into FIRRTL Node");
+            }
+        }
+        require(glue == 15 && svBody > 0, "ABI glue or actual SV computations disappeared from the fixture: glue=" +
+                std::to_string(glue) + " sv=" + std::to_string(svBody));
+        const auto external = top.metadata("firrtl.externalInstancePaths");
+        const auto modules = top.metadata("firrtl.externalInstanceModules");
+        const auto lines = top.metadata("firrtl.externalInstanceLines");
+        require(external && modules && lines && std::get<std::vector<std::string>>(*external).size() == 3 &&
+                std::get<std::vector<int64_t>>(*lines).size() == 3,
+                "annotated ABI wrapper lost or duplicated original external boundary records");
+        const auto moduleNames = std::get<std::vector<std::string>>(*modules);
+        require(std::count(moduleNames.begin(), moduleNames.end(), "BoxA") == 2 &&
+                std::count(moduleNames.begin(), moduleNames.end(), "BoxB") == 1,
+                "ABI specialization lost its original FIRRTL external module identity");
+        roundtrip(design);
+    }
+    request.firrtl.nodeAnnotations = false;
+    auto unannotated = ingest::readSources(request);
+    require(unannotated.success(), diagnostics(unannotated));
+    for (const auto& [name, graph] : unannotated.design->graphs())
+        require(!graph->semanticTree(), "explicit annotation opt-out still creates ABI Nodes");
+
+    const auto output = artifact("ingest-mixed");
+    const auto emptyFirrtl = output / "f28-elided-only.fir";
+    const auto emptySv = output / "f28-elided-only.sv";
+    std::ofstream(emptyFirrtl) << R"FIR(FIRRTL version 6.0.0
+circuit F28EmptyAbi :
+  extmodule EmptyAbi :
+    input ignored : UInt<0>
+    output empty : UInt<8>[0]
+    defname = F28EmptyImplementation
+  module F28EmptyAbi :
+    inst silent of EmptyAbi
+)FIR";
+    std::ofstream(emptySv) << "module F28EmptyImplementation(); initial $display(\"empty\"); endmodule\n";
+    request.firrtl.nodeAnnotations = true;
+    request.sources = {{ingest::SourceLanguage::Firrtl, emptyFirrtl, "f28-empty-abi"},
+                       {ingest::SourceLanguage::SystemVerilog, emptySv, "f28-empty-sv"}};
+    auto emptyResult = ingest::readSources(request);
+    require(emptyResult.success(), diagnostics(emptyResult));
+    bool emptyAdapter = false;
+    for (const auto& [name, graph] : emptyResult.design->graphs()) {
+        if (graph->metadata("ingest.link.kind") != grh::AttributeValue(std::string("adapter"))) continue;
+        emptyAdapter = true;
+        require(graph->validateSemanticTree().empty() && graph->semanticTree()->size() == 2,
+                "entirely elided ABI lost its declared Nodes");
+        for (const auto node : graph->semanticTree()->nodeIds())
+            require(graph->semanticNodeOperations(node).empty() && graph->semanticNodeAnchors(node).empty(),
+                    "entirely elided ABI fabricated a physical member");
+        for (const auto operation : graph->operations())
+            require(graph->opKind(operation) == OperationKind::kInstance && graph->opSemanticIds(operation).empty(),
+                    "entirely elided ABI fabricated transport membership");
+    }
+    require(emptyAdapter, "entirely elided ABI did not produce its adapter");
+    const auto emptyRestored = roundtrip(*emptyResult.design);
+    for (const bool globalPlan : {false, true}) {
+        auto design = emptyRestored.clone();
+        tx::HierFlattenOptions options;
+        options.useGlobalPlan = globalPlan;
+        require(node_test::run(design, std::make_unique<tx::HierFlattenPass>(options)),
+                "entirely elided ABI flatten failed");
+        const auto& top = *design.findGraph("F28EmptyAbi");
+        require(top.validateSemanticTree().empty() && top.semanticTree()->isFlat() && top.semanticTree()->size() == 2,
+                "entirely elided ABI flatten lost or duplicated an endpoint");
+        for (const auto port : {"silent.ignored", "silent.empty"}) {
+            const auto node = nodeNamed(top, port);
+            require(top.semanticNodeOperations(node).empty() && top.semanticNodeAnchors(node).empty(),
+                    "entirely elided ABI flatten fabricated a physical member");
+        }
+        roundtrip(design);
+    }
 }
 void parallelSvPublication(const std::filesystem::path& output) {
     const auto path = output / "parallel-order.sv";
@@ -655,7 +858,14 @@ circuit top :
     auto result = read(path); require(result.success(), diagnostics(result));
     require(result.design->graphs().size()==2, "hierarchy dependency was not lowered");
     tx::SessionStore session; pass(*result.design, session, "hier-flatten");
-    require(!node::inspect(*result.design->findGraph("top")).nodes.empty(), "hierarchy lost node provenance");
+    const auto& flattened = *result.design->findGraph("top");
+    require(flattened.semanticTree(), "hierarchy lost its SemanticTree");
+    require(std::any_of(flattened.operations().begin(), flattened.operations().end(), [&](const auto operation) {
+        const auto sources = flattened.opSemanticIds(operation);
+        return std::any_of(sources.begin(), sources.end(), [&](const auto source) {
+            return flattened.semanticTree()->path(source) == std::vector<std::string>{"top", "child", "n"};
+        });
+    }), "hierarchy lost node provenance");
     generate(*result.design, output / "hierarchy", driver);
     const auto mixedPath = output / "mixed.fir";
     std::ofstream(mixedPath) << R"FIR(FIRRTL version 6.0.0
@@ -962,4 +1172,13 @@ int main(){GrhSIM_top m;m.init();for(unsigned a=0;a<100;++a){m.clk=0;m.a=a;m.eva
     std::ofstream(output / "run.mk") << ".PHONY: run hierarchy cross-source top svtop top-hints svtop-hints parameters abi scalarized-abi inline path resource macro dpi\nrun: hierarchy cross-source top svtop top-hints svtop-hints parameters abi scalarized-abi inline path resource macro dpi\nhierarchy cross-source top svtop top-hints svtop-hints parameters abi scalarized-abi inline path resource macro dpi:\n\t$(MAKE) -C $@ -f run.mk run\n";
 }
 }
-int main() { try { test(); return 0; } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }
+int main(int argc, char** argv) {
+    try {
+        if (argc == 2 && std::string_view(argv[1]) == "--f28-abi") semanticAbi();
+        else test();
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

@@ -40,6 +40,28 @@ FIRRTL 节点 key 的实例路径限定使用每次递归内联独立的缓存�
 保持原克隆映射，normalize、schema、canonical key、root result 和数量上限
 检查及降级计数保持原语义。
 
+### SemanticTree（F28）
+
+SemanticTree 内部只有 Path，具名叶子 Node 保存实际 op 成员和必要的 ValueId
+边界 anchors。flatten 同时展平这套结构：顶图 Node 的 ID 保留，子图 Node
+使用显式映射搬迁到根下，删除中间 Path；不再 append 来源树或使用 SID 偏移。
+例如 `u` 路径下 Bundle `b` 的叶子 `y` 变为根下名为 `u.b.y` 的 Node。
+`.`、`\\`、`[`、`]` 在原始名字中反斜线转义；该限定名编码独立于 IR 符号的 `$`。
+JSON v5 保存 `namesFlattened`，因此往返后再次 flatten 不会重复转义。
+
+父实例端口占位与子图端口仅在实际端口搬迁关系、限定名和真实 anchor 相符时
+复用同一 Node。真正不同的具名端点可共享实际 value，但保留不同 Node；
+空 op 输入和零宽对象同样保留。op 的共享成员由同一接口维护，IR 不复制执行。
+全局计划在端口 union-find 代表确定后批量提交 anchors，普通和批量克隆使用
+同一 Node 映射。提交后校验成员引用、反向索引及所有叶子直接挂根的不变量。
+
+FIRRTL 外部实例的 SV 实现保持实际边界 metadata；无 SemanticTree 的 SV 内部
+op 不归入 FIRRTL 端口 Node。混合 ABI adapter 的真实接口 helper 在创建时归入
+对应端口 Node，随显式 formal/actual 映射搬迁；零宽端口仍保留空叶。
+adapter 已有 SemanticTree 时仍在原 FIRRTL 外部实例处记录一次实际边界，
+不把其内部实现实例重复记录。F28 支持到本 pass 为止，尚未迁移的后续变换
+通过 PassManager 明确报告不支持新 SemanticTree。
+
 ### 符号保护模式
 
 declaredSymbol（declared 的 value/op）在任何模式下都会保留为层次路径名并维持 declared 身份；未声明的子图符号一律改用内部名（`_val_N`/`_op_N`）。`symProtect` 模式目前只影响一种情形：父图侧**未声明**的端口映射值是否改名为子图的层次端口名。

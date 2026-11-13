@@ -684,6 +684,61 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
     graph.setAttr(instance, "moduleName", target);
     graph.setAttr(instance, "instanceName", std::string("implementation"));
     graph.setMetadata("ingest.link.kind", std::string("adapter"));
+    graph.setMetadata("ingest.link.sourceModule", source.name);
+    std::string implementation = target;
+    if (const auto original = child->metadata("ingest.sourceModule"))
+        if (const auto module = std::get_if<std::string>(&*original)) implementation = *module;
+    graph.setMetadata("ingest.link.implementationModule", std::move(implementation));
+    grh::SemanticTree* semanticTree = nullptr;
+    std::unordered_map<std::string_view, grh::SemanticId> semanticPorts;
+    std::vector<std::string> semanticPortNames;
+    std::vector<int64_t> semanticPortNodes;
+    std::vector<grh::SemanticId> transportNodes;
+    if (request_.firrtl.nodeAnnotations) {
+        semanticTree = &graph.getOrCreateSemanticTree(source.sourceUnit,
+            std::string(firrtl_.at(source.name).source->circuit()), name);
+        std::map<std::pair<grh::SemanticPathId, std::string>, grh::SemanticPathId> paths;
+        for (const auto& port : source.ports) {
+            if (port.fieldPath.empty()) throw std::invalid_argument("missing FIRRTL ABI field path: " + port.name);
+            auto parent = semanticTree->root();
+            for (std::size_t i = 0; i + 1 < port.fieldPath.size(); ++i) {
+                auto [path, inserted] = paths.try_emplace(std::pair{parent, port.fieldPath[i]});
+                if (inserted) path->second = semanticTree->addPath(parent, port.fieldPath[i]);
+                parent = path->second;
+            }
+            const auto node = semanticTree->addNode(parent, port.fieldPath.back());
+            semanticPorts.emplace(port.name, node);
+            semanticPortNames.push_back(port.name);
+            semanticPortNodes.push_back(node);
+            if (flatWidth(port)) transportNodes.push_back(node);
+        }
+        graph.setMetadata("firrtl.semanticPortNames", std::move(semanticPortNames));
+        graph.setMetadata("firrtl.semanticPortNodes", semanticPortNodes);
+        graph.setOpSemanticIds(instance, transportNodes);
+    }
+    grh::SrcLoc sourceLocation;
+    if (source.location) {
+        sourceLocation.file = source.location->file.generic_string();
+        sourceLocation.line = static_cast<uint32_t>(source.location->line);
+        sourceLocation.column = static_cast<uint32_t>(source.location->column);
+    }
+    sourceLocation.pass = "ingest-firrtl-abi";
+    sourceLocation.note = "implementation boundary";
+    graph.setOpSrcLoc(instance, sourceLocation);
+    const auto markValue = [&](grh::ValueId value, const PortLeafSignature& port) {
+        auto location = sourceLocation;
+        location.note = port.name;
+        graph.setValueSrcLoc(value, std::move(location));
+    };
+    const auto markOperation = [&](grh::OperationId operation, const PortLeafSignature& port) {
+        auto location = sourceLocation;
+        location.note = port.name;
+        graph.setOpSrcLoc(operation, std::move(location));
+        if (semanticTree) {
+            const auto node = semanticPorts.at(port.name);
+            graph.setOpSemanticIds(operation, std::span<const grh::SemanticId>(&node, 1));
+        }
+    };
     std::vector<std::string> inputs, outputs;
     std::set<std::string> used;
     std::set<std::string> bound;
@@ -704,6 +759,7 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
             (!sourceType.shape.empty() && !targetType.shape.empty() && sourceType.shape != targetType.shape))
             throw std::invalid_argument("incompatible boundary ABI width, kind, domain or shape: " + source.name + "." + port.name);
         const auto bridge = sourceType == targetType ? value : graph.createTemporaryValue(targetType);
+        if (bridge != value) markValue(bridge, port);
         if (port.direction == LeafDirection::Input) {
             inputs.push_back(targetPort); graph.addOperand(instance, bridge);
         } else {
@@ -714,6 +770,7 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
             graph.setAttr(assign, "ingest.abi.view", true);
             graph.addOperand(assign, port.direction == LeafDirection::Input ? value : bridge);
             graph.addResult(assign, port.direction == LeafDirection::Input ? bridge : value);
+            markOperation(assign, port);
         }
     };
     for (const auto& port : source.ports) {
@@ -734,6 +791,11 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
         }
         const grh::LogicalType sourceType{port.valueType, flatWidth(port), port.isSigned, grh::LogicDomain::FourState, port.shape};
         const auto value = graph.createValue(graph.internSymbol(port.name), sourceType);
+        markValue(value, port);
+        if (semanticTree) {
+            const auto node = semanticPorts.at(port.name);
+            graph.setValueSemanticIds(value, std::span<const grh::SemanticId>(&node, 1));
+        }
         if (port.direction == LeafDirection::Input) graph.bindInputPort(port.name, value);
         else graph.bindOutputPort(port.name, value);
         if (binding != bindings.end() || hasPort(targetPort) || port.shape.empty()) {
@@ -770,13 +832,17 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
             std::vector<grh::ValueId> elements;
             for (int64_t index = 0; index < port.shape[dimension]; ++index) {
                 const auto element = graph.createTemporaryValue(elementType);
+                markValue(element, port);
                 if (port.direction == LeafDirection::Input) {
                     const auto offset = graph.createTemporaryValue(
                         grh::LogicalType{grh::ValueType::Logic, 32, false, grh::LogicDomain::FourState, {}});
                     const auto constant = graph.createTemporaryOperation(grh::OperationKind::kConstant);
                     graph.setAttr(constant, "constValue", "32'd" + std::to_string(index)); graph.addResult(constant, offset);
+                    markValue(offset, port);
+                    markOperation(constant, port);
                     const auto slice = graph.createTemporaryOperation(grh::OperationKind::kSliceArray);
                     graph.addOperand(slice, aggregate); graph.addOperand(slice, offset); graph.addResult(slice, element);
+                    markOperation(slice, port);
                 }
                 indices.push_back(index); self(self, dimension + 1, element); indices.pop_back();
                 elements.push_back(element);
@@ -785,6 +851,7 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
                 const auto create = graph.createTemporaryOperation(grh::OperationKind::kArrayCreate);
                 for (const auto element : elements) graph.addOperand(create, element);
                 graph.addResult(create, aggregate);
+                markOperation(create, port);
             }
         };
         split(split, 0, value);
@@ -796,6 +863,18 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
             throw std::invalid_argument("binding names an unknown source port: " + binding.sourcePort);
     graph.setAttr(instance, "inputPortName", std::move(inputs)); graph.setAttr(instance, "outputPortName", std::move(outputs));
     graph.setAttr(instance, "inoutPortName", std::vector<std::string>{});
+    if (semanticTree) {
+        const auto errors = graph.validateSemanticTree();
+        if (!errors.empty()) throw std::invalid_argument("invalid FIRRTL ABI SemanticTree: " + errors.front());
+        for (const auto operation : graph.operations()) {
+            // A portless implementation or an entirely elided interface has
+            // no physical data transport. Its instance disappears in flatten.
+            if (operation == instance && transportNodes.empty()) continue;
+            if (graph.opSemanticIds(operation).empty())
+                throw std::invalid_argument("FIRRTL ABI operation has no Node membership: " +
+                    std::string(grh::toString(graph.opKind(operation))) + " id=" + std::to_string(operation.index));
+        }
+    }
     return name;
 }
 

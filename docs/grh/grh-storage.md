@@ -639,20 +639,30 @@ operand 的顺序同时填写 users 和 operandUseIndices。失败退出也须�
 
 ## 9. 自包含 SemanticTree
 
-每个 Graph 可持有一棵 `std::optional<SemanticTree>`，不引用其他 Graph 的来源树。树内节点保存
-`parent/kind/nameOffset/nameSize/index`；所有名称字符集中在同一个 `vector<char>`，节点集中在
-`vector<SemanticNode>`。SemanticNode 不含 `std::string` 或指针，因此默认树拷贝就是节点数组和字符区的深拷贝。
+F28 将原六类来源树替换为计算 Node 的组织结构。每个 Graph 可持有一棵
+`std::optional<SemanticTree>`，内部为独立 ID 域的 Path，叶子只有一种具名 Node。
+根是 Path，编号为 1；Node 的 `SemanticId` 与 `SemanticPathId` 分别计数，0 无效。
+Path 只存父路径与名字，Node 存父路径、名字及实际 op/anchor 成员范围。
+没有 NodeKind、角色、source shape 或子节点；数组形状、状态及 effect 语义由实际 IR 表达。
 
-SemanticId 是当前树的 uint32_t 本地节点下标，根为 1，0 无效。value/op 的 `semantics_` 行只保存
-`TopologyPools::semantics` 整数数组中的 Range；一个实体可以关联多个来源，设置列表时保留顺序和重复项，
-合并接口按既有规则去重。compact 重排实体行时同步移动 Range，不改变 SemanticId 本身。
+所有名称共享字符池，成员使用池中的 graph-local `{index,generation,next}` 记录，
+不为每个 Node 独立分配 `std::vector`。`tree.operations(id)` / `tree.anchors(id)`
+提供轻量遍历；`Graph::semanticNodeOperations` / `semanticNodeAnchors` 可取得实际 typed refs。
+op→Node 与 value→Node 的紧凑 Range 是同一成员关系的反向索引，由 Graph setter
+同步维护、去重。一个 op 可以属于多个 Node，IR 仍只执行一次。
 
-flatten 调用 `appendTree` 复制完整来源树，包括来源 Module 根。若复制后的源根为 R，则来源 ID x
-变为 `R+x-1`；源根的 parent 指向目标父节点，其余 parent 和 nameOffset 按各自基址平移。
-两条 flatten 路径都按同一公式重映射 value/op 来源。节点和名称数组按需几何扩容，不能每次
-精确 reserve 到本次追加后的长度，否则连续复制会反复搬迁已有整棵树。树中没有 Instance 节点、scope 或外部定义树引用；
-来源路径表达定义模块及字段关系，实例名仍由电路 symbol 表达。
+Node ID 是 Graph 内对象身份。路径裁剪、存储重排、flatten 保持顶图 Node ID；
+跨 Graph 复制返回显式 Node/Path 映射，不再使用 `copiedRoot + oldSID - 1`。
+clone 得到独立成员池，compact 在实体 ID 重排后重建引用；erase 移除实际成员引用。
+输入、别名、零宽及空数组可以是空 op Node，路径裁剪不会据此删除 Node。
+普通值替换或类型 view 通过实际引用和 Graph 成员 API 保持 anchors 与实现 op 关系。
 
-`semanticTree()` 返回当前 Graph 内树的借用指针，clone 得到独立深拷贝。JSON v4 直接保存这棵树的
-sourceUnit/circuit/nodes 和逐行 semanticIds，不序列化字符偏移、Range 或任何指针，详见
-[GRH JSON 规范](grh-json-spec.md)。
+`hier-flatten` 直接把子图叶子复制到目标根，使用实际实例/端口/op/value 映射。
+结束时所有 Node 直接连根；限定名逐段转义后用 `.` 连接。
+`namesFlattened` 记录名字已限定，避免 JSON 往返后重复编码。
+
+`validateSemanticTree` 校验 Path 拓扑、名字、所有实际成员存活与双向索引一致。
+JSON v5 只保存 Path、Node、显式 ID、名字和实际 op/value 引用，详见
+[GRH JSON 规范](grh-json-spec.md)。旧 `semanticBindings` 不参与新模型生产或写出；
+v4 不能自动转换成实际计算 Node，应从正常 ingest 重新生成。
+F28 首阶段支持 ingest→xmr-resolve→hier-flatten；尚未迁移的后续 pass 明确拒绝新树。

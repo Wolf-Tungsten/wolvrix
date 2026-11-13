@@ -49,6 +49,124 @@ namespace
             actual->pass == expected.pass && actual->note == expected.note;
     }
 
+    int mutationCheckpoint()
+    {
+        Design design;
+        auto& graph = design.createGraph("checkpoint");
+        design.markAsTop("checkpoint");
+        Graph* const originalGraph = &graph;
+        const auto graphId = graph.id();
+        const auto input = graph.createValue(graph.internSymbol("input"), 8, false);
+        const auto holeValue = graph.createValue(graph.internSymbol("hole"), 8, false);
+        const auto output = graph.createValue(graph.internSymbol("output"), 8, false);
+        const auto holeOp = graph.createOperation(OperationKind::kConstant, graph.internSymbol("hole_op"));
+        const auto operation = graph.createOperation(OperationKind::kNot, graph.internSymbol("not"));
+        graph.addOperand(operation, input);
+        graph.addResult(operation, output);
+        if (!graph.eraseValue(holeValue) || !graph.eraseOp(holeOp))
+            return fail("checkpoint fixture could not create ID holes");
+        graph.bindInputPort("in", input);
+        graph.bindOutputPort("out", output);
+        graph.setMetadata("checkpoint", std::string("before"));
+        graph.setAttr(operation, "strings", std::vector<std::string>{"original", "shared"});
+        graph.setAttr(operation, "numbers", std::vector<int64_t>{1, 2, 3});
+        graph.assignWriterOrder(operation, "state");
+        const SrcLoc location{"checkpoint.fir", 17, 2, 17, 9, "firrtl", "ingest", "original"};
+        graph.setOpAndValueSrcLocView(operation, output, SrcLocView(location));
+        auto& tree = graph.getOrCreateSemanticTree("checkpoint.fir", "Checkpoint", "checkpoint");
+        const auto path = tree.addPath(tree.root(), "child");
+        const auto node = tree.addNode(path, "output");
+        const std::array<SemanticId, 1> membership{node};
+        graph.setOpSemanticIds(operation, membership);
+        graph.setValueSemanticIds(input, membership);
+        graph.addDeclaredSymbol(graph.valueSymbol(input));
+        const auto scope = graph.internSymbol("generate");
+        const auto group = graph.addGenerateGroup(scope, graph.valueSymbol(input));
+        graph.addGenerateGroupSymbol(group, graph.valueSymbol(input));
+        const auto firstInternalOp = graph.makeInternalOpSym();
+        const auto firstInternalValue = graph.makeInternalValSym();
+        graph.markLocalCyclesChecked();
+        const auto* originalStore = &graph.payloadStore();
+        const auto originalStats = graph.payloadStats();
+        StoreDiagnostics diagnostics;
+        StoreJson store(&diagnostics);
+        const auto before = store.storeToString(design);
+        if (!before || diagnostics.hasError()) return fail("checkpoint fixture did not serialize");
+        {
+            auto checkpoint = graph.checkpointMutation();
+            if (&graph.payloadStore() == originalStore || graph.findValue("output") != output ||
+                graph.findOperation("not") != operation || graph.lookupSymbol("_op_0") != firstInternalOp ||
+                graph.lookupSymbol("_val_0") != firstInternalValue ||
+                !expectThrows([&] { (void)graph.valueWidth(holeValue); }) ||
+                !expectThrows([&] { (void)graph.opKind(holeOp); }))
+                return fail("checkpoint work copy changed IDs, holes or symbol reservations");
+            graph.semanticTree()->flatten();
+            graph.setMetadata("checkpoint", std::string("partial"));
+            graph.setAttr(operation, "numbers", std::vector<int64_t>{9, 10});
+            graph.setAttr(operation, "strings", std::vector<std::string>{"partial-only"});
+            graph.setOpSrcLoc(operation, SrcLoc{"partial-only.fir", 99});
+            const auto partial = graph.createValue(graph.internSymbol("partial-only"), 8, false);
+            graph.replaceOperand(operation, 0, partial);
+            graph.clearDeclaredSymbols();
+            graph.makeInternalOpSym();
+            graph.makeInternalValSym();
+            const auto writer = graph.createOperation(OperationKind::kNot, graph.internSymbol("partial_writer"));
+            graph.assignWriterOrder(writer, "state");
+            if (!graph.removeOutputPort("out") || !graph.eraseOpUnchecked(operation) ||
+                !graph.eraseValueUnchecked(output))
+                return fail("checkpoint work copy could not exercise erased semantic members");
+        }
+        const auto after = store.storeToString(design);
+        const auto afterStats = graph.payloadStats();
+        if (&graph != originalGraph || graph.id() != graphId || &graph.payloadStore() != originalStore ||
+            !after || *before != *after || graph.findValue("output") != output ||
+            graph.findOperation("not") != operation || graph.lookupSymbol("partial-only").valid() ||
+            graph.lookupSymbol("partial-only.fir").valid() ||
+            graph.semanticTree()->namesFlattened() || graph.semanticTree()->node(node).parent != path ||
+            graph.semanticNodeOperations(node) != std::vector<OperationId>{operation} ||
+            graph.semanticNodeAnchors(node) != std::vector<ValueId>{input} ||
+            !graph.validateSemanticTree().empty() || !graph.localCyclesChecked() ||
+            !sameSrcLoc(graph.opSrcLoc(operation), location) ||
+            afterStats.strings != originalStats.strings || afterStats.attributes != originalStats.attributes ||
+            afterStats.srcLocs != originalStats.srcLocs || afterStats.int64Payload != originalStats.int64Payload)
+            return fail("checkpoint rollback did not restore the exact graph preimage");
+        if (graph.symbolText(graph.makeInternalOpSym()) != "_op_1" ||
+            graph.symbolText(graph.makeInternalValSym()) != "_val_1")
+            return fail("checkpoint rollback did not restore internal name counters");
+        const auto writer = graph.createOperation(OperationKind::kNot, graph.internSymbol("writer"));
+        graph.assignWriterOrder(writer, "state");
+        if (graph.getOperation(writer).attr("writerOrder") != std::optional<AttributeValue>{int64_t{1}})
+            return fail("checkpoint rollback did not restore writer order counters");
+        const auto* beforeException = &graph.payloadStore();
+        try {
+            auto checkpoint = graph.checkpointMutation();
+            graph.setMetadata("checkpoint", std::string("exception"));
+            throw std::runtime_error("late failure");
+        } catch (const std::runtime_error&) {
+        }
+        if (&graph.payloadStore() != beforeException ||
+            graph.metadata("checkpoint") != std::optional<AttributeValue>{std::string("before")})
+            return fail("exception did not roll back the checkpoint");
+        {
+            auto checkpoint = graph.checkpointMutation(false);
+            if (&graph.payloadStore() != beforeException) return fail("disabled checkpoint copied the graph");
+            graph.setMetadata("disabled", true);
+        }
+        if (graph.metadata("disabled") != std::optional<AttributeValue>{true})
+            return fail("disabled checkpoint reverted a mutation");
+        {
+            auto checkpoint = graph.checkpointMutation();
+            graph.setMetadata("checkpoint", std::string("committed"));
+            checkpoint.commit();
+        }
+        if (graph.metadata("checkpoint") != std::optional<AttributeValue>{std::string("committed")} ||
+            graph.findValue("output") != output || graph.findOperation("not") != operation ||
+            !expectThrows([&] { (void)graph.valueWidth(holeValue); }) ||
+            !expectThrows([&] { (void)graph.opKind(holeOp); }))
+            return fail("committed checkpoint lost graph mutations or original entity identities");
+        return 0;
+    }
+
     int cachedSourceLocationImports()
     {
         const SrcLoc shared{std::string(4096, 'f'), 17, 3, 19, 71,
@@ -1419,6 +1537,17 @@ namespace
         target.rebuildUseLists();
         if (target.valueUsers(targetA).size() != 2 || target.valueUsers(targetB).size() != 1)
             return fail("consumed topology did not rebuild duplicate operand uses");
+        {
+            auto checkpoint = target.checkpointMutation();
+            if (target.opOperands(targetFirst).data() == firstOperands)
+                return fail("checkpoint retained mutable edge buffers from its preimage");
+            target.replaceOperand(targetFirst, 1, seedValue);
+            target.addOperand(targetSecond, targetA);
+        }
+        if (target.opOperands(targetFirst).data() != firstOperands ||
+            target.opOperands(targetFirst)[1] != targetA || target.opOperands(targetSecond).size() != 1 ||
+            target.valueUsers(targetA).size() != 2 || target.valueUsers(targetB).size() != 1)
+            return fail("checkpoint did not restore consumed edge buffers and backlinks");
         target.replaceOperand(targetFirst, 1, seedValue);
         target.addOperand(targetSecond, targetA);
         if (!target.eraseOperand(targetSecond, 1) || target.valueUsers(targetA).size() != 1 ||
@@ -1461,6 +1590,7 @@ int main()
         if (blockExecutorBatches() != 0) return 1;
         if (sharedColumnOwnership() != 0) return 1;
         if (consumedTopologyOwnership() != 0) return 1;
+        if (mutationCheckpoint() != 0) return 1;
         {
             Design ordered;
             auto& last = ordered.createGraph("z");
@@ -1881,9 +2011,9 @@ int main()
             return fail("Generate group not preserved in compact round-trip");
         }
 
-        // generateGroups is optional in v4.
+        // generateGroups is optional in v5.
         const std::string legacyJson = R"({
-  "formatVersion": 4,
+  "formatVersion": 5,
   "graphs": [
     {
       "symbol": "legacy",
@@ -1980,7 +2110,7 @@ int main()
         }
 
         const std::string nestedArrayJson = R"({
-  "formatVersion": 4,
+  "formatVersion": 5,
   "graphs": [
     {
       "symbol": "illegal_nested_array",
@@ -2024,7 +2154,7 @@ int main()
         }
 
         const std::string objectAttributeJson = R"({
-  "formatVersion": 4,
+  "formatVersion": 5,
   "graphs": [
     {
       "symbol": "illegal_object_attr",
@@ -2615,7 +2745,7 @@ int main()
             temporaryOptions.jsonMode = JsonPrintMode::PrettyCompact;
             temporaryOptions.emitDefUsers = true;
             const auto temporaryJson = temporaryStore.storeToString(temporaryDesign, temporaryOptions);
-            if (!temporaryJson || temporaryJson->find("\"formatVersion\": 4") == std::string::npos ||
+            if (!temporaryJson || temporaryJson->find("\"formatVersion\": 5") == std::string::npos ||
                 temporaryJson->find("\"tmp\"") != std::string::npos ||
                 temporaryJson->find("tmp_val_") != std::string::npos ||
                 temporaryJson->find("tmp_op_") != std::string::npos)

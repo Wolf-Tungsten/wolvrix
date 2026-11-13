@@ -752,7 +752,7 @@ namespace wolvrix::lib::store
             writer.setPrettyPrint(pretty);
             writer.startObject();
             writer.writeProperty("formatVersion");
-            writer.writeValue(int64_t{4});
+            writer.writeValue(int64_t{5});
 
             const bool timingEnabled = jsonTimingEnabled();
             writer.writeProperty("graphs");
@@ -1188,21 +1188,6 @@ namespace wolvrix::lib::store
             out.push_back('}');
         }
 
-        void writeSemanticIdsInline(JsonOutput &out,
-                                    std::span<const wolvrix::lib::grh::SemanticId> ids,
-                                    JsonPrintMode mode)
-        {
-            out.push_back('[');
-            bool first = true;
-            for (const auto id : ids)
-            {
-                if (!first) out.append(commaToken(mode));
-                out.append(std::to_string(id));
-                first = false;
-            }
-            out.push_back(']');
-        }
-
         void writeValueInline(JsonOutput &out,
                               const wolvrix::lib::grh::Graph &graph,
                               const GraphLocalIds &ids,
@@ -1260,11 +1245,6 @@ namespace wolvrix::lib::store
                                   {
                                       prop("users", [&]
                                            { writeUsersInline(out, graph, ids, graph.valueUsers(value), mode); });
-                                  }
-                                  if (!graph.valueSemanticIds(value).empty())
-                                  {
-                                      prop("semanticIds", [&]
-                                           { writeSemanticIdsInline(out, graph.valueSemanticIds(value), mode); });
                                   }
                                   if (options.emitSourceLocations && graph.valueSrcLoc(value))
                                   {
@@ -1338,11 +1318,6 @@ namespace wolvrix::lib::store
                                            }
                                            out.push_back(']');
                                        });
-                                  if (!graph.opSemanticIds(op).empty())
-                                  {
-                                      prop("semanticIds", [&]
-                                           { writeSemanticIdsInline(out, graph.opSemanticIds(op), mode); });
-                                  }
                                   if (!graph.opAttrRange(op).empty())
                                   {
                                       prop("attrs", [&]
@@ -1506,9 +1481,11 @@ namespace wolvrix::lib::store
         }
 
         void writeSemanticTreePrettyCompact(JsonOutput &out,
-                                            const wolvrix::lib::grh::SemanticTree &tree,
+                                            const wolvrix::lib::grh::Graph &graph,
+                                            const GraphLocalIds &ids,
                                             int indent)
         {
+            const auto &tree = *graph.semanticTree();
             out.push_back('{');
             appendNewlineAndIndent(out, indent + 1);
             appendQuotedString(out, "sourceUnit");
@@ -1521,23 +1498,76 @@ namespace wolvrix::lib::store
             appendQuotedString(out, tree.circuit());
             out.push_back(',');
             appendNewlineAndIndent(out, indent + 1);
-            appendQuotedString(out, "nodes");
+            appendQuotedString(out, "rootPath");
+            out.append(": ");
+            out.append(std::to_string(tree.root()));
+            out.push_back(',');
+            appendNewlineAndIndent(out, indent + 1);
+            appendQuotedString(out, "namesFlattened");
+            out.append(tree.namesFlattened() ? ": true," : ": false,");
+            appendNewlineAndIndent(out, indent + 1);
+            appendQuotedString(out, "paths");
             out.append(": [");
-            for (wolvrix::lib::grh::SemanticId id = 1; id <= tree.size(); ++id)
+            bool first = true;
+            for (const auto id : tree.pathIds())
             {
-                if (id != 1) out.push_back(',');
+                if (!first) out.push_back(',');
+                first = false;
                 appendNewlineAndIndent(out, indent + 2);
                 writeInlineObject(out, JsonPrintMode::PrettyCompact, [&](auto &&prop)
                 {
-                    const auto &node = tree.node(id);
-                    prop("parent", [&] { out.append(std::to_string(node.parent)); });
-                    prop("kind", [&] { appendQuotedString(out, wolvrix::lib::grh::toString(node.kind)); });
-                    prop("name", [&] { appendQuotedString(out, tree.name(id)); });
-                    if (node.kind == wolvrix::lib::grh::SemanticNodeKind::Element)
-                        prop("index", [&] { out.append(std::to_string(node.index)); });
+                    prop("id", [&] { out.append(std::to_string(id)); });
+                    prop("parent", [&] { out.append(std::to_string(tree.pathEntry(id).parent)); });
+                    prop("name", [&] { appendQuotedString(out, tree.pathName(id)); });
                 });
             }
-            if (tree.size() != 0) appendNewlineAndIndent(out, indent + 1);
+            if (!first) appendNewlineAndIndent(out, indent + 1);
+            out.append("],");
+            appendNewlineAndIndent(out, indent + 1);
+            appendQuotedString(out, "nodes");
+            out.append(": [");
+            first = true;
+            for (const auto id : tree.nodeIds())
+            {
+                if (!first) out.push_back(',');
+                first = false;
+                appendNewlineAndIndent(out, indent + 2);
+                writeInlineObject(out, JsonPrintMode::PrettyCompact, [&](auto &&prop)
+                {
+                    prop("id", [&] { out.append(std::to_string(id)); });
+                    prop("parent", [&] { out.append(std::to_string(tree.node(id).parent)); });
+                    prop("name", [&] { appendQuotedString(out, tree.name(id)); });
+                    prop("ops", [&] {
+                        std::vector<uint32_t> members;
+                        members.reserve(tree.operations(id).size());
+                        for (const auto op : graph.semanticNodeOperations(id)) members.push_back(ids.operation(op));
+                        std::sort(members.begin(), members.end());
+                        out.push_back('[');
+                        bool firstMember = true;
+                        for (const auto op : members) {
+                            if (!firstMember) out.append(", ");
+                            firstMember = false;
+                            out.append(std::to_string(op));
+                        }
+                        out.push_back(']');
+                    });
+                    prop("anchors", [&] {
+                        std::vector<uint32_t> members;
+                        members.reserve(tree.anchors(id).size());
+                        for (const auto value : graph.semanticNodeAnchors(id)) members.push_back(ids.value(value));
+                        std::sort(members.begin(), members.end());
+                        out.push_back('[');
+                        bool firstMember = true;
+                        for (const auto value : members) {
+                            if (!firstMember) out.append(", ");
+                            firstMember = false;
+                            out.append(std::to_string(value));
+                        }
+                        out.push_back(']');
+                    });
+                });
+            }
+            if (!first) appendNewlineAndIndent(out, indent + 1);
             out.push_back(']');
             appendNewlineAndIndent(out, indent);
             out.push_back('}');
@@ -1590,7 +1620,7 @@ namespace wolvrix::lib::store
                 appendNewlineAndIndent(out, indent);
                 appendQuotedString(out, "semanticTree");
                 out.append(": ");
-                writeSemanticTreePrettyCompact(out, *graph.semanticTree(), indent);
+                writeSemanticTreePrettyCompact(out, graph, ids, indent);
                 out.push_back(',');
             }
             appendNewlineAndIndent(out, indent);
@@ -1819,7 +1849,7 @@ namespace wolvrix::lib::store
             indent = 1;
             appendNewlineAndIndent(out, indent);
             appendQuotedString(out, "formatVersion");
-            out.append(": 4,");
+            out.append(": 5,");
             appendNewlineAndIndent(out, indent);
 
             appendQuotedString(out, "graphs");

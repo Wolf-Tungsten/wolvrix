@@ -242,6 +242,8 @@ namespace wolvrix::lib::transform
 
             try
             {
+                for (const auto& problem : graph->validateSemanticTree())
+                    error(*graph, "grh.verify: " + problem);
                 for (const auto& problem : ingest::node::inspect(*graph).errors)
                     error(*graph, "grh.verify: " + problem);
                 if (const std::string problem = grhsim::verifyGraph(*graph); !problem.empty())

@@ -373,12 +373,12 @@ class Session:
         return _native.session_graph_metadata(self._capsule, design=design, top=top)
 
     def semantic_stats(self, *, design: str) -> dict:
-        """Count SemanticTree nodes and value/operation SemanticId associations."""
+        """Count Path/Node objects, actual op memberships, unique op coverage and empty Nodes."""
         self._ensure_open()
         return _native.session_semantic_stats(self._capsule, design=design)
 
     def semantic_validate(self, *, design: str) -> dict:
-        """Validate unique instance paths and register symbols against SemanticTree paths."""
+        """Validate SemanticTree paths, named leaves and bidirectional op/anchor memberships."""
         self._ensure_open()
         return _native.session_semantic_validate(self._capsule, design=design)
 
@@ -486,6 +486,14 @@ def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tupl
         _ensure_no_extra_named(canonical_name, local)
     elif canonical_name == "comb-loop-elim":
         compiled.extend(_compile_comb_loop_elim_kwargs(named))
+    elif canonical_name == "split-static-array":
+        local = dict(named)
+        for key in ("trace_node_evolution", "trace_input_sha256", "trace_source_endpoints"):
+            value = local.pop(key, None)
+            if value is not None:
+                compiled.extend(["-" + key.replace("_", "-"),
+                                 str(int(value)) if isinstance(value, bool) else str(value)])
+        _ensure_no_extra_named(canonical_name, local)
     elif canonical_name == "simplify":
         compiled.extend(_compile_simplify_kwargs(named))
     elif canonical_name in ("register-write-normalize", "mux-tree-fold"):

@@ -2,6 +2,7 @@
 
 #include "core/grh.hpp"
 #include "core/state.hpp"
+#include "transform/node_evolution.hpp"
 #include "ingest/node_attributes.hpp"
 #include "constant_index.hpp"
 #include "slang/numeric/SVInt.h"
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
+#include <filesystem>
 #include <limits>
 #include <optional>
 #include <span>
@@ -39,6 +41,14 @@ namespace wolvrix::lib::transform
             int64_t offset = 0;
             int64_t width = 0;
         };
+
+        GraphEvolutionTrace::Geometry selectionTraceGeometry(const Graph &graph, ValueId base,
+                                                             const SliceGeometry &selection)
+        {
+            const auto shape = graph.valueShape(base);
+            return {"packed-selection", GraphEvolutionTrace::ref(base),
+                    std::vector<int64_t>(shape.begin(), shape.end()), {}, selection.offset, selection.width};
+        }
 
         struct SelectionKey
         {
@@ -232,9 +242,26 @@ namespace wolvrix::lib::transform
         class GraphSplitter
         {
         public:
-            GraphSplitter(Graph &graph, SplitStaticArrayPass::Stats &stats)
-                : graph_(graph), stats_(stats)
+            GraphSplitter(Graph &graph, SplitStaticArrayPass::Stats &stats,
+                          GraphEvolutionTrace *trace = nullptr)
+                : graph_(graph), stats_(stats), trace_(trace)
             {
+                for (const auto &binding : graph_.semanticBindings())
+                {
+                    using Role = wolvrix::lib::grh::SemanticBindingRole;
+                    if (trace_ && binding.role == Role::RegisterNext)
+                        watchIndexedEvidence(binding.operation, binding.value);
+                    if (!binding.value || binding.shape.empty() ||
+                        (binding.role != Role::Value && binding.role != Role::RegisterCurrent &&
+                         binding.role != Role::MemoryReadAddress)) continue;
+                    const OperationId producer = graph_.valueDef(binding.value);
+                    if (binding.operation && binding.operation != producer) continue;
+                    // StateSplitter publishes actual current-state member reads.
+                    if (binding.role == Role::RegisterCurrent && producer &&
+                        (graph_.opKind(producer) == OperationKind::kRegisterReadPort ||
+                         graph_.opKind(producer) == OperationKind::kRegisterReadArrayPort)) continue;
+                    sourceBindings_[binding.value].push_back(binding);
+                }
             }
 
             bool run()
@@ -269,13 +296,24 @@ namespace wolvrix::lib::transform
                         {
                             ++stats_.unsupportedSlicesSkipped;
                         }
+                        traceRetain(opId, arraySlice ? "dynamic_or_invalid_index" : "unsupported_slice_geometry");
                         continue;
                     }
                     const ValueId base = graph_.opOperands(opId)[0];
                     const ValueId result = graph_.opResults(opId)[0];
                     if (graph_.valueIsInput(base) || graph_.valueIsOutput(base) || graph_.valueIsInout(base))
                     {
+                        if (bindSelection(base, result, *geometry))
+                        {
+                            changed_ = true;
+                            if (trace_) trace_->step("rewrite", "static_source_projection_bound",
+                                {GraphEvolutionTrace::ref(base), GraphEvolutionTrace::ref(result),
+                                 GraphEvolutionTrace::ref(opId)},
+                                {GraphEvolutionTrace::ref(base), GraphEvolutionTrace::ref(result),
+                                 GraphEvolutionTrace::ref(opId)}, selectionTraceGeometry(graph_, base, *geometry));
+                        }
                         ++stats_.unsupportedSlicesSkipped;
+                        traceRetain(opId, "port_array_boundary");
                         continue;
                     }
                     SelectionKey key{base, geometry->offset, geometry->width,
@@ -290,6 +328,7 @@ namespace wolvrix::lib::transform
                     if (!selected.valid() || selected == base || selected == result)
                     {
                         ++stats_.unsupportedSlicesSkipped;
+                        traceRetain(opId, "unsupported_selection");
                         continue;
                     }
                     if (graph_.valueLogicalType(selected) != key.type)
@@ -318,6 +357,19 @@ namespace wolvrix::lib::transform
                     graph_.eraseAttr(opId, "sliceEnd");
                     graph_.eraseAttr(opId, "sliceWidth");
                     mergeRewriteMetadata(graph_, opId, opId, producer);
+                    const bool selectedBinding = bindSelection(base, selected, *geometry);
+                    const bool resultBinding = bindSelection(base, result, *geometry);
+                    if (trace_ && (selectedBinding || resultBinding))
+                        trace_->step("split", "source_member_projection_transferred",
+                            {GraphEvolutionTrace::ref(base), GraphEvolutionTrace::ref(selected),
+                             GraphEvolutionTrace::ref(result)},
+                            {GraphEvolutionTrace::ref(base), GraphEvolutionTrace::ref(selected),
+                             GraphEvolutionTrace::ref(result)}, selectionTraceGeometry(graph_, base, *geometry));
+                    if (trace_) trace_->step("rewrite", "static_selection_forwarded",
+                        {GraphEvolutionTrace::ref(opId), GraphEvolutionTrace::ref(result)},
+                        {GraphEvolutionTrace::ref(opId), GraphEvolutionTrace::ref(result)},
+                        selectionTraceGeometry(graph_, base, *geometry));
+                    traceIndexedEvidence(opId);
                     splitValues_.insert(base);
                     if (arraySlice)
                     {
@@ -339,6 +391,7 @@ namespace wolvrix::lib::transform
                 SelectionKey key{base, offset, type.width, type};
                 if (const ValueId selected = select(key, sourceOp, 1); selected.valid())
                 {
+                    changed_ = bindSelection(base, selected, {offset, type.width}) || changed_;
                     return selected;
                 }
                 const ValueId fallback = createView(OperationKind::kSliceStatic, {base}, key, sourceOp,
@@ -353,6 +406,230 @@ namespace wolvrix::lib::transform
             }
 
         private:
+            struct IndexedEvidenceDependencies
+            {
+                ValueId payload;
+                std::vector<OperationId> producers;
+            };
+
+            void watchIndexedEvidence(OperationId writer, ValueId payload)
+            {
+                if (const auto previous = indexedEvidenceDependencies_.find(writer);
+                    previous != indexedEvidenceDependencies_.end())
+                {
+                    for (const auto producer : previous->second.producers)
+                    {
+                        const auto found = indexedEvidence_.find(producer);
+                        if (found == indexedEvidence_.end()) continue;
+                        std::erase(found->second, std::pair{writer, previous->second.payload});
+                        if (found->second.empty()) indexedEvidence_.erase(found);
+                    }
+                    indexedEvidenceDependencies_.erase(previous);
+                }
+                if (!writer || !payload) return;
+                const auto kind = graph_.opKind(writer);
+                if (kind != OperationKind::kRegisterWriteArrayPort &&
+                    kind != OperationKind::kRegisterWriteArrayMaskPort) return;
+                const auto count = wolvrix::lib::grh::arrayPortIndexCount(graph_, writer);
+                const auto operands = graph_.opOperands(writer);
+                if (!count || operands.size() <= *count + 1 || operands[*count + 1] != payload) return;
+                IndexedEvidenceDependencies dependencies{payload, {}};
+                for (std::size_t axis = 0; axis < *count; ++axis)
+                {
+                    ValueId index = operands[axis + 1];
+                    if (!index) continue;
+                    const int32_t width = graph_.valueWidth(index);
+                    if (graph_.valueType(index) != ValueType::Logic || width <= 0) continue;
+                    for (unsigned depth = 0; depth < 16; ++depth)
+                    {
+                        const auto producer = graph_.valueDef(index);
+                        if (!producer) break;
+                        if (std::find(dependencies.producers.begin(), dependencies.producers.end(), producer) ==
+                            dependencies.producers.end()) dependencies.producers.push_back(producer);
+                        auto &dependents = indexedEvidence_[producer];
+                        const auto dependent = std::pair{writer, payload};
+                        if (std::find(dependents.begin(), dependents.end(), dependent) == dependents.end())
+                            dependents.push_back(dependent);
+                        const auto arguments = graph_.opOperands(producer);
+                        if (graph_.opKind(producer) != OperationKind::kAssign || arguments.size() != 1 || !arguments[0] ||
+                            graph_.valueWidth(arguments[0]) != width || graph_.valueType(arguments[0]) != ValueType::Logic)
+                            break;
+                        index = arguments[0];
+                    }
+                }
+                indexedEvidenceDependencies_.emplace(writer, std::move(dependencies));
+            }
+
+            void traceIndexedEvidence(OperationId producer)
+            {
+                if (!trace_) return;
+                const auto found = indexedEvidence_.find(producer);
+                if (found == indexedEvidence_.end()) return;
+                const auto dependents = found->second;
+                std::vector<GraphEvolutionTrace::Ref> refs{GraphEvolutionTrace::ref(producer)};
+                for (const auto result : graph_.opResults(producer)) refs.push_back(GraphEvolutionTrace::ref(result));
+                bool affected = false;
+                for (const auto &[writer, payload] : dependents)
+                {
+                    watchIndexedEvidence(writer, payload);
+                    const auto current = indexedEvidenceDependencies_.find(writer);
+                    if (current == indexedEvidenceDependencies_.end() ||
+                        std::find(current->second.producers.begin(), current->second.producers.end(), producer) ==
+                            current->second.producers.end()) continue;
+                    refs.push_back(GraphEvolutionTrace::ref(writer));
+                    refs.push_back(GraphEvolutionTrace::ref(payload));
+                    affected = true;
+                }
+                if (affected) trace_->step("rewrite", "indexed_update_index_rewritten", refs, refs);
+            }
+
+            void traceRetain(OperationId op, const char *reason)
+            {
+                if (trace_) trace_->step("retain", reason,
+                    {GraphEvolutionTrace::ref(op)}, {GraphEvolutionTrace::ref(op)});
+            }
+
+            std::optional<wolvrix::lib::grh::SemanticBinding> projectedBinding(
+                const wolvrix::lib::grh::SemanticBinding &source, ValueId base, ValueId target,
+                const SliceGeometry &geometry) const
+            {
+                if (source.sourceWidth <= 0 || geometry.offset < 0 || geometry.width <= 0 ||
+                    geometry.offset % source.sourceWidth || geometry.width % source.sourceWidth)
+                    return std::nullopt;
+                const LogicalType targetType = graph_.valueLogicalType(target);
+                if (targetType.kind != ValueType::Logic || targetType.leafWidth() != source.sourceWidth ||
+                    targetType.isSigned != source.sourceSigned || targetType.width != geometry.width)
+                    return std::nullopt;
+                auto binding = source;
+                if (binding.projection.empty()) binding.projection.assign(binding.shape.size(), -1);
+                std::vector<std::size_t> openAxes;
+                int64_t volume = 1;
+                for (std::size_t axis = 0; axis < binding.shape.size(); ++axis)
+                {
+                    if (binding.projection[axis] != -1) continue;
+                    const int64_t extent = binding.shape[axis];
+                    if (extent <= 0 || volume > std::numeric_limits<int64_t>::max() / extent)
+                        return std::nullopt;
+                    volume *= extent;
+                    openAxes.push_back(axis);
+                }
+                if (volume > std::numeric_limits<int64_t>::max() / source.sourceWidth ||
+                    volume * source.sourceWidth != graph_.valueWidth(base)) return std::nullopt;
+                const auto normalized = [](auto dimensions) {
+                    std::vector<int64_t> result;
+                    for (const int64_t extent : dimensions) if (extent != 1) result.push_back(extent);
+                    return result;
+                };
+                std::vector<int64_t> sourceShape;
+                for (const auto axis : openAxes) sourceShape.push_back(binding.shape[axis]);
+                const auto physicalShape = graph_.valueShape(base);
+                if (!physicalShape.empty() && normalized(physicalShape) != normalized(sourceShape))
+                    return std::nullopt;
+                const int64_t cells = geometry.width / source.sourceWidth;
+                const int64_t first = geometry.offset / source.sourceWidth;
+                if (first > volume - cells || first % cells) return std::nullopt;
+                const auto targetShape = normalized(targetType.shape);
+                std::optional<std::size_t> prefix;
+                for (std::size_t count = 0; count <= openAxes.size(); ++count)
+                {
+                    int64_t suffixCells = 1;
+                    std::vector<int64_t> suffix;
+                    for (std::size_t axis = count; axis < openAxes.size(); ++axis)
+                    {
+                        suffixCells *= binding.shape[openAxes[axis]];
+                        suffix.push_back(binding.shape[openAxes[axis]]);
+                    }
+                    if (suffixCells == cells && normalized(suffix) == targetShape) prefix = count;
+                }
+                if (!prefix) return std::nullopt;
+                int64_t remaining = first / cells;
+                for (std::size_t axis = *prefix; axis-- > 0;)
+                {
+                    const auto sourceAxis = openAxes[axis];
+                    binding.projection[sourceAxis] = remaining % binding.shape[sourceAxis];
+                    remaining /= binding.shape[sourceAxis];
+                }
+                if (remaining) return std::nullopt;
+                binding.value = target;
+                if (binding.operation) binding.operation = graph_.valueDef(target);
+                return binding;
+            }
+
+            bool bindSelection(ValueId base, ValueId target, const SliceGeometry &geometry)
+            {
+                const LogicalType type = graph_.valueLogicalType(target);
+                std::vector<SelectionKey> pending{{base, geometry.offset, geometry.width, type}};
+                std::unordered_set<SelectionKey, SelectionKeyHash> visited;
+                bool changed = false;
+                while (!pending.empty())
+                {
+                    const SelectionKey key = std::move(pending.back());
+                    pending.pop_back();
+                    if (!visited.insert(key).second || visited.size() > 256) continue;
+                    if (const auto found = sourceBindings_.find(key.base); found != sourceBindings_.end())
+                    {
+                        // Insertion can rehash this index or append to the same value.
+                        const auto sources = found->second;
+                        bool transferred = false;
+                        bool contextTransferred = false;
+                        for (const auto &source : sources)
+                        {
+                            auto binding = projectedBinding(source, key.base, target, {key.offset, key.width});
+                            if (!binding) continue;
+                            auto &endpoints = sourceBindings_[target];
+                            if (std::find(endpoints.begin(), endpoints.end(), *binding) != endpoints.end()) continue;
+                            graph_.addSemanticBinding(*binding);
+                            contextTransferred = contextTransferred || binding->operation.valid();
+                            endpoints.push_back(std::move(*binding));
+                            changed = transferred = true;
+                        }
+                        if (trace_ && transferred)
+                        {
+                            std::vector<GraphEvolutionTrace::Ref> refs{
+                                GraphEvolutionTrace::ref(key.base), GraphEvolutionTrace::ref(target)};
+                            if (contextTransferred) refs.push_back(GraphEvolutionTrace::ref(graph_.valueDef(target)));
+                            trace_->step("rewrite", "static_source_projection_bound", refs, refs,
+                                selectionTraceGeometry(graph_, key.base, {key.offset, key.width}));
+                        }
+                    }
+                    const OperationId producer = graph_.valueDef(key.base);
+                    if (!producer) continue;
+                    const auto operands = graph_.opOperands(producer);
+                    const auto push = [&](ValueId value, int64_t offset) {
+                        if (offset >= 0 && key.width <= graph_.valueWidth(value) &&
+                            offset <= graph_.valueWidth(value) - key.width)
+                            pending.push_back({value, offset, key.width, type});
+                    };
+                    if (graph_.opKind(producer) == OperationKind::kAssign && operands.size() == 1 &&
+                        graph_.valueWidth(operands[0]) == graph_.valueWidth(key.base))
+                        push(operands[0], key.offset);
+                    else if (graph_.opKind(producer) == OperationKind::kSliceStatic && operands.size() == 1)
+                    {
+                        if (const auto slice = staticSliceGeometry(graph_, producer))
+                            push(operands[0], slice->offset + key.offset);
+                    }
+                    else if (graph_.opKind(producer) == OperationKind::kArrayCreate ||
+                             graph_.opKind(producer) == OperationKind::kConcat)
+                    {
+                        int64_t offset = graph_.opKind(producer) == OperationKind::kConcat
+                            ? graph_.valueWidth(key.base) : 0;
+                        for (const ValueId operand : operands)
+                        {
+                            const int64_t width = graph_.valueWidth(operand);
+                            const int64_t low = graph_.opKind(producer) == OperationKind::kConcat
+                                ? offset - width : offset;
+                            if (key.offset >= low && key.offset - low <= width - key.width)
+                            {
+                                push(operand, key.offset - low);
+                                break;
+                            }
+                            offset += graph_.opKind(producer) == OperationKind::kConcat ? -width : width;
+                        }
+                    }
+                }
+                return changed;
+            }
+
             ValueId select(const SelectionKey &key, OperationId sourceOp, unsigned depth)
             {
                 if (depth >= 256)
@@ -386,6 +663,9 @@ namespace wolvrix::lib::transform
                     }
                     while (createdOps_.size() > opCheckpoint)
                     {
+                        if (trace_) trace_->step("delete", "selection_transaction_rolled_back",
+                            {GraphEvolutionTrace::ref(createdOps_.back()),
+                             GraphEvolutionTrace::ref(createdValues_[createdOps_.size() - 1])}, {});
                         requestedStaticSlices_.erase(createdOps_.back());
                         ingest::node::recordDead(graph_, createdOps_.back());
                         graph_.eraseOpUnchecked(createdOps_.back());
@@ -631,6 +911,11 @@ namespace wolvrix::lib::transform
                 graph_.setValueSemanticIds(result, semantics);
                 createdOps_.push_back(op);
                 createdValues_.push_back(result);
+                if (trace_) trace_->step("split", "selection_view_materialized",
+                    {GraphEvolutionTrace::ref(sourceOp)},
+                    {GraphEvolutionTrace::ref(sourceOp), GraphEvolutionTrace::ref(op),
+                     GraphEvolutionTrace::ref(result)},
+                    selectionTraceGeometry(graph_, key.base, {key.offset, key.width}));
                 ++stats_.opsCreated;
                 return result;
             }
@@ -665,6 +950,12 @@ namespace wolvrix::lib::transform
 
             Graph &graph_;
             SplitStaticArrayPass::Stats &stats_;
+            GraphEvolutionTrace *trace_ = nullptr;
+            std::unordered_map<ValueId, std::vector<wolvrix::lib::grh::SemanticBinding>, ValueIdHash> sourceBindings_;
+            std::unordered_map<OperationId, std::vector<std::pair<OperationId, ValueId>>,
+                               wolvrix::lib::grh::OperationIdHash> indexedEvidence_;
+            std::unordered_map<OperationId, IndexedEvidenceDependencies,
+                               wolvrix::lib::grh::OperationIdHash> indexedEvidenceDependencies_;
             std::unordered_map<SelectionKey, ValueId, SelectionKeyHash> cache_;
             std::unordered_set<SelectionKey, SelectionKeyHash> visiting_;
             std::unordered_set<ValueId, ValueIdHash> splitValues_;
@@ -699,18 +990,32 @@ namespace wolvrix::lib::transform
             std::vector<std::string> memberInitValues;
         };
 
+        GraphEvolutionTrace::Geometry memberTraceGeometry(const StateFamily &family, int64_t element)
+        {
+            std::vector<int64_t> coordinates(family.type.shape.size());
+            int64_t remaining = element;
+            for (std::size_t axis = family.type.shape.size(); axis-- > 0;)
+            {
+                coordinates[axis] = remaining % family.type.shape[axis];
+                remaining /= family.type.shape[axis];
+            }
+            return {"array-member", GraphEvolutionTrace::ref(family.declaration), family.type.shape,
+                    std::move(coordinates), element * family.leafWidth, family.leafWidth, element};
+        }
+
         class StateSplitter
         {
         public:
             StateSplitter(Graph &graph, GraphSplitter &splitter, SplitStaticArrayPass::Stats &stats,
-                          bool keepDeclared)
-                : graph_(graph), splitter_(splitter), stats_(stats), keepDeclared_(keepDeclared)
+                          bool keepDeclared, GraphEvolutionTrace *trace = nullptr)
+                : graph_(graph), splitter_(splitter), stats_(stats), keepDeclared_(keepDeclared), trace_(trace)
             {
             }
 
             bool run()
             {
                 collectFamilies();
+                captureBindings();
                 std::vector<StateFamily *> eligible;
                 for (StateFamily &family : families_)
                 {
@@ -718,17 +1023,20 @@ namespace wolvrix::lib::transform
                     if (keepDeclared_ && family.declared)
                     {
                         ++stats_.stateArraysDeclaredSkipped;
+                        traceRetain(family.declaration, "declared_symbol_retained");
                         continue;
                     }
                     if (family.dynamic)
                     {
                         ++stats_.stateArraysDynamicSkipped;
+                        traceRetain(family.declaration, "dynamic_state_index");
                         continue;
                     }
                     if (family.unsupported || (family.wholeReads.empty() && family.indexedReads.empty()) ||
-                        !prepareMembers(family))
+                        !prepareMembers(family) || !supportsBindings(family))
                     {
                         ++stats_.stateArraysUnsupportedSkipped;
+                        traceRetain(family.declaration, "unsupported_state_family");
                         continue;
                     }
                     eligible.push_back(&family);
@@ -738,6 +1046,7 @@ namespace wolvrix::lib::transform
                     if (!prepareMemberNames(*family))
                     {
                         ++stats_.stateArraysUnsupportedSkipped;
+                        traceRetain(family->declaration, "member_symbol_collision");
                         continue;
                     }
                     splitFamily(*family);
@@ -747,6 +1056,168 @@ namespace wolvrix::lib::transform
             }
 
         private:
+            void traceRetain(OperationId op, const char *reason)
+            {
+                if (trace_) trace_->step("retain", reason,
+                    {GraphEvolutionTrace::ref(op)}, {GraphEvolutionTrace::ref(op)});
+            }
+
+            using SemanticBinding = wolvrix::lib::grh::SemanticBinding;
+            using SemanticBindingRole = wolvrix::lib::grh::SemanticBindingRole;
+
+            void captureBindings()
+            {
+                std::unordered_set<ValueId, ValueIdHash> reads;
+                std::unordered_set<OperationId, wolvrix::lib::grh::OperationIdHash> writes;
+                for (const StateFamily &family : families_)
+                {
+                    for (const OperationId op : family.wholeReads)
+                    {
+                        const auto results = graph_.opResults(op);
+                        if (results.size() == 1) reads.insert(results[0]);
+                    }
+                    for (const OperationId op : family.wholeWrites) writes.insert(op);
+                    for (const auto &port : family.indexedWrites) writes.insert(port.op);
+                }
+                for (const auto &binding : graph_.semanticBindings())
+                {
+                    if (binding.operation && writes.contains(binding.operation))
+                        writerBindings_[binding.operation].push_back(binding);
+                    if (binding.value && reads.contains(binding.value) &&
+                        (binding.role == SemanticBindingRole::Value ||
+                         binding.role == SemanticBindingRole::RegisterCurrent ||
+                         binding.role == SemanticBindingRole::MemoryReadAddress) &&
+                        (!binding.operation || binding.operation == graph_.valueDef(binding.value)))
+                        readBindings_[binding.value].push_back(binding);
+                }
+            }
+
+            std::optional<SemanticBinding> memberBinding(const SemanticBinding &source,
+                                                         const StateFamily &family, int64_t element,
+                                                         bool alreadySelected = false) const
+            {
+                if (source.sourceWidth != family.leafWidth) return std::nullopt;
+                SemanticBinding binding = source;
+                if (binding.projection.empty()) binding.projection.assign(binding.shape.size(), -1);
+                std::vector<int64_t> sourceDimensions;
+                std::vector<int64_t> physicalDimensions;
+                for (std::size_t axis = 0; axis < binding.shape.size(); ++axis)
+                {
+                    if (binding.projection[axis] == -1)
+                    {
+                        if (binding.shape[axis] <= 0) return std::nullopt;
+                        if (binding.shape[axis] != 1) sourceDimensions.push_back(binding.shape[axis]);
+                    }
+                }
+                for (const int64_t extent : family.type.shape)
+                    if (extent != 1) physicalDimensions.push_back(extent);
+                const bool selected = alreadySelected && sourceDimensions.empty();
+                if (!selected && sourceDimensions != physicalDimensions) return std::nullopt;
+                if (selected && binding.shape == family.type.shape)
+                {
+                    int64_t remaining = element;
+                    for (std::size_t axis = binding.shape.size(); axis-- > 0;)
+                    {
+                        const int64_t coordinate = remaining % binding.shape[axis];
+                        remaining /= binding.shape[axis];
+                        if (binding.projection[axis] != -1 && binding.projection[axis] != coordinate)
+                            return std::nullopt;
+                    }
+                }
+                int64_t remaining = selected ? 0 : element;
+                for (std::size_t axis = binding.shape.size(); axis-- > 0;)
+                {
+                    if (binding.projection[axis] == -1)
+                    {
+                        binding.projection[axis] = remaining % binding.shape[axis];
+                        remaining /= binding.shape[axis];
+                    }
+                }
+                if (remaining != 0) return std::nullopt;
+                return binding;
+            }
+
+            bool supportsBindings(const StateFamily &family) const
+            {
+                for (const OperationId op : family.wholeReads)
+                {
+                    const auto results = graph_.opResults(op);
+                    if (results.size() != 1) return false;
+                    const auto found = readBindings_.find(results[0]);
+                    if (found == readBindings_.end()) continue;
+                    for (const auto &binding : found->second)
+                        if (binding.role == SemanticBindingRole::RegisterCurrent &&
+                            !memberBinding(binding, family, 0)) return false;
+                }
+                const auto supportedWriter = [&](OperationId op, int64_t element, bool indexed) {
+                    const auto found = writerBindings_.find(op);
+                    if (found == writerBindings_.end()) return true;
+                    const auto operands = graph_.opOperands(op);
+                    const auto indexCount = indexed ? wolvrix::lib::grh::arrayPortIndexCount(graph_, op)
+                                                    : std::optional<std::size_t>{0};
+                    if (!indexCount || operands.size() <= 1 + *indexCount) return false;
+                    for (const auto &binding : found->second)
+                        if (binding.role == SemanticBindingRole::RegisterNext &&
+                            (binding.value != operands[1 + *indexCount] ||
+                             !memberBinding(binding, family, element, indexed))) return false;
+                    return true;
+                };
+                for (const OperationId op : family.wholeWrites)
+                    if (!supportedWriter(op, 0, false)) return false;
+                for (const auto &port : family.indexedWrites)
+                    if (!supportedWriter(port.op, port.element, true)) return false;
+                return true;
+            }
+
+            void bindMemberRead(const StateFamily &family, OperationId sourceOp, ValueId source,
+                                OperationId read, ValueId value, int64_t element)
+            {
+                const auto found = readBindings_.find(source);
+                if (found == readBindings_.end()) return;
+                for (const auto &binding : found->second)
+                {
+                    auto projected = memberBinding(binding, family, element);
+                    if (!projected) continue;
+                    projected->value = value;
+                    if (projected->operation == sourceOp) projected->operation = read;
+                    graph_.addSemanticBinding(std::move(*projected));
+                }
+            }
+
+            void bindMemberWriter(const StateFamily &family, OperationId source, OperationId target,
+                                  ValueId data, int64_t element, bool indexed = false)
+            {
+                const auto found = writerBindings_.find(source);
+                if (found == writerBindings_.end()) return;
+                std::vector<SemanticBinding> replacements;
+                replacements.reserve(found->second.size());
+                for (const auto &binding : found->second)
+                {
+                    auto replacement = binding;
+                    if (binding.role == SemanticBindingRole::RegisterNext)
+                    {
+                        auto projected = memberBinding(binding, family, element, indexed);
+                        if (!projected) throw std::logic_error("validated state binding lost its source geometry");
+                        replacement = std::move(*projected);
+                        replacement.value = data;
+                    }
+                    replacement.operation = target;
+                    replacements.push_back(std::move(replacement));
+                }
+                graph_.replaceSemanticBindingsForOperation(target, replacements);
+                if (trace_)
+                {
+                    std::vector<GraphEvolutionTrace::Ref> before{GraphEvolutionTrace::ref(source)};
+                    std::vector<GraphEvolutionTrace::Ref> after{GraphEvolutionTrace::ref(target)};
+                    for (const auto &binding : found->second)
+                        if (binding.value) before.push_back(GraphEvolutionTrace::ref(binding.value));
+                    for (const auto &binding : replacements)
+                        if (binding.value) after.push_back(GraphEvolutionTrace::ref(binding.value));
+                    trace_->step("rewrite", "state_writer_bindings_transferred", std::move(before), std::move(after),
+                                 memberTraceGeometry(family, element));
+                }
+            }
+
             std::optional<int64_t> staticElementIndex(const StateFamily &family,
                                                        std::span<const ValueId> indices) const
             {
@@ -982,6 +1453,13 @@ namespace wolvrix::lib::transform
                 }
                 graph_.removeDeclaredSymbol(old);
                 graph_.addDeclaredSymbol(graph_.lookupSymbol(name));
+                if (trace_)
+                {
+                    std::vector<GraphEvolutionTrace::Ref> refs{GraphEvolutionTrace::graphRef(graph_)};
+                    if (const auto value = graph_.findValue(name)) refs.push_back(GraphEvolutionTrace::ref(value));
+                    if (const auto operation = graph_.findOperation(name)) refs.push_back(GraphEvolutionTrace::ref(operation));
+                    trace_->step("rewrite", "declared_symbol_transferred", refs, refs);
+                }
             }
 
             bool renameCollision(const std::string &name)
@@ -1006,6 +1484,8 @@ namespace wolvrix::lib::transform
                     const SymbolId old = graph_.valueSymbol(value);
                     graph_.setValueSymbol(value, graph_.internSymbol(renamed));
                     updateDeclaredSymbol(old, renamed);
+                    if (trace_) trace_->step("rewrite", "state_symbol_collision_renamed",
+                        {GraphEvolutionTrace::ref(value)}, {GraphEvolutionTrace::ref(value)});
                 }
                 else
                 {
@@ -1015,6 +1495,8 @@ namespace wolvrix::lib::transform
                     }
                     const SymbolId old = graph_.operationSymbol(op);
                     graph_.setOpSymbol(op, graph_.internSymbol(renamed));
+                    if (trace_) trace_->step("rewrite", "state_symbol_collision_renamed",
+                        {GraphEvolutionTrace::ref(op)}, {GraphEvolutionTrace::ref(op)});
                     if (const auto found = registerPortsBySymbol_.find(name); found != registerPortsBySymbol_.end())
                     {
                         std::vector<OperationId> references = std::move(found->second);
@@ -1022,6 +1504,8 @@ namespace wolvrix::lib::transform
                         for (const OperationId reference : references)
                         {
                             graph_.setAttr(reference, "regSymbol", renamed);
+                            if (trace_) trace_->step("rewrite", "state_symbol_collision_renamed",
+                                {GraphEvolutionTrace::ref(reference)}, {GraphEvolutionTrace::ref(reference)});
                         }
                         registerPortsBySymbol_[renamed] = std::move(references);
                     }
@@ -1076,9 +1560,15 @@ namespace wolvrix::lib::transform
                     if (family.declared)
                     {
                         graph_.addDeclaredSymbol(graph_.operationSymbol(member));
+                        if (trace_) trace_->step("rewrite", "declared_state_member_added",
+                            {GraphEvolutionTrace::graphRef(graph_), GraphEvolutionTrace::ref(family.declaration)},
+                            {GraphEvolutionTrace::graphRef(graph_), GraphEvolutionTrace::ref(member)});
                     }
                     ++stats_.opsCreated;
                     ++stats_.stateMembersCreated;
+                    if (trace_) trace_->step("split", "state_member_declaration",
+                        {GraphEvolutionTrace::ref(family.declaration)}, {GraphEvolutionTrace::ref(member)},
+                        memberTraceGeometry(family, i));
                 }
 
                 for (const IndexedStatePort &port : family.indexedReads)
@@ -1087,7 +1577,30 @@ namespace wolvrix::lib::transform
                     graph_.setOpKind(port.op, OperationKind::kRegisterReadPort);
                     graph_.setAttr(port.op, "regSymbol", family.memberNames[static_cast<std::size_t>(port.element)]);
                     registerPortsBySymbol_[family.memberNames[static_cast<std::size_t>(port.element)]].push_back(port.op);
+                    const auto results = graph_.opResults(port.op);
+                    if (results.size() == 1)
+                    {
+                        for (const OperationId originalRead : family.wholeReads)
+                        {
+                            const auto originalResults = graph_.opResults(originalRead);
+                            if (originalResults.size() == 1)
+                                bindMemberRead(family, originalRead, originalResults[0], port.op,
+                                               results[0], port.element);
+                        }
+                    }
                     ++stats_.stateReadsRewritten;
+                    if (trace_) {
+                        std::vector<GraphEvolutionTrace::Ref> refs{GraphEvolutionTrace::ref(port.op)};
+                        for (const auto value : graph_.opResults(port.op)) refs.push_back(GraphEvolutionTrace::ref(value));
+                        trace_->step("rewrite", "static_state_read_selected", refs, refs,
+                                     memberTraceGeometry(family, port.element));
+                        // Full current bindings are shared with this live endpoint.
+                        for (const auto original : family.wholeReads)
+                            trace_->step("rewrite", "state_current_projection_transferred",
+                                {GraphEvolutionTrace::ref(original), GraphEvolutionTrace::ref(port.op)},
+                                {GraphEvolutionTrace::ref(original), GraphEvolutionTrace::ref(port.op)},
+                                memberTraceGeometry(family, port.element));
+                    }
                 }
                 for (const OperationId op : family.wholeReads)
                 {
@@ -1104,6 +1617,9 @@ namespace wolvrix::lib::transform
                 if (family.declared)
                 {
                     graph_.removeDeclaredSymbol(graph_.operationSymbol(family.declaration));
+                    if (trace_) trace_->step("rewrite", "declared_state_array_removed",
+                        {GraphEvolutionTrace::graphRef(graph_), GraphEvolutionTrace::ref(family.declaration)},
+                        {GraphEvolutionTrace::graphRef(graph_)});
                 }
                 graph_.eraseOpUnchecked(family.declaration);
                 ++stats_.stateArraysSplit;
@@ -1132,8 +1648,14 @@ namespace wolvrix::lib::transform
                     {
                         graph_.setValueSrcLoc(value, *valueLocation);
                     }
+                    bindMemberRead(family, op, originalResult, read, value, i);
                     members.push_back(value);
                     ++stats_.opsCreated;
+                    if (trace_) trace_->step("split", "state_current_member_read",
+                        {GraphEvolutionTrace::ref(op), GraphEvolutionTrace::ref(originalResult)},
+                        {GraphEvolutionTrace::ref(op), GraphEvolutionTrace::ref(originalResult),
+                         GraphEvolutionTrace::ref(read), GraphEvolutionTrace::ref(value)},
+                        memberTraceGeometry(family, i));
                 }
 
                 std::vector<ValueId> level = std::move(members);
@@ -1166,6 +1688,9 @@ namespace wolvrix::lib::transform
                             graph_.setValueSrcLoc(row, *valueLocation);
                         }
                         rows.push_back(row);
+                        if (trace_) trace_->step("split", "state_aggregate_reconstruction",
+                            {GraphEvolutionTrace::ref(op)},
+                            {GraphEvolutionTrace::ref(op), GraphEvolutionTrace::ref(create), GraphEvolutionTrace::ref(row)});
                         ++stats_.opsCreated;
                     }
                     level = std::move(rows);
@@ -1194,6 +1719,9 @@ namespace wolvrix::lib::transform
                     }
                     replaceOperationOperands(graph_, op, std::span<const ValueId>(&packed, 1));
                     graph_.setOpKind(op, OperationKind::kAssign);
+                    if (trace_) trace_->step("split", "state_packed_view_reconstruction",
+                        {GraphEvolutionTrace::ref(op)},
+                        {GraphEvolutionTrace::ref(op), GraphEvolutionTrace::ref(create), GraphEvolutionTrace::ref(packed)});
                     ++stats_.opsCreated;
                 }
                 graph_.eraseAttr(op, "regSymbol");
@@ -1273,6 +1801,12 @@ namespace wolvrix::lib::transform
                                                  : OperationKind::kRegisterWritePort);
                 graph_.setAttr(port.op, "regSymbol", family.memberNames[static_cast<std::size_t>(port.element)]);
                 registerPortsBySymbol_[family.memberNames[static_cast<std::size_t>(port.element)]].push_back(port.op);
+                bindMemberWriter(family, port.op, port.op, operands[1], port.element, true);
+                if (trace_) trace_->step("rewrite", "static_state_write_selected",
+                    {GraphEvolutionTrace::ref(port.op), GraphEvolutionTrace::ref(family.declaration),
+                     GraphEvolutionTrace::ref(operands[1])},
+                    {GraphEvolutionTrace::ref(port.op), GraphEvolutionTrace::ref(operands[1])},
+                    memberTraceGeometry(family, port.element));
                 ++stats_.stateWritesRewritten;
             }
 
@@ -1320,6 +1854,11 @@ namespace wolvrix::lib::transform
                     graph_.setOpKind(target, targetKind);
                     graph_.setAttr(target, "regSymbol", family.memberNames[static_cast<std::size_t>(i)]);
                     registerPortsBySymbol_[family.memberNames[static_cast<std::size_t>(i)]].push_back(target);
+                    bindMemberWriter(family, op, target, data, i);
+                    if (trace_) trace_->step("split", "whole_state_writer_projected",
+                        {GraphEvolutionTrace::ref(op), GraphEvolutionTrace::ref(dataBase)},
+                        {GraphEvolutionTrace::ref(target), GraphEvolutionTrace::ref(data)},
+                        memberTraceGeometry(family, i));
                 }
                 ++stats_.stateWholeWritesSplit;
                 ++stats_.stateWritesRewritten;
@@ -1329,16 +1868,25 @@ namespace wolvrix::lib::transform
             GraphSplitter &splitter_;
             SplitStaticArrayPass::Stats &stats_;
             bool keepDeclared_ = false;
+            GraphEvolutionTrace *trace_ = nullptr;
             bool changed_ = false;
             std::vector<StateFamily> families_;
+            std::unordered_map<ValueId, std::vector<SemanticBinding>, ValueIdHash> readBindings_;
+            std::unordered_map<OperationId, std::vector<SemanticBinding>,
+                               wolvrix::lib::grh::OperationIdHash> writerBindings_;
             std::unordered_map<OperationId, std::size_t, wolvrix::lib::grh::OperationIdHash> familyByDeclaration_;
             std::unordered_map<std::string, std::vector<OperationId>> registerPortsBySymbol_;
         };
     } // namespace
 
     SplitStaticArrayPass::SplitStaticArrayPass()
+        : SplitStaticArrayPass(SplitStaticArrayOptions{})
+    {
+    }
+
+    SplitStaticArrayPass::SplitStaticArrayPass(SplitStaticArrayOptions options)
         : Pass("split-static-array", "split-static-array",
-               "Scalarize statically indexed combinational and state arrays")
+               "Scalarize statically indexed combinational and state arrays"), options_(std::move(options))
     {
     }
 
@@ -1352,10 +1900,26 @@ namespace wolvrix::lib::transform
         {
             try
             {
-                GraphSplitter splitter(*graph, stats_);
-                StateSplitter stateSplitter(*graph, splitter, stats_, keepDeclaredSymbols());
+                std::unique_ptr<GraphEvolutionTrace> trace;
+                if (!options_.traceNodeEvolution.empty()) {
+                    auto path = options_.traceNodeEvolution;
+                    const auto marker = path.find("{graph}");
+                    if (marker != std::string::npos) {
+                        std::string name = graph->symbol();
+                        for (auto& c : name) if (c == '/' || c == '\\') c = '_';
+                        path.replace(marker, 7, name);
+                    } else if (selectedGraphs.size() != 1) {
+                        throw std::invalid_argument("multi-graph evolution trace requires {graph} in path");
+                    }
+                    trace = std::make_unique<GraphEvolutionTrace>(*graph, path, id(),
+                        options_.traceInputSha256, options_.traceSourceEndpoints);
+                    result.artifacts.push_back(path);
+                }
+                GraphSplitter splitter(*graph, stats_, trace.get());
+                StateSplitter stateSplitter(*graph, splitter, stats_, keepDeclaredSymbols(), trace.get());
                 bool changed = stateSplitter.run();
                 changed = splitter.run() || changed;
+                if (trace) trace->finish();
                 if (changed)
                 {
                     ++stats_.changedGraphs;

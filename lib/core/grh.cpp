@@ -643,7 +643,10 @@ namespace wolvrix::lib::grh
         if (!sourceValues.empty()) clone.reserveValueCapacity(sourceValues.size());
         if (!sourceOperations.empty()) clone.reserveOperationCapacity(sourceOperations.size());
         for (const AttrKV& entry : source.metadata()) clone.setMetadata(entry.key, entry.value);
-        if (source.semanticTree_) clone.semanticTree_ = source.semanticTree_;
+        if (source.semanticTree_) {
+            clone.semanticTree_ = source.semanticTree_;
+            clone.semanticTree_->clearMembers();
+        }
 
         std::vector<SymbolId> symbolMap(source.symbols_.textById_.size());
         const auto mapSymbol = [&](SymbolId symbol) {
@@ -673,6 +676,9 @@ namespace wolvrix::lib::grh
             return mapped;
         };
         std::vector<ValueId> valueMap(source.store_->values_.size() + 1);
+        std::unordered_map<uint32_t, OperationId> operationMap;
+        for (const auto& binding : source.semanticBindings_)
+            if (binding.operation) operationMap.emplace(binding.operation.index, OperationId{});
         const auto mapValue = [&](ValueId id, const char* error) {
             if (id.graph != source.graphId_ || id.generation || id.index >= valueMap.size() ||
                 !valueMap[id.index].valid()) throw std::runtime_error(error);
@@ -705,6 +711,14 @@ namespace wolvrix::lib::grh
                 clone.addResult(destination, mapValue(result, "Missing result during graph clone"));
             clone.store_->operations_[destination.index - 1].srcLoc = copySrcLoc(operation.srcLoc);
             clone.setOpSemanticIds(destination, source.opSemanticIds(sourceId));
+            if (auto found = operationMap.find(sourceId.index); found != operationMap.end()) found->second = destination;
+        }
+        for (auto binding : source.semanticBindings_) {
+            if (binding.value) binding.value = mapValue(binding.value, "Missing semantic binding during graph clone");
+            if (binding.operation) {
+                binding.operation = operationMap.at(binding.operation.index);
+            }
+            clone.addSemanticBinding(std::move(binding));
         }
         for (const Port& port : source.inputPorts())
             clone.bindInputPort(port.name, mapValue(port.value, "Missing input port value during graph clone"));
@@ -3392,12 +3406,200 @@ namespace wolvrix::lib::grh
         if (!graphId_.valid()) throw std::invalid_argument("GraphId must be valid");
     }
 
+    Graph::MutationCheckpoint::MutationCheckpoint(Graph& graph, bool enabled)
+    {
+        if (!enabled) return;
+        auto original = std::make_unique<Graph>(*graph.owner_, graph.symbol_, graph.graphId_);
+        graph.copyMutableContentsTo(*original);
+        graph.swapMutableContents(*original);
+        graph_ = &graph;
+        original_ = std::move(original);
+    }
+
+    Graph::MutationCheckpoint::MutationCheckpoint(MutationCheckpoint&& other) noexcept
+        : graph_(std::exchange(other.graph_, nullptr)), original_(std::move(other.original_))
+    {
+    }
+
+    Graph::MutationCheckpoint::~MutationCheckpoint() noexcept
+    {
+        if (!original_) return;
+        graph_->swapMutableContents(*original_);
+        graph_->owner_->touch();
+    }
+
+    void Graph::MutationCheckpoint::commit() noexcept
+    {
+        original_.reset();
+        graph_ = nullptr;
+    }
+
+    Graph::MutationCheckpoint Graph::checkpointMutation(bool enabled)
+    {
+        return MutationCheckpoint(*this, enabled);
+    }
+
+    void Graph::copyMutableContentsTo(Graph& clone) const
+    {
+        // Retain immutable text bytes, but build independent indexes and tails.
+        // Every string and payload record keeps its original numeric identity.
+        (void)clone.symbols_.stringPool_->retain(*symbols_.stringPool_);
+        clone.symbols_.symbolsByStringId_ = symbols_.symbolsByStringId_;
+        clone.symbols_.textById_ = symbols_.textById_;
+        const auto& source = *store_;
+        auto& target = *clone.store_;
+        target.srcLocIds_ = source.srcLocIds_;
+        target.attrKeys_ = source.attrKeys_;
+        target.attrTags_ = source.attrTags_;
+        target.attrPayloads_ = source.attrPayloads_;
+        target.srcLocs_ = source.srcLocs_;
+        // PayloadPool segments are immutable after sharing; append starts a
+        // separate tail. Their existing scalar buffers need no second copy.
+        target.int64Payload_ = source.int64Payload_;
+        target.doublePayload_ = source.doublePayload_;
+        target.bitPayload_ = source.bitPayload_;
+        target.stringListPayload_ = source.stringListPayload_;
+
+        const auto& fromPools = *source.topology_;
+        auto& toPools = *target.topology_;
+        toPools.operands = fromPools.operands;
+        toPools.results = fromPools.results;
+        toPools.operandUseIndices = fromPools.operandUseIndices;
+        toPools.users = fromPools.users;
+        toPools.shapes = fromPools.shapes;
+        toPools.attrs = fromPools.attrs;
+        toPools.semantics = fromPools.semantics;
+        toPools.semanticLists = fromPools.semanticLists;
+        toPools.semanticListIds = fromPools.semanticListIds;
+        toPools.semanticHashNext = fromPools.semanticHashNext;
+        std::unordered_map<const std::vector<ValueId>*, std::vector<ValueId>*> edgePools{
+            {&fromPools.operands, &toPools.operands}, {&fromPools.results, &toPools.results}};
+        toPools.retainedEdges.reserve(fromPools.retainedEdges.size());
+        for (const auto& edges : fromPools.retainedEdges) {
+            if (!edges) {
+                toPools.retainedEdges.push_back(nullptr);
+                continue;
+            }
+            auto copy = std::make_unique<std::vector<ValueId>>(*edges);
+            edgePools.emplace(edges.get(), copy.get());
+            toPools.retainedEdges.push_back(std::move(copy));
+        }
+        const auto copyColumn = [](const auto& from, auto& to) {
+            to.resize(from.size());
+            for (std::size_t i = 0; i < from.size(); ++i) to[i] = from[i];
+        };
+        auto& fromValues = source.values_;
+        auto& toValues = target.values_;
+        toValues.symbol_ = fromValues.symbol_;
+        copyColumn(fromValues.width_, toValues.width_);
+        copyColumn(fromValues.isSigned_, toValues.isSigned_);
+        copyColumn(fromValues.type_, toValues.type_);
+        copyColumn(fromValues.domain_, toValues.domain_);
+        toValues.shape_ = fromValues.shape_;
+        toValues.isInput_ = fromValues.isInput_;
+        toValues.isOutput_ = fromValues.isOutput_;
+        toValues.isInout_ = fromValues.isInout_;
+        toValues.definingOp_ = fromValues.definingOp_;
+        toValues.srcLoc_ = fromValues.srcLoc_;
+        toValues.semantics_ = fromValues.semantics_;
+        toValues.alive_ = fromValues.alive_;
+        target.valueUsers_.reserve(source.valueUsers_.size());
+        for (const auto& users : source.valueUsers_) {
+            target.valueUsers_.emplace_back(toPools.users);
+            target.valueUsers_.back().bindSlice(toPools.users, users.offset(), users.size());
+        }
+        const auto& fromOps = source.operations_;
+        auto& toOps = target.operations_;
+        copyColumn(fromOps.kind_, toOps.kind_);
+        toOps.symbol_ = fromOps.symbol_;
+        toOps.srcLoc_ = fromOps.srcLoc_;
+        toOps.semantics_ = fromOps.semantics_;
+        toOps.alive_ = fromOps.alive_;
+        const auto copyEdges = [&](const auto& from, auto& to) {
+            to.reserve(from.size());
+            for (const auto& edges : from) {
+                to.emplace_back();
+                if (edges.backingPool())
+                    to.back().bindSlice(*edgePools.at(edges.backingPool()), edges.offset(), edges.size());
+            }
+        };
+        copyEdges(fromOps.operands_, toOps.operands_);
+        copyEdges(fromOps.results_, toOps.results_);
+        toOps.operandUseIndices_.reserve(fromOps.operandUseIndices_.size());
+        for (const auto& indices : fromOps.operandUseIndices_) {
+            toOps.operandUseIndices_.emplace_back(toPools.operandUseIndices);
+            toOps.operandUseIndices_.back().bindSlice(toPools.operandUseIndices, indices.offset(), indices.size());
+        }
+        toOps.attrs_.reserve(fromOps.attrs_.size());
+        for (const auto& attrs : fromOps.attrs_) {
+            toOps.attrs_.emplace_back(toPools.attrs);
+            toOps.attrs_.back().bindSlice(toPools.attrs, attrs.offset(), attrs.size());
+        }
+        target.liveOperations_ = source.liveOperations_;
+        target.liveValues_ = source.liveValues_;
+        target.operationsHaveTombstones_ = source.operationsHaveTombstones_;
+        target.valuesHaveTombstones_ = source.valuesHaveTombstones_;
+        target.inputPorts_ = source.inputPorts_;
+        target.outputPorts_ = source.outputPorts_;
+        target.inoutPorts_ = source.inoutPorts_;
+        target.symbolIndex_ = source.symbolIndex_;
+
+        clone.metadata_ = metadata_;
+        clone.semanticTree_ = semanticTree_;
+        clone.semanticBindings_ = semanticBindings_;
+        clone.semanticBindingValues_ = semanticBindingValues_;
+        clone.semanticBindingOps_ = semanticBindingOps_;
+        clone.semanticBindingIndexValid_ = semanticBindingIndexValid_;
+        clone.compacted_ = compacted_;
+        clone.srcLocEpoch_ = srcLocEpoch_;
+        clone.mutationEpoch_ = mutationEpoch_;
+        clone.localCycleProof_ = localCycleProof_;
+        clone.preparedFlattenFreeze_ = preparedFlattenFreeze_;
+        clone.declaredSymbols_ = declaredSymbols_;
+        clone.declaredSymbolSet_ = declaredSymbolSet_;
+        clone.generateGroups_ = generateGroups_;
+        clone.generateGroupsBySymbol_ = generateGroupsBySymbol_;
+        clone.nextWriterOrders_ = nextWriterOrders_;
+        clone.writerOrdersInitialized_ = writerOrdersInitialized_;
+        clone.nextInternalOpSym_ = nextInternalOpSym_;
+        clone.nextInternalValSym_ = nextInternalValSym_;
+    }
+
+    void Graph::swapMutableContents(Graph& other) noexcept
+    {
+        static_assert(std::is_nothrow_swappable_v<std::optional<SemanticTree>>);
+        using std::swap;
+        metadata_.swap(other.metadata_);
+        symbols_.swapStringState(other.symbols_);
+        store_.swap(other.store_);
+        semanticTree_.swap(other.semanticTree_);
+        semanticBindings_.swap(other.semanticBindings_);
+        semanticBindingValues_.swap(other.semanticBindingValues_);
+        semanticBindingOps_.swap(other.semanticBindingOps_);
+        swap(semanticBindingIndexValid_, other.semanticBindingIndexValid_);
+        swap(compacted_, other.compacted_);
+        swap(srcLocEpoch_, other.srcLocEpoch_);
+        swap(mutationEpoch_, other.mutationEpoch_);
+        swap(localCycleProof_, other.localCycleProof_);
+        swap(preparedFlattenFreeze_, other.preparedFlattenFreeze_);
+        declaredSymbols_.swap(other.declaredSymbols_);
+        declaredSymbolSet_.swap(other.declaredSymbolSet_);
+        generateGroups_.swap(other.generateGroups_);
+        generateGroupsBySymbol_.swap(other.generateGroupsBySymbol_);
+        nextWriterOrders_.swap(other.nextWriterOrders_);
+        swap(writerOrdersInitialized_, other.writerOrdersInitialized_);
+        swap(nextInternalOpSym_, other.nextInternalOpSym_);
+        swap(nextInternalValSym_, other.nextInternalValSym_);
+        store_->symbols_ = &symbols_;
+        other.store_->symbols_ = &other.symbols_;
+    }
+
     SemanticTree& Graph::getOrCreateSemanticTree(std::string sourceUnit, std::string circuit,
                                                  std::string module)
     {
         if (semanticTree_) {
             if (semanticTree_->sourceUnit() != sourceUnit || semanticTree_->circuit() != circuit ||
-                semanticTree_->name(semanticTree_->root()) != module)
+                semanticTree_->pathName(semanticTree_->root()) != module)
                 throw std::invalid_argument("Graph SemanticTree identity mismatch");
             return *semanticTree_;
         }
@@ -3406,10 +3608,266 @@ namespace wolvrix::lib::grh
         return *semanticTree_;
     }
 
-    SemanticId Graph::appendSemanticTree(const Graph& source, SemanticId parent,
-                                         std::string_view rootName)
+    std::string_view toString(SemanticBindingRole role) noexcept
     {
-        if (!source.semanticTree_ || this == &source) return 0;
+        switch (role) {
+        case SemanticBindingRole::Value: return "value";
+        case SemanticBindingRole::Predicate: return "predicate";
+        case SemanticBindingRole::RegisterCurrent: return "register-current";
+        case SemanticBindingRole::RegisterNext: return "register-next";
+        case SemanticBindingRole::Clock: return "clock";
+        case SemanticBindingRole::Reset: return "reset";
+        case SemanticBindingRole::MemoryReadAddress: return "memory-read-address";
+        case SemanticBindingRole::MemoryStorage: return "memory-storage";
+        case SemanticBindingRole::Effect: return "effect";
+        }
+        return "unknown";
+    }
+
+    std::optional<SemanticBindingRole> parseSemanticBindingRole(std::string_view text) noexcept
+    {
+        for (const auto role : {SemanticBindingRole::Value, SemanticBindingRole::Predicate,
+                SemanticBindingRole::RegisterCurrent, SemanticBindingRole::RegisterNext,
+                SemanticBindingRole::Clock, SemanticBindingRole::Reset,
+                SemanticBindingRole::MemoryReadAddress, SemanticBindingRole::MemoryStorage,
+                SemanticBindingRole::Effect})
+            if (toString(role) == text) return role;
+        return std::nullopt;
+    }
+
+    void Graph::validateSemanticBinding(const SemanticBinding& binding) const
+    {
+        if (!semanticTree_ || !semanticTree_->contains(binding.semantic))
+            throw std::invalid_argument("semantic binding has an invalid source");
+        if (binding.sourceWidth < 0 || toString(binding.role) == "unknown")
+            throw std::invalid_argument("semantic binding has an invalid type or role");
+        const bool operationOnly = binding.role == SemanticBindingRole::MemoryStorage ||
+                                   binding.role == SemanticBindingRole::Effect;
+        const bool emptySource = binding.sourceWidth == 0 ||
+            std::find(binding.shape.begin(), binding.shape.end(), 0) != binding.shape.end();
+        if (operationOnly && binding.value)
+            throw std::invalid_argument("storage/effect semantic binding is operation-only");
+        if (binding.value) {
+            if (!store_->valueAlive(binding.value))
+                throw std::invalid_argument("semantic binding value is not live");
+        } else if (!operationOnly && (!emptySource || binding.operation)) {
+            throw std::invalid_argument("only an empty source may have no semantic binding value");
+        }
+        if (binding.operation && !store_->opAlive(binding.operation))
+            throw std::invalid_argument("semantic binding operation is not live");
+        if (binding.role == SemanticBindingRole::RegisterNext &&
+            (!binding.operation || !isRegisterWritePortKind(opKind(binding.operation))))
+            throw std::invalid_argument("register-next semantic binding requires a writer context");
+        if (binding.role == SemanticBindingRole::Predicate &&
+            (binding.sourceWidth != 1 || !binding.shape.empty() || !binding.value ||
+             valueWidth(binding.value) != 1))
+            throw std::invalid_argument("predicate semantic binding requires a scalar one-bit value");
+        if ((binding.role == SemanticBindingRole::Effect ||
+             (binding.role == SemanticBindingRole::MemoryStorage && !emptySource)) && !binding.operation)
+            throw std::invalid_argument("storage/effect semantic binding requires an operation");
+        if (!binding.projection.empty() && binding.projection.size() != binding.shape.size())
+            throw std::invalid_argument("semantic binding projection differs from source rank");
+        for (std::size_t i = 0; i < binding.shape.size(); ++i) {
+            if (binding.shape[i] < 0)
+                throw std::invalid_argument("semantic binding has a negative extent");
+            if (i < binding.projection.size() &&
+                (binding.projection[i] < -1 || binding.projection[i] >= binding.shape[i]))
+                throw std::invalid_argument("semantic binding projection is out of range");
+        }
+        if (!binding.shapeFieldDepths.empty() && binding.shapeFieldDepths.size() != binding.shape.size())
+            throw std::invalid_argument("semantic binding field depths do not match source rank");
+        if (!std::is_sorted(binding.shapeFieldDepths.begin(), binding.shapeFieldDepths.end()) ||
+            (!binding.shapeFieldDepths.empty() && binding.shapeFieldDepths.front() < 0))
+            throw std::invalid_argument("semantic binding field depths are invalid");
+    }
+
+    void Graph::addSemanticBinding(SemanticBinding binding)
+    {
+        validateSemanticBinding(binding);
+        mutableStore(false);
+        const auto index = semanticBindings_.size();
+        if (semanticBindingIndexValid_) {
+            if (binding.value) semanticBindingValues_[binding.value.index].push_back(index);
+            if (binding.operation) semanticBindingOps_[binding.operation.index].push_back(index);
+        }
+        semanticBindings_.push_back(std::move(binding));
+    }
+
+    void Graph::replaceSemanticBindingsForOperation(OperationId operation,
+        std::span<const SemanticBinding> bindings)
+    {
+        if (!store_->opAlive(operation))
+            throw std::invalid_argument("semantic binding replacement operation is not live");
+        // The caller may pass a subspan of our own rows.
+        std::vector<SemanticBinding> replacements(bindings.begin(), bindings.end());
+        for (const auto& binding : replacements) {
+            if (binding.operation != operation)
+                throw std::invalid_argument("semantic binding replacement has a different operation");
+            validateSemanticBinding(binding);
+        }
+        mutableStore(false);
+        eraseSemanticBindings(operation);
+        for (auto& binding : replacements) addSemanticBinding(std::move(binding));
+    }
+
+    void Graph::indexSemanticBindings()
+    {
+        if (semanticBindingIndexValid_) return;
+        semanticBindingValues_.clear();
+        semanticBindingOps_.clear();
+        for (std::size_t i = 0; i < semanticBindings_.size(); ++i) {
+            const auto& binding = semanticBindings_[i];
+            if (binding.value) semanticBindingValues_[binding.value.index].push_back(i);
+            if (binding.operation) semanticBindingOps_[binding.operation.index].push_back(i);
+        }
+        semanticBindingIndexValid_ = true;
+    }
+
+    void Graph::redirectSemanticBindings(ValueId from, ValueId to)
+    {
+        if (from == to || semanticBindings_.empty()) return;
+        indexSemanticBindings();
+        auto found = semanticBindingValues_.find(from.index);
+        if (found == semanticBindingValues_.end()) return;
+        auto indices = std::move(found->second);
+        semanticBindingValues_.erase(found);
+        auto& target = semanticBindingValues_[to.index];
+        for (const auto index : indices) semanticBindings_[index].value = to;
+        target.insert(target.end(), indices.begin(), indices.end());
+    }
+
+    void Graph::remapSemanticBindingValues(std::span<const ValueId> sourceValues,
+                                           std::span<const ValueId> targetValues)
+    {
+        if (sourceValues.size() != targetValues.size())
+            throw std::invalid_argument("semantic binding value relocation lengths differ");
+        for (std::size_t i = 0; i < sourceValues.size(); ++i) {
+            if (!sameValueType(sourceValues[i], targetValues[i]))
+                throw std::invalid_argument("semantic binding relocation changes the value type");
+        }
+        if (semanticBindings_.empty()) return;
+        indexSemanticBindings();
+        std::vector<std::pair<std::size_t, ValueId>> updates;
+        std::unordered_set<uint32_t> seen;
+        for (std::size_t i = 0; i < sourceValues.size(); ++i) {
+            if (!seen.insert(sourceValues[i].index).second)
+                throw std::invalid_argument("duplicate semantic binding relocation source");
+            if (const auto found = semanticBindingValues_.find(sourceValues[i].index);
+                found != semanticBindingValues_.end())
+                for (const auto row : found->second) updates.emplace_back(row, targetValues[i]);
+        }
+        if (updates.empty()) return;
+        mutableStore(false);
+        for (const auto source : sourceValues) semanticBindingValues_.erase(source.index);
+        for (const auto& [row, target] : updates) {
+            semanticBindings_[row].value = target;
+            semanticBindingValues_[target.index].push_back(row);
+        }
+    }
+
+    void Graph::eraseSemanticBinding(std::size_t index)
+    {
+        const auto unlink = [&](auto& map, uint32_t key, std::size_t row) {
+            if (!key) return;
+            const auto found = map.find(key);
+            auto& rows = found->second;
+            rows.erase(std::find(rows.begin(), rows.end(), row));
+            if (rows.empty()) map.erase(found);
+        };
+        const auto removed = semanticBindings_[index];
+        unlink(semanticBindingValues_, removed.value.index, index);
+        unlink(semanticBindingOps_, removed.operation.index, index);
+        const auto last = semanticBindings_.size() - 1;
+        if (index != last) {
+            semanticBindings_[index] = std::move(semanticBindings_[last]);
+            const auto& moved = semanticBindings_[index];
+            if (moved.value) {
+                auto& rows = semanticBindingValues_.at(moved.value.index);
+                *std::find(rows.begin(), rows.end(), last) = index;
+            }
+            if (moved.operation) {
+                auto& rows = semanticBindingOps_.at(moved.operation.index);
+                *std::find(rows.begin(), rows.end(), last) = index;
+            }
+        }
+        semanticBindings_.pop_back();
+    }
+
+    void Graph::eraseSemanticBindings(ValueId value)
+    {
+        if (semanticBindings_.empty()) return;
+        indexSemanticBindings();
+        while (true) {
+            const auto found = semanticBindingValues_.find(value.index);
+            if (found == semanticBindingValues_.end()) break;
+            eraseSemanticBinding(found->second.back());
+        }
+    }
+
+    void Graph::eraseSemanticBindings(OperationId operation)
+    {
+        if (semanticBindings_.empty()) return;
+        indexSemanticBindings();
+        while (true) {
+            const auto found = semanticBindingOps_.find(operation.index);
+            if (found == semanticBindingOps_.end()) break;
+            eraseSemanticBinding(found->second.back());
+        }
+    }
+
+    void Graph::remapSemanticBindingsFrom(const Graph& source,
+        std::span<const ValueId> sourceValues, std::span<const ValueId> targetValues,
+        std::span<const OperationId> sourceOps, std::span<const OperationId> targetOps,
+        std::span<const SemanticId> nodeMap)
+    {
+        if (source.semanticBindings_.empty()) return;
+        if (this == &source || sourceValues.size() != targetValues.size() || sourceOps.size() != targetOps.size() ||
+            nodeMap.empty() || !semanticTree_ || !source.semanticTree_)
+            throw std::invalid_argument("invalid semantic binding relocation");
+        std::unordered_map<uint32_t, ValueId> values;
+        std::unordered_map<uint32_t, OperationId> operations;
+        for (const auto& binding : source.semanticBindings_) {
+            if (binding.value) values.emplace(binding.value.index, ValueId{});
+            if (binding.operation) operations.emplace(binding.operation.index, OperationId{});
+        }
+        for (std::size_t i = 0; i < sourceValues.size(); ++i) {
+            sourceValues[i].assertGraph(source.id());
+            targetValues[i].assertGraph(id());
+            if (auto found = values.find(sourceValues[i].index); found != values.end()) {
+                if (found->second && found->second != targetValues[i])
+                    throw std::invalid_argument("conflicting semantic binding value relocation");
+                found->second = targetValues[i];
+            }
+        }
+        for (std::size_t i = 0; i < sourceOps.size(); ++i) {
+            sourceOps[i].assertGraph(source.id());
+            targetOps[i].assertGraph(id());
+            if (auto found = operations.find(sourceOps[i].index); found != operations.end()) {
+                if (found->second && found->second != targetOps[i])
+                    throw std::invalid_argument("conflicting semantic binding operation relocation");
+                found->second = targetOps[i];
+            }
+        }
+        for (auto binding : source.semanticBindings_) {
+            if (binding.semantic >= nodeMap.size() || !semanticTree_->contains(nodeMap[binding.semantic]))
+                throw std::invalid_argument("missing semantic binding Node relocation");
+            binding.semantic = nodeMap[binding.semantic];
+            if (binding.value) {
+                binding.value = values.at(binding.value.index);
+                if (!binding.value) throw std::invalid_argument("missing semantic binding value relocation");
+            }
+            if (binding.operation) {
+                binding.operation = operations.at(binding.operation.index);
+                if (!binding.operation) throw std::invalid_argument("missing semantic binding operation relocation");
+            }
+            addSemanticBinding(std::move(binding));
+        }
+    }
+
+    SemanticTreeAppendResult Graph::appendSemanticTree(const Graph& source, SemanticPathId parent,
+                                                       std::string_view rootName)
+    {
+        if (!source.semanticTree_ || this == &source) return {};
         if (!semanticTree_) throw std::invalid_argument("target Graph has no SemanticTree");
         mutableStore();
         return semanticTree_->appendTree(*source.semanticTree_, parent, rootName);
@@ -3417,65 +3875,158 @@ namespace wolvrix::lib::grh
 
     SemanticTreePruneStats Graph::pruneSemanticTree()
     {
-        SemanticTreePruneStats stats;
-        if (!semanticTree_) return stats;
-        GraphStore& builder = *store_;
-        std::vector<uint8_t> referenced(semanticTree_->size() + 1, 0);
-        const auto& pool = builder.topology_->semantics;
-        const auto markRange = [&](Range range) {
-            if (range.offset > pool.size() || range.count > pool.size() - range.offset)
-                throw std::out_of_range("semantic list is out of range during tree pruning");
-            for (std::size_t offset = range.offset; offset < range.offset + range.count; ++offset) {
-                const SemanticId id = pool[offset];
-                if (!semanticTree_->contains(id))
-                    throw std::invalid_argument("invalid SemanticId during tree pruning");
-                referenced[id] = 1;
-            }
-            stats.semanticIds += range.count;
-        };
-        for (const ValueId value : values()) markRange(builder.values_.semantics_[builder.valueIndex(value)]);
-        for (const OperationId op : operations())
-            markRange(builder.operations_.semantics_[builder.opIndex(op)]);
-
-        SemanticTreePruneResult prune;
-        auto compacted = semanticTree_->buildPruned(referenced, prune);
-        stats.removedNodes = prune.removedNodes;
-        stats.removedNameBytes = prune.removedNameBytes;
-        stats.retainedNodes = prune.retainedNodes;
-        stats.retainedIndirectNodes = prune.retainedIndirectNodes;
-        if (!compacted) return stats;
-
-        auto& topology = *builder.topology_;
-        for (const SemanticId id : topology.semantics) {
-            if (id >= prune.oldToNew.size())
-                throw std::invalid_argument("SemanticId exceeds tree pruning map");
-        }
-        decltype(topology.semanticListIds) remappedListIds;
-        remappedListIds.reserve(topology.semanticLists.size());
-        std::vector<uint32_t> remappedHashNext(topology.semanticLists.size(), 0);
-        for (uint32_t index = 1; index < topology.semanticLists.size(); ++index) {
-            const Range range = topology.semanticLists[index];
-            if (range.offset > topology.semantics.size() ||
-                range.count > topology.semantics.size() - range.offset)
-                throw std::out_of_range("cached semantic list is out of range during tree pruning");
-            std::size_t hash = range.count;
-            for (std::size_t offset = range.offset; offset < range.offset + range.count; ++offset) {
-                const SemanticId id = prune.oldToNew[topology.semantics[offset]];
-                hash ^= std::hash<SemanticId>{}(id) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
-            }
-            auto [it, inserted] = remappedListIds.try_emplace(hash, index);
-            if (!inserted) {
-                remappedHashNext[index] = it->second;
-                it->second = index;
-            }
-        }
-
+        if (!semanticTree_) return {};
         mutableStore(false);
-        *semanticTree_ = std::move(*compacted);
-        for (SemanticId& id : topology.semantics) id = prune.oldToNew[id];
-        topology.semanticListIds.swap(remappedListIds);
-        topology.semanticHashNext.swap(remappedHashNext);
-        return stats;
+        // Empty-op Nodes are source boundaries too. Only unused Paths may vanish.
+        return semanticTree_->pruneEmptyPaths();
+    }
+
+    std::vector<OperationId> Graph::semanticNodeOperations(SemanticId id) const
+    {
+        if (!semanticTree_) throw std::invalid_argument("Graph has no SemanticTree");
+        std::vector<OperationId> result;
+        result.reserve(semanticTree_->operations(id).size());
+        for (const auto ref : semanticTree_->operations(id))
+            result.push_back(OperationId{ref.index, ref.generation, graphId_});
+        return result;
+    }
+
+    std::vector<ValueId> Graph::semanticNodeAnchors(SemanticId id) const
+    {
+        if (!semanticTree_) throw std::invalid_argument("Graph has no SemanticTree");
+        std::vector<ValueId> result;
+        result.reserve(semanticTree_->anchors(id).size());
+        for (const auto ref : semanticTree_->anchors(id))
+            result.push_back(ValueId{ref.index, ref.generation, graphId_});
+        return result;
+    }
+
+    std::vector<std::string> Graph::validateSemanticTree() const
+    {
+        std::vector<std::string> errors;
+        if (!semanticTree_) {
+            for (const auto op : operations())
+                if (!opSemanticIds(op).empty()) errors.push_back("operation has Node IDs without a SemanticTree");
+            for (const auto value : values())
+                if (!valueSemanticIds(value).empty()) errors.push_back("value has Node IDs without a SemanticTree");
+            return errors;
+        }
+        const auto& tree = *semanticTree_;
+        struct NameKey {
+            SemanticPathId parent;
+            std::string_view name;
+            bool operator==(const NameKey&) const = default;
+        };
+        struct NameHash {
+            std::size_t operator()(const NameKey& key) const noexcept {
+                return std::hash<std::string_view>{}(key.name) ^ (std::size_t(key.parent) * 0x9e3779b9u);
+            }
+        };
+        std::unordered_set<NameKey, NameHash> names;
+        names.reserve(tree.size() + tree.pathCount());
+        if (!tree.pathContains(tree.root()) || tree.pathEntry(tree.root()).parent)
+            errors.push_back("SemanticTree root Path is invalid");
+        std::vector<uint8_t> pathState(tree.pathCapacity(), 0);
+        for (const auto start : tree.pathIds()) {
+            auto current = start;
+            while (current && tree.pathContains(current) && !pathState[current]) {
+                pathState[current] = 1;
+                current = tree.pathEntry(current).parent;
+            }
+            if (current && tree.pathContains(current) && pathState[current] == 1)
+                errors.push_back("SemanticTree contains a Path cycle");
+            current = start;
+            while (current && tree.pathContains(current) && pathState[current] == 1) {
+                pathState[current] = 2;
+                current = tree.pathEntry(current).parent;
+            }
+        }
+        for (const auto id : tree.pathIds()) {
+            if (id == tree.root()) continue;
+            const auto parent = tree.pathEntry(id).parent;
+            if (!tree.pathContains(parent)) errors.push_back("Path has an invalid parent Path");
+            if (!names.insert({parent, tree.pathName(id)}).second)
+                errors.push_back("duplicate SemanticTree child name: " + std::string(tree.pathName(id)));
+        }
+        std::size_t forwardOps = 0, forwardAnchors = 0, reverseOps = 0, reverseAnchors = 0;
+        std::unordered_map<uint32_t, std::unordered_set<SemanticId>> opLookup, valueLookup;
+        for (const auto op : operations()) {
+            const auto ids = opSemanticIds(op);
+            reverseOps += ids.size();
+            std::unordered_set<SemanticId> seen;
+            for (std::size_t index = 0; index < ids.size(); ++index) {
+                const auto id = ids[index];
+                if (!tree.contains(id)) errors.push_back("operation refers to an invalid Node");
+                if (ids.size() >= 64 ? !seen.insert(id).second :
+                    std::find(ids.begin(), ids.begin() + index, id) != ids.begin() + index)
+                    errors.push_back("duplicate operation Node ID");
+            }
+            if (ids.size() >= 64) opLookup.emplace(op.index, std::move(seen));
+        }
+        for (const auto value : values()) {
+            const auto ids = valueSemanticIds(value);
+            reverseAnchors += ids.size();
+            std::unordered_set<SemanticId> seen;
+            for (std::size_t index = 0; index < ids.size(); ++index) {
+                const auto id = ids[index];
+                if (!tree.contains(id)) errors.push_back("value refers to an invalid Node");
+                if (ids.size() >= 64 ? !seen.insert(id).second :
+                    std::find(ids.begin(), ids.begin() + index, id) != ids.begin() + index)
+                    errors.push_back("duplicate value Node ID");
+            }
+            if (ids.size() >= 64) valueLookup.emplace(value.index, std::move(seen));
+        }
+        for (const auto id : tree.nodeIds()) {
+            const auto parent = tree.node(id).parent;
+            if (tree.namesFlattened() && !SemanticTree::validQualifiedName(tree.name(id)))
+                errors.push_back("invalid flattened Semantic Node name");
+            if (!tree.pathContains(parent)) errors.push_back("Node has an invalid parent Path");
+            if (!names.insert({parent, tree.name(id)}).second)
+                errors.push_back("duplicate SemanticTree child name: " + std::string(tree.name(id)));
+            slang::SmallVector<uint64_t, 8> refs;
+            std::unordered_set<uint64_t> largeRefs;
+            const auto duplicate = [&](SemanticEntityRef ref, std::size_t count) {
+                const auto key = (uint64_t(ref.generation) << 32) | ref.index;
+                if (count >= 64) return !largeRefs.insert(key).second;
+                if (std::find(refs.begin(), refs.end(), key) != refs.end()) return true;
+                refs.push_back(key);
+                return false;
+            };
+            for (const auto ref : tree.operations(id)) {
+                ++forwardOps;
+                if (duplicate(ref, tree.operations(id).size()))
+                    errors.push_back("duplicate Node operation");
+                if (!ref.index || ref.index > store_->operations_.size() || ref.generation ||
+                    !store_->operations_[ref.index - 1].alive) {
+                    errors.push_back("Node operation is not live");
+                    continue;
+                }
+                const auto cached = opLookup.find(ref.index);
+                const auto ids = opSemanticIds(OperationId{ref.index, ref.generation, graphId_});
+                if (cached == opLookup.end() ? std::find(ids.begin(), ids.end(), id) == ids.end() :
+                    !cached->second.contains(id)) errors.push_back("Node operation reverse membership differs");
+            }
+            refs.clear();
+            largeRefs.clear();
+            for (const auto ref : tree.anchors(id)) {
+                ++forwardAnchors;
+                if (duplicate(ref, tree.anchors(id).size()))
+                    errors.push_back("duplicate Node anchor");
+                if (!ref.index || ref.index > store_->values_.size() || ref.generation ||
+                    !store_->values_[ref.index - 1].alive) {
+                    errors.push_back("Node anchor is not live");
+                    continue;
+                }
+                const auto cached = valueLookup.find(ref.index);
+                const auto ids = valueSemanticIds(ValueId{ref.index, ref.generation, graphId_});
+                if (cached == valueLookup.end() ? std::find(ids.begin(), ids.end(), id) == ids.end() :
+                    !cached->second.contains(id)) errors.push_back("Node anchor reverse membership differs");
+            }
+        }
+        if (forwardOps != reverseOps) errors.push_back("Node operation membership counts differ");
+        if (forwardAnchors != reverseAnchors) errors.push_back("Node anchor membership counts differ");
+        if (tree.namesFlattened() && !tree.isFlat()) errors.push_back("flattened tree contains internal Paths");
+        return errors;
     }
 
     std::span<const SemanticId> Graph::valueSemanticIds(ValueId value) const
@@ -3488,14 +4039,59 @@ namespace wolvrix::lib::grh
         return std::span<const SemanticId>(ids.data() + range.offset, range.count);
     }
 
+    namespace {
+        struct SemanticMembershipUpdate {
+            slang::SmallVector<SemanticId, 4> unique, removed, added;
+        };
+        SemanticMembershipUpdate prepareSemanticMembers(const SemanticTree* tree,
+            std::span<const SemanticId> oldIds, std::span<const SemanticId> newIds)
+        {
+            SemanticMembershipUpdate result;
+            auto& unique = result.unique;
+            unique.reserve(newIds.size());
+            if (newIds.size() < 64) {
+                for (const auto id : newIds) {
+                    if (!tree || !tree->contains(id)) throw std::invalid_argument("invalid Semantic Node ID");
+                    if (std::find(unique.begin(), unique.end(), id) == unique.end()) unique.push_back(id);
+                }
+            } else {
+                std::unordered_set<SemanticId> seen;
+                seen.reserve(newIds.size());
+                for (const auto id : newIds) {
+                    if (!tree || !tree->contains(id)) throw std::invalid_argument("invalid Semantic Node ID");
+                    if (seen.insert(id).second) unique.push_back(id);
+                }
+            }
+            if (oldIds.size() + unique.size() < 64) {
+                for (const auto id : oldIds)
+                    if (std::find(unique.begin(), unique.end(), id) == unique.end()) result.removed.push_back(id);
+                for (const auto id : unique)
+                    if (std::find(oldIds.begin(), oldIds.end(), id) == oldIds.end()) result.added.push_back(id);
+            } else {
+                std::unordered_set<SemanticId> oldSet(oldIds.begin(), oldIds.end());
+                std::unordered_set<SemanticId> newSet(unique.begin(), unique.end());
+                for (const auto id : oldIds) if (!newSet.contains(id)) result.removed.push_back(id);
+                for (const auto id : unique) if (!oldSet.contains(id)) result.added.push_back(id);
+            }
+            return result;
+        }
+    }
+
     void Graph::setValueSemanticIds(ValueId value, std::span<const SemanticId> ids)
     {
         GraphStore& builder = mutableStore();
         const std::size_t row = builder.valueIndex(value);
-        if (!ids.empty() && !semanticTree_) throw std::invalid_argument("value has no SemanticTree");
-        for (const SemanticId id : ids)
-            if (!semanticTree_->contains(id)) throw std::invalid_argument("invalid value SemanticId");
-        builder.values_.semantics_[row] = builder.storeSemanticIds(ids);
+        if (!ids.empty() && !builder.valueAlive(value))
+            throw std::invalid_argument("Semantic Node anchor is not live");
+        const auto update = prepareSemanticMembers(semanticTree(), valueSemanticIds(value), ids);
+        // Allocate before publishing either direction of the relation.
+        const auto range = builder.storeSemanticIds({update.unique.data(), update.unique.size()});
+        if (semanticTree_) {
+            semanticTree_->reserveMembers(update.added.size());
+            for (const auto id : update.removed) semanticTree_->removeAnchor(id, {value.index, value.generation});
+            for (const auto id : update.added) semanticTree_->addAnchor(id, {value.index, value.generation});
+        }
+        builder.values_.semantics_[row] = range;
     }
 
     namespace {
@@ -3548,10 +4144,16 @@ namespace wolvrix::lib::grh
     {
         GraphStore& builder = mutableStore();
         const std::size_t row = builder.opIndex(op);
-        if (!ids.empty() && !semanticTree_) throw std::invalid_argument("operation has no SemanticTree");
-        for (const SemanticId id : ids)
-            if (!semanticTree_->contains(id)) throw std::invalid_argument("invalid operation SemanticId");
-        builder.operations_.semantics_[row] = builder.storeSemanticIds(ids);
+        if (!ids.empty() && !builder.opAlive(op))
+            throw std::invalid_argument("Semantic Node operation is not live");
+        const auto update = prepareSemanticMembers(semanticTree(), opSemanticIds(op), ids);
+        const auto range = builder.storeSemanticIds({update.unique.data(), update.unique.size()});
+        if (semanticTree_) {
+            semanticTree_->reserveMembers(update.added.size());
+            for (const auto id : update.removed) semanticTree_->removeOperation(id, {op.index, op.generation});
+            for (const auto id : update.added) semanticTree_->addOperation(id, {op.index, op.generation});
+        }
+        builder.operations_.semantics_[row] = range;
     }
 
     void Graph::addOpSemanticIds(OperationId op, std::span<const SemanticId> ids)
@@ -3573,85 +4175,46 @@ namespace wolvrix::lib::grh
     }
 
     std::size_t Graph::remapValueBlockSemantics(const Graph& source,
-                                                std::span<const ValueId> sourceValues,
-                                                std::span<const ValueId> targetValues,
-                                                SemanticId copiedRoot)
+        std::span<const ValueId> sourceValues, std::span<const ValueId> targetValues,
+        std::span<const SemanticId> nodeMap)
     {
         if (sourceValues.size() != targetValues.size())
             throw std::invalid_argument("semantic value block column lengths differ");
-        std::size_t total = 0, annotated = 0;
-        for (const ValueId value : sourceValues) {
-            const auto ids = source.valueSemanticIds(value);
-            annotated += !ids.empty();
-            total += ids.size();
-            for (const SemanticId id : ids)
-                if (!source.semanticTree_ || !source.semanticTree_->contains(id))
-                    throw std::invalid_argument("invalid source value SemanticId");
-        }
-        if (!total) return 0;
-        if (!copiedRoot || !semanticTree_ || copiedRoot > semanticTree_->size() ||
-            source.semanticTree_->size() > semanticTree_->size() - copiedRoot + 1)
-            throw std::invalid_argument("missing copied SemanticTree root");
-        GraphStore& builder = mutableStore();
+        std::size_t annotated = 0;
         std::vector<SemanticId> mapped;
-        const auto storeMapped = [&](std::span<const SemanticId> ids) {
-            if (ids.empty()) return Range{};
-            if (ids.size() == 1) {
-                const SemanticId id = copiedRoot + ids.front() - 1;
-                return builder.storeSemanticIds(std::span<const SemanticId>(&id, 1));
-            }
-            mapped.resize(ids.size());
-            std::transform(ids.begin(), ids.end(), mapped.begin(),
-                [copiedRoot](SemanticId id) { return copiedRoot + id - 1; });
-            return builder.storeSemanticIds(mapped);
-        };
         for (std::size_t i = 0; i < sourceValues.size(); ++i) {
-            const auto range = storeMapped(source.valueSemanticIds(sourceValues[i]));
-            builder.values_.semantics_[builder.valueIndex(targetValues[i])] = range;
+            mapped.clear();
+            for (const auto id : source.valueSemanticIds(sourceValues[i])) {
+                if (id >= nodeMap.size() || !semanticTree_ || !semanticTree_->contains(nodeMap[id]))
+                    throw std::invalid_argument("missing semantic Node relocation");
+                mapped.push_back(nodeMap[id]);
+            }
+            annotated += !mapped.empty();
+            setValueSemanticIds(targetValues[i], mapped);
         }
         return annotated;
     }
 
     std::size_t Graph::remapOperationBlockSemantics(const Graph& source,
-                                                    std::span<const OperationId> sourceOps,
-                                                    std::span<const OperationId> targetOps,
-                                                    SemanticId copiedRoot)
+        std::span<const OperationId> sourceOps, std::span<const OperationId> targetOps,
+        std::span<const SemanticId> nodeMap)
     {
         if (sourceOps.size() != targetOps.size())
             throw std::invalid_argument("semantic operation block column lengths differ");
-        std::size_t total = 0, annotated = 0;
-        for (const OperationId op : sourceOps) {
-            const auto ids = source.opSemanticIds(op);
-            annotated += !ids.empty();
-            total += ids.size();
-            for (const SemanticId id : ids)
-                if (!source.semanticTree_ || !source.semanticTree_->contains(id))
-                    throw std::invalid_argument("invalid source operation SemanticId");
-        }
-        if (!total) return 0;
-        if (!copiedRoot || !semanticTree_ || copiedRoot > semanticTree_->size() ||
-            source.semanticTree_->size() > semanticTree_->size() - copiedRoot + 1)
-            throw std::invalid_argument("missing copied SemanticTree root");
-        GraphStore& builder = mutableStore();
+        std::size_t annotated = 0;
         std::vector<SemanticId> mapped;
-        const auto storeMapped = [&](std::span<const SemanticId> ids) {
-            if (ids.empty()) return Range{};
-            if (ids.size() == 1) {
-                const SemanticId id = copiedRoot + ids.front() - 1;
-                return builder.storeSemanticIds(std::span<const SemanticId>(&id, 1));
-            }
-            mapped.resize(ids.size());
-            std::transform(ids.begin(), ids.end(), mapped.begin(),
-                [copiedRoot](SemanticId id) { return copiedRoot + id - 1; });
-            return builder.storeSemanticIds(mapped);
-        };
         for (std::size_t i = 0; i < sourceOps.size(); ++i) {
-            const auto range = storeMapped(source.opSemanticIds(sourceOps[i]));
-            builder.operations_.semantics_[builder.opIndex(targetOps[i])] = range;
+            mapped.clear();
+            for (const auto id : source.opSemanticIds(sourceOps[i])) {
+                if (id >= nodeMap.size() || !semanticTree_ || !semanticTree_->contains(nodeMap[id]))
+                    throw std::invalid_argument("missing semantic Node relocation");
+                mapped.push_back(nodeMap[id]);
+            }
+            annotated += !mapped.empty();
+            setOpSemanticIds(targetOps[i], mapped);
         }
         return annotated;
     }
-
 
     std::optional<AttributeValue> Graph::metadata(std::string_view key) const
     {
@@ -3919,7 +4482,41 @@ namespace wolvrix::lib::grh
         if (compacted_) return;
         owner_->touch();
         compacted_ = false;
+        if (!semanticBindings_.empty()) {
+            std::unordered_map<uint32_t, uint32_t> values;
+            std::unordered_map<uint32_t, uint32_t> operations;
+            for (const auto& binding : semanticBindings_) {
+                if (binding.value) values.emplace(binding.value.index, 0);
+                if (binding.operation) operations.emplace(binding.operation.index, 0);
+            }
+            uint32_t next = 0;
+            for (const auto value : this->values()) {
+                ++next;
+                if (auto found = values.find(value.index); found != values.end()) found->second = next;
+            }
+            next = 0;
+            for (const auto operation : this->operations()) {
+                ++next;
+                if (auto found = operations.find(operation.index); found != operations.end()) found->second = next;
+            }
+            for (auto& binding : semanticBindings_) {
+                if (binding.value) binding.value.index = values.at(binding.value.index);
+                if (binding.operation) binding.operation.index = operations.at(binding.operation.index);
+            }
+            semanticBindingIndexValid_ = false;
+            semanticBindingValues_.clear();
+            semanticBindingOps_.clear();
+        }
         store_->compact();
+        if (semanticTree_) {
+            semanticTree_->clearMembers();
+            for (const auto value : values())
+                for (const auto id : valueSemanticIds(value))
+                    semanticTree_->addAnchor(id, {value.index, value.generation});
+            for (const auto op : operations())
+                for (const auto id : opSemanticIds(op))
+                    semanticTree_->addOperation(id, {op.index, op.generation});
+        }
         ++srcLocEpoch_;
         compacted_ = true;
 
@@ -5171,6 +5768,7 @@ namespace wolvrix::lib::grh
         GraphStore &builder = mutableStore();
         builder.replaceResult(op, index, value);
         mergeValueSemanticIds(value, current);
+        if (sameValueType(current, value)) redirectSemanticBindings(current, value);
     }
 
     void Graph::replaceAllUses(ValueId from, ValueId to)
@@ -5179,6 +5777,7 @@ namespace wolvrix::lib::grh
         GraphStore &builder = mutableStore();
         builder.replaceAllUses(from, to);
         mergeValueSemanticIds(to, from);
+        redirectSemanticBindings(from, to);
     }
 
     ValueId Graph::replaceAllUsesWithView(ValueId from, ValueId to)
@@ -5208,6 +5807,7 @@ namespace wolvrix::lib::grh
         addOperand(viewOp, to);
         addResult(viewOp, view);
         setValueSemanticIds(view, valueSemanticIds(from));
+        setOpSemanticIds(viewOp, valueSemanticIds(from));
         replaceAllUses(from, view);
         return view;
     }
@@ -5236,6 +5836,8 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseOp(op);
         if (result)
         {
+            setOpSemanticIds(op, {});
+            eraseSemanticBindings(op);
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -5266,8 +5868,12 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseOp(op, replacementResults);
         if (result)
         {
-            for (std::size_t i = 0; i < results.size(); ++i)
+            setOpSemanticIds(op, {});
+            for (std::size_t i = 0; i < results.size(); ++i) {
                 mergeValueSemanticIds(replacementResults[i], results[i]);
+                redirectSemanticBindings(results[i], replacementResults[i]);
+            }
+            eraseSemanticBindings(op);
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -5290,6 +5896,8 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseOpUnchecked(op);
         if (result)
         {
+            setOpSemanticIds(op, {});
+            eraseSemanticBindings(op);
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -5312,6 +5920,8 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseValue(value);
         if (result)
         {
+            setValueSemanticIds(value, {});
+            eraseSemanticBindings(value);
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -5334,6 +5944,8 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseValueUnchecked(value);
         if (result)
         {
+            setValueSemanticIds(value, {});
+            eraseSemanticBindings(value);
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -5621,29 +6233,58 @@ namespace wolvrix::lib::grh
         writer.endObject();
         if (semanticTree_)
         {
+            const auto& tree = *semanticTree_;
             writer.writeProperty("semanticTree");
             writer.startObject();
             writer.writeProperty("sourceUnit");
-            writer.writeValue(semanticTree_->sourceUnit());
+            writer.writeValue(tree.sourceUnit());
             writer.writeProperty("circuit");
-            writer.writeValue(semanticTree_->circuit());
+            writer.writeValue(tree.circuit());
+            writer.writeProperty("rootPath");
+            writer.writeValue(static_cast<int64_t>(tree.root()));
+            writer.writeProperty("namesFlattened");
+            writer.writeValue(tree.namesFlattened());
+            writer.writeProperty("paths");
+            writer.startArray();
+            for (const auto id : tree.pathIds()) {
+                writer.startObject();
+                writer.writeProperty("id");
+                writer.writeValue(static_cast<int64_t>(id));
+                writer.writeProperty("parent");
+                writer.writeValue(static_cast<int64_t>(tree.pathEntry(id).parent));
+                writer.writeProperty("name");
+                writer.writeValue(tree.pathName(id));
+                writer.endObject();
+            }
+            writer.endArray();
             writer.writeProperty("nodes");
             writer.startArray();
-            for (SemanticId id = 1; id <= semanticTree_->size(); ++id)
-            {
-                const auto& node = semanticTree_->node(id);
+            for (const auto id : tree.nodeIds()) {
                 writer.startObject();
+                writer.writeProperty("id");
+                writer.writeValue(static_cast<int64_t>(id));
                 writer.writeProperty("parent");
-                writer.writeValue(static_cast<int64_t>(node.parent));
-                writer.writeProperty("kind");
-                writer.writeValue(toString(node.kind));
+                writer.writeValue(static_cast<int64_t>(tree.node(id).parent));
                 writer.writeProperty("name");
-                writer.writeValue(semanticTree_->name(id));
-                if (node.kind == SemanticNodeKind::Element)
-                {
-                    writer.writeProperty("index");
-                    writer.writeValue(static_cast<int64_t>(node.index));
-                }
+                writer.writeValue(tree.name(id));
+                std::vector<uint32_t> refs;
+                refs.reserve(tree.operations(id).size());
+                for (const auto ref : tree.operations(id))
+                    refs.push_back(operationLocalId(OperationId{ref.index, ref.generation, graphId_}));
+                std::sort(refs.begin(), refs.end());
+                writer.writeProperty("ops");
+                writer.startArray();
+                for (const auto ref : refs) writer.writeValue(static_cast<int64_t>(ref));
+                writer.endArray();
+                refs.clear();
+                refs.reserve(tree.anchors(id).size());
+                for (const auto ref : tree.anchors(id))
+                    refs.push_back(valueLocalId(ValueId{ref.index, ref.generation, graphId_}));
+                std::sort(refs.begin(), refs.end());
+                writer.writeProperty("anchors");
+                writer.startArray();
+                for (const auto ref : refs) writer.writeValue(static_cast<int64_t>(ref));
+                writer.endArray();
                 writer.endObject();
             }
             writer.endArray();
@@ -5756,13 +6397,6 @@ namespace wolvrix::lib::grh
                 }
                 writer.endArray();
             }
-            if (!valueSemanticIds(valueId).empty())
-            {
-                writer.writeProperty("semanticIds");
-                writer.startArray();
-                for (const auto id : valueSemanticIds(valueId)) writer.writeValue(static_cast<int64_t>(id));
-                writer.endArray();
-            }
             if (emitSourceLocations) writeSrcLoc(writer, value.srcLoc());
             writer.endObject();
         }
@@ -5848,13 +6482,6 @@ namespace wolvrix::lib::grh
             }
             writer.endArray();
 
-            if (!opSemanticIds(opId).empty())
-            {
-                writer.writeProperty("semanticIds");
-                writer.startArray();
-                for (const auto id : opSemanticIds(opId)) writer.writeValue(static_cast<int64_t>(id));
-                writer.endArray();
-            }
 
             if (!op.attrs().empty())
             {

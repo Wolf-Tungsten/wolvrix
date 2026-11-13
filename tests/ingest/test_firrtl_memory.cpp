@@ -13,7 +13,7 @@ void requireNoAddressCompare(const grh::Design& design, const std::string& name)
     }
 }
 void aggregateAndClocks(const std::string& name) {
-    auto result = read(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "memory" / (name + ".fir"));
+    auto result = read(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "memory" / (name + ".fir"), false);
     require(result.success(), diagnostics(result));
     run(*result.design, std::make_unique<tx::GrhVerifyPass>()); valid(*result.design);
     auto restored = roundTrip(*result.design); valid(restored);
@@ -66,7 +66,7 @@ void matrix(int readLatency, int writeLatency, const std::string& policy, bool i
         source.replace(source.find("m.r.clk, clk"), std::string_view("m.r.clk, clk").size(), "m.r.clk, readClock");
         source.replace(source.find("m.w.clk, clk"), std::string_view("m.w.clk, clk").size(), "m.w.clk, writeClock");
     }
-    auto result = text(name, source);
+    auto result = unannotatedText(name, source);
     require(result.success(), diagnostics(result));
     run(*result.design, std::make_unique<tx::GrhVerifyPass>()); valid(*result.design);
     auto restored = roundTrip(*result.design); valid(restored);
@@ -89,7 +89,7 @@ void matrix(int readLatency, int writeLatency, const std::string& policy, bool i
     generate(restored, artifact("firrtl-memory") / name, driver); models.push_back(name);
 }
 void standard() {
-    auto result = text("memory-standard", R"FIR(    input clk : Clock
+    auto result = unannotatedText("memory-standard", R"FIR(    input clk : Clock
     input wen : UInt<1>
     input ren : UInt<1>
     input addr : UInt<2>
@@ -159,6 +159,7 @@ circuit top :
     ingest::IngestRequest request;
     request.sources.push_back({ingest::SourceLanguage::Firrtl, path, "fixture"});
     request.firrtl.initPolicy = ingest::FirrtlInitPolicy::Zero;
+    request.firrtl.nodeAnnotations = false;
     auto result = ingest::readSources(request); require(result.success(), diagnostics(result));
     require(diagnostics(result).find("read-under-write=undefined") != std::string::npos,
             "undefined read-under-write did not emit a warning");
@@ -190,7 +191,7 @@ circuit top :
     require(cycle(0, 0, 0).as<uint64_t>() == 37, "undefined disabled read must remain ungated");
 }
 void depthOne() {
-    auto result = text("memory-depth-one", R"FIR(    input clk : Clock
+    auto result = unannotatedText("memory-depth-one", R"FIR(    input clk : Clock
     input mode : UInt<1>
     input en : UInt<1>
     input mask : UInt<1>
@@ -226,7 +227,7 @@ int main(){GrhSIM_top m;m.init();m.clk=0;m.mode=1;m.en=1;m.mask=1;m.data=93;m.ev
     models.push_back("depth-one");
 }
 void bundleRdwr() {
-    auto result = text("memory-bundle-rdwr", R"FIR(    input clk : Clock
+    auto result = unannotatedText("memory-bundle-rdwr", R"FIR(    input clk : Clock
     input addr : UInt<2>
     input wa : UInt<1>
     input wb : UInt<1>
@@ -265,7 +266,7 @@ void bundleRdwr() {
     models.push_back("bundle-rdwr");
 }
 void partialArrayPort() {
-    auto result = text("memory-partial-array-port", R"FIR(    input clk : Clock
+    auto result = unannotatedText("memory-partial-array-port", R"FIR(    input clk : Clock
     input wen : UInt<1>
     input second : UInt<1>
     input a : UInt<4>
@@ -315,7 +316,7 @@ void test() {
         for (const auto [r, w] : {std::pair{1, 1}, {2, 1}, {3, 2}, {2, 3}}) matrix(r, w, policy, true);
     for (const std::string policy : {"old", "new", "undefined"}) matrix(2, 1, policy, false, true);
     standard();
-    auto result = text("memory-cmem", R"FIR(    input clk : Clock
+    auto result = unannotatedText("memory-cmem", R"FIR(    input clk : Clock
     input wen : UInt<1>
     input addr : UInt<3>
     input data : UInt<8>

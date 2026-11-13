@@ -26,7 +26,7 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
 例如两个 8 位标量按 operands `[a,b]` 构造的结果为 `w=16, shape=[2]`，低字节来自 a。
 载入后由 `grh.verify` 独立复核完整类型；容器布局不变。
 
-- `formatVersion`: 必需且只能为 4，版本属于整个 Design；旧版本和无版本输入直接拒绝。
+- `formatVersion`: 必需且只能为 5，版本属于整个 Design；旧版本和无版本输入直接拒绝，并提示从源重新 ingest。
 - `graphs`: 按图名升序排列的数组，每个元素为单个 Graph 描述。
 - `aliases`: 可选，别名对象。键为 alias，值为目标 Graph 名称（symbol）。
 - `declaredSymbols`: 用户定义模块名数组（必需，缺失视为错误）。
@@ -36,15 +36,18 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
 - `symbol`: 图名称（必需，缺失视为错误）。
 - `dialects`: 方言名到整数版本的对象；基础 `grh:2` 必需，使用扩展 op 时声明对应版本，
   如 `grhsim:1`、`grhsim.cpu:1`。未知方言、kind 或不支持的版本拒绝读取。
-- `semanticTree`: 可选，Graph 自包含的来源树；没有来源信息时省略，不写 null，也不引用其他 Graph。
+- `semanticTree`: 可选，Graph 自包含的计算 Node 组织；没有此结构时省略，不写 null，也不引用其他 Graph。
   - `sourceUnit` / `circuit`: 来源单元和电路名。
-  - `nodes`: 节点数组，节点 ID 为数组下标加 1，根 ID 固定为 1。
-  - 每项为 `{ parent, kind, name, index? }`。根必须是 `parent=0, kind=module`；其他 parent 必须指向更早节点。
-  - `kind` 只接受 `module/declaration/expression/field/element`。flatten 深拷贝来源树时，源 Module 根可以成为非根节点；F20.P1 起，复制根的 `name` 使用规范化并唯一化后的实例名，不再使用来源模块定义名。
-  - Element 必须有非负 `index`，允许空 name；其他节点名称非空且不允许 index。
-  - SemanticId 就是该 Graph 树内的节点 ID，不包含实例 scope、外部树编号或指针。
-    F21 起，DCE 可以删除不再被存活 op/value 引用的分支并批量重编号；存活来源路径不变，
-    数字 ID 不得作为跨 pass 或跨 checkpoint 的稳定身份。
+  - `rootPath`: 根 Path 的显式 ID，固定为 1；根不是 Node。
+  - `namesFlattened`: 必需的布尔值，区分原始叶名和已经编码的限定名，避免重复 flatten 时再次转义。
+  - `paths`: 内部路径数组，每项 `{id,parent,name}`。根的 parent 为 0；其他 parent 必须指向实际 Path。名字非空，同级名字唯一，不能有环。
+  - `nodes`: 唯一一种 Node 的数组，每项 `{id,parent,name,ops,anchors}`。Node 永远是叶子，parent 必须指向 Path；名字非空，同级名字唯一。没有 kind、index 或角色分类。
+  - Path ID 与 Node ID 属于两个独立的正 uint32 域。ID 显式保存，允许空洞，不依赖数组次序；读入时按 parent 关系构建。普通存储和 clone/compact 不重编号 Node。
+  - `ops`: 必需，本 Node 实际 GRH operation 成员的局部 ID 集合；不能重复或悬空。同一个 op 可以属于多个 Node。
+  - `anchors`: 可选，缺省为空；为本 Node 保留边界的实际 value 局部 ID 集合。输入、别名等 Node 允许 ops 为空；anchors 不是新增 Node 类型，也不恢复旧来源投影。
+  - 写出时 Path/Node 按自身 ID 升序，ops/anchors 按对应 Graph 局部 ID 升序，空数组也显式写出。
+  - hier-flatten 后 paths 只保留根，所有 Node 直接挂根；限定名中的路径分隔符和原名中的分隔符按 SemanticTree 编码规则区分。
+  加载时拒绝无效父级、重复 ID/名字、悬空或重复成员，以及旧 kind/index/semanticBindings。旧 checkpoint 必须重新 ingest，不能仅修改版本号。
 - `metadata`: Graph 属性对象，负载编码与 op attrs 相同；保存转换阶段及逻辑域等语义。
   分区/调度缓存、裸实体 ID、CPU 布局及 chunk 不进入此对象。
 - `declaredSymbols`: 模块内部声明的符号名数组（必需）。
@@ -64,7 +67,6 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
   - `in` / `out` / `inout`: 输入/输出/inout 标记（`inout` 不可与 `in/out` 同时为真）。
   - `def`: 可选，定义该值的 Operation 局部 ID；省略时由 operation 的 `out` 边恢复。
   - `users`: 可选，使用者数组 `{ op, idx }`，`op` 为 Operation 局部 ID；省略时由 operation 的 `in` 边恢复。
-  - `semanticIds`: 可选，正整数数组。每项是当前 semanticTree 的节点 ID；顺序和重复项原样保留。
   - `loc`: 可选，源码位置与扩展调试信息 `{ file, line, col, endLine, endCol, origin, pass, note }`。
 - `ports`: 端口对象。
   - `in`: 输入端口数组，每项 `{ name, val }`，其中 `val` 为值局部 ID。
@@ -75,7 +77,6 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
   - `sym`: 符号名；仅语义对象写出，临时对象省略。
   - `kind`: 操作类型字符串（来自 `wolvrix::lib::grh::toString(OperationKind)`）。
   - `in` / `out`: 操作数与结果值局部 ID 数组，保持插入顺序。
-  - `semanticIds`: 可选，正整数数组，规则与 value 相同。
   - `attrs`: 可选属性对象，键为属性名，值为属性负载。FIRRTL effect
     operations (`kSystemTask`) use `firrtl.line` (int) for the 1-based source
     line of the originating FIRRTL statement; FIRRTL instance boundary
@@ -84,10 +85,25 @@ Graph metadata 只排序属性指针，不复制属性负载。图名/别名排�
     survives graph transforms and StoreJson round trips.
   - `loc`: 可选，源码位置与扩展调试信息 `{ file, line, col, endLine, endCol, origin, pass, note }`。
 
-FIRRTL 来源由 semanticTree 和 value/op 的 semanticIds 持久化，不生成旧
-`firrtl.node.members/origins/roots/rootResults` 或 `originModules`。flatten 将完整来源树深拷贝到目标 Graph，
-所有来源 ID 平移为新的本地编号；F20.P1 起，复制出的 Module 根使用实例名，声明及字段路径保持来源结构。
-没有 semanticTree 的 Graph 不允许出现非空 semanticIds；无效节点或引用直接拒绝，不静默丢弃。
+Node 的 ops/anchors 是持久化成员事实的唯一入口。value/op 不再写出或接受 semanticIds，
+也不生成旧 semanticBindings、`firrtl.node.members/origins/roots/rootResults` 或 `originModules`。
+加载完成后 Graph API 从这些成员同步建立反向查询；真实运行时 OperationId/ValueId 带图身份与代数，
+不能直接写入 JSON。写出和读入均经由 Graph 局部 ID 表映射。
+加载器先按实际 op/value 聚合全部 Node 归属，再为每个实体一次性建立双向成员；共享高扇出
+实现不会在成员池中留下所有逐次增长的归属前缀。
+
+FIRRTL 的正式端口关系保存在 Graph metadata 的 `firrtl.semanticPortNames:string[]` 与
+`firrtl.semanticPortNodes:int[]`；instance 的实际端口关系保存在对应 op attrs 的
+`semanticPortNames:string[]` 与 `semanticPortNodes:int[]`。两数组须成对出现、等长，名字非空唯一，
+Node ID 必须为本 Graph 实际存在的正 uint32；instance 或 blackbox 端口 Node 同时必须属于该 op。
+零宽等没有 runtime value 的端点仍引用正常 Node，不用零或负数充当占位。加载时严格检查这些关系，
+不会将溢出整数截断为有效 Node ID。它们记录实际端口对应关系，不增加 Node 类型。
+
+F28 首阶段支持正常 ingest-firrtl→xmr-resolve→hier-flatten，以及 grh.verify、stats、
+memory-init-check 和 multidriven-guard 只读检查。带 SemanticTree 的 Graph 进入尚未迁移的
+split-static-array、DCE、comb-loop-elim 或 GrhSIM 转换/优化/分区时，PassManager 在该 pass
+修改图之前明确拒绝；不自动删除 SemanticTree。旧 source-endpoint NodeEvolution trace 也明确拒绝新树。
+没有 SemanticTree 的 Graph 继续执行原有变换流程。
 
 生产环境默认省略全部 `def/users` 和 `loc`。加载后以 operation 的 `in/out` 边重建拓扑；`def/users`
 存在时仍校验与 operation 边一致。省略 `loc` 不影响电路或 SemanticTree，但被省略的源码位置在重新加载后不可恢复。
@@ -199,12 +215,15 @@ JSON 中若仍保留该 op，表示流程未完成。
 非数组对象仍会物化，含大量标量属性的 metadata 对象和单个超长字符串
 也会占用额外内存，不保证任意规模输入都能装入。文件须在整个同步读取过程中保持不变。
 `LoadJson::load(text)` / `load_json_text` 保留完整文本 DOM 路径。
-Python `Session.semantic_stats` 直接遍历已加载 Graph，返回树数、节点数、名称字节数、非空 value/op
-来源行和 SemanticId 总数，可在大型 checkpoint 验收时避免二次扫描 JSON 文本。
+Python `Session.semantic_stats` 直接遍历已加载 Graph，返回 `trees/root_path_count`、排除根的
+`path_count`、`node_count`、`name_bytes`、`total_op_count`、`op_membership_count`、
+`anchor_membership_count`、`covered_unique_op_count`、`uncovered_op_count`、`shared_op_count` 和
+`empty_op_node_count`。共享 op 的成员关系可以多条，但唯一覆盖只计一次；空 Node 单独统计。
+`Session.semantic_validate` 复用原生结构/双向成员校验，返回 `valid/error_count/checked_graphs/examples`。
 文件错误、语法或图构建错误都在 session 发布新设计之前返回；失败替换
 保留已有设计。
 
-- Design 只接受根 `formatVersion: 4`；v2、v3 和无版本输入必须重新从源生成，不提供迁移。
+- Design 只接受根 `formatVersion: 5`；v4 及更早版本和无版本输入必须重新从源生成，不提供字段迁移。
 - 属性对象只接受 `{t,v}` 或 `{t,vs}`，不读取旧 k/kind/value/values 别名。
 - 字符串实体引用和 tmp 已删除。扩展 op 必须声明所属方言版本。
   load 创建新设计实例，不恢复 revision 或 session 分析。
@@ -221,25 +240,28 @@ Python `Session.semantic_stats` 直接遍历已加载 Graph，返回树数、节
 ## 示例
 ```json
 {
-  "formatVersion": 4,
+  "formatVersion": 5,
   "graphs": [{
     "symbol": "sample",
     "dialects": {"grh": 2},
     "semanticTree": {
       "sourceUnit": "unit",
       "circuit": "sample",
+      "rootPath": 1,
+      "namesFlattened": false,
+      "paths": [{"id": 1, "parent": 0, "name": "sample"}],
       "nodes": [
-        {"parent": 0, "kind": "module", "name": "sample"},
-        {"parent": 1, "kind": "declaration", "name": "n"}
+        {"id": 1, "parent": 1, "name": "in", "ops": [], "anchors": [1]},
+        {"id": 2, "parent": 1, "name": "out", "ops": [1], "anchors": [2]}
       ]
     },
     "metadata": {},
     "declaredSymbols": [],
     "vals": [
       {"id": 1, "sym": "in", "w": 1, "sgn": false, "type": "logic", "domain": "4state",
-       "in": true, "out": false, "inout": false, "semanticIds": [2]},
+       "in": true, "out": false, "inout": false},
       {"id": 2, "sym": "out", "w": 1, "sgn": false, "type": "logic", "domain": "4state",
-       "in": false, "out": true, "inout": false, "semanticIds": [2]}
+       "in": false, "out": true, "inout": false}
     ],
     "ports": {
       "in": [{"name": "in", "val": 1}],
@@ -247,7 +269,7 @@ Python `Session.semantic_stats` 直接遍历已加载 Graph，返回树数、节
       "inout": []
     },
     "ops": [
-      {"id": 1, "sym": "drv", "kind": "kAssign", "in": [1], "out": [2], "semanticIds": [2]}
+      {"id": 1, "sym": "drv", "kind": "kAssign", "in": [1], "out": [2]}
     ]
   }],
   "aliases": {},

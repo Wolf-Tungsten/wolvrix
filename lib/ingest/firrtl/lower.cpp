@@ -73,6 +73,7 @@ struct Driver {
     std::string regSymbol;
     ValueId memoryMask;
     grh::SemanticId semantic = 0;
+    grh::SemanticId nextSemantic = 0;
 };
 
 struct LeafKeyView {
@@ -134,8 +135,17 @@ private:
     // Empty field paths (including arrays) use one hash lookup. Both the key
     // storage and Driver addresses belong to stable, never-erased map nodes.
     std::unordered_map<std::string_view, Driver*> rootDrivers_;
-    std::unordered_map<std::string_view, grh::SemanticId> semanticDeclarations_;
-    std::map<int, ValueId> guards_;
+    std::map<LeafKey, grh::SemanticId, LeafKeyLess> semanticLeaves_;
+    std::map<std::pair<grh::SemanticPathId, std::string>, grh::SemanticPathId> semanticPaths_;
+    std::set<std::pair<grh::SemanticPathId, std::string>> semanticNames_;
+    std::unordered_map<grh::SemanticId, uint32_t> semanticPipelineIndices_;
+    struct GuardValue {
+        ValueId value;
+        std::vector<grh::OperationId> operations;
+        std::vector<grh::SemanticId> consumers;
+    };
+    std::map<int, GuardValue> guards_;
+    int currentGuard_ = -1;
     grh::SemanticId currentSemantic_ = 0;
     class SemanticScope {
     public:
@@ -149,6 +159,10 @@ private:
     void setOpSemantic(grh::OperationId operation);
     void setOpSemantic(grh::OperationId operation, grh::SemanticId semantic);
     grh::SemanticId generatedSemantic(std::string name);
+    grh::SemanticId generatedSemantic(grh::SemanticPathId parent, std::string name);
+    grh::SemanticPathId semanticPath(grh::SemanticPathId parent, std::string_view name);
+    grh::SemanticId semanticLeaf(std::string_view name, std::span<const std::string> fields);
+    void finishGuardSemantics();
     Driver* rootDriver(std::string_view name) const;
     Driver& findDriver(std::string_view name, std::span<const std::string> fields);
     const Driver& findDriver(std::string_view name, std::span<const std::string> fields) const;
@@ -183,7 +197,7 @@ private:
     void checkCycles() const;
     void memories();
     bool memorySource(const LeafKey& key) const;
-    ValueId pipeline(ValueId data, ValueId clock, int64_t stages, Range range);
+    ValueId pipeline(ValueId data, ValueId clock, int64_t stages, Range range, bool readAddress = false);
     void effects();
     void instances();
 };
@@ -252,11 +266,49 @@ void Lowerer::setOpSemantic(grh::OperationId operation) {
 }
 void Lowerer::setOpSemantic(grh::OperationId operation, grh::SemanticId semantic) {
     if (semantic) graph_.setOpSemanticIds(operation, std::span<const grh::SemanticId>(&semantic, 1));
+    else if (currentGuard_ >= 0 && graph_.semanticTree())
+        guards_.at(currentGuard_).operations.push_back(operation);
 }
 grh::SemanticId Lowerer::generatedSemantic(std::string name) {
     auto* tree = graph_.semanticTree();
     if (!tree) return 0;
-    return tree->addNode(tree->root(), grh::SemanticNodeKind::Expression, name);
+    return generatedSemantic(tree->root(), std::move(name));
+}
+grh::SemanticId Lowerer::generatedSemantic(grh::SemanticPathId parent, std::string name) {
+    auto* tree = graph_.semanticTree();
+    if (!tree || !parent) return 0;
+    const auto base = name;
+    for (uint32_t suffix = 1; !semanticNames_.emplace(parent, name).second; ++suffix)
+        name = base + "$" + std::to_string(suffix);
+    return tree->addNode(parent, name);
+}
+grh::SemanticPathId Lowerer::semanticPath(grh::SemanticPathId parent, std::string_view name) {
+    auto* tree = graph_.semanticTree();
+    if (!tree || !parent) return 0;
+    auto [found, inserted] = semanticPaths_.try_emplace(std::pair{parent, std::string(name)});
+    if (inserted) {
+        if (!semanticNames_.emplace(parent, name).second)
+            throw std::logic_error("FIRRTL semantic path collides with a Node");
+        found->second = tree->addPath(parent, name);
+    }
+    return found->second;
+}
+grh::SemanticId Lowerer::semanticLeaf(std::string_view name, std::span<const std::string> fields) {
+    auto* tree = graph_.semanticTree();
+    if (!tree) return 0;
+    auto [found, inserted] = semanticLeaves_.try_emplace(LeafKey{std::string(name), {fields.begin(), fields.end()}});
+    if (!inserted) return found->second;
+    auto parent = tree->root();
+    auto leafName = name;
+    if (!fields.empty()) {
+        parent = semanticPath(parent, name);
+        for (std::size_t i = 0; i + 1 < fields.size(); ++i) parent = semanticPath(parent, fields[i]);
+        leafName = fields.back();
+    }
+    if (!semanticNames_.emplace(parent, leafName).second)
+        throw std::logic_error("FIRRTL semantic Node name collision");
+    found->second = tree->addNode(parent, leafName);
+    return found->second;
 }
 ValueId Lowerer::op(OperationKind kind, const LogicalType& type, std::span<const ValueId> args, Range range) {
     if (!type.width) return {};
@@ -516,10 +568,12 @@ ValueId Lowerer::stateRead(const Driver& driver, std::span<const ExprId> indices
 }
 void Lowerer::stateWrite(const Driver& driver, const Declaration::Register& state, ValueId enable,
                          const std::vector<ValueId>& indices, ValueId data, Range range) {
+    SemanticScope scope(currentSemantic_, driver.nextSemantic);
     const auto writer = graph_.createTemporaryOperation(indices.empty() ? OperationKind::kRegisterWritePort : OperationKind::kRegisterWriteArrayPort);
     graph_.addOperand(writer, enable);
     for (const auto value : indices) graph_.addOperand(writer, value);
-    graph_.addOperand(writer, data); graph_.addOperand(writer, expression(state.clock));
+    const auto clock = expression(state.clock);
+    graph_.addOperand(writer, data); graph_.addOperand(writer, clock);
     std::vector<std::string> edges{"posedge"};
     if (state.reset && semantics_.resolvedKind(semantics_.expressions[*state.reset]) == TypeKind::AsyncReset) {
         graph_.addOperand(writer, expression(*state.reset)); edges.push_back("posedge");
@@ -527,12 +581,25 @@ void Lowerer::stateWrite(const Driver& driver, const Declaration::Register& stat
     graph_.setAttr(writer, "regSymbol", driver.regSymbol); graph_.setAttr(writer, "eventEdge", edges);
     graph_.assignWriterOrder(writer, driver.regSymbol);
     graph_.setOpSrcLocView(writer, location(range));
-    setOpSemantic(writer, driver.semantic);
+    // All ordered writers belong to one next-state Node. The real operations
+    // retain enable, indices, event and order; no data operand stands in for
+    // the complete next-state computation.
+    setOpSemantic(writer);
 }
 
 ValueId Lowerer::guard(int id, Range range) {
-    if (const auto found = guards_.find(id); found != guards_.end()) return found->second;
-    SemanticScope scope(currentSemantic_, generatedSemantic("guard_" + std::to_string(id)));
+    auto& generated = guards_[id];
+    if (currentSemantic_) generated.consumers.push_back(currentSemantic_);
+    if (generated.value) return generated.value;
+    // A normalized guard is shared implementation of its consuming source
+    // declarations/effects, not a new FIRRTL expression declaration. Publish
+    // the complete consumer set once, after all requests have been collected.
+    SemanticScope scope(currentSemantic_, 0);
+    struct Context {
+        int& current;
+        int previous;
+        ~Context() { current = previous; }
+    } context{currentGuard_, std::exchange(currentGuard_, id)};
     ValueId result;
     const LogicalType bit{grh::ValueType::Logic, 1, false};
     if (id < 2) result = number(id, 1, range);
@@ -541,7 +608,29 @@ ValueId Lowerer::guard(int id, Range range) {
         const auto condition = adapt(expression(semantics_.guards.expressions[branch.variable]), bit, range);
         result = op(OperationKind::kMux, bit, {condition, guard(branch.high, range), guard(branch.low, range)}, range);
     }
-    guards_.emplace(id, result); return result;
+    generated.value = result; return result;
+}
+void Lowerer::finishGuardSemantics() {
+    if (!graph_.semanticTree()) return;
+    // Guards::make appends parents after their children. Reverse ID order is
+    // therefore a parent-before-child traversal, including cached subguards.
+    for (auto at = guards_.rbegin(); at != guards_.rend(); ++at) {
+        auto& [id, generated] = *at;
+        auto& consumers = generated.consumers;
+        std::sort(consumers.begin(), consumers.end());
+        consumers.erase(std::unique(consumers.begin(), consumers.end()), consumers.end());
+        if (consumers.empty()) throw std::logic_error("FIRRTL guard has no source consumer");
+        for (const auto operation : generated.operations) graph_.setOpSemanticIds(operation, consumers);
+        if (id >= 2) {
+            const auto branch = semantics_.guards.branches[id];
+            for (const auto child : {branch.high, branch.low}) {
+                if (child >= id) throw std::logic_error("FIRRTL guard DAG is not append-ordered");
+                auto& inherited = guards_.at(child).consumers;
+                inherited.insert(inherited.end(), consumers.begin(), consumers.end());
+            }
+        }
+        std::vector<grh::SemanticId>().swap(consumers);
+    }
 }
 void Lowerer::cover(Driver& driver, int64_t begin, int64_t end, int guard) {
     if (begin == end) return;
@@ -560,7 +649,7 @@ void Lowerer::connect(const Connection& connection) {
     path.fields.append(connection.sink.fields);
     auto& driver = findDriver(path.name, path.fields.span());
     if (!driver.value) return;
-    SemanticScope scope(currentSemantic_, driver.semantic);
+    SemanticScope scope(currentSemantic_, driver.regSymbol.empty() ? driver.semantic : driver.nextSemantic);
     const auto fullType = graph_.valueLogicalType(driver.value);
     auto dataType = fullType;
     for (std::size_t i = 0; i < path.indices.size(); ++i) dataType.width /= fullType.shape[i];
@@ -732,23 +821,40 @@ bool Lowerer::memorySource(const LeafKey& key) const {
         if (port.name == key.second[0] && port.read && key.second[1] == (port.write ? "rdata" : "data")) return true;
     return false;
 }
-ValueId Lowerer::pipeline(ValueId data, ValueId clock, int64_t stages, Range range) {
+ValueId Lowerer::pipeline(ValueId data, ValueId clock, int64_t stages, Range range, bool readAddress) {
     const auto type = graph_.valueLogicalType(data);
     for (int64_t i = 0; i < stages; ++i) {
+        grh::SemanticId current = 0, next = 0;
+        if (const auto* tree = graph_.semanticTree()) {
+            if (!currentSemantic_) throw std::logic_error("FIRRTL memory pipeline has no consumer Node");
+            const auto parent = tree->node(currentSemantic_).parent;
+            const auto name = std::string(tree->name(currentSemantic_)) +
+                (readAddress ? "$ADDR" : "$PIPE") + std::to_string(semanticPipelineIndices_[currentSemantic_]++);
+            current = generatedSemantic(parent, name);
+            next = generatedSemantic(parent, name + "$NEXT");
+        }
         const auto state = graph_.createOperation(OperationKind::kRegister);
         const std::string symbol(graph_.getOperation(state).symbolText());
         grh::setStateLogicalType(graph_, state, type);
         grh::InitStep init; init.value = std::to_string(type.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
         grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLocView(state, location(range));
         graph_.setAttr(state, "firrtl.memoryPipeline", true);
-        setOpSemantic(state);
+        setOpSemantic(state, current);
         const auto write = graph_.createTemporaryOperation(OperationKind::kRegisterWritePort);
-        for (const auto value : {number(1, 1, range), data, clock}) graph_.addOperand(write, value);
+        {
+            SemanticScope scope(currentSemantic_, next);
+            for (const auto value : {number(1, 1, range), data, clock}) graph_.addOperand(write, value);
+        }
         graph_.setAttr(write, "regSymbol", symbol); graph_.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
         graph_.assignWriterOrder(write, symbol);
         graph_.setOpSrcLocView(write, location(range));
-        setOpSemantic(write);
-        data = op(OperationKind::kRegisterReadPort, type, {}, range); graph_.setAttr(graph_.valueDef(data), "regSymbol", symbol);
+        setOpSemantic(write, next);
+        {
+            SemanticScope scope(currentSemantic_, current);
+            data = op(OperationKind::kRegisterReadPort, type, {}, range);
+        }
+        graph_.setAttr(graph_.valueDef(data), "regSymbol", symbol);
+        if (current) graph_.setValueSemanticIds(data, std::span<const grh::SemanticId>(&current, 1));
     }
     return data;
 }
@@ -802,24 +908,39 @@ void Lowerer::memories() {
             ValueId address, clock, readEnable, writeEnable;
             ValueId writeAddress, writeData, writeMask;
         };
+        grh::SemanticPathId memoryPath = 0, storagePath = 0;
+        if (const auto* tree = graph_.semanticTree()) memoryPath = semanticPath(tree->root(), name);
         for (const auto& leaf : semantics_.leavesCached(memory.data)) {
-            const auto type = logical(leaf); if (!type.width) continue;
+            grh::SemanticId storageSemantic = 0;
+            if (memoryPath) {
+                if (leaf.fields.empty()) storageSemantic = generatedSemantic(memoryPath, "$storage");
+                else {
+                    if (!storagePath) {
+                        std::string local = "$storage";
+                        for (uint32_t suffix = 1; semanticNames_.contains({memoryPath, local}); ++suffix)
+                            local = "$storage$" + std::to_string(suffix);
+                        storagePath = semanticPath(memoryPath, local);
+                    }
+                    auto parent = storagePath;
+                    for (std::size_t i = 0; i + 1 < leaf.fields.size(); ++i)
+                        parent = semanticPath(parent, leaf.fields[i]);
+                    storageSemantic = generatedSemantic(parent, leaf.fields.back());
+                }
+            }
+            const auto type = logical(leaf);
+            if (!type.width) continue;
             auto storage = type; storage.shape.insert(storage.shape.begin(), memory.depth);
             auto storedLeaf = leaf; storedLeaf.shape.insert(storedLeaf.shape.begin(), memory.depth);
             storage.width = static_cast<int32_t>(semantics_.total(storedLeaf));
-            grh::SemanticId storageSemantic = 0;
-            if (auto* semanticTree = graph_.semanticTree()) {
-                auto [it, inserted] = semanticDeclarations_.try_emplace(name);
-                if (inserted)
-                    it->second = semanticTree->addNode(semanticTree->root(), grh::SemanticNodeKind::Declaration, name);
-                storageSemantic = memory.standard ? it->second : semanticTree->addFieldPath(it->second, leaf.fields);
-            }
             const auto state = graph_.createOperation(OperationKind::kRegister);
             const std::string symbol(graph_.getOperation(state).symbolText());
             grh::setStateLogicalType(graph_, state, storage);
             grh::InitStep init; init.value = std::to_string(storage.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
             grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLocView(state, location(memory.range));
             graph_.setAttr(state, "firrtl.memory", name); graph_.setAttr(state, "firrtl.readUnderWrite", memory.readUnderWrite);
+            graph_.setAttr(state, "firrtl.memoryDepth", static_cast<int64_t>(memory.depth));
+            graph_.setAttr(state, "firrtl.memoryReadLatency", static_cast<int64_t>(memory.readLatency));
+            graph_.setAttr(state, "firrtl.memoryWriteLatency", static_cast<int64_t>(memory.writeLatency));
             setOpSemantic(state, storageSemantic);
             std::vector<Port> ports;
             for (const auto& port : memory.ports) {
@@ -906,7 +1027,7 @@ void Lowerer::memories() {
                     const bool delayAddress = memory.readUnderWrite != "old";
                     const bool gateRead = memory.readUnderWrite != "undefined";
                     if (delayAddress) {
-                        address = pipeline(address, port.clock, memory.readLatency, port.source->range);
+                        address = pipeline(address, port.clock, memory.readLatency, port.source->range, true);
                         if (gateRead) enable = pipeline(enable, port.clock, memory.readLatency, port.source->range);
                     }
                     data = op(OperationKind::kRegisterReadArrayPort, type, {address}, port.source->range);
@@ -930,12 +1051,10 @@ void Lowerer::memories() {
 }
 void Lowerer::effects() {
     const LogicalType bit{grh::ValueType::Logic, 1, false};
-    std::size_t effectIndex = 0;
     for (const auto& effect : semantics_.effects) {
         const auto& statement = semantics_.body.arena.statements[effect.statement];
         SemanticScope scope(currentSemantic_, generatedSemantic(
-            "effect@" + std::to_string(statement.range.line) + ":" + std::to_string(statement.range.column) +
-            "#" + std::to_string(effectIndex++)));
+            "effect@" + std::to_string(statement.range.line)));
         auto operands = statement.operands;
         std::string text, name; std::vector<ValueId> arguments;
         const bool verification = statement.kind == StmtKind::Assert || statement.kind == StmtKind::Assume || statement.kind == StmtKind::Cover || statement.kind == StmtKind::Intrinsic;
@@ -1045,21 +1164,34 @@ void Lowerer::instances() {
         // line so they can be matched to GSIM's boundary node lineno.
         graph_.setAttr(operation, "firrtl.line", static_cast<int64_t>(instance.range.line));
         graph_.setOpSrcLocView(operation, location(instance.range));
-        if (const auto found = semanticDeclarations_.find(instance.name); found != semanticDeclarations_.end())
-            setOpSemantic(operation, found->second);
         std::vector<std::string> inputs, outputs;
+        std::vector<std::string> semanticPorts;
+        std::vector<int64_t> semanticPortNodes;
+        std::vector<grh::SemanticId> members;
         const auto& declaration = semantics_.declaration(instance.name);
         for (const auto& leaf : semantics_.leavesCached(declaration.type, declaration.flow)) {
             const auto& driver = findDriver(instance.name, leaf.fields);
-            if (!driver.value) continue;
+            if (driver.semantic) members.push_back(driver.semantic);
             std::string port = leaf.fields.front();
             for (std::size_t i = 1; i < leaf.fields.size(); ++i) port += "__DOT__" + leaf.fields[i];
+            if (driver.semantic) {
+                semanticPorts.push_back(port);
+                semanticPortNodes.push_back(driver.semantic);
+            }
+            if (!driver.value) continue;
             if (leaf.flow == 2) { inputs.push_back(port); graph_.addOperand(operation, driver.value); }
             else { outputs.push_back(port); graph_.addResult(operation, driver.value); }
         }
         graph_.setAttr(operation, "inputPortName", std::move(inputs));
         graph_.setAttr(operation, "outputPortName", std::move(outputs));
         graph_.setAttr(operation, "inoutPortName", std::vector<std::string>{});
+        if (graph_.semanticTree()) {
+            if (members.empty()) members.push_back(generatedSemantic(
+                semanticPath(graph_.semanticTree()->root(), instance.name), "$instance"));
+            graph_.setOpSemanticIds(operation, members);
+            graph_.setAttr(operation, "semanticPortNames", std::move(semanticPorts));
+            graph_.setAttr(operation, "semanticPortNodes", std::move(semanticPortNodes));
+        }
     }
 }
 ModuleSignature Lowerer::run() {
@@ -1069,6 +1201,8 @@ ModuleSignature Lowerer::run() {
     signature.location = semantics_.source.position(module.range);
     graph_.setMetadata("firrtl.version", std::string(semantics_.source.version()));
     graph_.setMetadata("firrtl.sourceUnit", std::string(semantics_.source.unit()));
+    graph_.setMetadata("firrtl.guardSemanticPolicy", std::string("consumer-nodes-v2"));
+    graph_.setMetadata("firrtl.semanticNodePolicy", std::string("leaf-op-members-v1"));
     graph_.setMetadata("firrtl.invalidPolicy", std::string(options_.invalidPolicy == FirrtlInvalidPolicy::Unknown ? "unknown" : "zero"));
     graph_.setMetadata("firrtl.initPolicy", std::string(options_.initPolicy == FirrtlInitPolicy::Unknown ? "unknown" : "zero"));
     graph_.setMetadata("firrtl.enabledLayers", options_.enabledLayers);
@@ -1078,20 +1212,15 @@ ModuleSignature Lowerer::run() {
             std::string(semantics_.source.circuit()), std::string(module.name));
     std::set<std::string> names; std::vector<std::string> elided;
     rootDrivers_.reserve(semantics_.declarationOrder.size());
-    semanticDeclarations_.reserve(semantics_.declarationOrder.size());
     for (const auto& name : semantics_.declarationOrder) {
         const auto& declaration = semantics_.declaration(name);
-        if (semanticTree) {
-            const auto kind = declaration.definition ? grh::SemanticNodeKind::Expression : grh::SemanticNodeKind::Declaration;
-            semanticDeclarations_.emplace(name, semanticTree->addNode(semanticTree->root(), kind, name));
-        }
         for (const auto& leaf : semantics_.leavesCached(declaration.type, declaration.flow)) {
             auto symbol = name; for (const auto& field : leaf.fields) symbol += "__DOT__" + field;
             if (!names.insert(symbol).second) throw Error(declaration.range, "flattened FIRRTL name collision '" + symbol + "'");
             const auto type = logical(leaf); ValueId value;
             grh::SemanticId semantic = 0;
-            if (semanticTree && type.width)
-                semantic = semanticTree->addFieldPath(semanticDeclarations_.at(name), leaf.fields);
+            if (semanticTree)
+                semantic = semanticLeaf(name, leaf.fields);
             if (type.width) {
                 value = declaration.state ? graph_.createTemporaryValue(type) : graph_.createValue(graph_.internSymbol(symbol), type);
                 graph_.setValueSrcLocView(value, location(declaration.range));
@@ -1135,7 +1264,29 @@ ModuleSignature Lowerer::run() {
             }
         }
     }
+    if (semanticTree) {
+        std::vector<std::string> names;
+        std::vector<int64_t> nodes;
+        names.reserve(signature.ports.size());
+        nodes.reserve(signature.ports.size());
+        for (const auto& port : signature.ports) {
+            names.push_back(port.name);
+            const auto fields = std::span<const std::string>(port.fieldPath).subspan(1);
+            nodes.push_back(findDriver(port.fieldPath.front(), fields).semantic);
+        }
+        graph_.setMetadata("firrtl.semanticPortNames", std::move(names));
+        graph_.setMetadata("firrtl.semanticPortNodes", std::move(nodes));
+    }
     if (!elided.empty()) graph_.setMetadata("firrtl.elidedLeaves", std::move(elided));
+    // Reserve every source path before deriving helpers. Generated endpoints
+    // share the ordinary local name space and resolve collisions explicitly.
+    if (semanticTree) {
+        for (auto& [key, driver] : drivers_) {
+            if (!semantics_.declaration(key.first).state) continue;
+            driver.nextSemantic = generatedSemantic(semanticTree->node(driver.semantic).parent,
+                std::string(semanticTree->name(driver.semantic)) + "$NEXT");
+        }
+    }
     for (const auto& name : semantics_.declarationOrder) {
         const auto& declaration = semantics_.declaration(name);
         if (!declaration.definition) continue;
@@ -1157,7 +1308,7 @@ ModuleSignature Lowerer::run() {
         for (const auto& leaf : semantics_.leavesCached(declaration.type)) {
             const auto& driver = findDriver(name, leaf.fields);
             if (!driver.value) continue;
-            SemanticScope scope(currentSemantic_, driver.semantic);
+            SemanticScope scope(currentSemantic_, driver.nextSemantic);
             const auto data = adapt(expression(*declaration.state->initial, leaf.fields), logical(leaf), declaration.range);
             stateWrite(driver, *declaration.state, expression(*declaration.state->reset), {}, data, declaration.range);
         }
@@ -1173,6 +1324,39 @@ ModuleSignature Lowerer::run() {
                 throw Error(driver.range, "FIRRTL component '" + key.first + "' is not fully initialized on every path");
         SemanticScope scope(currentSemantic_, driver.semantic);
         drive(driver.value, driver.current ? driver.current : invalid(graph_.valueLogicalType(driver.value), driver.range), driver.range);
+    }
+    finishGuardSemantics();
+    if (semanticTree) {
+        for (const auto& [key, driver] : drivers_) {
+            if (!driver.nextSemantic || !driver.value) continue;
+            const auto members = graph_.semanticNodeOperations(driver.nextSemantic);
+            if (std::any_of(members.begin(), members.end(), [&](const auto operation) {
+                return grh::isRegisterWritePortKind(graph_.opKind(operation));
+            })) continue;
+            // No writer is the real GRH hold operation. Keep the next leaf as
+            // an alias of the current value without materializing circuitry.
+            const auto current = graph_.valueSemanticIds(driver.value);
+            std::vector<grh::SemanticId> anchors(current.begin(), current.end());
+            anchors.push_back(driver.nextSemantic);
+            graph_.setValueSemanticIds(driver.value, anchors);
+        }
+        // Publication requires complete producer membership. This reads the
+        // Graph-maintained reverse index; it never reconstructs or assigns it.
+        for (const auto operation : graph_.operations()) {
+            const auto owners = graph_.opSemanticIds(operation);
+            if (!owners.empty() && std::all_of(owners.begin(), owners.end(), [&](const auto owner) {
+                return semanticTree->contains(owner);
+            })) continue;
+            auto range = module.range;
+            if (const auto source = graph_.opSrcLoc(operation)) {
+                range.line = source->line;
+                range.column = source->column;
+            }
+            const auto op = graph_.getOperation(operation);
+            throw Error(range, "FIRRTL operation '" + std::string(op.symbolText()) + "' (" +
+                std::string(grh::toString(op.kind())) + ", id=" + std::to_string(operation.index) +
+                ") has " + (owners.empty() ? "no SemanticTree Node membership" : "an invalid SemanticTree Node membership"));
+        }
     }
     checkCycles();
     if (!graph_.metadata("firrtl.pendingCombLoopCheck")) graph_.markLocalCyclesChecked();

@@ -49,6 +49,19 @@ namespace wolvrix::lib::transform
 
     namespace
     {
+        bool supportsSemanticNodes(std::string_view pass)
+        {
+            return pass == "xmr-resolve" || pass == "hier-flatten" || pass == "grh.verify" ||
+                pass == "stats" || pass == "memory-init-check" || pass == "multidriven-guard";
+        }
+
+        std::string semanticSupportError(std::string_view pass, const grh::Graph &graph)
+        {
+            if (!graph.semanticTree() || supportsSemanticNodes(pass)) return {};
+            return "F28 SemanticTree Node membership is not supported by pass " + std::string(pass) +
+                "; supported transformation boundary is ingest-firrtl -> xmr-resolve -> hier-flatten";
+        }
+
         std::string formatContext(const wolvrix::lib::grh::Graph *graph, const wolvrix::lib::grh::Operation *op, const wolvrix::lib::grh::Value *value)
         {
             std::string ctx;
@@ -442,6 +455,19 @@ namespace wolvrix::lib::transform
                 continue;
             }
 
+            std::string semanticError;
+            if (selected) semanticError = semanticSupportError(pass->id(), *selected);
+            else for (const auto &[name, graph] : design.graphs()) {
+                semanticError = semanticSupportError(pass->id(), *graph);
+                if (!semanticError.empty()) break;
+            }
+            if (!semanticError.empty()) {
+                diags.error(pass->id(), std::move(semanticError), "semantic-tree-support");
+                encounteredFailure = true;
+                if (options_.stopOnError) break;
+                continue;
+            }
+
             pass->setContext(&context);
             const auto firstDiagnostic = diags.messages().size();
             auto startTime = std::chrono::steady_clock::now();
@@ -581,6 +607,8 @@ namespace wolvrix::lib::transform
             serial |= !entry.instance->preservesDialects();
             for (const auto dialect : initialDialects)
                 if (!entry.instance->supportsDialect(dialect)) serial = true;
+            for (const auto* graph : targets)
+                if (!semanticSupportError(entry.instance->id(), *graph).empty()) serial = true;
         }
         if (serial || (options_.stopOnError && diags.hasError())) {
             auto result = runImpl(design, diags, nullptr, false);
@@ -625,7 +653,11 @@ namespace wolvrix::lib::transform
                             const auto dialect = descriptor ? descriptor->dialect : "unknown";
                             if (!pass->supportsDialect(dialect)) { unsupported = dialect; break; }
                         }
-                        if (!unsupported.empty()) {
+                        const auto semanticError = semanticSupportError(pass->id(), *task.graph);
+                        if (!semanticError.empty()) {
+                            stage.diagnostics.error(pass->id(), semanticError, "semantic-tree-support");
+                            stage.result.failed = true;
+                        } else if (!unsupported.empty()) {
                             stage.diagnostics.error(pass->id(), "Pass does not support dialect " + unsupported, "pipeline");
                             stage.result.failed = true;
                         } else {
@@ -1512,12 +1544,36 @@ namespace wolvrix::lib::transform
         }
         if (normalized == "split-static-array")
         {
-            if (!args.empty())
+            SplitStaticArrayOptions options;
+            for (std::size_t i = 0; i < args.size(); ++i)
             {
-                error = "split-static-array does not accept arguments";
+                const std::string_view arg = args[i];
+                if (arg == "-trace-node-evolution" || arg == "-trace-input-sha256" ||
+                    arg == "-trace-source-endpoints") {
+                    if (++i == args.size()) {
+                        error = std::string(arg) + " expects a value";
+                        return nullptr;
+                    }
+                    if (arg == "-trace-node-evolution") options.traceNodeEvolution = args[i];
+                    else if (arg == "-trace-input-sha256") options.traceInputSha256 = args[i];
+                    else if (args[i] == "true" || args[i] == "1") options.traceSourceEndpoints = true;
+                    else if (args[i] == "false" || args[i] == "0") options.traceSourceEndpoints = false;
+                    else {
+                        error = "invalid -trace-source-endpoints value";
+                        return nullptr;
+                    }
+                } else {
+                    error = "unknown split-static-array option: " + std::string(arg);
+                    return nullptr;
+                }
+            }
+            if (!options.traceInputSha256.empty() &&
+                (options.traceInputSha256.size() != 64 ||
+                 options.traceInputSha256.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)) {
+                error = "-trace-input-sha256 requires a 64-digit SHA256";
                 return nullptr;
             }
-            return std::make_unique<SplitStaticArrayPass>();
+            return std::make_unique<SplitStaticArrayPass>(std::move(options));
         }
         if (normalized == "dead-code-elim")
         {

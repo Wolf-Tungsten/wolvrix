@@ -1,5 +1,10 @@
 # split-static-array
 
+F28 支持边界：带新版 SemanticTree 的图会在本 pass 修改 IR 之前明确拒绝，
+目前尚未实现单一叶 Node 的拆分／成员演化维护。以下数组变换适用于无新树的图；
+来源 SID、semanticBindings 与 source-endpoint trace 说明记录 F26/F27 的旧接口，
+不是 F28 新模型的支持声明。可选全物理 op/value trace 设施保留。
+
 静态索引解析与 `dead-code-elim` 共用私有 `constant_index.hpp`：字面量先使用
 `slang::SVInt` 读取，再按常量 producer 的 width/signedness 投影；等宽 assign
 仅改变最后索引的 signedness 解释。下划线、字面量宽度和 GRH value 宽度都参与实际
@@ -43,6 +48,27 @@ pass 先按 `regSymbol` 收集完整状态族，只有整族满足条件才改�
 
 状态成员声明和成员读写复制原声明或端口的操作属性、来源位置及 SemanticId，成员 value 沿用原读结果的 SemanticId。多个成员因此仍可映射回原来的父状态或表达式。pass 不直接删除语义节点；无引用声明、表达式及其空父节点由后续 DCE 的 SemanticTree prune 统一处理。
 
+`semanticBindings` 同时跟随真实端点迁移。成员 current 绑定到实际成员读结果，包含保留 ID 的 indexed read；成员 next 绑定到实际 scalar data 和对应 writer operation。原 writer 被复用为成员 0 时，其旧 next/clock/reset 上下文原子替换，其他成员 writer 克隆相应上下文。原 source shape、shapeFieldDepths 和已固定 projection 保持不变，只将本次选中的开放轴固定为成员坐标。例如源 `[2,1]` 的第二个 scalar 成员仍记录 `shape=[2,1], projection=[1,0]`，不会变成无数组轴的新源对象。
+
+组合静态读从 base 的原生 binding 投影到实际 read result；位序保持的 `kAssign`、`kArrayCreate`、`kConcat` 和 `kSliceStatic` 连接可以继续追溯到上游 source。端口数组保留 `kSliceArray` 时也维护该读关系。成功选择已有 scalar operand 时，selected value 同样获得对应 source projection。无法解释的几何不补造来源；递归选择失败回滚时不污染已有 value 的绑定。
+
+## 可选原生演化记录
+
+普通 pass 默认不写 trace。通过 C++ `SplitStaticArrayOptions` 或 Python 参数启用：
+
+```python
+session.run_pass("split-static-array", design="design.main",
+                 trace_node_evolution="ptmp/split.jsonl",
+                 trace_input_sha256=firrtl_sha256,
+                 trace_source_endpoints=False)
+```
+
+`trace_source_endpoints=False` 记录全部存活 operation/value；`True` 记录来源端点及 writer 上下文，前序已绑定且仍存活的实体即使丢失最后一条绑定也保留在 after 库存中。多图路径必须含 `{graph}`。SHA256 是调用方验证的输入身份，producer 不把传入字符串当成自行计算的证明。
+
+公共 `GraphEvolutionTrace` 输出 `wolvrix.node-evolution.v1` JSONL。typed ref 包含原生 ID 与 generation，库存内的 `sources` 表示源端点，`structure` 记录实际操作数、结果、属性、定义及 owner；writer 的绑定上下文保留在其 operation 上。pass 内步骤记录静态选择、成员化、重组、保留、符号冲突及事务回滚的原因。共享实体关联的步骤归并为唯一边界事件，原始步骤保留在 `steps`，不会把回滚临时对象作为最终 after 成员。成功完成才写完整 footer。
+
+trace 开关不参与绑定传递或优化决策。来源覆盖、成员投影与库存完整性分别核验；这些记录不声明行为等价。零宽/空数组且无物理端点的 SemanticTree 节点不在物理库存分母中。
+
 ## 示例
 
 组合数组：
@@ -72,3 +98,15 @@ out = kRegisterReadArrayPort(r, 1)
 ```
 
 拆分后形成 `r_0/r_1/r_2`，分别写入 `current_0`、`e1`、`e2`，`out` 直接读取 `r_1`。若 `r_2` 没有其他读者，独立 DCE 删除其声明、写口及 `e2` 的独占驱动。
+
+## 原生演化与后态重放
+
+`trace_node_evolution` 可选输出 pass 前后的全部存活 operation／value，以及 graph context。完整库存声明 `inventoryScope=all-live` 和 `replayContract=native-field-delta.v1`；仅来源端点模式不宣称完整图可重放。trace 关闭时同样维护正常 semantic bindings，trace 不改变普通 pass 输出。
+
+原生步骤解释实际拆分、保留、删除和改写；边界 `mutation` 以 `eventSeq` 关联真实事件，记录 `create/erase/update` 与 `expect/set/unset`。消费者从 before 库存和 mutation 独立生成后态；实际 after 只用于逐字段核对。未被事件解释的变化，或者只用 retain 解释的内容修改，使 `replayComplete=false`，不能作为通过证据。
+
+`steps[].seq` 是 recorder 接收步骤时的全局顺序，组件归并后仍保留，不能使用 event 顺序代替实际步骤顺序。静态选择步骤原生记录 `geometry.kind=packed-selection`、`base` typed ref、变换当时的 `physicalShape` 和从低位起算的 `offset/width`（位）；状态成员步骤记录 `kind=array-member`、原声明 `base`、原物理数组形状、行优先 `element/coordinates` 及其位区间。例如 `[2,3]` 的 8 位成员 `[1,2]` 为 `element=5, offset=40, width=8`。这些是物理选择位置，不替代 `sources[]` 的 FIRRTL 来源 projection。所有步骤与组件的 `partition` 仍保守为 false，不将重叠视图宣称为无重叠划分。
+
+完整节点载荷包含真实 symbol、位置、类型／domain、operands／results、attrs、完整 binding context 与 state target。graph context 包含 metadata、端口引用、declared symbols 和 generate groups。反向 uses 可由 operands 重建；分配器／intern pool 和静态来源树节点不属于本合约的活跃节点范围，header 明示排除项。GRH ref 同时保留 ID 和 generation，禁止因 ID 重用而混淆实体。
+
+全节点重放和跨端测量的阶段记录统一见 `pdocs/firrtl-ingest/F27-node-evolution.md`；来源对应、结构重放及电路行为等价是分别验证的结论。

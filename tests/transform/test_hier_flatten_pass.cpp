@@ -1,4 +1,5 @@
 #include "core/grh.hpp"
+#include "core/semantic_tree.hpp"
 #include "core/store.hpp"
 #include "core/transform.hpp"
 #include "ingest/node_attributes.hpp"
@@ -647,9 +648,9 @@ int testSharedScalarIndexShape()
 int testDpiImportOriginMerge()
 {
     // Two child graphs declare the same DPI import (shared declaration file,
-    // XiangShan assert.v pattern) and the top graph has its own copy. With
-    // originModules provenance stamping, the flatten-time merge must compare
-    // only the signature attrs and union the provenance.
+    // XiangShan assert.v pattern) and the top graph has its own copy. The
+    // flatten-time merge compares only the signature and does not reintroduce
+    // the retired originModules annotation.
     wolvrix::lib::grh::Design design;
     wolvrix::lib::grh::Graph &childA = design.createGraph("childA");
     wolvrix::lib::grh::Graph &childB = design.createGraph("childB");
@@ -726,17 +727,8 @@ int testDpiImportOriginMerge()
         return fail("Duplicate DPI imports must merge into a single op");
     }
     const auto origins = getOriginModules(top, found);
-    if (!origins || origins->size() != 3)
-    {
-        return fail("Merged DPI import must carry all three origin modules");
-    }
-    auto has = [&](std::string_view name) {
-        return std::find(origins->begin(), origins->end(), name) != origins->end();
-    };
-    if (!has("top") || !has("u_childA") || !has("u_childB"))
-    {
-        return fail("Merged DPI import origin set mismatch");
-    }
+    if (origins && !origins->empty())
+        return fail("Merged DPI import reintroduced retired originModules");
     return 0;
 }
 
@@ -828,8 +820,8 @@ int checkSourceFreezeWiring(const wolvrix::lib::grh::Design &design)
             return fail("source freeze generated group did not retain its instance's target operation symbol");
     }
     const auto inspection = node::inspect(top);
-    if (!inspection.errors.empty() || inspection.nodes.size() != 2)
-        return fail("source freeze changed shared-instance FIRRTL node identities");
+    if (!inspection.errors.empty() || !inspection.nodes.empty())
+        return fail("source freeze reintroduced retired FIRRTL node attributes");
     return 0;
 }
 
@@ -912,8 +904,8 @@ int testSourceFreezeFallbackAndFailure()
         return fail("source freeze changed missing-module diagnostics");
     if (const int result = checkSourceFreezeWiring(design)) return result;
     const auto inventory = top->metadata(wolvrix::lib::ingest::node::kInventory);
-    if (!inventory || std::get<std::vector<std::string>>(*inventory).size() != 2)
-        return fail("failed source freeze flatten did not publish shared inventory");
+    if (inventory && !std::get<std::vector<std::string>>(*inventory).empty())
+        return fail("failed source freeze flatten reintroduced retired node inventory");
     return 0;
 }
 
@@ -1347,7 +1339,7 @@ int testCloneMetadataPreservation()
         child.setAttr(producer, "before", std::string("preserve-before"));
         if (provenance == 1) child.setAttr(producer, kOriginModulesKey, std::vector<std::string>{});
         if (provenance == 2) child.setAttr(producer, kOriginModulesKey, std::vector<std::string>{"leaf", "u0", "leaf"});
-        // Preserve the historical overwrite behavior for a non-vector attr.
+        // A retired annotation is dropped regardless of its old payload type.
         if (provenance == 3) child.setAttr(producer, kOriginModulesKey, int64_t{7});
         child.setAttr(producer, "after", std::string("preserve-after"));
         grh::SrcLoc location;
@@ -1396,8 +1388,8 @@ int testCloneMetadataPreservation()
             !sameLocation(child.valueSrcLoc(child.opResults(sourceProducer)[0])))
             return fail("cloning moved metadata out of its preserved source definition");
         std::vector<std::string> expectedKeys;
-        for (const auto &attr : child.opAttrRange(sourceProducer)) expectedKeys.emplace_back(attr.key());
-        if (provenance == 0) expectedKeys.emplace_back(kOriginModulesKey);
+        for (const auto &attr : child.opAttrRange(sourceProducer))
+            if (attr.key() != kOriginModulesKey) expectedKeys.emplace_back(attr.key());
         for (int i = 0; i < 2; ++i)
         {
             const std::string prefix = "u" + std::to_string(i);
@@ -1405,12 +1397,8 @@ int testCloneMetadataPreservation()
             if (!clone.valid() || !sameLocation(top.opSrcLoc(clone)) ||
                 !sameLocation(top.valueSrcLoc(top.opResults(clone)[0])))
                 return fail("cloned value or operation source location changed");
-            const auto expectedOrigins = provenance == 2
-                ? (i == 0 ? std::vector<std::string>{"leaf", "u0", "leaf"}
-                          : std::vector<std::string>{"u1", "leaf", "u0", "leaf"})
-                : std::vector<std::string>{prefix};
-            if (getOriginModules(top, clone) != expectedOrigins)
-                return fail("clone changed provenance order, duplicates, or empty-attr handling");
+            if (top.getOperation(clone).attr(kOriginModulesKey))
+                return fail("clone retained retired originModules annotation");
             std::vector<std::string> actualKeys;
             for (const auto &attr : top.opAttrRange(clone)) actualKeys.emplace_back(attr.key());
             if (actualKeys != expectedKeys ||
@@ -2011,7 +1999,6 @@ int testResultLocationInheritanceReference()
                 const auto op = target.createOperation(source.opKind(sourceOp), symbol);
                 target.copyOpSrcLoc(op, source, sourceOp);
                 for (const auto attr : source.opAttrRange(sourceOp)) target.setAttrView(op, attr.key(), attr.value());
-                target.setAttr(op, "originModules", std::vector<std::string>{prefix});
                 for (const auto value : source.opResults(sourceOp)) target.addResult(op, values[value.index]);
             }
         }
@@ -2060,8 +2047,361 @@ int testResultLocationInheritanceReference()
     return 0;
 }
 
+int testSemanticTreeBelowUnannotatedTop()
+{
+    namespace grh = wolvrix::lib::grh;
+    std::string reference;
+    for (const bool global : {false, true})
+    {
+        grh::Design design;
+        auto& leaf = design.createGraph("FirrtlLeaf");
+        auto& wrapper = design.createGraph("SvWrapper");
+        auto& top = design.createGraph("svtop");
+        design.markAsTop("svtop");
+        auto& tree = leaf.getOrCreateSemanticTree("fir", "Original", "FirrtlLeaf");
+        const auto semantic = tree.addNode(tree.root(), "n");
+        const auto constant = [](grh::Graph& graph, std::string_view name) {
+            const auto value = graph.createValue(graph.internSymbol(name), 1, false);
+            const auto operation = graph.createOperation(grh::OperationKind::kConstant);
+            graph.setAttr(operation, "value", std::string("1'b0"));
+            graph.addResult(operation, value);
+            return std::pair(value, operation);
+        };
+        const auto [sourceValue, sourceOperation] = constant(leaf, "n");
+        leaf.setValueSemanticIds(sourceValue, std::span<const grh::SemanticId>(&semantic, 1));
+        leaf.setOpSemanticIds(sourceOperation, std::span<const grh::SemanticId>(&semantic, 1));
+        tree.addNode(tree.root(), "empty");
+        constant(wrapper, "local");
+        const auto [topValue, topOperation] = constant(top, "original");
+        const auto instance = [](grh::Graph& graph, std::string_view module, std::string_view name) {
+            const auto operation = graph.createOperation(grh::OperationKind::kInstance);
+            graph.setAttr(operation, "moduleName", std::string(module));
+            graph.setAttr(operation, "instanceName", std::string(name));
+        };
+        for (const auto name : {"f0", "f1"}) instance(wrapper, "FirrtlLeaf", name);
+        for (const auto name : {"w0", "w1"}) instance(top, "SvWrapper", name);
+        HierFlattenOptions options;
+        options.useGlobalPlan = global;
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>(options));
+        PassDiagnostics diagnostics;
+        if (!manager.run(design, diagnostics).success || diagnostics.hasError())
+            return fail("FIRRTL source below an unannotated SV top did not flatten");
+        if (!top.semanticTree() || top.semanticTree()->sourceUnit() != "fir" ||
+            top.semanticTree()->circuit() != "Original" ||
+            top.semanticTree()->pathName(top.semanticTree()->root()) != "svtop")
+            return fail("mixed target tree did not retain first imported source context and target root");
+        if (!top.opSemanticIds(topOperation).empty() || !top.valueSemanticIds(topValue).empty())
+            return fail("mixed target tree invented provenance for original SV operations");
+        std::size_t annotated = 0, unannotated = 0;
+        for (const auto operation : top.operations())
+        {
+            const auto ids = top.opSemanticIds(operation);
+            if (ids.empty()) { ++unannotated; continue; }
+            ++annotated;
+            const auto name = top.semanticTree()->name(ids.front());
+            if (ids.size() != 1 ||
+                (name != "w0.f0.n" && name != "w0.f1.n" && name != "w1.f0.n" && name != "w1.f1.n"))
+                return fail("mixed source lost an unannotated ancestor or independent instance path");
+        }
+        if (annotated != 4 || unannotated != 3 || top.semanticTree()->pathCount() != 1 ||
+            top.semanticTree()->size() != 8 || !top.validateSemanticTree().empty())
+            return fail("mixed source retained internal paths or invented SV ownership");
+        std::size_t completeNodes = 0, emptyNodes = 0;
+        for (const auto id : top.semanticTree()->nodeIds())
+        {
+            if (top.semanticTree()->node(id).parent != top.semanticTree()->root())
+                return fail("flatten retained a semantic container");
+            const auto ops = top.semanticNodeOperations(id);
+            const auto values = top.semanticNodeAnchors(id);
+            if (top.semanticTree()->name(id).ends_with(".empty") && ops.empty() && values.empty())
+                ++emptyNodes;
+            else if (ops.size() == 1 && values.size() == 1 && top.valueDef(values.front()) == ops.front())
+                ++completeNodes;
+            else return fail("flatten did not relocate Node members and anchors together");
+        }
+        if (completeNodes != 4 || emptyNodes != 4)
+            return fail("flatten lost a complete or empty Node");
+        const auto serialized = wolvrix::lib::store::StoreJson().storeToString(design);
+        if (!serialized) return fail("mixed source tree could not be serialized");
+        if (reference.empty()) reference = *serialized;
+        else if (reference != *serialized) return fail("mixed source tree differs between scalar and global flatten");
+        PassDiagnostics second;
+        if (!manager.run(design, second).success || second.hasError() ||
+            wolvrix::lib::store::StoreJson().storeToString(design) != serialized)
+            return fail("repeated mixed flatten changed the imported SemanticTree");
+    }
+    return 0;
+}
+
+int testExternalImplementationBindings()
+{
+    namespace grh = wolvrix::lib::grh;
+    std::string reference;
+    for (const bool global : {false, true})
+    {
+        grh::Design design;
+        auto& leaf = design.createGraph("SvImplementation");
+        leaf.setMetadata("ingest.sourceModule", std::string("SharedImplementation"));
+        leaf.setMetadata("ingest.link.sourceModule", std::string("FirrtlExternal"));
+        leaf.setMetadata("ingest.link.implementationModule", std::string("ResolvedImplementation"));
+        auto& middle = design.createGraph("FirrtlMiddle");
+        auto& top = design.createGraph("top");
+        design.markAsTop("top");
+        const auto leafInput = leaf.createValue(leaf.internSymbol("data"), 8, false);
+        const auto leafOutput = leaf.createValue(leaf.internSymbol("out"), 8, false);
+        leaf.bindInputPort("data", leafInput);
+        leaf.bindOutputPort("out", leafOutput);
+        const auto drive = leaf.createOperation(grh::OperationKind::kAssign, leaf.internSymbol("drive"));
+        leaf.addOperand(drive, leafInput);
+        leaf.addResult(drive, leafOutput);
+
+        auto& middleTree = middle.getOrCreateSemanticTree("fixture", "top", "FirrtlMiddle");
+        const auto externalPath = middleTree.addPath(middleTree.root(), "external");
+        const auto inputSemantic = middleTree.addNode(externalPath, "data");
+        const auto outputSemantic = middleTree.addNode(externalPath, "out");
+        const auto middleInput = middle.createValue(middle.internSymbol("data"), 8, false);
+        const auto middleOutput = middle.createValue(middle.internSymbol("out"), 8, false);
+        middle.bindInputPort("data", middleInput);
+        middle.bindOutputPort("out", middleOutput);
+        middle.setValueSemanticIds(middleInput, std::span<const grh::SemanticId>(&inputSemantic, 1));
+        middle.setValueSemanticIds(middleOutput, std::span<const grh::SemanticId>(&outputSemantic, 1));
+        const auto external = middle.createOperation(grh::OperationKind::kInstance);
+        middle.addOperand(external, middleInput);
+        middle.addResult(external, middleOutput);
+        middle.setAttr(external, "moduleName", std::string("SvImplementation"));
+        middle.setAttr(external, "instanceName", std::string("external"));
+        middle.setAttr(external, "firrtl.line", int64_t{57});
+        middle.setAttr(external, "inputPortName", std::vector<std::string>{"data"});
+        middle.setAttr(external, "outputPortName", std::vector<std::string>{"out"});
+        const std::vector<grh::SemanticId> externalSemantics{inputSemantic, outputSemantic};
+        middle.setOpSemanticIds(external, externalSemantics);
+
+        auto& topTree = top.getOrCreateSemanticTree("fixture", "top", "top");
+        const auto topInput = top.createValue(top.internSymbol("data"), 8, false);
+        top.bindInputPort("data", topInput);
+        for (const auto& name : {std::string("m0"), std::string("m1")})
+        {
+            const auto output = top.createValue(top.internSymbol(name + "out"), 8, false);
+            top.bindOutputPort(name + "out", output);
+            const auto instance = top.createOperation(grh::OperationKind::kInstance);
+            top.addOperand(instance, topInput);
+            top.addResult(instance, output);
+            top.setAttr(instance, "moduleName", std::string("FirrtlMiddle"));
+            top.setAttr(instance, "instanceName", name);
+            top.setAttr(instance, "firrtl.line", int64_t{100});
+        }
+
+        HierFlattenOptions options;
+        options.useGlobalPlan = global;
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>(options));
+        PassDiagnostics diagnostics;
+        if (!manager.run(design, diagnostics).success || diagnostics.hasError())
+            return fail("external implementation binding flatten failed");
+        const auto expect = [&](std::string_view key, grh::AttributeValue value) {
+            return top.metadata(key) == std::optional<grh::AttributeValue>(std::move(value));
+        };
+        if (!expect("firrtl.externalInstancePaths", std::vector<std::string>{"m0$external", "m1$external"}) ||
+            !expect("firrtl.externalInstanceModules", std::vector<std::string>{"FirrtlExternal", "FirrtlExternal"}) ||
+            !expect("firrtl.externalInstanceImplementations", std::vector<std::string>{"ResolvedImplementation", "ResolvedImplementation"}) ||
+            !expect("firrtl.externalInstanceLines", std::vector<int64_t>{57, 57}) ||
+            !expect("firrtl.externalInstanceInputOffsets", std::vector<int64_t>{0, 1, 2}) ||
+            !expect("firrtl.externalInstanceOutputOffsets", std::vector<int64_t>{0, 1, 2}) ||
+            !expect("firrtl.externalInstanceInoutOffsets", std::vector<int64_t>{0, 0, 0}) ||
+            !expect("firrtl.externalInstanceInputPorts", std::vector<std::string>{"m0$external$data", "m1$external$data"}) ||
+            !expect("firrtl.externalInstanceOutputPorts", std::vector<std::string>{"m0$external$out", "m1$external$out"}) ||
+            !expect("firrtl.externalInstanceInoutPorts", std::vector<std::string>{}))
+            return fail("external implementation binding did not preserve complete per-instance boundaries");
+        for (const auto operation : top.operations())
+        {
+            if (top.opKind(operation) != grh::OperationKind::kAssign) continue;
+            const auto ids = top.opSemanticIds(operation);
+            if (!ids.empty())
+                return fail("external SV implementation was assigned to a FIRRTL boundary Node");
+        }
+        if (topTree.size() != 4 || !topTree.isFlat() || !top.validateSemanticTree().empty())
+            return fail("external boundary Nodes or relocated anchors were lost");
+        const auto serialized = wolvrix::lib::store::StoreJson().storeToString(design);
+        if (!serialized) return fail("external implementation metadata serialization failed");
+        if (reference.empty()) reference = *serialized;
+        else if (reference != *serialized) return fail("external bindings differ between legacy and global flatten");
+        PassDiagnostics second;
+        if (!manager.run(design, second).success || second.hasError() ||
+            wolvrix::lib::store::StoreJson().storeToString(design) != serialized)
+            return fail("repeated flatten duplicated external implementation bindings");
+    }
+    return 0;
+}
+
+int testSemanticPortNodeRelocation()
+{
+    namespace grh = wolvrix::lib::grh;
+    std::string reference;
+    for (const bool global : {false, true})
+    {
+        grh::Design design;
+        auto& child = design.createGraph("child");
+        auto& childTree = child.getOrCreateSemanticTree("fixture", "top", "child");
+        const auto xNode = childTree.addNode(childTree.root(), "x");
+        const auto yNode = childTree.addNode(childTree.root(), "y");
+        const auto x = child.createValue(child.internSymbol("x"), 8, false);
+        const auto y = child.createValue(child.internSymbol("y"), 8, false);
+        child.bindInputPort("x", x);
+        child.bindOutputPort("y", y);
+        child.setValueSemanticIds(x, std::span<const grh::SemanticId>(&xNode, 1));
+        child.setValueSemanticIds(y, std::span<const grh::SemanticId>(&yNode, 1));
+        const auto drive = child.createOperation(grh::OperationKind::kAssign);
+        child.addOperand(drive, x);
+        child.addResult(drive, y);
+        child.setOpSemanticIds(drive, std::span<const grh::SemanticId>(&yNode, 1));
+
+        auto& top = design.createGraph("top");
+        design.markAsTop("top");
+        auto& tree = top.getOrCreateSemanticTree("fixture", "top", "top");
+        const auto inputNode = tree.addNode(tree.root(), "a");
+        const auto input = top.createValue(top.internSymbol("a"), 8, false);
+        top.bindInputPort("a", input);
+        top.setValueSemanticIds(input, std::span<const grh::SemanticId>(&inputNode, 1));
+        std::vector<grh::SemanticId> originalIds{inputNode};
+        for (const std::string name : {"u", "v"})
+        {
+            const auto path = tree.addPath(tree.root(), name);
+            const auto inNode = tree.addNode(path, "x");
+            const auto outNode = tree.addNode(path, "y");
+            originalIds.push_back(inNode);
+            originalIds.push_back(outNode);
+            const auto output = top.createValue(top.internSymbol(name + "out"), 8, false);
+            top.bindOutputPort(name + "out", output);
+            const auto oldInput = top.valueSemanticIds(input);
+            std::vector<grh::SemanticId> inputIds(oldInput.begin(), oldInput.end());
+            inputIds.push_back(inNode);
+            top.setValueSemanticIds(input, inputIds);
+            top.setValueSemanticIds(output, std::span<const grh::SemanticId>(&outNode, 1));
+            const auto instance = top.createOperation(grh::OperationKind::kInstance);
+            top.setAttr(instance, "moduleName", std::string("child"));
+            top.setAttr(instance, "instanceName", name);
+            top.addOperand(instance, input);
+            top.addResult(instance, output);
+            top.setOpSemanticIds(instance, std::vector<grh::SemanticId>{inNode, outNode});
+        }
+        HierFlattenOptions options;
+        options.useGlobalPlan = global;
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>(options));
+        PassDiagnostics diagnostics;
+        if (!manager.run(design, diagnostics).success || diagnostics.hasError())
+            return fail("semantic port Node relocation failed");
+        if (tree.size() != 5 || !tree.isFlat() || tree.nodeIds() != originalIds ||
+            !top.validateSemanticTree().empty())
+            return fail("flatten duplicated placeholders, changed Node IDs, or retained paths");
+        for (const auto id : tree.nodeIds())
+        {
+            const auto ops = top.semanticNodeOperations(id);
+            const auto anchors = top.semanticNodeAnchors(id);
+            if (anchors.size() != 1) return fail("port Node lost its final boundary anchor");
+            if (tree.name(id).ends_with(".y"))
+            {
+                if (ops.size() != 1 || top.valueDef(anchors.front()) != ops.front())
+                    return fail("output Node did not acquire the child's actual operation");
+            }
+            else if (!ops.empty() || anchors.front() != input)
+                return fail("input Node acquired circuitry or an incorrect alias representative");
+        }
+        const auto serialized = wolvrix::lib::store::StoreJson().storeToString(design);
+        if (!serialized) return fail("semantic port Nodes could not be serialized");
+        if (reference.empty()) reference = *serialized;
+        else if (reference != *serialized) return fail("semantic port Nodes differ between flatten implementations");
+    }
+    return 0;
+}
+
+int testSemanticQualifierAndInvalidPort()
+{
+    namespace grh = wolvrix::lib::grh;
+    for (const bool sourceFlat : {false, true})
+    {
+        grh::Design design;
+        auto& child = design.createGraph("child");
+        auto& source = child.getOrCreateSemanticTree("fixture", "top", "child");
+        const auto path = source.addPath(source.root(), "a.b");
+        const auto id = source.addNode(path, "c[0]");
+        if (sourceFlat) source.flatten();
+        auto& top = design.createGraph("top");
+        design.markAsTop("top");
+        const auto instance = top.createOperation(grh::OperationKind::kInstance);
+        top.setAttr(instance, "moduleName", std::string("child"));
+        top.setAttr(instance, "instanceName", std::string("u.dot"));
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>());
+        PassDiagnostics diagnostics;
+        if (!manager.run(design, diagnostics).success || !top.semanticTree() ||
+            top.semanticTree()->size() != 1 ||
+            top.semanticTree()->name(top.semanticTree()->nodeIds().front()) != "u\\.dot.a\\.b.c\\[0\\]")
+            return fail("hier-flatten lost reversible names or re-escaped a flattened source");
+        (void)id;
+    }
+    for (const bool global : {false, true})
+    for (const bool invalidAnchor : {false, true})
+    {
+        grh::Design design;
+        auto& child = design.createGraph("child");
+        auto& source = child.getOrCreateSemanticTree("fixture", "top", "child");
+        const auto inputNode = source.addNode(source.root(), "x");
+        const auto input = child.createTemporaryValue(8, false);
+        child.bindInputPort("x", input);
+        child.setValueSemanticIds(input, std::span<const grh::SemanticId>(&inputNode, 1));
+        auto& top = design.createGraph("top");
+        design.markAsTop("top");
+        auto& tree = top.getOrCreateSemanticTree("fixture", "top", "top");
+        const auto placeholder = tree.addNode(tree.addPath(tree.root(), "u"), "x");
+        const auto expected = top.createTemporaryValue(8, false);
+        const auto actual = top.createTemporaryValue(8, false);
+        top.bindInputPort("a", expected);
+        top.bindInputPort("b", actual);
+        top.setValueSemanticIds(expected, std::span<const grh::SemanticId>(&placeholder, 1));
+        // Expand a valid instance before the second one fails, so rollback
+        // must restore operations, values, members and the original Paths.
+        const auto good = top.createOperation(grh::OperationKind::kInstance);
+        top.setAttr(good, "moduleName", std::string("child"));
+        top.setAttr(good, "instanceName", std::string("good"));
+        top.addOperand(good, expected);
+        const auto instance = top.createOperation(grh::OperationKind::kInstance);
+        top.setAttr(instance, "moduleName", std::string(invalidAnchor ? "child" : "missing"));
+        top.setAttr(instance, "instanceName", std::string("u"));
+        top.addOperand(instance, actual);
+        top.setOpSemanticIds(instance, std::span<const grh::SemanticId>(&placeholder, 1));
+        HierFlattenOptions options;
+        options.useGlobalPlan = global;
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>(options));
+        PassDiagnostics diagnostics;
+        const auto before = wolvrix::lib::store::StoreJson().storeToString(design);
+        if (!before) return fail("rollback fixture could not be serialized");
+        bool rejected = false;
+        try { rejected = !manager.run(design, diagnostics).success; }
+        catch (const std::invalid_argument& error)
+        {
+            rejected = std::string_view(error.what()).find("placeholder has no port mapping") != std::string_view::npos;
+        }
+        if (!rejected) return fail("flatten accepted invalid semantic instance correspondence");
+        if (design.findGraph("top") != &top || !design.findGraph("child") ||
+            top.valueWidth(expected) != 8 || top.valueWidth(actual) != 8 ||
+            top.opKind(good) != grh::OperationKind::kInstance ||
+            top.opKind(instance) != grh::OperationKind::kInstance ||
+            !top.validateSemanticTree().empty() ||
+            wolvrix::lib::store::StoreJson().storeToString(design) != before)
+            return fail("failed flatten published partial IR or SemanticTree changes");
+    }
+    return 0;
+}
+
 int main()
 {
+    if (const int result = testSemanticQualifierAndInvalidPort()) return result;
+    if (const int result = testSemanticPortNodeRelocation()) return result;
+    if (const int result = testSemanticTreeBelowUnannotatedTop()) return result;
+    if (const int result = testExternalImplementationBindings()) return result;
     if (const int result = testBlockRunsSerialParallelIdentity()) return result;
     if (const int result = testGlobalBoundaryPlanReference()) return result;
     if (const int result = testResolvedXmrGlobalBlocksReference()) return result;

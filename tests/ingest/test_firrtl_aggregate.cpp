@@ -70,7 +70,7 @@ void rectangularMixedIndexBounds() {
     connect noOpOut, noOp
 )FIR";
     for (const auto policy : {ingest::FirrtlInvalidPolicy::Unknown, ingest::FirrtlInvalidPolicy::Zero}) {
-        auto result = text("rectangular-mixed-index-bounds", body, policy);
+        auto result = unannotatedText("rectangular-mixed-index-bounds", body, policy);
         require(result.success(), diagnostics(result));
         run(*result.design, std::make_unique<tx::GrhVerifyPass>());
         auto restored = roundTrip(*result.design);
@@ -118,8 +118,8 @@ void geometry() {
             for (const auto& field : fields) { symbol += "__DOT__" + field; path.push_back(field); }
             const auto value = graph.findValue(symbol); require(bool(value), "missing aggregate node field root");
             const auto ids = graph.valueSemanticIds(value);
-            require(ids.size() == 1 && tree->node(ids[0]).kind == grh::SemanticNodeKind::Field &&
-                    tree->path(ids[0]) == path, "node identity field geometry is wrong");
+            require(ids.size() == 1 && tree->path(ids[0]) == path,
+                    "node identity field geometry is wrong");
             require(nodeFields.insert(ids[0]).second, "aggregate node fields share an identity");
             const auto root = graph.valueDef(value);
             require(root && graph.opSemanticIds(root).size() == 1 && graph.opSemanticIds(root)[0] == ids[0],
@@ -139,11 +139,10 @@ void geometry() {
         }
     }
     require(nodeFields.size() == 6, "Vector node identity was expanded per element or Bundle field omitted");
-    for (grh::SemanticId id = 1; id <= tree->size(); ++id) {
+    for (const auto id : tree->nodeIds()) {
         const auto path = tree->path(id);
         if (path.size() < 2 || (path[1] != "selected" && path[1] != "aliasPacket")) continue;
-        require(tree->node(id).kind != grh::SemanticNodeKind::Element,
-                "Vector node identity was expanded per element");
+        require(nodeFields.contains(id), "Vector node identity was expanded per element");
     }
     require(count(graph,OperationKind::kArrayCreate)>0,"per-element width adaptation lost array construction");
     bool multiIndex = false;
@@ -172,10 +171,12 @@ void geometry() {
             require(oracle.output("lastOut",inputs)==(data&255),"whole connect did not override earlier partial write");
         }
     };
-    check(graph); check(*stored.findGraph("top")); run(source,std::make_unique<tx::SimplifyPass>()); valid(source); check(graph);
+    check(graph); check(*stored.findGraph("top"));
+    auto executable = design(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR)/"comb/aggregate.fir", false);
+    run(executable,std::make_unique<tx::SimplifyPass>()); valid(executable); check(*executable.findGraph("top"));
 }
 void flowsAndCoverage() {
-    auto result=text("flips",R"FIR(    input in : {d : UInt<4>, flip ready : UInt<1>}
+    auto result=unannotatedText("flips",R"FIR(    input in : {d : UInt<4>, flip ready : UInt<1>}
     output out : {d : UInt<4>, flip ready : UInt<1>}
     connect out,in
 )FIR");
@@ -184,7 +185,7 @@ void flowsAndCoverage() {
     Oracle oracle(graph);
     const std::map<std::string,uint64_t> inputs{{"in__DOT__d",13},{"out__DOT__ready",1}};
     require(oracle.output("out__DOT__d",inputs)==13 && oracle.output("in__DOT__ready",inputs)==1,"flipped whole connect reversed the wrong driver");
-    auto coverage=text("coverage",R"FIR(    input sel : UInt<1>
+    auto coverage=unannotatedText("coverage",R"FIR(    input sel : UInt<1>
     output y : UInt<4>[2]
     when sel :
       connect y[0],UInt<4>(1)
@@ -195,7 +196,7 @@ void flowsAndCoverage() {
 )FIR");
     require(coverage.success(),diagnostics(coverage)); Oracle paths(*coverage.design->findGraph("top"));
     require(paths.output("y",{{"sel",1}})==0x21 && paths.output("y",{{"sel",0}})==0x43,"when/else coverage or array element order differs");
-    auto local=text("local-wire",R"FIR(    input sel : UInt<1>
+    auto local=unannotatedText("local-wire",R"FIR(    input sel : UInt<1>
     output y : UInt<4>
     when sel :
       wire w : UInt<4>
@@ -205,7 +206,7 @@ void flowsAndCoverage() {
 )FIR");
     require(local.success(),diagnostics(local)); Oracle localOracle(*local.design->findGraph("top"));
     require(localOracle.output("y",{{"sel",1}})==7 && localOracle.output("y",{{"sel",0}})==9,"conditional declaration was required outside its scope");
-    auto boolean=text("boolean-coverage",R"FIR(    input sel : UInt<1>
+    auto boolean=unannotatedText("boolean-coverage",R"FIR(    input sel : UInt<1>
     output y : UInt<4>
     output typed : UInt<4>
     when sel : connect y,UInt<4>(3)
@@ -231,7 +232,7 @@ void flowsAndCoverage() {
 void accessSize() {
     std::size_t previous=0;
     for(const auto extent : {32,4096}) {
-        auto result=text("access-"+std::to_string(extent),"    input a : UInt<1>["+std::to_string(extent)+"]\n    input i : UInt<13>\n    output y : UInt<1>\n    node n = a[i]\n    connect y,n\n");
+        auto result=unannotatedText("access-"+std::to_string(extent),"    input a : UInt<1>["+std::to_string(extent)+"]\n    input i : UInt<13>\n    output y : UInt<1>\n    node n = a[i]\n    connect y,n\n");
         require(result.success(),diagnostics(result)); auto& graph=*result.design->findGraph("top");
         require(count(graph,OperationKind::kSliceArray)==1 && count(graph,OperationKind::kEq)==0,"dynamic read expanded into per-slot decoding");
         if(previous) require(graph.operations().size()==previous,"dynamic read operation count scales with array extent");
@@ -262,7 +263,7 @@ void constantIndexBounds() {
     connect matrixOut, w
 )FIR";
     for (const auto policy : {ingest::FirrtlInvalidPolicy::Unknown, ingest::FirrtlInvalidPolicy::Zero}) {
-        auto result = text("constant-index-bounds", body, policy);
+        auto result = unannotatedText("constant-index-bounds", body, policy);
         require(result.success(), diagnostics(result));
         auto& graph = *result.design->findGraph("top");
         require(count(graph, OperationKind::kLt) == 2, "constant indices created runtime bounds checks");
@@ -287,7 +288,7 @@ void constantIndexBounds() {
             }
         }
     }
-    auto assignment = text("unmasked-wire", "    input a : UInt<4>\n    output y : UInt<4>\n    connect y, a\n");
+    auto assignment = unannotatedText("unmasked-wire", "    input a : UInt<4>\n    output y : UInt<4>\n    connect y, a\n");
     require(assignment.success(), diagnostics(assignment));
     const auto& graph = *assignment.design->findGraph("top");
     for (const auto op : graph.operations()) if (graph.opKind(op) == OperationKind::kConstant)
@@ -308,13 +309,13 @@ circuit top :
     connect w[1],b
     connect y,w
 )FIR";
-    auto result=read(path); require(result.success(),diagnostics(result)); auto& graph=*result.design->findGraph("top");
+    auto result=read(path, false); require(result.success(),diagnostics(result)); auto& graph=*result.design->findGraph("top");
     shape(graph,"w",14,{2}); shape(graph,"y",14,{2});
     require(result.modules[0].ports[2].elementWidth==7 && !result.modules[0].ports[2].requiresTypeResolution,"inferred array signature used total width as element width");
     Oracle oracle(graph); require(oracle.output("y",{{"a",7},{"b",79}})==((79<<7)|7),"alias/vector element widths were not shared and inferred");
 }
 void elementDependencies() {
-    auto result = text("array-element-dependencies", R"FIR(    input a : UInt<4>
+    auto result = unannotatedText("array-element-dependencies", R"FIR(    input a : UInt<4>
     input b : UInt<4>
     output y : UInt<1>[2][2]
     wire matrix : UInt<1>[2][2]
@@ -338,7 +339,7 @@ void elementDependencies() {
             require(oracle.output("y", {{"a", a}, {"b", b}}) == (a < b ? 2 : 4),
                 "acyclic element dependencies changed while preserving arrays");
     }
-    auto cycle = text("real-array-cycle", R"FIR(    output y : UInt<1>[2]
+    auto cycle = unannotatedText("real-array-cycle", R"FIR(    output y : UInt<1>[2]
     connect y[0], not(y[1])
     connect y[1], not(y[0])
 )FIR");
@@ -346,7 +347,7 @@ void elementDependencies() {
         "range analysis accepted a real array element cycle");
 }
 void conditionalElementDependencies() {
-    auto result = text("conditional-array-element-dependencies", R"FIR(    input initial : UInt<1>[24]
+    auto result = unannotatedText("conditional-array-element-dependencies", R"FIR(    input initial : UInt<1>[24]
     input outer : UInt<1>
     input a : UInt<1>
     input b : UInt<1>
@@ -407,7 +408,7 @@ void conditionalElementDependencies() {
         }
     }
     for (unsigned high : {5u, 10u}) {
-        auto unknown = text("unknown-conditional-element", std::string(R"FIR(    output y : UInt<4>[2]
+        auto unknown = unannotatedText("unknown-conditional-element", std::string(R"FIR(    output y : UInt<4>[2]
     wire condition : UInt<1>
     invalidate condition
     connect y[0], UInt<4>(5)
@@ -427,7 +428,7 @@ void conditionalElementDependencies() {
             (high == 5 ? merged.as<uint64_t>() == 0x55 : merged.slice(7, 4).hasUnknown()),
             "unknown partial-write guard changed untouched bits or lost the written slice's merge");
     }
-    auto cycle = text("real-conditional-array-cycle", R"FIR(    output y : UInt<1>[2]
+    auto cycle = unannotatedText("real-conditional-array-cycle", R"FIR(    output y : UInt<1>[2]
     connect y[0], UInt<1>(1)
     connect y[1], UInt<1>(0)
     when y[0] : connect y[0], UInt<1>(0)
@@ -436,7 +437,7 @@ void conditionalElementDependencies() {
         "conditional partial connect hid a real dependency on its own destination");
 }
 void guardedPieceRanges() {
-    auto result = text("guarded-piece-ranges", R"FIR(    input initial : SInt<4>[2][3]
+    auto result = unannotatedText("guarded-piece-ranges", R"FIR(    input initial : SInt<4>[2][3]
     input row : SInt<4>[2]
     input first : SInt<4>
     input last : SInt<4>
@@ -497,7 +498,7 @@ void guardedPieceRanges() {
     }
 }
 void mixedStaticDynamicPieceRanges() {
-    auto result = text("mixed-static-dynamic-piece-ranges", R"FIR(    input initial : UInt<4>[2][3]
+    auto result = unannotatedText("mixed-static-dynamic-piece-ranges", R"FIR(    input initial : UInt<4>[2][3]
     input row : UInt<4>[2]
     input cell : UInt<4>
     input index : UInt<2>

@@ -3,6 +3,7 @@
 #include "transform/xmr_resolve.hpp"
 #include "core/transform.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -164,6 +165,14 @@ int main()
     top.setAttr(instOp, "outputPortName", std::vector<std::string>{});
     top.setAttr(instOp, "inoutPortName", std::vector<std::string>{});
 
+    const auto unusedInstance = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance,
+                                                     top.internSymbol("_op_test_xmr_unused_inst"));
+    top.setAttr(unusedInstance, "moduleName", std::string("leaf"));
+    top.setAttr(unusedInstance, "instanceName", std::string("u_unused"));
+    top.setAttr(unusedInstance, "inputPortName", std::vector<std::string>{});
+    top.setAttr(unusedInstance, "outputPortName", std::vector<std::string>{});
+    top.setAttr(unusedInstance, "inoutPortName", std::vector<std::string>{});
+
     const auto readValue = top.createValue(top.internSymbol("xmr_read"), 8, false);
     const auto xmrRead =
         top.createOperation(wolvrix::lib::grh::OperationKind::kXMRRead,
@@ -194,6 +203,20 @@ int main()
     top.addOperand(xmrWriteLatch, latchMask);
     top.setAttr(xmrWriteLatch, "xmrPath", std::string("u_leaf.lat_b"));
 
+    auto& leafTree = leaf.getOrCreateSemanticTree("fixture", "Circuit", "leaf");
+    const auto regNode = leafTree.addNode(leafTree.root(), "reg_a");
+    const auto latchNode = leafTree.addNode(leafTree.root(), "lat_b");
+    leaf.setOpSemanticIds(regOp, std::span<const wolvrix::lib::grh::SemanticId>(&regNode, 1));
+    leaf.setOpSemanticIds(latchOp, std::span<const wolvrix::lib::grh::SemanticId>(&latchNode, 1));
+    auto& topTree = top.getOrCreateSemanticTree("fixture", "Circuit", "top");
+    const auto readNode = topTree.addNode(topTree.root(), "read");
+    const auto writeRegNode = topTree.addNode(topTree.root(), "write_reg");
+    const auto writeLatchNode = topTree.addNode(topTree.root(), "write_latch");
+    top.setOpSemanticIds(xmrRead, std::span<const wolvrix::lib::grh::SemanticId>(&readNode, 1));
+    top.setValueSemanticIds(readValue, std::span<const wolvrix::lib::grh::SemanticId>(&readNode, 1));
+    top.setOpSemanticIds(xmrWriteReg, std::span<const wolvrix::lib::grh::SemanticId>(&writeRegNode, 1));
+    top.setOpSemanticIds(xmrWriteLatch, std::span<const wolvrix::lib::grh::SemanticId>(&writeLatchNode, 1));
+
     PassManager manager;
     manager.addPass(std::make_unique<XmrResolvePass>());
     PassDiagnostics diags;
@@ -210,6 +233,28 @@ int main()
     if (!hasNoXmrOps(top))
     {
         return fail("XMR ops were not fully resolved");
+    }
+    for (const auto* graph : {&top, &leaf}) {
+        if (!graph->validateSemanticTree().empty()) return fail("XMR left invalid Node members/anchors");
+        for (const auto operation : graph->operations())
+            if (graph->opSemanticIds(operation).empty()) return fail("XMR created an unowned implementation op");
+    }
+    const auto readAnchors = top.semanticNodeAnchors(readNode);
+    if (readAnchors.size() != 1 || readAnchors.front() != top.outputPortValue("observed"))
+        return fail("XMR read Node did not retain its actual relocated boundary anchor");
+    bool sharedPadding = false;
+    for (const auto operation : top.operations())
+        if (top.opKind(operation) == wolvrix::lib::grh::OperationKind::kConstant &&
+            top.opSemanticIds(operation).size() > 1) sharedPadding = true;
+    if (!sharedPadding) return fail("cached input padding is not shared by all actual consuming port Nodes");
+    for (const std::string_view state : {"reg_a", "lat_b"}) {
+        bool found = false;
+        for (const auto id : leafTree.nodeIds()) {
+            if (leafTree.name(id) != std::string(state) + "$NEXT") continue;
+            const auto members = leaf.semanticNodeOperations(id);
+            found = members.size() == 1 && leaf.getOperation(members.front()).attr("writerOrder").has_value();
+        }
+        if (!found) return fail("XMR storage writer is not a complete member of a separate next-state Node");
     }
     if (!hasRegisterReadOutput(leaf))
     {
@@ -245,6 +290,12 @@ int main()
     if (outputNames->size() != 1 || !startsWith((*outputNames)[0], "__xmr_r_"))
     {
         return fail("Unexpected XMR read output port names");
+    }
+    for (const auto operation : {instOp, unusedInstance}) {
+        const auto names = getAttrStrings(top.getOperation(operation), "semanticPortNames");
+        const auto nodes = top.getOperation(operation).attr("semanticPortNodes");
+        if (!names || !nodes || names->size() != 8 || std::get<std::vector<int64_t>>(*nodes).size() != 8)
+            return fail("XMR generated ports were not published through explicit formal Node bindings");
     }
 
     return 0;

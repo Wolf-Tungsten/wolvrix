@@ -7,7 +7,6 @@
 #include <filesystem>
 #include <string>
 #include <type_traits>
-#include <unordered_set>
 #include <vector>
 
 namespace wolvrix::app::pybind
@@ -71,38 +70,42 @@ namespace wolvrix::app::pybind
         if (!session) return nullptr;
         auto *design = sessionDesign(*session, designKey);
         if (!design) { PyErr_Format(PyExc_KeyError, "design key not found: %s", designKey); return nullptr; }
-        uint64_t trees = 0, nodes = 0, nameBytes = 0, valueRows = 0, operationRows = 0, semanticIds = 0;
-        uint64_t semanticPoolIds = 0, semanticLists = 0;
+        uint64_t trees = 0, paths = 0, nodes = 0, nameBytes = 0;
+        uint64_t totalOps = 0, memberships = 0, anchors = 0, covered = 0, uncovered = 0, shared = 0, emptyNodes = 0;
         for (const auto &[symbol, graph] : design->graphs()) {
             (void)symbol;
-            const auto payloadStats = graph->payloadStats();
-            semanticPoolIds += payloadStats.semanticIds;
-            semanticLists += payloadStats.semanticLists;
             if (const auto *tree = graph->semanticTree()) {
                 ++trees;
+                paths += tree->pathCount() - 1;
                 nodes += tree->size();
                 nameBytes += tree->nameBytes();
-            }
-            for (const auto value : graph->values()) {
-                const auto ids = graph->valueSemanticIds(value);
-                valueRows += !ids.empty();
-                semanticIds += ids.size();
+                for (const auto id : tree->nodeIds()) {
+                    emptyNodes += tree->operations(id).empty();
+                    anchors += tree->anchors(id).size();
+                }
             }
             for (const auto op : graph->operations()) {
                 const auto ids = graph->opSemanticIds(op);
-                operationRows += !ids.empty();
-                semanticIds += ids.size();
+                ++totalOps;
+                memberships += ids.size();
+                covered += !ids.empty();
+                uncovered += ids.empty();
+                shared += ids.size() > 1;
             }
         }
-        return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
+        return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
                              "trees", static_cast<unsigned long long>(trees),
-                             "nodes", static_cast<unsigned long long>(nodes),
+                             "root_path_count", static_cast<unsigned long long>(trees),
+                             "path_count", static_cast<unsigned long long>(paths),
+                             "node_count", static_cast<unsigned long long>(nodes),
                              "name_bytes", static_cast<unsigned long long>(nameBytes),
-                             "value_rows", static_cast<unsigned long long>(valueRows),
-                             "operation_rows", static_cast<unsigned long long>(operationRows),
-                             "semantic_ids", static_cast<unsigned long long>(semanticIds),
-                             "semantic_pool_ids", static_cast<unsigned long long>(semanticPoolIds),
-                             "semantic_lists", static_cast<unsigned long long>(semanticLists));
+                             "total_op_count", static_cast<unsigned long long>(totalOps),
+                             "op_membership_count", static_cast<unsigned long long>(memberships),
+                             "anchor_membership_count", static_cast<unsigned long long>(anchors),
+                             "covered_unique_op_count", static_cast<unsigned long long>(covered),
+                             "uncovered_op_count", static_cast<unsigned long long>(uncovered),
+                             "shared_op_count", static_cast<unsigned long long>(shared),
+                             "empty_op_node_count", static_cast<unsigned long long>(emptyNodes));
     }
 
     PyObject *py_session_semantic_validate(PyObject *, PyObject *args, PyObject *kwargs) {
@@ -116,62 +119,21 @@ namespace wolvrix::app::pybind
         auto *design = sessionDesign(*session, designKey);
         if (!design) { PyErr_Format(PyExc_KeyError, "design key not found: %s", designKey); return nullptr; }
 
-        uint64_t duplicatePaths = 0, symbolMismatches = 0, checkedRegisters = 0;
+        uint64_t errorCount = 0, checkedGraphs = 0;
         std::vector<std::string> examples;
-        const auto example = [&](std::string text) {
-            if (examples.size() < 8) examples.push_back(std::move(text));
-        };
         for (const auto &[symbol, graph] : design->graphs()) {
-            const auto *tree = graph->semanticTree();
-            if (!tree) continue;
-            std::unordered_set<std::string> modulePaths;
-            for (lib::grh::SemanticId id = 1; id <= tree->size(); ++id) {
-                if (tree->node(id).kind != lib::grh::SemanticNodeKind::Module) continue;
-                std::string path;
-                for (const auto &component : tree->path(id)) {
-                    if (!path.empty()) path.push_back('/');
-                    path += component;
-                }
-                if (!modulePaths.insert(path).second) {
-                    ++duplicatePaths;
-                    example(symbol + ": duplicate module path " + path);
-                }
-            }
-            std::unordered_set<uint32_t> declaredSymbols;
-            for (const auto declared : graph->declaredSymbols()) declaredSymbols.insert(declared.value);
-            for (const auto op : graph->operations()) {
-                if (graph->opKind(op) != lib::grh::OperationKind::kRegister) continue;
-                const auto opSymbol = graph->operationSymbol(op);
-                if (!opSymbol.valid() || !declaredSymbols.contains(opSymbol.value)) continue;
-                const std::string opName(graph->symbolText(opSymbol));
-                if (opName.find('$') == std::string::npos) continue;
-                ++checkedRegisters;
-                for (const auto semantic : graph->opSemanticIds(op)) {
-                    std::vector<lib::grh::SemanticId> lineage;
-                    for (auto current = semantic; current; current = tree->node(current).parent)
-                        lineage.push_back(current);
-                    std::string instancePath;
-                    for (auto at = lineage.rbegin(); at != lineage.rend(); ++at) {
-                        if (*at == tree->root()) continue;
-                        const auto &node = tree->node(*at);
-                        if (node.kind != lib::grh::SemanticNodeKind::Module) continue;
-                        if (!instancePath.empty()) instancePath.push_back('$');
-                        instancePath += tree->name(*at);
-                    }
-                    if (instancePath.empty() || !opName.starts_with(instancePath + "$")) {
-                        ++symbolMismatches;
-                        example(symbol + ": " + opName + " lacks instance prefix " + instancePath);
-                        break;
-                    }
-                }
-            }
+            ++checkedGraphs;
+            const auto errors = graph->validateSemanticTree();
+            errorCount += errors.size();
+            for (const auto &error : errors)
+                if (examples.size() < 8) examples.push_back(symbol + ": " + error);
         }
         PyObject *exampleList = metadataValue(examples);
         if (!exampleList) return nullptr;
-        PyObject *result = Py_BuildValue("{s:K,s:K,s:K,s:N}",
-            "module_path_duplicates", static_cast<unsigned long long>(duplicatePaths),
-            "register_symbol_mismatches", static_cast<unsigned long long>(symbolMismatches),
-            "checked_registers", static_cast<unsigned long long>(checkedRegisters),
+        PyObject *result = Py_BuildValue("{s:O,s:K,s:K,s:N}",
+            "valid", errorCount == 0 ? Py_True : Py_False,
+            "error_count", static_cast<unsigned long long>(errorCount),
+            "checked_graphs", static_cast<unsigned long long>(checkedGraphs),
             "examples", exampleList);
         if (!result) Py_DECREF(exampleList);
         return result;

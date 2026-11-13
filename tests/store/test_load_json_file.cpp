@@ -137,7 +137,7 @@ int main() {
         }
 
         const std::string reordered = R"json({
-          "formatVersion":4,
+          "formatVersion":5,
           "tops":["g"], "aliases":{"alias":"g"}, "declaredSymbols":["design"],
           "graphs":[{
             "ops":[{"id":22,"out":[12],"in":[11],"attrs":{
@@ -154,12 +154,16 @@ int main() {
             "declaredSymbols":["decl"],"symbol":"g","symbol":"ignored duplicate"
           }]
         })json";
-        checkBoth(directory / "reordered-v4.json", reordered);
+        checkBoth(directory / "reordered-v5.json", reordered);
+        auto legacy = reordered;
+        legacy.replace(legacy.find("\"formatVersion\":5"), std::string("\"formatVersion\":5").size(),
+                       "\"formatVersion\":4");
+        checkRejected(directory / "legacy-v4.json", legacy);
         checkRejected(directory / "trailing.json", reordered + "garbage");
         checkRejected(directory / "truncated.json", reordered.substr(0, reordered.size() - 4));
         checkRejected(directory / "invalid-escape.json", "{\"graphs\":[],\"declaredSymbols\":[],\"unknown\":[\"\\q\"]}");
         checkRejected(directory / "invalid-number.json", "{\"graphs\":[],\"declaredSymbols\":[],\"unknown\":[1e99999]}");
-        checkRejected(directory / "unknown-value.json", R"json({"formatVersion":4,"graphs":[{
+        checkRejected(directory / "unknown-value.json", R"json({"formatVersion":5,"graphs":[{
             "symbol":"g","dialects":{"grh":2},"metadata":{},"declaredSymbols":[],"vals":[],
             "ops":[{"id":1,"kind":"kAssign","in":[99],"out":[]}]
           }],"declaredSymbols":[]})json");

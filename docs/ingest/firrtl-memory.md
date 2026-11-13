@@ -32,6 +32,14 @@ through every field of that port while preserving unwritten storage fields.
 
 ## GRH representation
 
+Each storage `kRegister` keeps its source geometry in `firrtl.memoryDepth`,
+`firrtl.memoryReadLatency` and `firrtl.memoryWriteLatency` integer attributes,
+alongside `firrtl.memory` and `firrtl.readUnderWrite`. These describe the FIRRTL
+memory before latency pipelines are expanded. For a `smem UInt<8>[4]`, the
+attributes are depth 4, read latency 1 and write latency 1, with packed storage
+width 32 and shape `[4]`. Read/write pipeline states remain attributed to their
+source mport rather than becoming additional memory declarations.
+
 ```firrtl
 cmem words : UInt<8>[16]
 read mport r = words[addr], clock

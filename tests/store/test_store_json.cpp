@@ -127,14 +127,14 @@ int main()
     {
         return fail("Attribute payload missing expected compact layout");
     }
-    // v4 graph-local references are JSON numbers, never strings.
+    // v5 graph-local references are JSON numbers, never strings.
     if (prettyCompactJson.find("\"val\": \"") != std::string::npos ||
         prettyCompactJson.find("\"def\": \"") != std::string::npos ||
         prettyCompactJson.find("\"op\": \"") != std::string::npos ||
         prettyCompactJson.find("\"in\": [\"") != std::string::npos ||
         prettyCompactJson.find("\"out\": [\"") != std::string::npos)
     {
-        return fail("v4 graph-local references were emitted as JSON strings");
+        return fail("v5 graph-local references were emitted as JSON strings");
     }
     const std::size_t valsInlinePos = prettyCompactJson.find("{\"id\": 1, \"sym\": \"in\"");
     if (valsInlinePos == std::string::npos)
@@ -220,14 +220,14 @@ int main()
     {
         legacyRejected = true;
     }
-    if (!legacyRejected) return fail("v3 JSON was accepted by the v4-only loader");
+    if (!legacyRejected) return fail("v3 JSON was accepted by the v5-only loader");
 
-    // Case 4: v4 local IDs are graph-local and must remain valid when the
+    // Case 4: v5 local IDs are graph-local and must remain valid when the
     // operation array is reordered and its IDs are sparse.  In particular,
     // use-list validation must compare encoded local IDs rather than runtime
     // OperationId indices, which follow parse order.
     const std::string reorderedJson = R"({
-  "formatVersion": 4,
+  "formatVersion": 5,
   "graphs": [{
     "symbol": "reordered",
     "dialects": {"grh": 2},
@@ -253,7 +253,7 @@ int main()
     if (!reorderedGraph || reorderedGraph->operations().size() != 2 ||
         reorderedGraph->valueUsers(reorderedGraph->findValue("in")).size() != 2)
     {
-        return fail("v4 sparse local IDs or reordered operations were not loaded");
+        return fail("v5 sparse local IDs or reordered operations were not loaded");
     }
 
     const auto replaceOnce = [](std::string text, const std::string &from, const std::string &to) {
@@ -273,7 +273,7 @@ int main()
         {
             return 0;
         }
-        return fail(std::string("Malformed v4 JSON was accepted: ") + label);
+        return fail(std::string("Malformed v5 JSON was accepted: ") + label);
     };
     if (expectLoadFailure(replaceOnce(reorderedJson, "\"id\": 901", "\"id\": 900"),
                           "duplicate value ID") != 0 ||
@@ -318,7 +318,7 @@ int main()
     goldenDesign.createGraph("empty");
     goldenDesign.markAsTop("empty");
     const std::string golden = R"({
-  "formatVersion": 4,
+  "formatVersion": 5,
   "graphs": [
     {
       "symbol": "empty",

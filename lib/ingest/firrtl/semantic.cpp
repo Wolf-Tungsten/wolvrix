@@ -656,6 +656,7 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
             }
             const auto fixed = staticIndex(statement.operands[0]);
             const int condition = fixed ? (*fixed != 0) : guards.variable(expressionKey(statement.operands[0]), statement.operands[0]);
+            if (!summarizing_) whenPredicates.push_back({statement.operands[0], statement.range, condition});
             conditionGuards_.push_back(condition);
             this->statements(statement.body, guards.conjunction(guard, condition));
             conditionGuards_.back() = guards.negate(condition);
@@ -827,6 +828,7 @@ void Semantics::normalizeGuards() {
     for (auto& effect : effects) effect.guard = convert(effect.guard);
     for (auto& [name, declaration] : declarations) declaration.guard = convert(declaration.guard);
     for (auto& [name, memory] : memories) for (auto& port : memory.ports) port.guard = convert(port.guard);
+    for (auto& when : whenPredicates) when.guard = predicate(when.expression);
     guards = std::move(normalized);
     constantValues_.clear();
 }

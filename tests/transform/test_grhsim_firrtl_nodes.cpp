@@ -72,28 +72,16 @@ void largeNodes() {
 }
 
 void semanticTreeNodes() {
-    for (const bool anchors : {false, true}) {
-        Fixture fixture; chain(fixture, 7);
-        const auto ops = computation(fixture.graph);
-        auto& tree = fixture.graph.getOrCreateSemanticTree("test", "top", "top");
-        const auto declaration = tree.addNode(tree.root(), grh::SemanticNodeKind::Declaration, "bundle");
-        const auto fieldA = tree.addNode(declaration, grh::SemanticNodeKind::Field, "a");
-        const auto fieldB = tree.addNode(declaration, grh::SemanticNodeKind::Field, "b");
-        const auto instance = tree.addNode(tree.root(), grh::SemanticNodeKind::Module, "other");
-        const auto separate = tree.addNode(instance, grh::SemanticNodeKind::Expression, "bundle");
-        for (unsigned i = 0; i < ops.size(); ++i) {
-            const auto semantic = i < 6 ? (i % 2 ? fieldA : fieldB) : separate;
-            fixture.graph.setOpSemanticIds(ops[i], std::array{semantic});
-        }
-        fixture.graph.setValueSemanticIds(fixture.graph.opResults(ops[5])[0], std::array{fieldA});
-        run(fixture.design, "partition-nonsink", fixture.session,
-            {"-max-supernode-nodes=1", "-clone-shared=0", anchors ? "-semantic-nodes=1" : "-semantic-nodes=0"});
-        for (unsigned i = 1; i < 6; ++i)
-            require(owner(fixture.graph, ops[0]) == owner(fixture.graph, ops[i]), "SemanticTree source expression split into op nodes");
-        require(owner(fixture.graph, ops[5]) != owner(fixture.graph, ops[6]), "different semantic instance families merged");
-        require(stat(fixture.graph, "semantic-covered-ops") == ops.size() && stat(fixture.graph, "firrtl-nodes") == 2,
-            "auto mode did not consume SemanticTree families");
-    }
+    Fixture fixture; chain(fixture, 7);
+    const auto ops = computation(fixture.graph);
+    auto &tree = fixture.graph.getOrCreateSemanticTree("test", "top", "top");
+    const auto node = tree.addNode(tree.root(), "out");
+    for (const auto op : ops) fixture.graph.setOpSemanticIds(op, std::array{node});
+    const auto checkpoint = json(fixture.design);
+    require(!run(fixture.design, "partition-nonsink", fixture.session,
+        {"-max-supernode-nodes=1", "-clone-shared=0"}, false),
+        "partition-nonsink must reject unsupported F28 Node evolution");
+    require(json(fixture.design) == checkpoint, "unsupported partition changed Node memberships or IR");
 }
 
 void dagCensus() {
@@ -318,13 +306,9 @@ void cloneIntoExistingNode() {
     const auto right = fixture.compute(OperationKind::kAdd, Fixture::type(32), {inverted, x});
     fixture.task("display", {en, left, right});
     fixture.convert(); const auto reference = fixture.design.clone(); fixture.split();
-    auto& tree = fixture.graph.getOrCreateSemanticTree("test", "top", "top");
     for (const auto op : computation(fixture.graph)) {
         const auto name = std::string(fixture.graph.symbolText(fixture.graph.operationSymbol(op)));
         tag(fixture.graph, op, {key(name)});
-        const auto source = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, name);
-        fixture.graph.setOpSemanticIds(op, std::array{source});
-        fixture.graph.setValueSemanticIds(fixture.graph.opResults(op)[0], std::array{source});
     }
     node::establishPolicy(fixture.graph);
     run(fixture.design, "grhsim-partition-nonsink", fixture.session,
@@ -334,12 +318,6 @@ void cloneIntoExistingNode() {
     require(stat(fixture.graph, "nodes") == stat(fixture.graph, "firrtl-nodes") + stat(fixture.graph, "mffc-nodes") +
         stat(fixture.graph, "boundary-nodes"), "clone changed node count");
     capacity(fixture.graph, 1);
-    for (const auto op : fixture.graph.operations())
-        if (sim::attribute<bool>(fixture.graph, op, "grhsim.nodeClone").value_or(false)) {
-            require(!fixture.graph.opSemanticIds(op).empty(), "partition clone lost operation SemanticId");
-            for (const auto value : fixture.graph.opResults(op))
-                require(!fixture.graph.valueSemanticIds(value).empty(), "partition clone lost value SemanticId");
-        }
     run(fixture.design, "grhsim-partition-sink", fixture.session);
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, fixture.graph);
     compare(reference, fixture.design, {}, {{{"x", 3}, {"enable", 1}}, {{"x", 7}, {"enable", 1}},
@@ -347,7 +325,7 @@ void cloneIntoExistingNode() {
 }
 
 void clockDomainIsolation() {
-    for (const std::string association : {"off", "legacy", "semantic"}) {
+    for (const std::string association : {"off", "legacy"}) {
         Fixture fixture; auto& graph = fixture.graph;
         const auto clockA = fixture.input("clock_a"), clockB = fixture.input("clock_b");
         const auto data = fixture.input("data", 8), enable = fixture.input("enable");
@@ -378,12 +356,6 @@ void clockDomainIsolation() {
             for (const auto op : sameFamily) tag(graph, op, {key("mixed_clock_and_data")});
             tag(graph, graph.valueDef(invertedData), {key("plain_transform")});
             node::establishPolicy(graph);
-        } else if (association == "semantic") {
-            auto& tree = graph.getOrCreateSemanticTree("test", "top", "top");
-            const auto family = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "mixed_clock_and_data");
-            for (const auto op : sameFamily) graph.setOpSemanticIds(op, std::array{family});
-            const auto separate = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "plain_transform");
-            graph.setOpSemanticIds(graph.valueDef(invertedData), std::array{separate});
         }
         const auto source = json(fixture.design);
         for (const std::string cost : {"legacy", "bytes"}) for (const bool clone : {false, true}) {

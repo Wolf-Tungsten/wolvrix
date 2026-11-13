@@ -3,7 +3,7 @@
 namespace {
 using namespace firrtl_test;
 void annotations() {
-    auto result = read(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "effects/annotations.fir");
+    auto result = read(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "effects/annotations.fir", false);
     require(result.success(), diagnostics(result));
     run(*result.design, std::make_unique<tx::GrhVerifyPass>());
     auto restored = roundTrip(*result.design); auto& graph = *restored.findGraph("top");
@@ -16,11 +16,11 @@ void annotations() {
     valid(restored);
     const auto path = artifact("firrtl-fixtures") / "annotations-unknown.fir";
     std::ofstream(path) << "FIRRTL version 6.0.0\ncircuit top :%[[{\"class\":\"unknown.Init\",\"target\":\"~|top\"}]]\n  public module top :\n";
-    result = read(path);
+    result = read(path, false);
     require(!result.success() && diagnostics(result).find("unsupported FIRRTL annotation class") != std::string::npos, "unknown observable annotation accepted");
     const auto reject = [&](std::string_view json, std::string_view message) {
         std::ofstream(path) << "FIRRTL version 6.0.0\ncircuit top :%[[\n  " << json << "\n]]\n  public module top :\n    skip\n";
-        auto result = read(path);
+        auto result = read(path, false);
         require(!result.success() && !result.design && diagnostics(result).find(message) != std::string::npos, diagnostics(result));
         const auto& location = result.diagnostics.front().location;
         require(location && location->line == 3 && location->sourceLine.find("class") != std::string::npos,
@@ -44,7 +44,7 @@ circuit top :%[[
     connect y, packet.data
 )FIR";
     std::ofstream(path) << zeroWidth;
-    result = read(path); require(result.success(), diagnostics(result));
+    result = read(path, false); require(result.success(), diagnostics(result));
     restored = roundTrip(*result.design);
     auto& zeroGraph = *restored.findGraph("top");
     require(zeroGraph.declaredSymbols().empty() && !zeroGraph.findValue("packet__DOT__mask") && !zeroGraph.findValue("empty"),
@@ -55,7 +55,7 @@ circuit top :%[[
     auto missing = zeroWidth;
     missing.replace(missing.find("packet.mask"), std::string("packet.mask").size(), "packet.missing");
     std::ofstream(path) << missing;
-    result = read(path);
+    result = read(path, false);
     require(!result.success() && diagnostics(result).find("DontTouch target cannot be resolved") != std::string::npos,
         "zero-width target handling accepted an unknown field");
 
@@ -75,7 +75,7 @@ circuit top :%[[
     connect packet.bytes[0], UInt<8>(1)
     connect packet.bytes[1], UInt<8>(2)
 )FIR";
-    result = read(path); require(result.success(), diagnostics(result));
+    result = read(path, false); require(result.success(), diagnostics(result));
     restored = roundTrip(*result.design);
     run(restored, std::make_unique<tx::SimplifyPass>());
     const auto& stateGraph = *restored.findGraph("top");
@@ -94,7 +94,7 @@ circuit top :%[[
     cmem storage : {tag : UInt<3>, bytes : UInt<8>[2]}[4]
     cmem storageExtra : UInt<8>[4]
 )FIR";
-    result = read(path); require(result.success(), diagnostics(result));
+    result = read(path, false); require(result.success(), diagnostics(result));
     restored = roundTrip(*result.design);
     auto& memoryGraph = *restored.findGraph("top");
     require(memoryGraph.declaredSymbols().size() == 2,
@@ -110,7 +110,7 @@ circuit top :%[[
     valid(restored);
 }
 void probes(const std::filesystem::path& output) {
-    auto result = text("probe-aggregate", R"FIR(    input en : UInt<1>
+    auto result = unannotatedText("probe-aggregate", R"FIR(    input en : UInt<1>
     input a : {x : UInt<8>, y : UInt<4>[2]}
     output exposed : Probe<{x : UInt<8>, y : UInt<4>[2]}>
     output indexed : Probe<UInt<8>>[2]
@@ -171,6 +171,7 @@ circuit top :
     for (const bool enabled : {false, true}) {
         ingest::IngestRequest request;
         request.sources.push_back({ingest::SourceLanguage::Firrtl, path, "fixture"});
+        request.firrtl.nodeAnnotations = false;
         if (enabled) request.firrtl.enabledLayers = {"Verification.Assert"};
         auto result = ingest::readSources(request); require(result.success(), diagnostics(result));
         run(*result.design, std::make_unique<tx::GrhVerifyPass>()); valid(*result.design);
@@ -190,6 +191,7 @@ int main(){std::ostringstream s;auto* old=std::cout.rdbuf(s.rdbuf());GrhSIM_top 
         ingest::IngestRequest request;
         request.sources.push_back({ingest::SourceLanguage::Firrtl, path, "fixture"});
         request.firrtl.enabledLayers = std::move(enabled);
+        request.firrtl.nodeAnnotations = false;
         auto result = ingest::readSources(request);
         if (message.empty()) {
             require(result.success(), diagnostics(result)); valid(*result.design);
@@ -208,7 +210,7 @@ int main(){std::ostringstream s;auto* old=std::cout.rdbuf(s.rdbuf());GrhSIM_top 
     check("wrong-nesting", "    layerblock B :\n      skip\n", {"A.B"}, "incorrectly nested");
 }
 void ordered(const std::filesystem::path& output) {
-    auto result = read(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "effects/ordered.fir");
+    auto result = read(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "effects/ordered.fir", false);
     require(result.success(), diagnostics(result));
     run(*result.design, std::make_unique<tx::GrhVerifyPass>()); valid(*result.design);
     auto restored = roundTrip(*result.design); valid(restored);
@@ -261,7 +263,7 @@ void sourceLines() {
 void terminal(const std::filesystem::path& output, std::string_view name, std::string_view command, int code, std::string_view stderrText) {
     std::string body = "    input clk : Clock\n    input en : UInt<1>\n    input data : UInt<8>\n    printf(clk, en, \"before\\n\")\n    ";
     body += command; body += "\n    printf(clk, en, \"after\\n\")\n";
-    auto result = text(name, body); require(result.success(), diagnostics(result));
+    auto result = unannotatedText(name, body); require(result.success(), diagnostics(result));
     run(*result.design, std::make_unique<tx::GrhVerifyPass>()); valid(*result.design);
     const auto path = output / name;
     generate(*result.design, path, R"CPP(#include "model/grhsim_top.hpp"
@@ -293,7 +295,7 @@ void test() {
     error("external-binding", "    inst impl of External\n", "unknown module");
     const auto externalPath = artifact("firrtl-fixtures") / "effect-external.fir";
     std::ofstream(externalPath) << "FIRRTL version 6.0.0\ncircuit top :\n  extmodule External :\n    defname = Impl\n  public module top :\n    inst impl of External\n";
-    auto external = read(externalPath);
+    auto external = read(externalPath, false);
     require(!external.success() && !external.design && diagnostics(external).find("external implementation binding for 'External'") != std::string::npos,
             "missing external implementation did not produce a binding request");
     require(external.modules.size() == 2 && external.modules.front().external && external.modules.front().implementationName == "Impl",

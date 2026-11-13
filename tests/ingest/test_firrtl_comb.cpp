@@ -94,8 +94,9 @@ circuit main :
     ingest::IngestRequest request; request.sources.push_back({ingest::SourceLanguage::Firrtl,path,{}});
     auto main=ingest::readSources(request);
     require(main.success() && main.design->findGraph("main") && !main.design->findGraph("helper"),"default top ignored circuit name");
-    const auto inspection=node::inspect(*main.design->findGraph("main"));
-    require(node::parseKey(inspection.nodes.at(0).key).sourceUnit=="selection.fir","implicit source identity depends on absolute checkout path");
+    const auto* selectedTree = main.design->findGraph("main")->semanticTree();
+    require(selectedTree && selectedTree->sourceUnit() == "selection.fir",
+            "implicit source identity depends on absolute checkout path");
     request.tops={"helper","main"}; auto both=ingest::readSources(request);
     require(both.success() && both.design->graphs().size()==2,"explicit FIRRTL top selection did not lower both modules");
     request.tops={"main","state"}; auto hierarchy=ingest::readSources(request);
@@ -125,7 +126,9 @@ void sourceInfoOwnership() {
             const auto kind = graph.opKind(op);
             if (kind != OperationKind::kAnd && kind != OperationKind::kOr && kind != OperationKind::kAdd) continue;
             const auto loc = graph.opSrcLoc(op);
-            require(loc && (loc->line == 7 || loc->line == 8), "nested expression source line lost");
+            require(loc && (loc->line == 7 || loc->line == 8),
+                    "nested expression source line lost: " + std::string(grh::toString(kind)) +
+                    " line=" + (loc ? std::to_string(loc->line) : "<missing>"));
             const auto& expected = loc->line == 7 ? first : second;
             require(loc->note == expected, "nested expression source info borrowed temporary storage");
             for (const auto value : graph.opResults(op)) {
@@ -137,7 +140,11 @@ void sourceInfoOwnership() {
         require(checked == 6, "source info fixture did not exercise nested expressions on both lines");
     };
     check(*result.design->findGraph("top"));
-    auto stored = roundTrip(*result.design);
+    wolvrix::lib::store::StoreOptions options;
+    options.emitSourceLocations = true;
+    const auto serialized = wolvrix::lib::store::StoreJson().storeToString(*result.design, options);
+    require(serialized.has_value(), "source info checkpoint store failed");
+    auto stored = grh::Design::fromJsonString(*serialized);
     check(*stored.findGraph("top"));
 }
 void symbolLookupSemantics() {
@@ -272,7 +279,14 @@ void test() {
     require(graph.valueWidth(graph.findValue("selected")) == 6, "inferred wire width lost FIRRTL add carry");
     for (const auto value : graph.values()) require(graph.valueDomain(value) == grh::LogicDomain::FourState, "FIRRTL silently projected to TwoState");
     auto inspection = node::inspect(graph); require(inspection.errors.empty(), inspection.report(graph));
-    require(inspection.nodes.size() == 6, "node leaves or aliases lost before simplify");
+    require(graph.semanticTree(), "FIRRTL node annotations have no SemanticTree");
+    for (const std::string_view name : {"n0", "n1", "repeated", "alias", "constant", "result"}) {
+        const auto value = graph.findValue(name);
+        const auto ids = graph.valueSemanticIds(value);
+        require(ids.size() == 1 && graph.semanticTree()->path(ids.front()) ==
+                std::vector<std::string>({"top", std::string(name)}),
+                "named computation or alias lost its leaf Node before simplify");
+    }
     require(count(graph, OperationKind::kAnd) == 4, "node expressions copied or prematurely shared");
     bool sourceInfo = false;
     for (const auto op : graph.operations()) if (auto loc = graph.opSrcLoc(op); loc && loc->note.find("comb.scala") != std::string::npos) sourceInfo = true;
@@ -284,16 +298,20 @@ void test() {
         require(oracle.output("local", inputs) == 2*(a&b), "node internal expression semantics differ");
     }
     run(source, std::make_unique<tx::GrhVerifyPass>());
-    run(source, std::make_unique<tx::SimplifyPass>());
-    valid(source); require(count(graph, OperationKind::kAnd) == 1, "node hints blocked ordinary cross-source CSE");
-    auto stored = roundTrip(source); valid(stored); run(stored, std::make_unique<tx::GrhVerifyPass>());
+    auto checkpoint = roundTrip(source); valid(checkpoint);
+    // F28 covers ingest through flatten. Exercise later optimization/emission
+    // with the explicit ingest opt-out until those passes maintain Node evolution.
     auto unannotated = design(path, false);
-    require(node::inspect(*unannotated.findGraph("top")).nodes.empty(), "disabled node annotations still present");
+    require(!unannotated.findGraph("top")->semanticTree(), "disabled node annotations still present");
+    run(unannotated, std::make_unique<tx::SimplifyPass>());
+    valid(unannotated); require(count(*unannotated.findGraph("top"), OperationKind::kAnd) == 1,
+                              "ordinary cross-source CSE changed");
+    auto stored = roundTrip(unannotated); valid(stored); run(stored, std::make_unique<tx::GrhVerifyPass>());
     const auto output = artifact("firrtl-comb");
     generate(stored, output, basicDriver);
-    auto aggregate = design(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR)/"comb/aggregate.fir");
+    auto aggregate = design(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR)/"comb/aggregate.fir", false);
     generate(aggregate, output/"aggregate", aggregateDriver);
-    auto signedArithmetic = design(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR)/"comb/signed.fir");
+    auto signedArithmetic = design(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR)/"comb/signed.fir", false);
     generate(signedArithmetic, output/"signed", signedDriver);
     std::ofstream(output/"run.mk", std::ios::app) << "\n.PHONY: aggregate signed\nrun: aggregate signed\naggregate signed:\n\t$(MAKE) -C $@ -f run.mk run\n";
 }

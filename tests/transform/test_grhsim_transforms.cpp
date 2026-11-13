@@ -221,9 +221,8 @@ void testGenerateGroupMembershipIndex() {
 }
 
 void testF22Passes() {
-    // ExprOpt must carry source identities while rewriting an internal
-    // same-arm mux.  GSIM leaves dead rows for the explicit DCE stage, so the
-    // operation remains as an assignment until that stage is requested.
+    // ExprOpt rewrites an internal same-arm mux. GSIM leaves dead rows for the
+    // explicit DCE stage, so the operation remains an assignment until then.
     {
         Builder b;
         const auto input = b.input("input", 8);
@@ -232,23 +231,15 @@ void testF22Passes() {
         const auto muxOp = b.graph.valueDef(mux);
         const auto view = b.compute(OperationKind::kAssign, b.type(8), {mux});
         b.output("out", view);
-        auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
-        const auto semantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "muxNode");
-        b.graph.setOpSemanticIds(muxOp, std::array{semantic});
-        b.graph.setValueSemanticIds(mux, std::array{semantic});
         require(run(b.design, std::make_unique<sim::ExprOptPass>()), "F22 ExprOpt failed");
         require(std::find(b.graph.operations().begin(), b.graph.operations().end(), muxOp) != b.graph.operations().end() &&
                     b.graph.opKind(muxOp) == OperationKind::kAssign,
                 "F22 ExprOpt did not rewrite the same-arm mux without hidden DCE");
-        require(std::find(b.graph.valueSemanticIds(base).begin(), b.graph.valueSemanticIds(base).end(), semantic) !=
-                    b.graph.valueSemanticIds(base).end(),
-                "F22 ExprOpt dropped the surviving SemanticTree identity");
     }
 
     // GSIM compares complete expression subtrees, rather than only the
     // ValueId at each mux arm.  Two independently-built but equivalent
-    // subtrees must therefore collapse to one arm while carrying the mux
-    // source identity to the surviving value.
+    // subtrees must therefore collapse to one arm.
     {
         Builder b;
         const auto input = b.input("input", 8), select = b.input("select");
@@ -259,23 +250,10 @@ void testF22Passes() {
         const auto muxOp = b.graph.valueDef(mux);
         const auto view = b.compute(OperationKind::kAssign, b.type(8), {mux});
         b.output("out", view);
-        auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
-        const auto semantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "structuralMux");
-        const auto rightSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "structuralMuxCopy");
-        b.graph.setOpSemanticIds(muxOp, std::array{semantic});
-        b.graph.setValueSemanticIds(mux, std::array{semantic});
-        b.graph.setOpSemanticIds(b.graph.valueDef(right), std::array{rightSemantic});
-        b.graph.setValueSemanticIds(right, std::array{rightSemantic});
         require(run(b.design, std::make_unique<sim::ExprOptPass>()), "F22 structural ExprOpt failed");
         require(std::find(b.graph.operations().begin(), b.graph.operations().end(), muxOp) !=
                     b.graph.operations().end() && b.graph.opKind(muxOp) == OperationKind::kAssign,
                 "F22 ExprOpt did not rewrite a structurally redundant mux without hidden DCE");
-        require(std::find(b.graph.valueSemanticIds(left).begin(), b.graph.valueSemanticIds(left).end(), semantic) !=
-                    b.graph.valueSemanticIds(left).end(),
-                "F22 structural ExprOpt dropped the mux SemanticTree identity");
-        require(std::find(b.graph.valueSemanticIds(left).begin(), b.graph.valueSemanticIds(left).end(), rightSemantic) !=
-                    b.graph.valueSemanticIds(left).end(),
-                "F22 structural ExprOpt dropped the equivalent arm SemanticTree identity");
         require(run(b.design, std::make_unique<transform::DeadCodeElimPass>()),
                 "explicit DCE after F22 ExprOpt failed");
         require(std::find(b.graph.operations().begin(), b.graph.operations().end(), rightOp) ==
@@ -440,39 +418,28 @@ void testF24UsedBitsPreservesFourStateArithmetic() {
 }
 
 void testGrhToGrhsimSemanticTree() {
-    Builder b;
-    const auto clk = b.input("clk"), enable = b.input("enable"), data = b.input("data", 8);
-    const auto state = b.state("semantic_state", b.type(8), "8'h00");
-    const auto readValue = b.read(state);
-    b.output("out", readValue);
-    const auto write = b.write(OperationKind::kRegisterWritePort, state, {enable, data, clk});
-
-    auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
-    const auto stateSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Declaration, "semantic_state");
-    const auto writeSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "write");
-    const auto clockSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Declaration, "clk");
-    b.graph.setOpSemanticIds(state, std::array{stateSemantic});
-    b.graph.setOpSemanticIds(write, std::array{writeSemantic});
-    b.graph.setValueSemanticIds(readValue, std::array{stateSemantic});
-    b.graph.setValueSemanticIds(clk, std::array{clockSemantic});
-
-    convert(b.design);
-    bool sawEdge = false;
-    for (const auto op : b.graph.operations()) {
-        if (b.graph.opKind(op) != sim::kEdgeDetect) continue;
-        sawEdge = true;
-        const auto opIds = b.graph.opSemanticIds(op);
-        require(std::find(opIds.begin(), opIds.end(), writeSemantic) != opIds.end(),
-                "grh-to-grhsim dropped source SemanticId from edge detector");
-        require(!b.graph.opResults(op).empty(), "edge detector has no result");
-        const auto resultIds = b.graph.valueSemanticIds(b.graph.opResults(op).front());
-        require(std::find(resultIds.begin(), resultIds.end(), writeSemantic) != resultIds.end(),
-                "grh-to-grhsim dropped SemanticId from edge detector result");
-        require(std::find(opIds.begin(), opIds.end(), clockSemantic) != opIds.end() &&
-                    std::find(resultIds.begin(), resultIds.end(), clockSemantic) != resultIds.end(),
-                "grh-to-grhsim dropped clock value SemanticId while growing the semantic pool");
+    for (const std::string name : {"expr-opt", "used-bits", "split-nodes", "constant-analysis",
+            "alias-analysis", "pattern-detect", "common-expr", "grh-to-grhsim",
+            "comb-loop-elim", "split-static-array", "dead-code-elim", "simplify"}) {
+        Builder b;
+        const auto input = b.input("input", 8);
+        const auto value = b.compute(OperationKind::kNot, b.type(8), {input});
+        b.output("out", value);
+        auto &tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
+        const auto node = tree.addNode(tree.root(), "out");
+        b.graph.setOpSemanticIds(b.graph.valueDef(value), std::array{node});
+        const auto stamp = transform::DesignStamp::capture(b.graph);
+        std::string error;
+        auto pass = transform::makePass(name, {}, error);
+        require(bool(pass), "missing pass factory: " + name);
+        transform::PassManager manager;
+        manager.addPass(std::move(pass));
+        transform::PassDiagnostics diagnostics;
+        const auto result = manager.run(b.design, diagnostics);
+        require(!result.success && !result.changed && diagnostics.hasError() && stamp.matches(b.graph) &&
+                diagnostics.messages().front().message.find("F28 SemanticTree") != std::string::npos,
+                "unmigrated pass ran on F28 Nodes: " + name);
     }
-    require(sawEdge, "grh-to-grhsim did not synthesize an edge detector");
 
     // A plain SV-style graph has no SemanticTree. Conversion must keep that
     // representation valid and must not invent source identities.
@@ -625,10 +592,6 @@ void testF23AliasAnalysis() {
     const auto consumer = b.compute(OperationKind::kNot, b.type(8), {full}, "consumer");
     b.output("out", consumer);
     const auto aliasOp = b.graph.valueDef(alias), fullOp = b.graph.valueDef(full);
-    auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
-    const auto aliasSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "aliasNode");
-    b.graph.setOpSemanticIds(aliasOp, std::array{aliasSemantic});
-    b.graph.setValueSemanticIds(alias, std::array{aliasSemantic});
     require(run(b.design, std::make_unique<transform::AliasAnalysisPass>()),
             "F23 AliasAnalysis failed");
     require(std::find(b.graph.operations().begin(), b.graph.operations().end(), aliasOp) !=
@@ -638,9 +601,6 @@ void testF23AliasAnalysis() {
             "F23 AliasAnalysis performed hidden DCE");
     require(b.graph.opOperands(b.graph.valueDef(consumer))[0] == input,
             "F23 AliasAnalysis did not redirect identity views");
-    require(std::find(b.graph.valueSemanticIds(input).begin(), b.graph.valueSemanticIds(input).end(), aliasSemantic) !=
-                b.graph.valueSemanticIds(input).end(),
-            "F23 AliasAnalysis dropped the surviving SemanticTree identity");
     require(run(b.design, std::make_unique<transform::DeadCodeElimPass>(), nullptr, false),
             "explicit DCE after F23 AliasAnalysis failed");
     require(std::find(b.graph.operations().begin(), b.graph.operations().end(), aliasOp) ==
@@ -667,33 +627,6 @@ void testF23ConstantAnalysis() {
         const auto folded = slang::SVInt::fromString(sim::attribute<std::string>(b.graph, op, "constValue").value());
         require(folded.as<uint64_t>() == std::optional<uint64_t>(7),
                 "F23 pure expression produced the wrong literal");
-    }
-
-    // Folding keeps the producer identity, and also carries source node
-    // identities from constant operands that the later explicit DCE may
-    // reclaim.
-    {
-        Builder b;
-        const auto lhs = b.constant(8, "8'h03"), rhs = b.constant(8, "8'h04");
-        const auto sum = b.compute(OperationKind::kAdd, b.type(8), {lhs, rhs}, "semantic_sum");
-        b.output("sum", sum);
-        auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
-        const auto lhsSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "lhs");
-        const auto rhsSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "rhs");
-        const auto sumSemantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression, "sum");
-        b.graph.setValueSemanticIds(lhs, std::array{lhsSemantic});
-        b.graph.setOpSemanticIds(b.graph.valueDef(lhs), std::array{lhsSemantic});
-        b.graph.setValueSemanticIds(rhs, std::array{rhsSemantic});
-        b.graph.setOpSemanticIds(b.graph.valueDef(rhs), std::array{rhsSemantic});
-        b.graph.setValueSemanticIds(sum, std::array{sumSemantic});
-        b.graph.setOpSemanticIds(b.graph.valueDef(sum), std::array{sumSemantic});
-        require(run(b.design, std::make_unique<transform::ConstantAnalysisPass>()),
-                "F23 semantic constant analysis failed");
-        const auto semantics = b.graph.valueSemanticIds(sum);
-        require(std::find(semantics.begin(), semantics.end(), lhsSemantic) != semantics.end() &&
-                    std::find(semantics.begin(), semantics.end(), rhsSemantic) != semantics.end() &&
-                    std::find(semantics.begin(), semantics.end(), sumSemantic) != semantics.end(),
-                "F23 constant analysis dropped folded source SemanticTree identities");
     }
 
     // Pure system functions are still represented by the ordinary GRH kind
@@ -859,17 +792,10 @@ void testConstantAnalysisTopology() {
 void testF23CommonExpr() {
     Builder b;
     const auto input = b.input("input", 8);
-    auto& tree = b.graph.getOrCreateSemanticTree("unit.fir", "Circuit", "top");
-    std::vector<grh::SemanticId> semantics;
     std::vector<grh::OperationId> duplicateOps;
     for (int i = 0; i < 5; ++i) {
         const auto value = b.compute(OperationKind::kNot, b.type(8), {input}, "common" + std::to_string(i));
         duplicateOps.push_back(b.graph.valueDef(value));
-        const auto semantic = tree.addNode(tree.root(), grh::SemanticNodeKind::Expression,
-                                           "common" + std::to_string(i));
-        semantics.push_back(semantic);
-        b.graph.setOpSemanticIds(duplicateOps.back(), std::array{semantic});
-        b.graph.setValueSemanticIds(value, std::array{semantic});
         b.graph.setAttr(duplicateOps.back(), "originModules", std::vector<std::string>{"origin" + std::to_string(i)});
         if (i == 4) b.graph.addDeclaredSymbol(b.graph.operationSymbol(duplicateOps.back()));
         b.output("out" + std::to_string(i), b.compute(OperationKind::kAssign, b.type(8), {value}));
@@ -887,13 +813,6 @@ void testF23CommonExpr() {
         if (!b.graph.valueUsers(b.graph.opResults(op)[0]).empty()) ++liveNot;
     require(liveNot == 1, "F23 CommonExpr did not redirect duplicate users");
     const auto representative = duplicateOps.front();
-    for (const auto semantic : semantics) {
-        const auto opIds = b.graph.opSemanticIds(representative);
-        const auto valueIds = b.graph.valueSemanticIds(b.graph.opResults(representative)[0]);
-        require(std::find(opIds.begin(), opIds.end(), semantic) != opIds.end() &&
-                    std::find(valueIds.begin(), valueIds.end(), semantic) != valueIds.end(),
-                "F23 CommonExpr dropped a merged operation/value SemanticId");
-    }
     require(transform::getOriginModules(b.graph, representative).value_or(std::vector<std::string>{}).size() == 5,
             "F23 CommonExpr dropped merged origins");
     require(run(b.design, std::make_unique<transform::DeadCodeElimPass>(), nullptr, false),

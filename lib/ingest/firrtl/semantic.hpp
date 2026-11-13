@@ -186,6 +186,11 @@ struct Effect {
     StmtId statement = 0;
     int guard = 1;
 };
+struct WhenPredicate {
+    ExprId expression = 0;
+    Range range;
+    int guard = 0;
+};
 struct Instance {
     std::string name;
     std::string target;
@@ -234,6 +239,9 @@ public:
     std::unordered_map<std::string, std::pair<std::string, std::size_t>,
                        SemanticNameHash, SemanticNameEqual> memoryPorts;
     std::vector<Effect> effects;
+    // Source occurrences remain distinct even when Boolean normalization
+    // shares their predicates or eliminates the controlled statements.
+    std::vector<WhenPredicate> whenPredicates;
     std::vector<Instance> instances;
     std::unordered_set<StmtId> activeStatements;
     bool layerEnabled(std::string_view path) const;

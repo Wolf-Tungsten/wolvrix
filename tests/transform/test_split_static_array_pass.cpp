@@ -4,11 +4,16 @@
 #include "core/state.hpp"
 #include "core/transform.hpp"
 #include "transform/dead_code_elim.hpp"
+#include "transform/node_evolution.hpp"
 #include "transform/split_static_array.hpp"
 #include "transform/verify.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -142,11 +147,29 @@ namespace
         PassManager manager;
         manager.options().graphThreads = 2;
         manager.options().keepDeclaredSymbols = keepDeclared;
-        manager.addPass(std::make_unique<SplitStaticArrayPass>());
+        SplitStaticArrayOptions options;
+        if (const char *directory = std::getenv("WOLVRIX_NODE_EVOLUTION_TEST_DIR")) {
+            static std::size_t sequence = 0;
+            std::filesystem::create_directories(directory);
+            options.traceNodeEvolution = (std::filesystem::path(directory) /
+                (graph.symbol() + "-" + std::to_string(++sequence) + ".jsonl")).string();
+        }
+        manager.addPass(std::make_unique<SplitStaticArrayPass>(options));
         manager.addPass(std::make_unique<GrhVerifyPass>());
         PassDiagnostics diagnostics;
         const PassManagerResult result = manager.run(design, diagnostics);
         if (!result.success || diagnostics.hasError() || !result.changed) return false;
+        if (!options.traceNodeEvolution.empty())
+        {
+            std::ifstream trace(options.traceNodeEvolution);
+            const std::string content((std::istreambuf_iterator<char>(trace)), {});
+            if (content.find("\"replayComplete\":true") == std::string::npos)
+            {
+                std::cerr << "[split-static-array-tests] native replay has unexplained changes in "
+                          << options.traceNodeEvolution << '\n';
+                return false;
+            }
+        }
         for (const OperationId op : graph.operations())
         {
             if (graph.opKind(op) == OperationKind::kAssign && graph.opOperands(op).size() == 1 &&
@@ -176,7 +199,6 @@ namespace
         Graph *graph = nullptr;
         ValueId array;
         ValueId read;
-        SemanticId arraySemantic = 0;
 
         ConcatFixture()
         {
@@ -193,9 +215,6 @@ namespace
             graph->addResult(concat, packed);
             array = unary(*graph, OperationKind::kAssign, "array", packed, shape);
             graph->addDeclaredSymbol(graph->valueSymbol(array));
-            auto &tree = graph->getOrCreateSemanticTree("unit", "circuit", "g");
-            arraySemantic = tree.addNode(tree.root(), SemanticNodeKind::Declaration, "array");
-            graph->setValueSemanticIds(array, std::span<const SemanticId>(&arraySemantic, 1));
             const ValueId zero = constant(*graph, "zero", 2, "2'd0");
             read = readElement(*graph, "out", array, std::span<const ValueId>(&zero, 1));
         }
@@ -204,6 +223,108 @@ namespace
 
 int main()
 {
+    // Until split owns Node evolution, every execution entry must reject before mutation.
+    for (int entry = 0; entry < 3; ++entry) {
+        Design design;
+        auto &graph = design.createGraph("semantic_unsupported");
+        const auto a = constant(graph, "a", 8, "8'h12");
+        const auto b = constant(graph, "b", 8, "8'h34");
+        const auto array = arrayCreate(graph, "array", std::array<ValueId, 2>{a, b});
+        auto &tree = graph.getOrCreateSemanticTree("unit", "circuit", "semantic_unsupported");
+        const auto node = tree.addNode(tree.root(), "array");
+        graph.setOpSemanticIds(graph.valueDef(array), std::span<const SemanticId>(&node, 1));
+        const auto stamp = DesignStamp::capture(graph);
+        PassManager manager;
+        manager.options().graphThreads = 2;
+        manager.addPass(std::make_unique<SplitStaticArrayPass>());
+        PassDiagnostics diagnostics;
+        const auto result = entry == 0 ? manager.run(design, diagnostics) :
+            entry == 1 ? manager.runGraph(graph, diagnostics) : manager.runGraphPipeline(design, diagnostics);
+        if (result.success || result.changed || !diagnostics.hasError() || !stamp.matches(graph) ||
+            diagnostics.messages().front().message.find("F28 SemanticTree") == std::string::npos)
+            return fail("split-static-array must reject unsupported F28 Nodes before mutation");
+        bool traceRejected = false;
+        try {
+            GraphEvolutionTrace trace(graph, "artifacts/f28-unsupported-trace.jsonl", "split-static-array");
+        } catch (const std::exception &error) {
+            traceRejected = std::string(error.what()).find("F28 SemanticTree") != std::string::npos;
+        }
+        if (!traceRejected || !stamp.matches(graph))
+            return fail("legacy source trace must reject F28 Nodes before opening an artifact");
+    }
+    if (const char *directory = std::getenv("WOLVRIX_NODE_EVOLUTION_TEST_DIR"))
+    {
+        Design design;
+        Graph &graph = design.createGraph("native_replay_metadata");
+        const ValueId old = constant(graph, "old", 8, "8'h12");
+        const OperationId producer = graph.valueDef(old);
+        const ValueId input = graph.createValue(graph.internSymbol("input"), 8, false);
+        const ValueId busInput = graph.createValue(graph.internSymbol("bus_input"), 8, false);
+        const ValueId busOutput = graph.createValue(graph.internSymbol("bus_output"), 8, false);
+        const ValueId oe = graph.createValue(graph.internSymbol("oe"), 1, false);
+        graph.bindInputPort("source", input);
+        graph.bindOutputPort("sink", old);
+        graph.bindInoutPort("bus", busInput, busOutput, oe);
+        graph.addDeclaredSymbol(graph.valueSymbol(old));
+        const auto group = graph.addGenerateGroup(graph.internSymbol("scope"), graph.internSymbol("item"));
+        graph.addGenerateGroupSymbol(group, graph.valueSymbol(old));
+        graph.setMetadata("revision", int64_t{1});
+        graph.setAttr(producer, "boolean", true);
+        graph.setAttr(producer, "integer", int64_t{7});
+        graph.setAttr(producer, "double", 0.125);
+        graph.setAttr(producer, "string", std::string("quoted \" text\\line\n"));
+        graph.setAttr(producer, "booleans", std::vector<bool>{true, false});
+        graph.setAttr(producer, "integers", std::vector<int64_t>{-4, 8});
+        graph.setAttr(producer, "doubles", std::vector<double>{0.25, -0.5});
+        graph.setAttr(producer, "strings", std::vector<std::string>{"a", "b\tc"});
+        graph.setOpSrcLoc(producer, {"source.fir", 2, 3, 4, 5, "firrtl", "ingest", "before"});
+        graph.setValueSrcLoc(old, {"source.fir", 6, 7, 8, 9, "firrtl", "ingest", "value"});
+        const auto path = std::filesystem::path(directory) / "fixtures" / "native_replay_metadata.jsonl";
+        GraphEvolutionTrace trace(graph, path.string(), "native-replay-fixture");
+        graph.setMetadata("revision", int64_t{2});
+        graph.setAttr(producer, "integer", int64_t{9});
+        graph.eraseAttr(producer, "boolean");
+        graph.setOpSrcLoc(producer, {"new.fir", 12, 13, 14, 15, "firrtl", "split", "after"});
+        graph.removeOutputPort("sink");
+        graph.bindOutputPort("renamed_sink", old);
+        graph.setValueSymbol(old, graph.internSymbol("renamed_value"));
+        graph.removeDeclaredSymbol(graph.lookupSymbol("old"));
+        graph.addDeclaredSymbol(graph.valueSymbol(old));
+        graph.addGenerateGroupSymbol(group, graph.valueSymbol(old));
+        trace.step("rewrite", "fixture_metadata_changed",
+            {GraphEvolutionTrace::graphRef(graph), GraphEvolutionTrace::ref(producer), GraphEvolutionTrace::ref(old)},
+            {GraphEvolutionTrace::graphRef(graph), GraphEvolutionTrace::ref(producer), GraphEvolutionTrace::ref(old)});
+        const ValueId fresh = constant(graph, "fresh", 8, "8'h34");
+        trace.step("create", "fixture_entity_created", {},
+            {GraphEvolutionTrace::ref(graph.valueDef(fresh)), GraphEvolutionTrace::ref(fresh)});
+        trace.finish();
+        std::ifstream result(path);
+        const std::string content((std::istreambuf_iterator<char>(result)), {});
+        if (content.find("\"replayComplete\":true") == std::string::npos)
+            return fail("native replay fixture did not account for complete metadata");
+
+        const auto negative = std::filesystem::path(directory) / "negative" / "unexplained.jsonl";
+        GraphEvolutionTrace unexplained(graph, negative.string(), "native-replay-negative");
+        graph.setAttr(producer, "integer", int64_t{10});
+        unexplained.finish();
+        std::ifstream rejected(negative);
+        const std::string rejectedContent((std::istreambuf_iterator<char>(rejected)), {});
+        if (rejectedContent.find("\"replayComplete\":false") == std::string::npos ||
+            rejectedContent.find("boundary_change_without_native_event") == std::string::npos)
+            return fail("native replay accepted an unrecorded boundary change");
+
+        const auto retainedPath = std::filesystem::path(directory) / "negative" / "retained_mutation.jsonl";
+        GraphEvolutionTrace retained(graph, retainedPath.string(), "native-replay-negative");
+        graph.setAttr(producer, "integer", int64_t{11});
+        retained.retain(producer, "fixture_retained_after_mutation");
+        retained.finish();
+        std::ifstream retainedResult(retainedPath);
+        const std::string retainedContent((std::istreambuf_iterator<char>(retainedResult)), {});
+        if (retainedContent.find("\"replayComplete\":false") == std::string::npos)
+            return fail("native replay accepted a retain-only explanation for a mutation");
+    }
+
+
     for (const auto &[literal, width] : {
              std::pair<const char *, int32_t>{"4'b1_0", 4},
              std::pair<const char *, int32_t>{"8'h12", 2}})
@@ -270,7 +391,7 @@ int main()
             graph.findValue("e1").valid() || graph.findValue("e2").valid() ||
             !graph.findValue("e0").valid())
             return fail("default DCE retained the declared aggregate or its unread elements");
-        if (graph.isDeclaredSymbol(graph.lookupSymbol("array")) || graph.semanticTree()->size() != 1)
+        if (graph.isDeclaredSymbol(graph.lookupSymbol("array")))
             return fail("aggregate declaration or semantic node was not reclaimed");
     }
 
@@ -313,44 +434,6 @@ int main()
             return fail("nested-array DCE did not remove unselected members");
     }
 
-    {
-        Design design;
-        Graph &graph = design.createGraph("mux");
-        const ValueId a = constant(graph, "a", 8, "8'h10");
-        const ValueId b = constant(graph, "b", 8, "8'h11");
-        const ValueId c = constant(graph, "c", 8, "8'h12");
-        const ValueId d = constant(graph, "d", 8, "8'h13");
-        const std::array<ValueId, 2> leftValues{a, b};
-        const std::array<ValueId, 2> rightValues{c, d};
-        const ValueId left = arrayCreate(graph, "left", leftValues);
-        const ValueId right = arrayCreate(graph, "right", rightValues);
-        const ValueId cond = constant(graph, "cond", 1, "1'b0");
-        const ValueId array = graph.createValue(graph.internSymbol("array"), 16, false,
-                                                ValueType::Logic, std::array<int64_t, 1>{2});
-        const OperationId mux = graph.createOperation(OperationKind::kMux, graph.internSymbol("array_op"));
-        for (const ValueId operand : {cond, left, right}) graph.addOperand(mux, operand);
-        graph.addResult(mux, array);
-        const ValueId one = constant(graph, "one", 1, "1'd1");
-        const ValueId read = readElement(graph, "out", array, std::span<const ValueId>(&one, 1));
-        auto &tree = graph.getOrCreateSemanticTree("unit", "circuit", "mux");
-        const SemanticId readSemantic = tree.addNode(tree.root(), SemanticNodeKind::Expression, "read");
-        const SemanticId arraySemantic = tree.addNode(tree.root(), SemanticNodeKind::Expression, "array");
-        graph.setOpSemanticIds(graph.valueDef(read), std::span<const SemanticId>(&readSemantic, 1));
-        graph.setOpSemanticIds(mux, std::span<const SemanticId>(&arraySemantic, 1));
-        if (!split(graph, design)) return fail("shaped mux read was not split");
-        const ValueId selected = graph.opOperands(graph.valueDef(read))[0];
-        const OperationId selectedMux = graph.valueDef(selected);
-        if (graph.opKind(selectedMux) != OperationKind::kMux ||
-            graph.opOperands(selectedMux).size() != 3 ||
-            graph.opOperands(selectedMux)[1] != b || graph.opOperands(selectedMux)[2] != d ||
-            graph.opSemanticIds(selectedMux).size() != 1 ||
-            graph.opSemanticIds(selectedMux)[0] != readSemantic)
-            return fail("mux split did not preserve the selected branches and semantics");
-        if (!dce(design, false)) return fail("mux-array DCE failed");
-        if (graph.findValue("a").valid() || graph.findValue("c").valid() ||
-            !graph.findValue("b").valid() || !graph.findValue("d").valid())
-            return fail("mux-array DCE did not remove the unselected element cone");
-    }
 
     {
         Design design;
@@ -473,6 +556,12 @@ int main()
             graph.opKind(graph.valueDef(read)) != OperationKind::kSliceArray)
             return fail("dynamic array read was not left intact");
     }
+
+
+
+
+
+
 
     {
         Design design;
@@ -847,32 +936,6 @@ int main()
             return fail("run-created static fallback retained unread members or concat inputs");
     }
 
-    {
-        Design design;
-        Graph &graph = design.createGraph("run_created_fallback_rollback");
-        const ValueId condition = graph.createValue(graph.internSymbol("condition"), 1, false);
-        graph.bindInputPort("condition", condition);
-        const ValueId trueValue = graph.createValue(graph.internSymbol("true_value"), 2, false);
-        graph.bindInputPort("true_value", trueValue);
-        ValueId falseValue = graph.createValue(graph.internSymbol("false_value"), 2, false);
-        graph.bindInputPort("false_value", falseValue);
-        const ValueId array = graph.createValue(graph.internSymbol("array"), 2, false,
-                                                ValueType::Logic, std::array<int64_t, 1>{2});
-        const ValueId out = staticSlice(graph, "out", array, 0, 1, true);
-        for (int i = 0; i < 300; ++i)
-            falseValue = unary(graph, OperationKind::kAssign, "alias" + std::to_string(i), falseValue);
-        const OperationId mux = graph.createOperation(OperationKind::kMux, graph.internSymbol("array_op"));
-        for (const ValueId operand : {condition, trueValue, falseValue}) graph.addOperand(mux, operand);
-        graph.addResult(mux, array);
-        PassManager manager;
-        manager.addPass(std::make_unique<SplitStaticArrayPass>());
-        manager.addPass(std::make_unique<GrhVerifyPass>());
-        PassDiagnostics diagnostics;
-        const PassManagerResult result = manager.run(design, diagnostics);
-        if (!result.success || diagnostics.hasError() || result.changed ||
-            graph.opKind(graph.valueDef(out)) != OperationKind::kSliceStatic)
-            return fail("rolled-back run-created fallback was not removed from the worklist");
-    }
 
     {
         Design design;

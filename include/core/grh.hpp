@@ -299,6 +299,33 @@ struct OperationId {
     friend constexpr bool operator!=(OperationId lhs, OperationId rhs) noexcept { return !(lhs == rhs); }
 };
 
+// Exact source endpoints, independent of the many-to-many semantic owner lists.
+enum class SemanticBindingRole : uint8_t {
+    Value, Predicate, RegisterCurrent, RegisterNext, Clock, Reset, MemoryReadAddress,
+    MemoryStorage, Effect,
+};
+std::string_view toString(SemanticBindingRole role) noexcept;
+std::optional<SemanticBindingRole> parseSemanticBindingRole(std::string_view text) noexcept;
+
+struct SemanticBinding {
+    SemanticId semantic = 0;
+    SemanticBindingRole role = SemanticBindingRole::Value;
+    // Empty for an empty source or for operation-only storage/effect roles.
+    ValueId value;
+    // A writer/read operation context; register-next is one guarded update.
+    OperationId operation;
+    // Empty means the whole source; otherwise one index per source axis,
+    // with -1 retaining an unselected or dynamically selected axis.
+    std::vector<int64_t> projection;
+    std::vector<int64_t> shape;
+    // Number of field components preceding each source array axis.
+    std::vector<int64_t> shapeFieldDepths;
+    // Element type, independent of the physical value's packed total width.
+    int32_t sourceWidth = -1;
+    bool sourceSigned = false;
+    friend bool operator==(const SemanticBinding&, const SemanticBinding&) = default;
+};
+
 struct ValueIdHash {
     std::size_t operator()(const ValueId& id) const noexcept
     {
@@ -1202,6 +1229,28 @@ public:
     Graph(Graph&&) = delete;
     Graph& operator=(Graph&&) = delete;
 
+    class MutationCheckpoint {
+    public:
+        ~MutationCheckpoint() noexcept;
+        MutationCheckpoint(const MutationCheckpoint&) = delete;
+        MutationCheckpoint& operator=(const MutationCheckpoint&) = delete;
+        MutationCheckpoint(MutationCheckpoint&&) noexcept;
+        MutationCheckpoint& operator=(MutationCheckpoint&&) = delete;
+        void commit() noexcept;
+
+    private:
+        friend class Graph;
+        MutationCheckpoint(Graph& graph, bool enabled);
+        Graph* graph_ = nullptr;
+        std::unique_ptr<Graph> original_;
+    };
+
+    // Copy the current graph before mutation; destruction restores its exact
+    // preimage unless committed. Entity IDs, holes and this Graph's address
+    // survive either outcome. The graph must outlive the checkpoint; changes
+    // to other graphs or the Design catalog are outside this transaction.
+    [[nodiscard]] MutationCheckpoint checkpointMutation(bool enabled = true);
+
     const std::string& symbol() const noexcept { return symbol_; }
     const GraphId& id() const noexcept { return graphId_; }
     Design& owner() const noexcept { return *owner_; }
@@ -1287,9 +1336,27 @@ public:
     const SemanticTree* semanticTree() const noexcept { return semanticTree_ ? &*semanticTree_ : nullptr; }
     SemanticTree& getOrCreateSemanticTree(std::string sourceUnit, std::string circuit,
                                           std::string module);
-    SemanticId appendSemanticTree(const Graph& source, SemanticId parent,
-                                  std::string_view rootName);
+    SemanticTreeAppendResult appendSemanticTree(const Graph& source, SemanticPathId parent,
+                                               std::string_view rootName);
     SemanticTreePruneStats pruneSemanticTree();
+    std::vector<OperationId> semanticNodeOperations(SemanticId id) const;
+    std::vector<ValueId> semanticNodeAnchors(SemanticId id) const;
+    std::vector<std::string> validateSemanticTree() const;
+    // Source endpoints, distinct from implementation owner SemanticIds.
+    std::span<const SemanticBinding> semanticBindings() const noexcept { return semanticBindings_; }
+    void addSemanticBinding(SemanticBinding binding);
+    // Replace one writer's endpoint rows after a committed rewrite. Validation
+    // precedes removal so a rejected replacement leaves the original rows intact.
+    void replaceSemanticBindingsForOperation(OperationId operation,
+                                             std::span<const SemanticBinding> bindings);
+    void remapSemanticBindingsFrom(const Graph& source,
+                                   std::span<const ValueId> sourceValues,
+                                   std::span<const ValueId> targetValues,
+                                   std::span<const OperationId> sourceOps,
+                                   std::span<const OperationId> targetOps,
+                                   std::span<const SemanticId> nodeMap);
+    void remapSemanticBindingValues(std::span<const ValueId> sourceValues,
+                                    std::span<const ValueId> targetValues);
 
     std::span<const OperationId> operations() const;
     std::span<const ValueId> values() const;
@@ -1451,11 +1518,11 @@ public:
     std::size_t remapValueBlockSemantics(const Graph& source,
                                          std::span<const ValueId> sourceValues,
                                          std::span<const ValueId> targetValues,
-                                         SemanticId copiedRoot);
+                                         std::span<const SemanticId> nodeMap);
     std::size_t remapOperationBlockSemantics(const Graph& source,
                                              std::span<const OperationId> sourceOps,
                                              std::span<const OperationId> targetOps,
-                                             SemanticId copiedRoot);
+                                             std::span<const SemanticId> nodeMap);
     // Offsets have ops.size()+1 entries, begin at zero, and terminate at the
     // corresponding flat edge count. Results acquire their definitions now;
     // reverse uses must be rebuilt before querying or mutating imported edges.
@@ -1511,6 +1578,14 @@ private:
     void copyOpSrcLoc(OperationId op, const Graph& source, OperationId sourceOp,
                       SrcLocImportContext* context);
     void cloneContentsTo(Graph& destination) const;
+    void copyMutableContentsTo(Graph& destination) const;
+    void swapMutableContents(Graph& other) noexcept;
+    void redirectSemanticBindings(ValueId from, ValueId to);
+    void indexSemanticBindings();
+    void eraseSemanticBinding(std::size_t index);
+    void eraseSemanticBindings(ValueId value);
+    void eraseSemanticBindings(OperationId operation);
+    void validateSemanticBinding(const SemanticBinding& binding) const;
     void removeSymbolFromGenerateGroups(SymbolId sym) noexcept;
     // Alias replacement requires the complete value type to be identical.
     void guardShapeAlias(ValueId from, ValueId to, std::string_view api);
@@ -1525,6 +1600,10 @@ private:
     GraphSymbolTable symbols_;
     std::shared_ptr<GraphStore> store_;
     std::optional<SemanticTree> semanticTree_;
+    std::vector<SemanticBinding> semanticBindings_;
+    std::unordered_map<uint32_t, std::vector<std::size_t>> semanticBindingValues_;
+    std::unordered_map<uint32_t, std::vector<std::size_t>> semanticBindingOps_;
+    bool semanticBindingIndexValid_ = false;
     bool compacted_ = true;
     uint64_t srcLocEpoch_ = 0;
     uint64_t mutationEpoch_ = 0;

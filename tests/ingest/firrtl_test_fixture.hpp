@@ -35,10 +35,17 @@ inline grh::Design design(const std::filesystem::path& path, bool annotations = 
     require(result.success(), diagnostics(result)); return std::move(*result.design);
 }
 inline ingest::IngestResult text(std::string_view name, std::string_view body,
-                                ingest::FirrtlInvalidPolicy policy = ingest::FirrtlInvalidPolicy::Zero) {
+                                ingest::FirrtlInvalidPolicy policy = ingest::FirrtlInvalidPolicy::Zero,
+                                bool annotations = true) {
     const auto path = artifact("firrtl-fixtures") / (std::string(name) + ".fir");
     std::ofstream(path) << "FIRRTL version 6.0.0\ncircuit top :\n  public module top :\n" << body;
-    return read(path, true, policy);
+    return read(path, annotations, policy);
+}
+// Execution/optimization tests explicitly opt out until later passes implement
+// the F28 Node lifecycle. Semantic coverage is exercised with annotations on.
+inline ingest::IngestResult unannotatedText(std::string_view name, std::string_view body,
+                                ingest::FirrtlInvalidPolicy policy = ingest::FirrtlInvalidPolicy::Zero) {
+    return text(name, body, policy, false);
 }
 inline void error(std::string_view name, std::string_view body, std::string_view message, uint64_t line = 0) {
     auto result = text(name, body);

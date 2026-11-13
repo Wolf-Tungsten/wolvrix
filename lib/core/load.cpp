@@ -1076,67 +1076,74 @@ namespace wolvrix::lib::load
         {
             if (graph.semanticTree()) throw std::runtime_error("Graph SemanticTree is already initialized");
             const auto &object = json.asObject("graph.semanticTree");
-            const auto sourceUnit = object.find("sourceUnit");
-            const auto circuit = object.find("circuit");
-            const auto nodes = object.find("nodes");
-            if (sourceUnit == object.end() || circuit == object.end() || nodes == object.end())
-                throw std::runtime_error("SemanticTree missing sourceUnit/circuit/nodes");
-            const auto &nodeArray = nodes->second.asArray("semanticTree.nodes");
-            if (nodeArray.size() == 0) throw std::runtime_error("SemanticTree has no root node");
-            std::size_t id = 0;
-            for (const auto &entry : nodeArray)
-            {
-                ++id;
+            for (const auto &[key, ignored] : object) {
+                (void)ignored;
+                if (key != "sourceUnit" && key != "circuit" && key != "rootPath" &&
+                    key != "namesFlattened" && key != "paths" && key != "nodes")
+                    throw std::runtime_error("Unknown SemanticTree v5 field: " + key);
+            }
+            const auto parseId = [](const JsonValue &entry, std::string_view context, bool allowZero = false) {
+                const int64_t value = entry.asInt(context);
+                if (value < (allowZero ? 0 : 1) || static_cast<uint64_t>(value) > std::numeric_limits<uint32_t>::max())
+                    throw std::runtime_error(std::string(context) + ": invalid uint32 ID");
+                return static_cast<uint32_t>(value);
+            };
+            const auto root = parseId(object.at("rootPath"), "semanticTree.rootPath");
+            if (root != 1) throw std::runtime_error("SemanticTree rootPath must be 1");
+            struct PathRecord {
+                uint32_t parent;
+                std::string name;
+                std::vector<uint32_t> children;
+            };
+            std::unordered_map<uint32_t, PathRecord> paths;
+            for (const auto &entry : object.at("paths").asArray("semanticTree.paths")) {
+                const auto &path = entry.asObject("semanticTree.paths[]");
+                for (const auto &[key, ignored] : path) {
+                    (void)ignored;
+                    if (key != "id" && key != "parent" && key != "name")
+                        throw std::runtime_error("Unknown SemanticTree path field: " + key);
+                }
+                const auto id = parseId(path.at("id"), "semanticTree.path.id");
+                const auto parent = parseId(path.at("parent"), "semanticTree.path.parent", true);
+                if (!paths.emplace(id, PathRecord{parent, path.at("name").asString("semanticTree.path.name"), {}}).second)
+                    throw std::runtime_error("Duplicate SemanticTree Path ID");
+            }
+            const auto rootRecord = paths.find(root);
+            if (rootRecord == paths.end() || rootRecord->second.parent != 0)
+                throw std::runtime_error("SemanticTree root must be a parentless Path");
+            graph.getOrCreateSemanticTree(object.at("sourceUnit").asString("semanticTree.sourceUnit"),
+                                          object.at("circuit").asString("semanticTree.circuit"),
+                                          rootRecord->second.name);
+            for (const auto &[id, path] : paths) {
+                if (id == root) continue;
+                const auto parent = paths.find(path.parent);
+                if (parent == paths.end()) throw std::runtime_error("SemanticTree Path has unknown parent");
+                parent->second.children.push_back(id);
+            }
+            std::vector<uint32_t> pending{root};
+            for (std::size_t index = 0; index < pending.size(); ++index) {
+                const auto id = pending[index];
+                const auto &path = paths.at(id);
+                if (id != root) graph.semanticTree()->importPath(id, path.parent, path.name);
+                pending.insert(pending.end(), path.children.begin(), path.children.end());
+            }
+            if (pending.size() != paths.size()) throw std::runtime_error("SemanticTree Path cycle");
+            for (const auto &entry : object.at("nodes").asArray("semanticTree.nodes")) {
                 const auto &node = entry.asObject("semanticTree.nodes[]");
-                const auto parent = node.find("parent");
-                const auto kind = node.find("kind");
-                const auto name = node.find("name");
-                if (parent == node.end() || kind == node.end() || name == node.end())
-                    throw std::runtime_error("SemanticTree node missing parent/kind/name");
-                const int64_t parentId = parent->second.asInt("semanticTree.node.parent");
-                const auto nodeKind = wolvrix::lib::grh::parseSemanticNodeKind(
-                    kind->second.asString("semanticTree.node.kind"));
-                if (!nodeKind) throw std::runtime_error("Unknown SemanticTree node kind");
-                const auto &nodeName = name->second.asString("semanticTree.node.name");
-                const auto indexField = node.find("index");
-                int64_t nodeIndex = -1;
-                if (*nodeKind == wolvrix::lib::grh::SemanticNodeKind::Element)
-                {
-                    if (indexField == node.end()) throw std::runtime_error("SemanticTree element missing index");
-                    nodeIndex = indexField->second.asInt("semanticTree.node.index");
+                for (const auto &[key, ignored] : node) {
+                    (void)ignored;
+                    if (key != "id" && key != "parent" && key != "name" && key != "ops" && key != "anchors")
+                        throw std::runtime_error("Unknown SemanticTree Node field: " + key);
                 }
-                else if (indexField != node.end())
-                {
-                    throw std::runtime_error("SemanticTree non-element must not have index");
-                }
-                if (id == 1)
-                {
-                    if (parentId != 0 || *nodeKind != wolvrix::lib::grh::SemanticNodeKind::Module)
-                        throw std::runtime_error("SemanticTree root must be a parentless module");
-                    graph.getOrCreateSemanticTree(sourceUnit->second.asString("semanticTree.sourceUnit"),
-                                                  circuit->second.asString("semanticTree.circuit"), nodeName);
-                    continue;
-                }
-                if (parentId <= 0 || static_cast<uint64_t>(parentId) >= id)
-                    throw std::runtime_error("SemanticTree parent must precede its child");
-                graph.semanticTree()->addNode(static_cast<wolvrix::lib::grh::SemanticId>(parentId),
-                                              *nodeKind, nodeName, nodeIndex);
+                const auto id = parseId(node.at("id"), "semanticTree.node.id");
+                const auto parent = parseId(node.at("parent"), "semanticTree.node.parent");
+                if (graph.semanticTree()->contains(id)) throw std::runtime_error("Duplicate SemanticTree Node ID");
+                graph.semanticTree()->importNode(id, parent, node.at("name").asString("semanticTree.node.name"));
+                (void)node.at("ops").asArray("semanticTree.node.ops");
+                if (const auto anchors = node.find("anchors"); anchors != node.end())
+                    (void)anchors->second.asArray("semanticTree.node.anchors");
             }
-        }
-
-        std::vector<wolvrix::lib::grh::SemanticId> parseSemanticIds(const JsonValue &json)
-        {
-            const auto &array = json.asArray("semanticIds");
-            std::vector<wolvrix::lib::grh::SemanticId> ids;
-            ids.reserve(array.size());
-            for (const auto &entry : array)
-            {
-                const int64_t id = entry.asInt("semanticIds[]");
-                if (id <= 0 || static_cast<uint64_t>(id) > std::numeric_limits<wolvrix::lib::grh::SemanticId>::max())
-                    throw std::runtime_error("SemanticId is outside the positive uint32 range");
-                ids.push_back(static_cast<wolvrix::lib::grh::SemanticId>(id));
-            }
-            return ids;
+            graph.semanticTree()->setNamesFlattened(object.at("namesFlattened").asBool("semanticTree.namesFlattened"));
         }
 
     } // namespace
@@ -1167,8 +1174,8 @@ namespace wolvrix::lib::load
         }
         const auto &rootObj = root.asObject("design");
         const auto formatVersion = rootObj.find("formatVersion");
-        if (formatVersion == rootObj.end() || formatVersion->second.asInt("design.formatVersion") != 4)
-            throw std::runtime_error("Unsupported GRH JSON; expected formatVersion 4; regenerate the checkpoint");
+        if (formatVersion == rootObj.end() || formatVersion->second.asInt("design.formatVersion") != 5)
+            throw std::runtime_error("Unsupported GRH JSON; expected formatVersion 5; regenerate the checkpoint from source");
 
         Design design;
         auto graphsIt = rootObj.find("graphs");
@@ -1202,7 +1209,9 @@ namespace wolvrix::lib::load
             }
             const auto &graphObj = graphValue.asObject("graph");
             if (graphObj.find("formatVersion") != graphObj.end())
-                throw std::runtime_error("Graph formatVersion is not part of GRH JSON v4");
+                throw std::runtime_error("Graph formatVersion is not part of GRH JSON v5");
+            if (graphObj.contains("semanticBindings"))
+                throw std::runtime_error("GRH JSON v5 does not accept legacy semanticBindings; regenerate from source");
             std::unordered_map<std::string, uint32_t> dialects;
             if (const auto declared = graphObj.find("dialects"); declared != graphObj.end())
             {
@@ -1215,7 +1224,7 @@ namespace wolvrix::lib::load
                 }
             }
             if (!dialects.contains("grh"))
-                throw std::runtime_error("GRH JSON v4 requires its dialect version");
+                throw std::runtime_error("GRH JSON v5 requires its dialect version");
             auto symbolIt = graphObj.find("symbol");
             if (symbolIt == graphObj.end())
             {
@@ -1350,6 +1359,7 @@ namespace wolvrix::lib::load
             std::unordered_map<uint32_t, ValueId> valueIds;
             std::unordered_map<uint32_t, OperationId> operationIds;
             std::unordered_map<OperationId, uint32_t, wolvrix::lib::grh::OperationIdHash> operationLocalIds;
+            std::vector<OperationId> semanticPortMapOperations;
             valueIds.reserve(valuesArray.size() * 2 + 1);
             operationIds.reserve(opReserve * 2 + 1);
             operationLocalIds.reserve(opReserve * 2 + 1);
@@ -1404,7 +1414,7 @@ namespace wolvrix::lib::load
                     throw std::runtime_error("Value entry missing required fields");
                 }
                 if (valueObj.find("tmp") != valueObj.end())
-                    throw std::runtime_error("GRH JSON v4 value must not contain tmp marker");
+                    throw std::runtime_error("GRH JSON v5 value must not contain tmp marker");
 
                 std::string symbol;
                 if (symIt != valueObj.end())
@@ -1424,7 +1434,7 @@ namespace wolvrix::lib::load
                     if (!parsed) throw std::runtime_error("Unknown value domain");
                     domain = *parsed;
                 }
-                else throw std::runtime_error("GRH JSON v4 value is missing domain");
+                else throw std::runtime_error("GRH JSON v5 value is missing domain");
                 wolvrix::lib::grh::ValueType valueType = wolvrix::lib::grh::ValueType::Logic;
                 if (auto typeIt = valueObj.find("type"); typeIt != valueObj.end())
                 {
@@ -1525,11 +1535,8 @@ namespace wolvrix::lib::load
                         ++valuesLocCount;
                     }
                 }
-                if (const auto semantics = valueObj.find("semanticIds"); semantics != valueObj.end())
-                {
-                    const auto ids = parseSemanticIds(semantics->second);
-                    graph.setValueSemanticIds(valueId, ids);
-                }
+                if (valueObj.contains("semanticIds"))
+                    throw std::runtime_error("GRH JSON v5 stores memberships in semanticTree Nodes, not value semanticIds");
                 ++valuesCount;
                 if (progressStep > 0 && (valuesCount % progressStep) == 0)
                 {
@@ -1850,7 +1857,7 @@ namespace wolvrix::lib::load
                     const auto idIt = opObj.find("id");
                     if (idIt == opObj.end()) throw std::runtime_error("Operation entry missing id");
                     if (opObj.find("tmp") != opObj.end())
-                        throw std::runtime_error("GRH JSON v4 operation must not contain tmp marker");
+                        throw std::runtime_error("GRH JSON v5 operation must not contain tmp marker");
 
                     std::string opSymbol;
                     if (symIt != opObj.end())
@@ -1946,11 +1953,8 @@ namespace wolvrix::lib::load
                         opsOutputsMs += toMillis(now - opOutputsStart);
                     }
 
-                    if (const auto semantics = opObj.find("semanticIds"); semantics != opObj.end())
-                    {
-                        const auto ids = parseSemanticIds(semantics->second);
-                        graph.setOpSemanticIds(opId, ids);
-                    }
+                    if (opObj.contains("semanticIds"))
+                        throw std::runtime_error("GRH JSON v5 stores memberships in semanticTree Nodes, not operation semanticIds");
 
                     if (auto attrsIt = opObj.find("attrs"); attrsIt != opObj.end())
                     {
@@ -1960,6 +1964,8 @@ namespace wolvrix::lib::load
                             opAttrsStart = TimingClock::now();
                         }
                         const auto &attrsObj = attrsIt->second.asObject("operation.attrs");
+                        if (attrsObj.contains("semanticPortNames") || attrsObj.contains("semanticPortNodes"))
+                            semanticPortMapOperations.push_back(opId);
                         graph.reserveOpAttrCapacity(opId, attrsObj.size());
                         for (const auto &[attrName, attrValue] : attrsObj)
                         {
@@ -2003,7 +2009,103 @@ namespace wolvrix::lib::load
                 }
             }
 
-            // v4 keeps def/use lists as redundant, checkable topology facts.
+            if (const auto tree = graphObj.find("semanticTree"); tree != graphObj.end()) {
+                struct Membership {
+                    wolvrix::lib::grh::SemanticId node;
+                    uint32_t next;
+                };
+                std::vector<uint32_t> operationHeads(opsCount + 1), valueHeads(valuesCount + 1);
+                std::vector<Membership> memberships(1);
+                const auto append = [&](auto &heads, uint32_t index, wolvrix::lib::grh::SemanticId node) {
+                    if (memberships.size() >= std::numeric_limits<uint32_t>::max())
+                        throw std::runtime_error("Too many SemanticTree memberships");
+                    if (index >= heads.size()) heads.resize(static_cast<std::size_t>(index) + 1);
+                    memberships.push_back({node, heads[index]});
+                    heads[index] = static_cast<uint32_t>(memberships.size() - 1);
+                };
+                for (const auto &entry : tree->second.asObject("semanticTree").at("nodes").asArray("semanticTree.nodes")) {
+                    const auto &node = entry.asObject("semanticTree.nodes[]");
+                    const auto id = parseLocalId(node.at("id"), "semanticTree.node.id");
+                    std::unordered_set<uint32_t> seenOps;
+                    for (const auto &member : node.at("ops").asArray("semanticTree.node.ops")) {
+                        const auto local = parseLocalId(member, "semanticTree.node.ops[]");
+                        if (!seenOps.insert(local).second) throw std::runtime_error("Duplicate SemanticTree Node operation");
+                        const auto op = parseOperationRef(member, "semanticTree.node.ops[]");
+                        append(operationHeads, op.index, id);
+                    }
+                    if (const auto anchors = node.find("anchors"); anchors != node.end()) {
+                        std::unordered_set<uint32_t> seenValues;
+                        for (const auto &anchor : anchors->second.asArray("semanticTree.node.anchors")) {
+                            const auto local = parseLocalId(anchor, "semanticTree.node.anchors[]");
+                            if (!seenValues.insert(local).second) throw std::runtime_error("Duplicate SemanticTree Node anchor");
+                            const auto value = parseValueRef(anchor, "semanticTree.node.anchors[]");
+                            append(valueHeads, value.index, id);
+                        }
+                    }
+                }
+                // A shared op can belong to many Nodes. Publish each complete
+                // reverse row once, instead of repeatedly copying its prefix.
+                std::vector<wolvrix::lib::grh::SemanticId> ids;
+                const auto collect = [&](const auto &heads, uint32_t index) {
+                    ids.clear();
+                    for (auto member = index < heads.size() ? heads[index] : 0; member; member = memberships[member].next)
+                        ids.push_back(memberships[member].node);
+                    std::sort(ids.begin(), ids.end());
+                };
+                for (const auto op : graph.operations()) {
+                    collect(operationHeads, op.index);
+                    if (!ids.empty()) graph.setOpSemanticIds(op, ids);
+                }
+                for (const auto value : graph.values()) {
+                    collect(valueHeads, value.index);
+                    if (!ids.empty()) graph.setValueSemanticIds(value, ids);
+                }
+                const auto errors = graph.validateSemanticTree();
+                if (!errors.empty()) throw std::runtime_error("Invalid SemanticTree: " + errors.front());
+            }
+
+            const auto validatePortMap = [&](const std::optional<AttributeValue> &names,
+                                             const std::optional<AttributeValue> &nodes,
+                                             std::string_view context, OperationId instance = {}) {
+                if (!names && !nodes) return;
+                const std::string label(context);
+                if (!names || !nodes) throw std::runtime_error(label + ": missing names or Nodes");
+                const auto *portNames = std::get_if<std::vector<std::string>>(&*names);
+                const auto *portNodes = std::get_if<std::vector<int64_t>>(&*nodes);
+                if (!portNames || !portNodes || portNames->size() != portNodes->size())
+                    throw std::runtime_error(label + ": expected equally sized string[] and int[]");
+                const auto *tree = graph.semanticTree();
+                if (!tree) throw std::runtime_error(label + ": no SemanticTree");
+                std::unordered_set<std::string_view> seen;
+                std::unordered_set<wolvrix::lib::grh::SemanticId> owners;
+                if (instance) {
+                    const auto kind = graph.opKind(instance);
+                    if (kind != OperationKind::kInstance && kind != OperationKind::kBlackbox)
+                        throw std::runtime_error(label + ": port map belongs to a non-instance/blackbox operation");
+                    const auto ids = graph.opSemanticIds(instance);
+                    owners.insert(ids.begin(), ids.end());
+                }
+                for (std::size_t i = 0; i < portNames->size(); ++i) {
+                    const auto &name = (*portNames)[i];
+                    if (name.empty() || !seen.insert(name).second)
+                        throw std::runtime_error(label + ": empty or duplicate port name");
+                    const auto id = (*portNodes)[i];
+                    if (id <= 0 || static_cast<uint64_t>(id) > std::numeric_limits<wolvrix::lib::grh::SemanticId>::max() ||
+                        !tree->contains(static_cast<wolvrix::lib::grh::SemanticId>(id)))
+                        throw std::runtime_error(label + ": invalid Node ID");
+                    if (instance && !owners.contains(static_cast<wolvrix::lib::grh::SemanticId>(id)))
+                        throw std::runtime_error(label + ": Node is not an instance operation member");
+                }
+            };
+            validatePortMap(graph.metadata("firrtl.semanticPortNames"), graph.metadata("firrtl.semanticPortNodes"),
+                            "graph formal semantic port map");
+            for (const auto op : semanticPortMapOperations) {
+                const auto operation = graph.getOperation(op);
+                validatePortMap(operation.attr("semanticPortNames"), operation.attr("semanticPortNodes"),
+                                "instance actual semantic port map", op);
+            }
+
+            // v5 keeps def/use lists as redundant, checkable topology facts.
             // Operation edges are authoritative for rebuilding the graph.
             {
                 for (const auto &valueEntry : valuesArray)

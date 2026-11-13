@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wolvrix::lib::transform
@@ -236,6 +237,92 @@ namespace wolvrix::lib::transform
         std::vector<PendingPort> pendingOutputPorts;
         std::vector<PendingPort> pendingInputPorts;
         std::unordered_map<std::string, std::unordered_map<std::string, wolvrix::lib::grh::ValueId>> inputPadCache;
+        using SemanticNodes = std::unordered_map<std::string, grh::SemanticId>;
+        using SemanticPaths = std::unordered_map<std::string, grh::SemanticPathId>;
+        std::unordered_map<grh::Graph*, SemanticNodes> semanticNodes;
+        std::unordered_map<grh::Graph*, SemanticPaths> semanticPaths;
+        std::unordered_set<grh::ValueId, grh::ValueIdHash> paddingValues;
+        const auto appendMembers = [](grh::Graph& graph, grh::OperationId operation,
+                                      std::span<const grh::SemanticId> members) {
+            const auto old = graph.opSemanticIds(operation);
+            std::vector<grh::SemanticId> ids(old.begin(), old.end());
+            ids.insert(ids.end(), members.begin(), members.end());
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            graph.setOpSemanticIds(operation, ids);
+        };
+        const auto appendPortBinding = [](std::vector<std::string>& names, std::vector<int64_t>& nodes,
+                                            const std::string& port, grh::SemanticId node) {
+            const auto found = std::find(names.begin(), names.end(), port);
+            if (found == names.end()) {
+                names.push_back(port);
+                nodes.push_back(node);
+            } else if (nodes.at(found - names.begin()) != node) {
+                throw std::logic_error("XMR semantic port binding changed Node identity");
+            }
+        };
+        const auto semanticBoundary = [&](grh::Graph& graph, const std::vector<std::string>& components,
+                                           grh::ValueId value) -> grh::SemanticId {
+            auto* tree = graph.semanticTree();
+            if (!tree) return 0;
+            auto [nodeMap, inserted] = semanticNodes.try_emplace(&graph);
+            auto& paths = semanticPaths[&graph];
+            if (inserted) {
+                for (const auto id : tree->nodeIds()) nodeMap->second.emplace(tree->qualifiedName(id), id);
+                for (const auto id : tree->pathIds()) {
+                    auto path = tree->pathComponents(id);
+                    path.erase(path.begin());
+                    paths.emplace(grh::SemanticTree::qualifiedName(path), id);
+                }
+            }
+            const auto key = grh::SemanticTree::qualifiedName(components);
+            auto [found, newNode] = nodeMap->second.try_emplace(key);
+            if (newNode) {
+                auto parent = tree->root();
+                std::vector<std::string> prefix;
+                for (std::size_t i = 0; i + 1 < components.size(); ++i) {
+                    prefix.push_back(components[i]);
+                    auto [path, newPath] = paths.try_emplace(grh::SemanticTree::qualifiedName(prefix));
+                    if (newPath) path->second = tree->addPath(parent, components[i]);
+                    parent = path->second;
+                }
+                found->second = tree->addNode(parent, components.back());
+            }
+            if (value) {
+                const auto old = graph.valueSemanticIds(value);
+                std::vector<grh::SemanticId> ids(old.begin(), old.end());
+                ids.push_back(found->second);
+                graph.setValueSemanticIds(value, ids);
+            }
+            if (components.size() == 1 && value &&
+                (graph.inputPortValue(components.front()) == value || graph.outputPortValue(components.front()) == value)) {
+                std::vector<std::string> names;
+                std::vector<int64_t> nodes;
+                if (const auto old = graph.metadata("firrtl.semanticPortNames")) names = std::get<std::vector<std::string>>(*old);
+                if (const auto old = graph.metadata("firrtl.semanticPortNodes")) nodes = std::get<std::vector<int64_t>>(*old);
+                appendPortBinding(names, nodes, components.front(), found->second);
+                graph.setMetadata("firrtl.semanticPortNames", std::move(names));
+                graph.setMetadata("firrtl.semanticPortNodes", std::move(nodes));
+            }
+            return found->second;
+        };
+        const auto instanceBoundary = [&](grh::Graph& graph, grh::OperationId instance,
+                                           const std::string& port, grh::ValueId value) {
+            if (!graph.semanticTree()) return;
+            const auto name = getAttrString(graph.getOperation(instance), "instanceName");
+            if (!name) return;
+            const auto node = semanticBoundary(graph, {*name, port}, value);
+            auto names = getAttrStrings(graph.getOperation(instance), "semanticPortNames");
+            std::vector<int64_t> nodes;
+            if (const auto old = graph.getOperation(instance).attr("semanticPortNodes"))
+                nodes = std::get<std::vector<int64_t>>(*old);
+            appendPortBinding(names, nodes, port, node);
+            graph.setAttr(instance, "semanticPortNames", std::move(names));
+            graph.setAttr(instance, "semanticPortNodes", std::move(nodes));
+            appendMembers(graph, instance, std::span<const grh::SemanticId>(&node, 1));
+            if (paddingValues.contains(value))
+                appendMembers(graph, graph.valueDef(value), std::span<const grh::SemanticId>(&node, 1));
+        };
         auto makeInternalValueSymbol = [&](wolvrix::lib::grh::Graph &graph)
         {
             return graph.makeInternalValSym();
@@ -284,6 +371,35 @@ namespace wolvrix::lib::transform
             int32_t width = 0;
             bool isSigned = false;
         };
+        std::unordered_map<grh::OperationId, std::vector<grh::SemanticId>, grh::OperationIdHash> storageNextNodes;
+        const auto storageWriteMembers = [&](grh::Graph& graph, const StorageInfo& storage,
+                                               const std::string& name) -> std::vector<grh::SemanticId> {
+            if (!graph.semanticTree()) return {};
+            const auto found = storageNextNodes.find(storage.opId);
+            if (found != storageNextNodes.end()) return found->second;
+            std::vector<grh::SemanticId> members;
+            for (const auto operation : graph.operations()) {
+                const auto kind = graph.opKind(operation);
+                if (!grh::isRegisterWritePortKind(kind) && kind != grh::OperationKind::kLatchWritePort) continue;
+                const auto symbol = getAttrString(graph.getOperation(operation),
+                    storage.kind == StorageKind::Latch ? "latchSymbol" : "regSymbol");
+                if (!symbol || *symbol != name) continue;
+                const auto ids = graph.opSemanticIds(operation);
+                members.insert(members.end(), ids.begin(), ids.end());
+            }
+            if (members.empty()) {
+                for (const auto current : graph.opSemanticIds(storage.opId)) {
+                    auto components = graph.semanticTree()->path(current);
+                    components.erase(components.begin());
+                    components.back() += "$NEXT";
+                    members.push_back(semanticBoundary(graph, components, {}));
+                }
+            }
+            std::sort(members.begin(), members.end());
+            members.erase(std::unique(members.begin(), members.end()), members.end());
+            storageNextNodes.emplace(storage.opId, members);
+            return members;
+        };
 
         auto getPadInput = [&](wolvrix::lib::grh::Graph &graph, int32_t width, bool isSigned) -> wolvrix::lib::grh::ValueId {
             const int32_t normalized = normalizeWidth(width);
@@ -304,6 +420,7 @@ namespace wolvrix::lib::transform
             graph.addResult(op, value);
             graph.setAttr(op, "constValue", std::to_string(normalized) + "'b0");
             graphCache.emplace(key, value);
+            paddingValues.insert(value);
             result.changed = true;
             return value;
         };
@@ -406,6 +523,7 @@ namespace wolvrix::lib::transform
             if (existing.valid() && existing != value)
             {
                 warning(graph, "XMR output port already bound; keeping existing binding");
+                semanticBoundary(graph, {portName}, existing);
                 return existing;
             }
             if (!existing.valid())
@@ -417,6 +535,7 @@ namespace wolvrix::lib::transform
                     *added = true;
                 }
             }
+            semanticBoundary(graph, {portName}, value);
             return value;
         };
 
@@ -433,6 +552,7 @@ namespace wolvrix::lib::transform
             wolvrix::lib::grh::ValueId existing = graph.inputPortValue(portName);
             if (existing.valid())
             {
+                semanticBoundary(graph, {portName}, existing);
                 return existing;
             }
             wolvrix::lib::grh::ValueId value = graph.findValue(portName);
@@ -453,6 +573,7 @@ namespace wolvrix::lib::transform
                 }
             }
             graph.bindInputPort(portName, value);
+            semanticBoundary(graph, {portName}, value);
             result.changed = true;
             if (added)
             {
@@ -484,6 +605,10 @@ namespace wolvrix::lib::transform
             {
                 graph.setAttr(op, "latchSymbol", std::string(storageName));
             }
+            const auto storageOwners = graph.opSemanticIds(storage.opId);
+            const std::vector<grh::SemanticId> members(storageOwners.begin(), storageOwners.end());
+            graph.setOpSemanticIds(op, members);
+            graph.setValueSemanticIds(value, members);
             result.changed = true;
             return value;
         };
@@ -503,6 +628,7 @@ namespace wolvrix::lib::transform
             {
                 if (names[i] == portName)
                 {
+                    instanceBoundary(graph, opId, portName, resultsSpan[i]);
                     return resultsSpan[i];
                 }
             }
@@ -523,6 +649,7 @@ namespace wolvrix::lib::transform
             graph.insertResult(opId, insertIndex, value);
             names.push_back(portName);
             graph.setAttr(opId, "outputPortName", names);
+            instanceBoundary(graph, opId, portName, value);
             result.changed = true;
             return value;
         };
@@ -544,6 +671,7 @@ namespace wolvrix::lib::transform
                     {
                         warning(graph, op, "XMR input port already connected; keeping existing operand");
                     }
+                    instanceBoundary(graph, opId, portName, operandsSpan[i]);
                     return operandsSpan[i];
                 }
             }
@@ -555,6 +683,7 @@ namespace wolvrix::lib::transform
             graph.insertOperand(opId, insertIndex, value);
             names.push_back(portName);
             graph.setAttr(opId, "inputPortName", names);
+            instanceBoundary(graph, opId, portName, value);
             result.changed = true;
             return value;
         };
@@ -600,6 +729,7 @@ namespace wolvrix::lib::transform
                     graph.setValueShape(replacement, value.shape());
                 }
                 graph.replaceAllUsesWithView(target, replacement);
+                graph.setValueSemanticIds(target, {});
                 result.changed = true;
                 return replacement;
             }
@@ -628,6 +758,7 @@ namespace wolvrix::lib::transform
                 graph.setValueShape(replacement, value.shape());
             }
             graph.replaceAllUsesWithView(target, replacement);
+            graph.setValueSemanticIds(target, {});
             for (const auto &name : outputNames)
             {
                 graph.bindOutputPort(name, replacement);
@@ -930,6 +1061,7 @@ namespace wolvrix::lib::transform
             current = &root;
             for (const auto &hop : hops)
             {
+                if (hop.parent == &root) appendMembers(root, hop.instOp, root.opSemanticIds(opId));
                 for (std::size_t idx = 0; idx < drivers.size(); ++idx)
                 {
                     if (!drivers[idx].valid())
@@ -976,6 +1108,8 @@ namespace wolvrix::lib::transform
                     leafGraph->setAttr(writeOp, "regSymbol", leafName);
                     leafGraph->assignWriterOrder(writeOp, leafName);
                     leafGraph->setAttr(writeOp, "eventEdge", *eventEdgesOpt);
+                    leafGraph->setOpSemanticIds(writeOp, storageWriteMembers(*leafGraph, *storage, leafName));
+                    if (leafGraph == &root) appendMembers(root, writeOp, root.opSemanticIds(opId));
                     result.changed = true;
                     return true;
                 }
@@ -991,6 +1125,8 @@ namespace wolvrix::lib::transform
                     }
                     leafGraph->setAttr(writeOp, "latchSymbol", leafName);
                     leafGraph->assignWriterOrder(writeOp, leafName);
+                    leafGraph->setOpSemanticIds(writeOp, storageWriteMembers(*leafGraph, *storage, leafName));
+                    if (leafGraph == &root) appendMembers(root, writeOp, root.opSemanticIds(opId));
                     result.changed = true;
                     return true;
                 }
@@ -1005,6 +1141,8 @@ namespace wolvrix::lib::transform
                 leafGraph->setAttr(writeOp, "regSymbol", leafName);
                 leafGraph->assignWriterOrder(writeOp, leafName);
                 leafGraph->setAttr(writeOp, "eventEdge", *eventEdgesOpt);
+                leafGraph->setOpSemanticIds(writeOp, storageWriteMembers(*leafGraph, *storage, leafName));
+                if (leafGraph == &root) appendMembers(root, writeOp, root.opSemanticIds(opId));
                 result.changed = true;
                 return true;
             }
@@ -1027,6 +1165,8 @@ namespace wolvrix::lib::transform
                          opSym, "assign_write");
             leafGraph->addOperand(assign, drivers.front());
             leafGraph->addResult(assign, *replacement);
+            leafGraph->setOpSemanticIds(assign, leafGraph->valueSemanticIds(*replacement));
+            if (leafGraph == &root) appendMembers(root, assign, root.opSemanticIds(opId));
             result.changed = true;
             return true;
         };
@@ -1097,8 +1237,14 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
+                    const auto owners = graph.opSemanticIds(opId);
+                    const auto anchors = graph.valueSemanticIds(oldResult);
+                    std::vector<grh::SemanticId> ids(anchors.begin(), anchors.end());
+                    ids.insert(ids.end(), owners.begin(), owners.end());
+                    graph.setValueSemanticIds(oldResult, ids);
                     const auto root = ingest::node::redirectRoots(graph, oldResult, *replacement);
                     const auto view = graph.replaceAllUsesWithView(oldResult, root);
+                    graph.setValueSemanticIds(oldResult, {});
                     const std::vector<wolvrix::lib::grh::Port> ports(graph.outputPorts().begin(), graph.outputPorts().end());
                     for (const auto& port : ports) if (port.value == oldResult) graph.bindOutputPort(port.name, view);
                     graph.eraseOp(opId);

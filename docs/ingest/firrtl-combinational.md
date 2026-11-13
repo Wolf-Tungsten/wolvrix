@@ -22,15 +22,16 @@ if (result.success()) {
 
 An empty top list selects each source's circuit main module. Explicit tops must
 be unique and unambiguous across sources. Syntax validation checks every module;
-behavioral lowering visits selected modules. Instances and mixed FIRRTL/SV
-binding are reserved for F07, so a selected module containing an instance fails
-with a located stage diagnostic. A multi-top failure publishes no design, even
-if an earlier top was lowered successfully.
+behavioral lowering visits selected modules and their dependencies. The shared
+driver resolves instances and mixed FIRRTL/SV implementations through indexed
+interfaces. A multi-top failure publishes no design, even if an earlier top was
+lowered successfully.
 
-Use explicit logical source units for persistent node identity. The default is
+Use explicit logical source units for stable source provenance. The default is
 the relative input path, or the basename for an absolute input path. Duplicate
 units are rejected; basename collisions need explicit distinct units. Source
-locations retain the full filename independently of the persistent node key.
+locations retain the full filename independently. Semantic Node IDs identify
+objects within their Graph; they are not source keys or GSIM numeric IDs.
 
 ## Types and operations
 
@@ -77,6 +78,13 @@ Bundle fields flatten using `__DOT__`; all Vector dimensions migrate to each
 leaf's shape in outer-to-inner order. Name collisions are errors. A Vector of
 Bundles has one node identity per Bundle leaf, irrespective of element count.
 Singleton dimensions remain explicit.
+
+With node annotations enabled, sibling field paths reuse their common
+SemanticTree Paths within the same declaration. For `{bits : {a : UInt<1>,
+b : UInt<1>}}`, `bits.a` and `bits.b` are leaf Nodes under the shared `bits`
+Path. Paths contain no operations, and Nodes have no children. Another
+declaration receives its own independent path. Arrays remain one Node per data
+leaf before a future split pass; no Node is created for each array element.
 
 ```firrtl
 input packet : { valid : UInt<1>, data : UInt<4>[2] }[3]
@@ -127,6 +135,18 @@ appropriate ground connections. Later whole connects replace earlier drivers;
 later partial connects replace only their indexed subarray. Conditional connects
 use muxes. Reads of wires and output ports observe final connectivity, regardless
 of the read's textual position.
+
+Normalized path guards share actual implementation operations across connects
+and effects. Every consuming Node includes those operations in its membership,
+including consumers added after a cache hit and consumers reached through nested
+guard dependencies. For example, `when c: connect x, a; connect y, b` gives both
+Nodes the shared guard operations. Register-update consumers are the next-state
+Nodes. Membership may overlap; the shared IR operations still execute once.
+
+`firrtl.guardSemanticPolicy="consumer-nodes-v2"` records this policy. A `when`
+occurrence does not create a separate `when@...` Node. Its internal guard
+calculation belongs to its consumers. A real FIRRTL declaration named `guard_N`
+remains an ordinary named Node.
 
 For combinational partial writes with static indices, the frontend splices the
 updated slice between the unchanged high and low slices. A conditional static
@@ -189,7 +209,7 @@ removes the apparent whole-array cycle while preserving the public array shape.
 A mutual dependency between both elements is rejected by `comb-loop-elim` with
 `fail_on_true_loop=True` before simulation conversion.
 
-## Logic domain and node metadata
+## Logic domain and SemanticTree Nodes
 
 All materialized values initially use FourState, like ordinary GRH inputs.
 `FirrtlInvalidPolicy::Unknown` is the default: invalidate, out-of-bounds reads and
@@ -198,16 +218,62 @@ division by zero yield X. The explicit `Zero` policy yields zero. The graph reco
 The existing `grh-to-grhsim` pass performs the later TwoState projection. Compare
 SV and FIRRTL simulation with a fixed, recorded invalid-value policy.
 
-Each materialized node leaf emits schema 2 members/origins on its internal
-operations and an optional root mapping on its named result's initial assign view.
-Aliases reuse their original producers. Referencing another node reuses its named
-result; it neither clones nor relabels the referenced expression. `nodeAnnotations`
-can explicitly disable these attributes. See [node-attributes.md](node-attributes.md)
-for verification and soft association semantics: ordinary simplify can share
-across nodes and SV, remove named result views and lose roots. No view is kept
-alive solely for these attrs. Whole-expression analysis consumes only provable
-remaining candidates; nonsink partitioning separately uses current member sets
-as optional hints.
+With `nodeAnnotations` enabled, normal lowering publishes one SemanticTree
+(`firrtl.semanticNodePolicy="leaf-op-members-v1"`). Internal entries are Paths;
+every named Node is a leaf containing actual GRH operation references and any
+necessary actual ValueId anchors. All Nodes use the same structure. Type, shape,
+state, event and expression semantics are read from the referenced IR. The old
+six kinds, source binding roles, projections and duplicated source-shape schema
+are not part of this model. `shapeFieldDepths` remains interface ABI information
+in `PortLeafSignature`; see [firrtl-parser.md](firrtl-parser.md).
+
+Node-to-op membership is authoritative. Graph APIs maintain its reverse op-to-Node
+index and value anchors together. Lowering registers members when it creates or
+shares operations. Before publishing a FIRRTL module, it checks every live op
+has valid Node membership and reports the concrete op if membership is missing.
+This check does not assign unowned operations to a root or module container.
+
+For `node y = mux(c, add(a,b), d)`, Node `y` owns the generated add, mux and
+necessary adaptation/result operations. Named `a`, `b`, `c` and `d` are input
+boundaries; their producers remain in their own Nodes. A named alias has its own
+Node and boundary even when it shares a value. Neither circuits nor identity
+operations are duplicated to maintain the inventory. Input Nodes may have no
+ops and use their real input value as an anchor. Zero-width leaves and empty
+arrays retain empty Nodes without fabricated executable values.
+
+A register has distinct current and next Nodes with the same structure. The
+current Node owns the state declaration and initial full-state read. The next
+Node contains every ordered writer and the operations lowering creates for its
+data, enable, indices, clock and reset expressions. Each writer retains its real
+operands, `writerOrder` and `eventEdge`, so one writer's data value is never used
+as a substitute for complete next-state behavior. A register with no writer
+has an empty-op next Node anchored to the actual current value, expressing hold.
+Names such as `r$NEXT` are producer-assigned display names; IDs and IR references
+carry identity, and generated-name collisions are resolved explicitly.
+
+Memory storage Nodes own actual storage declarations under a `$storage` path
+component. Memory port Nodes own their generated access computations. Each
+latency pipeline stage has separate current/next Nodes containing its real
+declaration, read and write operations. An effect Node named `effect@<source line>`
+owns its actual task and supporting computation. Storage and effects need no
+fabricated result value.
+
+`hier-flatten` relocates Node members and anchors with the actual op/value maps,
+then attaches every Node directly to the root Path. Names contain the escaped,
+qualified instance/field path, such as `u.packet.data`. Formal-port-to-Node maps
+published by ingest identify instance placeholders, including elided ports, so
+flatten does not duplicate parent placeholders and child port Nodes. Internal
+SV operations without a SemanticTree receive no FIRRTL membership merely because
+they implement a FIRRTL external port.
+
+JSON v5 stores explicit Path/Node IDs and actual `ops`/`anchors` references.
+Ordinary export needs no reconstruction script. `make test_f28_semantic_tree`
+checks core lifecycle, ingest, XMR, both flatten paths, empty endpoints, shared
+membership and JSON roundtrip. Later passes whose Node evolution has not been
+migrated reject annotated graphs without changing them. Functional execution
+tests explicitly ingest with `nodeAnnotations=false` when exercising those
+passes. Node correspondence alone does not establish expression, state-transition
+or event equivalence.
 
 ## Verification
 
@@ -217,6 +283,7 @@ Run through the playground Makefile:
 make test_firrtl_comb
 make test_firrtl_aggregate
 make test_firrtl_widths
+make test_f28_semantic_tree
 make test_array_create
 make test_transform_shape_mapping
 make test_grhsim_cpu_st_cpp
@@ -224,8 +291,10 @@ make test_wolvrix
 ```
 
 The FIRRTL suites compare ordinary GRH with independent arithmetic and geometric
-expectations before/after simplify and JSON reload. They also check node ownership,
-source locations, staged errors, resets, zero widths, port selection and failed-read
+expectations and JSON reload. The dedicated F28 suite checks annotated Node
+membership through ingest, XMR and flatten; execution suites explicitly opt out
+of annotations for later simplify and GrhSIM conversion. They also check source
+locations, staged errors, resets, zero widths, port selection and failed-read
 atomicity. `test_firrtl_comb` emits, compiles and executes three GrhSIM models:
 basic node/when logic, Bundle/Vector dynamic accesses and writes, and signed
 arithmetic. Generated models live in `build/artifacts/firrtl-comb`; build and test

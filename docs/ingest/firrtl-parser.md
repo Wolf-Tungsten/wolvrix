@@ -32,7 +32,7 @@ modules as described in [firrtl-combinational.md](firrtl-combinational.md),
 [firrtl-state.md](firrtl-state.md), [firrtl-memory.md](firrtl-memory.md), and
 [firrtl-effects.md](firrtl-effects.md).
 Unsupported behavioral constructs return located errors and no design. Parsing
-alone does not publish an executable design or create GRH node attributes.
+alone does not publish an executable design or create a SemanticTree.
 
 ```cpp
 #include "ingest/firrtl.hpp"
@@ -125,10 +125,10 @@ remain outer-to-inner shape dimensions. For example:
 input packet : { valid : UInt<1>, data : UInt<32>[4] }[8]
 ```
 
-| Shared leaf | fieldPath | elementWidth | shape |
-| --- | --- | ---: | --- |
-| `packet__DOT__valid` | `[packet,valid]` | 1 | `[8]` |
-| `packet__DOT__data` | `[packet,data]` | 32 | `[8,4]` |
+| Shared leaf | fieldPath | elementWidth | shape | shapeFieldDepths |
+| --- | --- | ---: | --- | --- |
+| `packet__DOT__valid` | `[packet,valid]` | 1 | `[8]` | `[1]` |
+| `packet__DOT__data` | `[packet,data]` | 32 | `[8,4]` | `[1,2]` |
 
 `fieldPath` starts with the original port name. Flattened name collisions are
 diagnosed. `sourceType`, `isConst`, and `requiresTypeResolution` retain distinctions
@@ -139,12 +139,99 @@ later resolution. A successful scan does not grant permission to bind these as
 plain SV Logic ports. The typed source index retains full nested types and layer
 colors for subsequent stages.
 
+`shapeFieldDepths` is port-layout information used by mixed-language ABI
+matching. Each entry counts the `fieldPath` components before that Vector axis,
+including the original port name. Thus `r[0].data` has depth 1 and
+`r.data[0]` has depth 2. For the table's `packet.data`, the outer Vector is after
+`packet` and the inner Vector is after `packet.data`, giving `[1,2]`. Adjacent
+Vector axes may have the same depth. These coordinates retain source layout in
+`PortLeafSignature`; they are not fields of a SemanticTree Node.
+
 Parameters distinguish quoted strings from `RawStringParameter`, and preserve
 integer values without a 64-bit truncation. Decimal parameter integers use signed
 two's-complement bits, at least 32 bits and wider when needed; integer expressions
 retain their original literal spelling and explicit FIRRTL type/width. Raw string
 parameters must remain distinct during specialization because their SV meaning
 differs from quoted strings.
+
+## SemanticTree and mixed hierarchy boundaries
+
+With `nodeAnnotations` enabled, FIRRTL lowering creates a SemanticTree containing
+internal Paths and one kind of named leaf Node. A Node contains actual GRH op
+members and necessary actual value anchors. Bundle and module/instance prefixes
+are Paths before flattening, never executable Nodes. Arrays stay one leaf per
+data field. Input and alias Nodes may have empty op sets; zero-width and empty
+array endpoints may have neither ops nor anchors. Named boundaries remain
+distinct even when their implementations share operations or values.
+
+Module metadata `firrtl.semanticPortNames` and `firrtl.semanticPortNodes` publish
+the formal-port-to-Node map. Instance attributes `semanticPortNames` and
+`semanticPortNodes` publish its actual-port-to-Node map in the parent Graph.
+Names use the shared `PortLeafSignature.name` encoding, including `__DOT__` for
+Bundle fields. The parallel arrays include elided zero-width and empty-array
+ports. Flatten uses these explicit mappings and checks real anchors for
+materialized ports; it does not infer identity from a final display name.
+
+`hier-flatten` copies Node members and anchors through the same op/value
+relocation as the circuit. It reuses mapped instance-port placeholders and
+attaches all resulting Nodes directly to the root Path, removing internal Paths.
+Each Node's name is its escaped qualified instance/field path. There is no
+Module, Declaration, Field or other Node-kind classification, and no source
+endpoint binding-role schema. Register current/next, memory storage/pipelines
+and effects use the same leaf structure; their complete behavior is carried by
+their real IR members as described in [firrtl-combinational.md](firrtl-combinational.md).
+
+An SV implementation bound to a FIRRTL external instance may have no
+SemanticTree. Its internal operations, including state and DPI operations,
+remain outside FIRRTL Node membership. Actual FIRRTL port Nodes and their
+relocated boundary values remain available, but their presence does not assign
+the SV implementation's internal computations to those Nodes. Complete op
+coverage is enforced when publishing each annotated FIRRTL module; a mixed
+flattened graph can also contain unannotated SV operations.
+
+A mixed-language ABI adapter also publishes the explicit formal-port Node map,
+including elided ports. It registers actual array offset constants, slices,
+array construction and signedness-view assignments in the corresponding port
+Node when creating each operation. These helpers carry `ingest-firrtl-abi`
+source locations; they implement the FIRRTL interface and are not classified as
+SV body operations. Only logical formal values become anchors. Physical SV
+port values and implementation computations do not acquire additional anchors
+or FIRRTL membership. The temporary implementation instance carries only
+materialized port membership, allowing elided endpoints to remain empty leaves.
+
+Flattening emits one external boundary record per such instance as graph metadata:
+
+- `firrtl.externalInstancePaths`, `Modules`, `Implementations`, and `Lines`
+  are parallel arrays containing the flattened instance path, original FIRRTL
+  external module name, original implementation module, and originating FIRRTL
+  instance line. ABI adapters preserve these identities in
+  `ingest.link.sourceModule` and `ingest.link.implementationModule`; a direct
+  implementation uses `ingest.sourceModule`, or its linked name when absent.
+- `firrtl.externalInstanceInputPorts`, `OutputPorts`, and `InoutPorts` contain
+  full flattened boundary names. Their corresponding `InputOffsets`,
+  `OutputOffsets`, and `InoutOffsets` arrays have one extra entry; instance `i`
+  owns ports in the half-open interval `[offsets[i], offsets[i+1])`.
+
+For example, paths `["cpu$gate"]`, implementations `["ClockGate"]`, input ports
+`["cpu$gate$CK", "cpu$gate$E", "cpu$gate$TE"]`, and input offsets `[0,3]`
+identify the three inputs of one external implementation. These records preserve
+source and boundary identity; they do not assert that internal SV operations are
+individually equivalent to another frontend's external-module representation.
+These external-boundary records contain no SemanticIds, so tree relocation does
+not invalidate them. They are separate from the explicit semantic port maps
+whose Node IDs are remapped when a graph is copied.
+
+When an unannotated SV top contains FIRRTL descendants, flatten creates the target
+SemanticTree on the first FIRRTL tree import. The tree takes `sourceUnit` and
+`circuit` from that first source, and uses the actual top graph name as its root.
+Intervening SV instance names contribute to the qualified name. A FIRRTL Node
+`n` below `svtop.w.f` becomes the root's direct leaf named `w.f.n`; the reversible
+`path()` query returns `["svtop", "w", "f", "n"]`. The query's tokens do not
+imply retained internal Path records. Unrelated SV operations and values acquire
+no membership from that instance prefix. JSON v5 exports the actual leaf op
+sets and anchors directly; normal ingest and flatten need no reconstruction
+script. Later passes without F28 Node-lifecycle support reject annotated input
+without changing the graph.
 
 ## Resource behavior and validation
 

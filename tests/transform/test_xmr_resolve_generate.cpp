@@ -102,6 +102,20 @@ int main()
     top.setAttr(xmrWrite, "xmrPath", std::string("gen_loop[1].acc"));
     top.setAttr(xmrWrite, "eventEdge", std::vector<std::string>{"posedge"});
 
+    auto& tree = top.getOrCreateSemanticTree("fixture", "Circuit", "top");
+    const auto signalNode = tree.addNode(tree.root(), "gen_loop$3$sig");
+    const auto stateNode = tree.addNode(tree.root(), "gen_loop$1$acc");
+    const auto readNode = tree.addNode(tree.root(), "read");
+    const auto writeNode = tree.addNode(tree.root(), "write");
+    const auto destinationNode = tree.addNode(tree.root(), "dst");
+    top.setValueSemanticIds(sigValue, std::span<const wolvrix::lib::grh::SemanticId>(&signalNode, 1));
+    top.setValueSemanticIds(readValue, std::span<const wolvrix::lib::grh::SemanticId>(&readNode, 1));
+    top.setValueSemanticIds(dstValue, std::span<const wolvrix::lib::grh::SemanticId>(&destinationNode, 1));
+    top.setOpSemanticIds(regOp, std::span<const wolvrix::lib::grh::SemanticId>(&stateNode, 1));
+    top.setOpSemanticIds(xmrRead, std::span<const wolvrix::lib::grh::SemanticId>(&readNode, 1));
+    top.setOpSemanticIds(xmrWrite, std::span<const wolvrix::lib::grh::SemanticId>(&writeNode, 1));
+    top.setOpSemanticIds(assign, std::span<const wolvrix::lib::grh::SemanticId>(&destinationNode, 1));
+
     PassManager manager;
     manager.addPass(std::make_unique<XmrResolvePass>());
     PassDiagnostics diags;
@@ -115,6 +129,15 @@ int main()
     {
         return fail("Generate-scope XMR ops were not resolved");
     }
+    if (!top.validateSemanticTree().empty()) return fail("XMR left invalid Node members or anchors");
+    const auto readAnchors = top.semanticNodeAnchors(readNode);
+    if (readAnchors.size() != 1 || readAnchors.front() != sigValue ||
+        !top.semanticNodeOperations(readNode).empty())
+        return fail("eliminated XMR read did not preserve a Node anchored to the actual source boundary");
+    const auto writes = top.semanticNodeOperations(writeNode);
+    if (writes.size() != 1 || top.opKind(writes.front()) != wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort ||
+        top.opOperands(writes.front()).size() != 4 || !top.getOperation(writes.front()).attr("writerOrder"))
+        return fail("same-graph XMR write lost its complete actual replacement operation");
 
     const wolvrix::lib::grh::Operation assignOp = top.getOperation(assign);
     if (assignOp.operands().size() != 1)

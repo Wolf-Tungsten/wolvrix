@@ -12,12 +12,14 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -264,12 +266,25 @@ namespace wolvrix::lib::transform
         {
             std::string moduleName;
             std::string instanceName;
-            wolvrix::lib::grh::SemanticId semantic = 0;
+            std::vector<wolvrix::lib::grh::SemanticId> semantics;
+            std::vector<std::string> semanticPortNames;
+            std::vector<wolvrix::lib::grh::SemanticId> semanticPortNodes;
+            int64_t firrtlLine = 0;
             std::vector<wolvrix::lib::grh::ValueId> operands;
             std::vector<wolvrix::lib::grh::ValueId> results;
             std::optional<std::vector<std::string>> inputPortNames;
             std::optional<std::vector<std::string>> outputPortNames;
             std::optional<std::vector<std::string>> inoutPortNames;
+        };
+
+        struct ExternalInstanceBindings
+        {
+            std::vector<std::string> paths;
+            std::vector<std::string> modules;
+            std::vector<std::string> implementations;
+            std::vector<int64_t> lines;
+            std::vector<int64_t> inputOffsets{0}, outputOffsets{0}, inoutOffsets{0};
+            std::vector<std::string> inputs, outputs, inouts;
         };
 
         struct GlobalInlinePlan
@@ -394,8 +409,18 @@ namespace wolvrix::lib::transform
                                std::string)> opError;
             HierFlattenOptions::SymProtectMode symProtect = HierFlattenOptions::SymProtectMode::All;
             std::vector<std::string> nodeInstancePath;
-            wolvrix::lib::grh::SemanticId currentSemanticParent = 0;
-            wolvrix::lib::grh::SemanticId currentInstanceSemantic = 0;
+            std::unordered_map<std::string, wolvrix::lib::grh::SemanticId> semanticNames;
+            ExternalInstanceBindings externalInstances;
+            struct PendingSemanticAnchor
+            {
+                std::vector<wolvrix::lib::grh::SemanticId> nodes;
+                wolvrix::lib::grh::ValueId value;
+                std::size_t valueNode = GlobalPortUnionFind::invalid;
+            };
+            std::vector<PendingSemanticAnchor> semanticAnchors;
+            std::unordered_multimap<wolvrix::lib::grh::SemanticId, wolvrix::lib::grh::ValueId> deferredAnchorValues;
+            std::vector<wolvrix::lib::grh::OperationId> semanticBridges;
+            std::vector<std::pair<wolvrix::lib::grh::OperationId, std::vector<int64_t>>> semanticPortAttributes;
             bool profile = false;
             std::size_t numThreads = 1;
             GlobalInlinePlan plan;
@@ -914,6 +939,9 @@ namespace wolvrix::lib::transform
                                  wolvrix::lib::grh::Graph &target,
                                  const std::string &prefix,
                                  DenseValueMap valueMap,
+                                 std::span<const wolvrix::lib::grh::SemanticId> instanceSemantics,
+                                 const std::unordered_map<wolvrix::lib::grh::SemanticId,
+                                                          wolvrix::lib::grh::SemanticId>& portNodeMap,
                                  InlineState &state);
 
         wolvrix::lib::grh::ValueId mapInputPortType(wolvrix::lib::grh::Graph &target,
@@ -952,8 +980,7 @@ namespace wolvrix::lib::transform
             target.reserveOpResultCapacity(assign, 1);
             target.addOperand(assign, targetValue);
             target.addResult(assign, view);
-            const auto semantics = target.valueSemanticIds(targetValue);
-            if (!semantics.empty()) target.setOpSemanticIds(assign, semantics);
+            state.semanticBridges.push_back(assign);
             views.emplace_back(expected, view);
             state.changed = true;
             return view;
@@ -999,8 +1026,7 @@ namespace wolvrix::lib::transform
                 target.reserveOpResultCapacity(assign, 1);
                 target.addOperand(assign, found);
                 target.addResult(assign, targetValue);
-                const auto semantics = target.valueSemanticIds(targetValue);
-                if (!semantics.empty()) target.setOpSemanticIds(assign, semantics);
+                state.semanticBridges.push_back(assign);
                 target.setOpSrcLoc(assign, makeTransformSrcLoc("hier-flatten", "output-view"));
                 state.changed = true;
             }
@@ -1074,9 +1100,11 @@ namespace wolvrix::lib::transform
             }
 
             std::string baseName = !info.instanceName.empty() ? info.instanceName : info.moduleName;
-            std::string component = normalizeComponent(baseName);
+            const std::string normalizedBase = normalizeComponent(baseName);
+            std::string component = normalizedBase;
             component = uniqueInstanceComponent(state, prefix, component);
             const std::string childPrefix = makeHierName(prefix, component);
+            const std::string semanticComponent = baseName + component.substr(normalizedBase.size());
 
             auto mapValue = [&](wolvrix::lib::grh::ValueId src) -> std::optional<wolvrix::lib::grh::ValueId> {
                 const auto mapped = valueMap.get(src);
@@ -1302,12 +1330,71 @@ namespace wolvrix::lib::transform
                 return false;
             }
 
-            const auto previousInstanceSemantic = state.currentInstanceSemantic;
-            if (info.semantic) state.currentInstanceSemantic = info.semantic;
-            state.nodeInstancePath.push_back(component);
-            const bool success = inlineGraphContents(*child, target, childPrefix, std::move(childPortMap), state);
+            bool externalAdapter = false;
+            if (const auto linkedKind = child->metadata("ingest.link.kind"))
+                if (const auto kind = std::get_if<std::string>(&*linkedKind)) externalAdapter = *kind == "adapter";
+            if (!info.semantics.empty() && info.firrtlLine > 0 && (!child->semanticTree() || externalAdapter))
+            {
+                // Record the actual FIRRTL/SV boundary. An unannotated SV
+                // implementation does not become a FIRRTL port's computation;
+                // an annotated ABI adapter still denotes that same boundary.
+                auto& bindings = state.externalInstances;
+                bindings.paths.push_back(childPrefix);
+                std::string sourceModule = info.moduleName;
+                if (const auto original = child->metadata("ingest.link.sourceModule"))
+                    if (const auto name = std::get_if<std::string>(&*original)) sourceModule = *name;
+                bindings.modules.push_back(std::move(sourceModule));
+                std::string implementation = info.moduleName;
+                if (const auto sourceModule = child->metadata("ingest.sourceModule"))
+                    if (const auto name = std::get_if<std::string>(&*sourceModule)) implementation = *name;
+                if (const auto linked = child->metadata("ingest.link.implementationModule"))
+                    if (const auto name = std::get_if<std::string>(&*linked)) implementation = *name;
+                bindings.implementations.push_back(std::move(implementation));
+                bindings.lines.push_back(info.firrtlLine);
+                for (const auto& port : child->inputPorts())
+                    bindings.inputs.push_back(makeHierName(childPrefix, port.name));
+                for (const auto& port : child->outputPorts())
+                    bindings.outputs.push_back(makeHierName(childPrefix, port.name));
+                for (const auto& port : child->inoutPorts())
+                    bindings.inouts.push_back(makeHierName(childPrefix, port.name));
+                bindings.inputOffsets.push_back(static_cast<int64_t>(bindings.inputs.size()));
+                bindings.outputOffsets.push_back(static_cast<int64_t>(bindings.outputs.size()));
+                bindings.inoutOffsets.push_back(static_cast<int64_t>(bindings.inouts.size()));
+            }
+            std::unordered_map<wolvrix::lib::grh::SemanticId, wolvrix::lib::grh::SemanticId> portNodeMap;
+            if (child->semanticTree() && !info.semanticPortNames.empty())
+            {
+                const auto formalNames = child->metadata("firrtl.semanticPortNames");
+                const auto formalNodes = child->metadata("firrtl.semanticPortNodes");
+                if (!formalNames || !formalNodes)
+                    throw std::invalid_argument("Flatten semantic instance port map has no module declaration");
+                const auto* names = std::get_if<std::vector<std::string>>(&*formalNames);
+                const auto* nodes = std::get_if<std::vector<int64_t>>(&*formalNodes);
+                if (!names || !nodes || names->size() != nodes->size() ||
+                    info.semanticPortNames.size() != info.semanticPortNodes.size())
+                    throw std::invalid_argument("Flatten semantic port map sizes differ");
+                std::unordered_map<std::string_view, wolvrix::lib::grh::SemanticId> formals;
+                for (std::size_t i = 0; i < names->size(); ++i)
+                {
+                    if ((*nodes)[i] <= 0 || static_cast<uint64_t>((*nodes)[i]) >
+                        std::numeric_limits<wolvrix::lib::grh::SemanticId>::max() || !child->semanticTree() ||
+                        !child->semanticTree()->contains(static_cast<wolvrix::lib::grh::SemanticId>((*nodes)[i])) ||
+                        !formals.emplace((*names)[i], static_cast<wolvrix::lib::grh::SemanticId>((*nodes)[i])).second)
+                        throw std::invalid_argument("Flatten semantic formal port map is invalid");
+                }
+                for (std::size_t i = 0; i < info.semanticPortNames.size(); ++i)
+                {
+                    const auto formal = formals.find(info.semanticPortNames[i]);
+                    if (formal == formals.end() || !target.semanticTree() ||
+                        !target.semanticTree()->contains(info.semanticPortNodes[i]) ||
+                        !portNodeMap.emplace(formal->second, info.semanticPortNodes[i]).second)
+                        throw std::invalid_argument("Flatten semantic actual port map is invalid");
+                }
+            }
+            state.nodeInstancePath.push_back(semanticComponent);
+            const bool success = inlineGraphContents(*child, target, childPrefix, std::move(childPortMap),
+                                                    info.semantics, portNodeMap, state);
             state.nodeInstancePath.pop_back();
-            state.currentInstanceSemantic = previousInstanceSemantic;
             return success;
         }
 
@@ -1316,11 +1403,22 @@ namespace wolvrix::lib::transform
             InstanceInfo info;
             info.moduleName = getAttrString(op, "moduleName").value_or(std::string());
             info.instanceName = getAttrString(op, "instanceName").value_or(std::string());
+            if (const auto line = op.attr("firrtl.line"))
+                if (const auto value = std::get_if<int64_t>(&*line)) info.firrtlLine = *value;
             info.operands.assign(op.operands().begin(), op.operands().end());
             info.results.assign(op.results().begin(), op.results().end());
             info.inputPortNames = getAttrStrings(op, "inputPortName");
             info.outputPortNames = getAttrStrings(op, "outputPortName");
             info.inoutPortNames = getAttrStrings(op, "inoutPortName");
+            info.semanticPortNames = getAttrStrings(op, "semanticPortNames").value_or(std::vector<std::string>{});
+            if (const auto nodes = op.attr("semanticPortNodes"))
+                if (const auto ids = std::get_if<std::vector<int64_t>>(&*nodes))
+                    for (const auto id : *ids)
+                    {
+                        if (id <= 0 || static_cast<uint64_t>(id) > std::numeric_limits<uint32_t>::max())
+                            throw std::invalid_argument("Flatten semantic actual port Node ID is invalid");
+                        info.semanticPortNodes.push_back(static_cast<uint32_t>(id));
+                    }
             return info;
         }
 
@@ -1331,8 +1429,22 @@ namespace wolvrix::lib::transform
             const auto attrs = graph.opAttrRange(opId);
             info.moduleName = getAttrStringBorrowed(attrs, "moduleName").value_or(std::string_view());
             info.instanceName = getAttrStringBorrowed(attrs, "instanceName").value_or(std::string_view());
+            for (const auto attr : attrs)
+                if (attr.key() == "firrtl.line")
+                    if (const auto value = attr.value().get<int64_t>()) info.firrtlLine = *value;
             const auto semantics = graph.opSemanticIds(opId);
-            if (!semantics.empty()) info.semantic = semantics.front();
+            info.semantics.assign(semantics.begin(), semantics.end());
+            if (const auto names = getAttrStringsBorrowed(attrs, "semanticPortNames"))
+                info.semanticPortNames.assign(names->begin(), names->end());
+            for (const auto attr : attrs)
+                if (attr.key() == "semanticPortNodes")
+                    if (const auto nodes = attr.value().get<std::vector<int64_t>>())
+                        for (const auto id : *nodes)
+                        {
+                            if (id <= 0 || static_cast<uint64_t>(id) > std::numeric_limits<uint32_t>::max())
+                                throw std::invalid_argument("Flatten semantic actual port Node ID is invalid");
+                            info.semanticPortNodes.push_back(static_cast<uint32_t>(id));
+                        }
             const auto operands = graph.opOperands(opId);
             const auto results = graph.opResults(opId);
             info.operands.assign(operands.begin(), operands.end());
@@ -1522,6 +1634,9 @@ namespace wolvrix::lib::transform
                                  wolvrix::lib::grh::Graph &target,
                                  const std::string &prefix,
                                  DenseValueMap valueMap,
+                                 std::span<const wolvrix::lib::grh::SemanticId> instanceSemantics,
+                                 const std::unordered_map<wolvrix::lib::grh::SemanticId,
+                                                          wolvrix::lib::grh::SemanticId>& portNodeMap,
                                  InlineState &state)
         {
             if (state.failed)
@@ -1535,21 +1650,9 @@ namespace wolvrix::lib::transform
                 return false;
             }
             state.stack.insert(&source);
-            struct SemanticParentGuard {
-                InlineState& state;
-                wolvrix::lib::grh::SemanticId parent;
-                ~SemanticParentGuard() { state.currentSemanticParent = parent; }
-            } semanticParentGuard{state, state.currentSemanticParent};
-            wolvrix::lib::grh::SemanticId copiedSemanticRoot = 0;
+            std::vector<wolvrix::lib::grh::SemanticId> semanticMap;
             if (source.semanticTree())
             {
-                if (!target.semanticTree())
-                {
-                    state.graphError(source, "Flatten source has a SemanticTree but target does not");
-                    state.failed = true;
-                    state.stack.erase(&source);
-                    return false;
-                }
                 if (state.nodeInstancePath.empty())
                 {
                     state.graphError(source, "Flatten instance path is empty during SemanticTree copy");
@@ -1557,19 +1660,94 @@ namespace wolvrix::lib::transform
                     state.stack.erase(&source);
                     return false;
                 }
+                if (!target.semanticTree())
+                {
+                    const auto& context = *source.semanticTree();
+                    target.getOrCreateSemanticTree(context.sourceUnit(), context.circuit(), target.symbol());
+                }
                 const auto semanticStarted = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
                 const auto nameBytesBefore = target.semanticTree()->nameBytes();
-                copiedSemanticRoot = target.appendSemanticTree(source, state.currentSemanticParent,
-                                                               state.nodeInstancePath.back());
+                const auto& sourceTree = *source.semanticTree();
+                auto& targetTree = *target.semanticTree();
+                targetTree.flatten();
+                semanticMap.resize(sourceTree.nodeCapacity());
+                const std::unordered_set<wolvrix::lib::grh::SemanticId> placeholders(
+                    instanceSemantics.begin(), instanceSemantics.end());
+                std::unordered_set<uint32_t> portValues;
+                for (const auto& port : source.inputPorts()) portValues.insert(port.value.index);
+                for (const auto& port : source.outputPorts()) portValues.insert(port.value.index);
+                for (const auto& port : source.inoutPorts())
+                {
+                    portValues.insert(port.in.index);
+                    portValues.insert(port.out.index);
+                    portValues.insert(port.oe.index);
+                }
+                for (const auto id : sourceTree.nodeIds())
+                {
+                    const auto name = sourceTree.qualifiedName(id, state.nodeInstancePath);
+                    const auto existing = state.semanticNames.find(name);
+                    if (existing == state.semanticNames.end())
+                    {
+                        const auto copied = targetTree.addNode(targetTree.root(), name);
+                        semanticMap[id] = copied;
+                        state.semanticNames.emplace(name, copied);
+                        continue;
+                    }
+                    // Reuse only a known instance-port placeholder with an
+                    // actual port relocation. Sharing an arbitrary value or
+                    // display name does not merge distinct named endpoints.
+                    if (!placeholders.contains(existing->second))
+                        throw std::invalid_argument("Flatten semantic Node name collision: " + name);
+                    const auto formal = portNodeMap.find(id);
+                    if (!portNodeMap.empty() && (formal == portNodeMap.end() || formal->second != existing->second))
+                        throw std::invalid_argument("Flatten semantic formal/actual Node correspondence differs: " + name);
+                    if (sourceTree.anchors(id).empty() && targetTree.anchors(existing->second).empty() &&
+                        formal != portNodeMap.end() && sourceTree.operations(id).empty())
+                    {
+                        semanticMap[id] = existing->second;
+                        continue;
+                    }
+                    bool boundary = false;
+                    const auto equivalentBoundary = [&](wolvrix::lib::grh::ValueId left,
+                                                        wolvrix::lib::grh::ValueId right) {
+                        if (left == right) return true;
+                        for (const auto bridge : state.semanticBridges)
+                        {
+                            const auto inputs = target.opOperands(bridge);
+                            const auto outputs = target.opResults(bridge);
+                            if (inputs.size() == 1 && outputs.size() == 1 &&
+                                ((inputs.front() == left && outputs.front() == right) ||
+                                 (inputs.front() == right && outputs.front() == left))) return true;
+                        }
+                        return false;
+                    };
+                    for (const auto anchor : sourceTree.anchors(id))
+                    {
+                        if (!portValues.contains(anchor.index)) continue;
+                        const wolvrix::lib::grh::ValueId value{anchor.index, anchor.generation, source.id()};
+                        const auto relocated = valueMap.get(value);
+                        if (!relocated.valid()) continue;
+                        for (const auto targetAnchor : targetTree.anchors(existing->second))
+                        {
+                            const wolvrix::lib::grh::ValueId expected{
+                                targetAnchor.index, targetAnchor.generation, target.id()};
+                            boundary |= equivalentBoundary(relocated, expected);
+                        }
+                        const auto [first, last] = state.deferredAnchorValues.equal_range(existing->second);
+                        for (auto prior = first; prior != last; ++prior)
+                            boundary |= equivalentBoundary(relocated, prior->second);
+                    }
+                    if (!boundary)
+                        throw std::invalid_argument("Flatten semantic placeholder has no port mapping: " + name);
+                    semanticMap[id] = existing->second;
+                }
                 if (state.profile)
                 {
                     state.metrics.semanticCopy += FlattenClock::now() - semanticStarted;
                     state.metrics.semanticNodesCopied += source.semanticTree()->size();
                     state.metrics.semanticNameBytesCopied += target.semanticTree()->nameBytes() - nameBytesBefore;
                 }
-                if (copiedSemanticRoot) state.currentSemanticParent = copiedSemanticRoot;
             }
-            const auto fallbackSemantic = state.currentInstanceSemantic;
             const auto plannedInstance = valueMap.plannedInstance;
             const auto enterEvent = state.plan.consume(GlobalInlinePlan::EventKind::EnterValues, plannedInstance);
             if (state.plan.enabled)
@@ -1590,45 +1768,44 @@ namespace wolvrix::lib::transform
                 targetIds.clear();
                 for (const auto sourceId : sourceIds)
                 {
-                    if (!copiedSemanticRoot || !source.semanticTree()->contains(sourceId))
+                    if (sourceId >= semanticMap.size() || !semanticMap[sourceId])
                         throw std::invalid_argument("Flatten encountered an invalid source SemanticId");
-                    const auto targetId = copiedSemanticRoot + sourceId - 1;
+                    const auto targetId = semanticMap[sourceId];
                     if (!target.semanticTree()->contains(targetId))
                         throw std::invalid_argument("Flatten SemanticId relocation left the copied tree");
                     targetIds.push_back(targetId);
                 }
             };
             slang::SmallVector<wolvrix::lib::grh::SemanticId, 4> mappedSemantics;
+            const auto relocateSemanticPortAttributes = [&](wolvrix::lib::grh::OperationId sourceOp,
+                                                            wolvrix::lib::grh::OperationId targetOp) {
+                if (!source.semanticTree() || source.opKind(sourceOp) != wolvrix::lib::grh::OperationKind::kBlackbox)
+                    return;
+                for (const auto attr : source.opAttrRange(sourceOp))
+                {
+                    if (attr.key() != "semanticPortNodes") continue;
+                    const auto sourceNodes = attr.value().get<std::vector<int64_t>>();
+                    if (!sourceNodes) throw std::invalid_argument("Flatten semantic blackbox ports are not Node IDs");
+                    std::vector<int64_t> mapped;
+                    mapped.reserve(sourceNodes->size());
+                    for (const auto id : *sourceNodes)
+                    {
+                        if (id <= 0 || static_cast<uint64_t>(id) >= semanticMap.size() || !semanticMap[id])
+                            throw std::invalid_argument("Flatten semantic blackbox port has no Node relocation");
+                        mapped.push_back(semanticMap[id]);
+                    }
+                    state.semanticPortAttributes.emplace_back(targetOp, std::move(mapped));
+                }
+            };
             const auto copyOperationSemantics = [&](wolvrix::lib::grh::OperationId sourceOp,
                                                     wolvrix::lib::grh::OperationId targetOp) {
+                relocateSemanticPortAttributes(sourceOp, targetOp);
                 const auto sourceIds = source.opSemanticIds(sourceOp);
-                if (sourceIds.empty())
-                {
-                    if (!source.semanticTree() && fallbackSemantic)
-                    {
-                        target.setOpSemanticIds(targetOp, std::span<const wolvrix::lib::grh::SemanticId>(&fallbackSemantic, 1));
-                        ++state.metrics.annotatedOperations;
-                    }
-                    return;
-                }
+                if (sourceIds.empty()) return;
                 ++state.metrics.annotatedOperations;
                 remapSemantics(sourceIds, mappedSemantics);
                 target.setOpSemanticIds(targetOp,
                     std::span<const wolvrix::lib::grh::SemanticId>(mappedSemantics.data(), mappedSemantics.size()));
-            };
-            const auto mergeValueSemantics = [&](wolvrix::lib::grh::ValueId sourceValue,
-                                                 wolvrix::lib::grh::ValueId targetValue) {
-                const auto sourceIds = source.valueSemanticIds(sourceValue);
-                if (sourceIds.empty()) return;
-                remapSemantics(sourceIds, mappedSemantics);
-                slang::SmallVector<wolvrix::lib::grh::SemanticId, 4> merged;
-                const auto existing = target.valueSemanticIds(targetValue);
-                merged.append(existing.begin(), existing.end());
-                for (const auto id : mappedSemantics)
-                    if (std::find(merged.begin(), merged.end(), id) == merged.end()) merged.push_back(id);
-                if (merged.size() != existing.size())
-                    target.setValueSemanticIds(targetValue,
-                        std::span<const wolvrix::lib::grh::SemanticId>(merged.data(), merged.size()));
             };
 
             std::unordered_set<uint32_t> declaredSet;
@@ -1748,7 +1925,7 @@ namespace wolvrix::lib::transform
             const bool retainColumns = state.plan.enabled && state.plan.definitionUses.at(&source) == 1;
             target.appendValueBlock(source, sourceValues, valueSymbols, newValues, srcLocImport,
                 state.plan.enabled ? 1 : state.numThreads, retainColumns);
-            target.remapValueBlockSemantics(source, sourceValues, newValues, copiedSemanticRoot);
+            target.remapValueBlockSemantics(source, sourceValues, newValues, semanticMap);
             if (state.plan.enabled)
             {
                 auto &event = state.plan.events[enterEvent];
@@ -1759,8 +1936,16 @@ namespace wolvrix::lib::transform
                 valueMap.set(sourceValues[index], newValues[index]);
             for (const auto sourceValue : semanticPorts)
             {
-                const auto targetValue = valueMap.get(sourceValue);
-                if (targetValue.valid()) mergeValueSemantics(sourceValue, targetValue);
+                const auto sourceIds = source.valueSemanticIds(sourceValue);
+                if (sourceIds.empty()) continue;
+                remapSemantics(sourceIds, mappedSemantics);
+                const auto valueNode = valueMap.node(sourceValue);
+                const auto value = valueMap.get(sourceValue);
+                if (valueNode == GlobalPortUnionFind::invalid && !value.valid())
+                    throw std::logic_error("Flatten semantic anchor has no value relocation");
+                state.semanticAnchors.push_back({
+                    {mappedSemantics.begin(), mappedSemantics.end()}, value, valueNode});
+                for (const auto id : mappedSemantics) state.deferredAnchorValues.emplace(id, value);
             }
             state.metrics.valuesCloned += sourceValues.size();
             state.changed |= !sourceValues.empty();
@@ -1897,20 +2082,12 @@ namespace wolvrix::lib::transform
                     runOutput.resize(run.operations.size());
                     target.appendOperationBlock(source, run.operations, runSymbols, runOutput, srcLocImport,
                         state.plan.enabled ? 1 : state.numThreads, retainColumns);
-                    if (!source.semanticTree())
-                    {
-                        if (fallbackSemantic)
-                        {
-                            for (const auto targetOp : runOutput)
-                                target.setOpSemanticIds(targetOp,
-                                    std::span<const wolvrix::lib::grh::SemanticId>(&fallbackSemantic, 1));
-                            state.metrics.annotatedOperations += runOutput.size();
-                        }
-                    }
-                    else
+                    if (source.semanticTree())
                     {
                         state.metrics.annotatedOperations += target.remapOperationBlockSemantics(
-                            source, run.operations, runOutput, copiedSemanticRoot);
+                            source, run.operations, runOutput, semanticMap);
+                        for (std::size_t i = 0; i < run.operations.size(); ++i)
+                            relocateSemanticPortAttributes(run.operations[i], runOutput[i]);
                     }
                     if (state.plan.enabled)
                     {
@@ -1941,11 +2118,17 @@ namespace wolvrix::lib::transform
                         ++state.metrics.instanceCalls;
                         ++state.metrics.instanceOperations;
                         InstanceInfo info = buildInstanceInfo(source, opId);
-                        if (info.semantic)
+                        for (auto& semantic : info.semantics)
                         {
-                            if (!copiedSemanticRoot || !source.semanticTree()->contains(info.semantic))
+                            if (semantic >= semanticMap.size() || !semanticMap[semantic])
                                 throw std::invalid_argument("Flatten encountered an invalid instance SemanticId");
-                            info.semantic = copiedSemanticRoot + info.semantic - 1;
+                            semantic = semanticMap[semantic];
+                        }
+                        for (auto& semantic : info.semanticPortNodes)
+                        {
+                            if (semantic >= semanticMap.size() || !semanticMap[semantic])
+                                throw std::invalid_argument("Flatten semantic actual port has no Node relocation");
+                            semantic = semanticMap[semantic];
                         }
                         if (state.profile)
                         {
@@ -1994,6 +2177,11 @@ namespace wolvrix::lib::transform
                                 state.failed = true;
                                 break;
                             }
+                            const auto previous = target.opSemanticIds(existing);
+                            std::vector<wolvrix::lib::grh::SemanticId> merged(previous.begin(), previous.end());
+                            remapSemantics(source.opSemanticIds(opId), mappedSemantics);
+                            merged.insert(merged.end(), mappedSemantics.begin(), mappedSemantics.end());
+                            if (!merged.empty()) target.setOpSemanticIds(existing, merged);
                             if (neededOpSymbols.contains(op.symbol().value))
                             {
                                 opRename.emplace(op.symbol().value, existingOp.symbol());
@@ -2217,6 +2405,58 @@ namespace wolvrix::lib::transform
             }
         }
 
+        void commitSemanticAnchors(InlineState& state, wolvrix::lib::grh::Graph& target)
+        {
+            for (auto& [operation, nodes] : state.semanticPortAttributes)
+                target.setAttr(operation, "semanticPortNodes", std::move(nodes));
+            state.semanticPortAttributes.clear();
+            if (state.plan.enabled) state.plan.ports.compress();
+            for (auto& pending : state.semanticAnchors)
+            {
+                if (pending.valueNode != GlobalPortUnionFind::invalid)
+                    pending.value = state.plan.ports.get(pending.valueNode);
+                if (!pending.value.valid())
+                    throw std::logic_error("Flatten semantic anchor representative is missing");
+            }
+            // A top clock may anchor thousands of independent instance Nodes.
+            // Publish their union once, rather than copying a growing reverse
+            // list at every instance boundary.
+            auto& anchors = state.semanticAnchors;
+            std::sort(anchors.begin(), anchors.end(), [](const auto& left, const auto& right) {
+                return left.value.index < right.value.index;
+            });
+            for (std::size_t begin = 0; begin < anchors.size();)
+            {
+                std::size_t end = begin + 1;
+                while (end < anchors.size() && anchors[end].value == anchors[begin].value) ++end;
+                const auto value = anchors[begin].value;
+                const auto existing = target.valueSemanticIds(value);
+                std::vector<wolvrix::lib::grh::SemanticId> merged(existing.begin(), existing.end());
+                for (std::size_t row = begin; row < end; ++row)
+                    merged.insert(merged.end(), anchors[row].nodes.begin(), anchors[row].nodes.end());
+                std::sort(merged.begin(), merged.end());
+                merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+                target.setValueSemanticIds(value, merged);
+                begin = end;
+            }
+            state.semanticAnchors.clear();
+            state.deferredAnchorValues.clear();
+            for (const auto operation : state.semanticBridges)
+            {
+                std::vector<wolvrix::lib::grh::SemanticId> members;
+                const auto collect = [&](auto values) {
+                    for (const auto value : values)
+                        for (const auto id : target.valueSemanticIds(value))
+                            if (std::find(members.begin(), members.end(), id) == members.end())
+                                members.push_back(id);
+                };
+                collect(target.opResults(operation));
+                if (members.empty()) collect(target.opOperands(operation));
+                if (!members.empty()) target.setOpSemanticIds(operation, members);
+            }
+            state.semanticBridges.clear();
+        }
+
         void consumeSingleUseTopology(InlineState &state, wolvrix::lib::grh::Graph &target)
         {
             if (!state.plan.enabled || state.failed) return;
@@ -2271,6 +2511,51 @@ namespace wolvrix::lib::transform
                 // pointer/span saved in completed plan or import contexts.
                 for (const auto block : job.blocks) state.plan.operands[block].consumed = true;
             }
+        }
+
+        void publishExternalInstanceBindings(InlineState& state, wolvrix::lib::grh::Graph& target)
+        {
+            auto& bindings = state.externalInstances;
+            if (bindings.paths.empty()) return;
+            const auto publish = [&](std::string_view key, auto& values) {
+                using Values = std::decay_t<decltype(values)>;
+                if (const auto previous = target.metadata(key))
+                {
+                    if (const auto old = std::get_if<Values>(&*previous))
+                    {
+                        Values joined = *old;
+                        joined.insert(joined.end(), values.begin(), values.end());
+                        target.setMetadata(key, std::move(joined));
+                        return;
+                    }
+                    throw std::invalid_argument("Flatten external-instance metadata has an invalid type");
+                }
+                target.setMetadata(key, std::move(values));
+            };
+            const auto publishOffsets = [&](std::string_view key, std::vector<int64_t>& values) {
+                if (const auto previous = target.metadata(key))
+                {
+                    if (const auto old = std::get_if<std::vector<int64_t>>(&*previous); old && !old->empty())
+                    {
+                        std::vector<int64_t> joined = *old;
+                        for (std::size_t i = 1; i < values.size(); ++i) joined.push_back(old->back() + values[i]);
+                        target.setMetadata(key, std::move(joined));
+                        return;
+                    }
+                    throw std::invalid_argument("Flatten external-instance offsets have an invalid type");
+                }
+                target.setMetadata(key, std::move(values));
+            };
+            publish("firrtl.externalInstancePaths", bindings.paths);
+            publish("firrtl.externalInstanceModules", bindings.modules);
+            publish("firrtl.externalInstanceImplementations", bindings.implementations);
+            publish("firrtl.externalInstanceLines", bindings.lines);
+            publishOffsets("firrtl.externalInstanceInputOffsets", bindings.inputOffsets);
+            publishOffsets("firrtl.externalInstanceOutputOffsets", bindings.outputOffsets);
+            publishOffsets("firrtl.externalInstanceInoutOffsets", bindings.inoutOffsets);
+            publish("firrtl.externalInstanceInputPorts", bindings.inputs);
+            publish("firrtl.externalInstanceOutputPorts", bindings.outputs);
+            publish("firrtl.externalInstanceInoutPorts", bindings.inouts);
         }
 
         bool hasXmrOps(const wolvrix::lib::grh::Graph &graph)
@@ -2392,6 +2677,18 @@ namespace wolvrix::lib::transform
             return result;
         }
 
+        const bool maintainsSemantics = std::any_of(design().graphs().begin(), design().graphs().end(),
+            [](const auto& entry) { return entry.second && entry.second->semanticTree(); });
+        const auto* initialTree = top->semanticTree();
+        const bool editsSemantics = maintainsSemantics &&
+            ((initialTree && (!initialTree->namesFlattened() || !initialTree->isFlat())) ||
+             std::any_of(top->operations().begin(), top->operations().end(), [&](const auto operation) {
+                 return top->opKind(operation) == wolvrix::lib::grh::OperationKind::kInstance;
+             }));
+        // Keep only the original root graph as the rollback image, before any
+        // expansion or path edits. Source definitions stay alive until commit.
+        auto checkpoint = top->checkpointMutation(editsSemantics);
+
         SourceFreezeStats sourceFreeze;
         if (profile)
         {
@@ -2429,7 +2726,14 @@ namespace wolvrix::lib::transform
         // graphs receive the `inst$...$` prefix (and only child graphs'
         // generate groups gain the scope prefix).
         const std::string topName = top->symbol();
-        if (top->semanticTree()) state.currentSemanticParent = top->semanticTree()->root();
+        if (auto* tree = top->semanticTree())
+        {
+            state.changed |= !tree->namesFlattened() || !tree->isFlat();
+            tree->flatten();
+            for (const auto id : tree->nodeIds())
+                if (!state.semanticNames.emplace(std::string(tree->name(id)), id).second)
+                    throw std::invalid_argument("Flatten encountered duplicate top semantic Node names");
+        }
 
         DenseValueMap identity(*top);
         for (const auto valueId : top->values())
@@ -2527,27 +2831,43 @@ namespace wolvrix::lib::transform
                  state.plan.nextInstance != state.plan.instances.size()))
                 throw std::logic_error("Flatten global event plan was not fully consumed");
             commitGlobalMetadata(state, *top);
-            if (!options_.preserveFlattenedModules) consumeSingleUseTopology(state, *top);
+            commitSemanticAnchors(state, *top);
+            // Moving source topology destroys its graph. The semantic path
+            // retains sources until validation and the root transaction commit.
+            if (!maintainsSemantics && !options_.preserveFlattenedModules)
+                consumeSingleUseTopology(state, *top);
             state.plan.commitOperands(*top, state.executor.get());
         }
         catch (...)
         {
-            commitGlobalMetadata(state, *top);
-            state.plan.commitOperands(*top, state.executor.get());
-            top->rebuildUseLists();
+            if (!maintainsSemantics)
+            {
+                commitGlobalMetadata(state, *top);
+                state.plan.commitOperands(*top, state.executor.get());
+                top->rebuildUseLists();
+            }
             throw;
         }
         top->rebuildUseLists();
 
+        if (!state.failed && top->semanticTree())
+        {
+            if (!top->semanticTree()->isFlat())
+                throw std::logic_error("Flatten left internal semantic paths");
+            const auto semanticErrors = top->validateSemanticTree();
+            for (const auto& message : semanticErrors) error(*top, message);
+            state.failed |= !semanticErrors.empty();
+        }
+
         if (state.failed)
         {
-            if (profile)
+            if (!maintainsSemantics && profile)
             {
                 const auto started = FlattenClock::now();
                 nodeInventory.flush();
                 metrics.flush += FlattenClock::now() - started;
             }
-            else
+            else if (!maintainsSemantics)
             {
                 nodeInventory.flush();
             }
@@ -2556,6 +2876,9 @@ namespace wolvrix::lib::transform
             return result;
         }
 
+        publishExternalInstanceBindings(state, *top);
+
+        std::vector<std::string> toDelete;
         if (!options_.preserveFlattenedModules)
         {
             std::unordered_set<std::string> keepModules;
@@ -2579,7 +2902,6 @@ namespace wolvrix::lib::transform
                     }
                 }
             }
-            std::vector<std::string> toDelete;
             toDelete.reserve(design().graphs().size());
             for (const auto &entry : design().graphs())
             {
@@ -2591,10 +2913,6 @@ namespace wolvrix::lib::transform
                 {
                     toDelete.push_back(entry.first);
                 }
-            }
-            for (const auto &name : toDelete)
-            {
-                design().deleteGraph(name);
             }
         }
 
@@ -2608,6 +2926,8 @@ namespace wolvrix::lib::transform
         {
             nodeInventory.flush();
         }
+        checkpoint.commit();
+        for (const auto& name : toDelete) design().deleteGraph(name);
         result.changed = state.changed;
         emitProfile();
         return result;

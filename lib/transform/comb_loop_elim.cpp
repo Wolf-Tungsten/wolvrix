@@ -2695,13 +2695,13 @@ namespace wolvrix::lib::transform
                         frag = graph.createValue(static_cast<int32_t>(width),
                                                  baseValue.isSigned(),
                                                  baseValue.type(),
-                                                 baseValue.shape());
+                                                 baseValue.shape(), baseValue.domain());
                     }
                     else
                     {
                         frag = graph.createValue(static_cast<int32_t>(width),
                                                  baseValue.isSigned(),
-                                                 baseValue.type());
+                                                 baseValue.type(), {}, baseValue.domain());
                     }
                     graph.setValueSemanticIds(frag, baseOrigin.semantics);
                     fragmentMap.emplace(RangeNode{valueId, range}, frag);
@@ -2816,7 +2816,8 @@ namespace wolvrix::lib::transform
                             graph.setAttr(sliceOp, "sliceEnd", localHigh);
                             ValueId frag = graph.createValue(static_cast<int32_t>(width),
                                                              graph.getValue(valueId).isSigned(),
-                                                             graph.getValue(valueId).type());
+                                                             graph.getValue(valueId).type(), {},
+                                                             graph.getValue(valueId).domain());
                             graph.addResult(sliceOp, frag);
                             stampViewOrigins(sliceOp, valueId, frag);
                             fragmentMap.emplace(RangeNode{valueId, range}, frag);
@@ -2850,7 +2851,8 @@ namespace wolvrix::lib::transform
                 graph.setAttr(sliceOp, "sliceEnd", range.high);
                 ValueId frag = graph.createValue(static_cast<int32_t>(width),
                                                  graph.getValue(valueId).isSigned(),
-                                                 graph.getValue(valueId).type());
+                                                 graph.getValue(valueId).type(), {},
+                                                 graph.getValue(valueId).domain());
                 graph.addResult(sliceOp, frag);
                 stampViewOrigins(sliceOp, valueId, frag);
                 fragmentMap.emplace(RangeNode{valueId, range}, frag);
@@ -2905,7 +2907,7 @@ namespace wolvrix::lib::transform
                 }
                 const Value value = graph.getValue(valueId);
                 ValueId fullView = graph.createValue(value.width(), value.isSigned(), value.type(),
-                                                     value.shape());
+                                                     value.shape(), value.domain());
                 graph.addResult(concatOp, fullView);
                 stampViewOrigins(concatOp, valueId, fullView);
                 fullViewCache.emplace(valueId, fullView);
@@ -3850,7 +3852,7 @@ namespace wolvrix::lib::transform
 
                 auto emitNewBinary = [&](OperationKind kind, ValueId lhs, ValueId rhs) -> std::optional<ValueId>
                 {
-                    ValueId out = graph.createValue(1, false, resultValue.type());
+                    ValueId out = graph.createValue(1, false, resultValue.type(), {}, resultValue.domain());
                     if (!createOp(kind, std::vector<ValueId>{lhs, rhs}, out, custom.srcLoc, opId))
                     {
                         return std::nullopt;
@@ -3996,12 +3998,26 @@ namespace wolvrix::lib::transform
                     // downstream shape-aware users (kSliceArray, ports) stay
                     // verifier-legal.
                     viewValue = graph.createValue(value.width(), value.isSigned(), value.type(),
-                                                  value.shape());
+                                                  value.shape(), value.domain());
                     graph.addResult(concatOp, viewValue);
                     stampViewOrigins(concatOp, valueId, viewValue);
                 }
                 viewMap.emplace(valueId, viewValue);
             }
+
+            // Source bindings denote complete values. A fragment inherits
+            // ownership, but becomes a binding only through the complete
+            // reassembled view, never through the first narrowed result.
+            std::vector<ValueId> bindingSources;
+            std::vector<ValueId> bindingTargets;
+            bindingSources.reserve(viewMap.size());
+            bindingTargets.reserve(viewMap.size());
+            for (const auto& [source, target] : viewMap)
+            {
+                bindingSources.push_back(source);
+                bindingTargets.push_back(target);
+            }
+            graph.remapSemanticBindingValues(bindingSources, bindingTargets);
 
             for (ValueId valueId : loop.loopValues)
             {

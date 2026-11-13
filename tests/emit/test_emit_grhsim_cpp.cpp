@@ -16,6 +16,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -11613,6 +11614,430 @@ int main() {
         return 0;
     }
 
+    int runWideConcatReductionTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_WIDE_CONCAT_REDUCTION";
+        const char *old = std::getenv(key);
+        const std::optional<std::string> saved = old ? std::optional<std::string>(old) : std::nullopt;
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(2);
+        std::vector<ValueId> tracked;
+        std::ostringstream setup, checks;
+        const std::vector<std::vector<int32_t>> shapes = {
+            std::vector<int32_t>(65, 1), std::vector<int32_t>(86, 1),
+            std::vector<int32_t>(110, 1), std::vector<int32_t>(111, 1),
+            std::vector<int32_t>(638, 1), {64, 64}, {63, 64, 2}, {65, 1},
+        };
+        std::size_t number = 0;
+        for (const auto &widths : shapes)
+        {
+            const std::string shape = "shape" + std::to_string(number++);
+            int32_t total = 0;
+            std::vector<ValueId> inputs;
+            std::vector<std::string> names;
+            // Large Boolean concats deliberately repeat inputs as well.
+            for (std::size_t i = 0; i < widths.size(); ++i)
+            {
+                total += widths[i];
+                if (widths.size() > 65 && i >= 65)
+                {
+                    inputs.push_back(inputs[i % 65]);
+                    names.push_back(names[i % 65]);
+                    continue;
+                }
+                const auto name = shape + "_in" + std::to_string(i);
+                const auto value = makeLogicValue(graph, name, widths[i], i % 2 == 1);
+                graph.bindInputPort(name, value);
+                inputs.push_back(value);
+                names.push_back(name);
+                if (widths[i] <= 64)
+                {
+                    setup << "sim." << name << " = static_cast<decltype(sim." << name
+                          << ")>(pattern(t," << i << ")" << (widths[i] == 1 ? " & 1u" : "") << ");\n";
+                }
+                else
+                {
+                    setup << "for(unsigned w=0;w<sim." << name << ".size();++w) sim."
+                          << name << "[w]=pattern(t," << i << "+w);\n";
+                }
+            }
+            setup << "std::array<std::uint64_t," << (total + 63) / 64 << "> " << shape << "_packed{};\n"
+                  << "unsigned " << shape << "_cursor=" << total << ";bool " << shape
+                  << "_all=true," << shape << "_any=false," << shape << "_parity=false;\n";
+            for (std::size_t i = 0; i < inputs.size(); ++i)
+            {
+                setup << shape << "_cursor-=" << widths[i] << ";for(unsigned b=0;b<" << widths[i] << ";++b){"
+                      << "const bool bit=(";
+                if (widths[i] <= 64)
+                    setup << "static_cast<std::uint64_t>(sim." << names[i] << ") >> b";
+                else
+                    setup << "sim." << names[i] << "[b/64] >> (b%64)";
+                setup << ") & 1u;" << shape << "_all&=bit;" << shape << "_any|=bit;"
+                      << shape << "_parity^=bit;const unsigned dst=" << shape << "_cursor+b;"
+                      << shape << "_packed[dst/64]|=std::uint64_t(bit)<<(dst%64);}\n";
+            }
+            for (unsigned family = 0; family < 8; ++family)
+            {
+                const auto prefix = shape + "f" + std::to_string(family);
+                const auto concat = makeLogicValue(graph, prefix + "_concat", total);
+                const auto op = graph.createOperation(OperationKind::kConcat, graph.internSymbol(prefix + "_op"));
+                for (auto input : inputs) graph.addOperand(op, input);
+                graph.addResult(op, concat);
+                if (family == 7) graph.setAttr(op, "hasSideEffects", true);
+                nodes[0].push_back(op);
+                const auto output = [&](OperationKind kind, const std::string &suffix, const std::string &expected) {
+                    const auto name = prefix + suffix;
+                    const auto value = makeLogicValue(graph, name, 1);
+                    const auto reduction = graph.createOperation(kind, graph.internSymbol(name + "_op"));
+                    graph.addOperand(reduction, concat);
+                    graph.addResult(reduction, value);
+                    graph.bindOutputPort(name, value);
+                    nodes[family == 5 ? 1 : 0].push_back(reduction);
+                    checks << "if(sim." << name << " != (" << expected << ")) return " << number * 10 + family << ";\n";
+                };
+                if (family == 0 || family == 2)
+                {
+                    output(OperationKind::kReduceAnd, "_all", shape + "_all");
+                    output(OperationKind::kReduceNand, "_notall", "!" + shape + "_all");
+                }
+                if (family != 0 && family != 4)
+                {
+                    output(OperationKind::kReduceOr, "_any", shape + "_any");
+                    output(OperationKind::kReduceNor, "_none", "!" + shape + "_any");
+                }
+                if (family == 3)
+                {
+                    graph.bindOutputPort(prefix + "_packed", concat);
+                    checks << "if(sim." << prefix << "_packed != " << shape << "_packed) return 90;\n";
+                }
+                if (family == 4)
+                {
+                    output(OperationKind::kReduceXor, "_parity", shape + "_parity");
+                    output(OperationKind::kReduceXnor, "_notparity", "!" + shape + "_parity");
+                }
+                if (family == 5 || family == 6) tracked.push_back(concat);
+            }
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        for (auto value : tracked) fanout[value.index - 1u] = {1u};
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", ActivityScheduleTopoOrder{0,1});
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_wide_concat_reduction";
+        std::map<std::string, std::string> sources;
+        for (const std::string mode : {"default", "on", "off", "env-off", "attr-on-env-off",
+                                      "attr-off-env-on", "parent-off", "parent-off-wide-off"})
+        {
+            ::unsetenv(key);
+            if (mode == "env-off" || mode == "attr-on-env-off") ::setenv(key, "0", 1);
+            if (mode == "attr-off-env-on") ::setenv(key, "1", 1);
+            const bool parentOff = mode.starts_with("parent-off");
+            const bool enabled = mode == "default" || mode == "on" || mode == "attr-on-env-off";
+            const auto dir = base / mode;
+            EmitOptions options;
+            options.outputDir = dir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["scalar_concat_reduction"] = parentOff ? "0" : "1";
+            options.attributes["wordwise_wide_concat"] = "1";
+            if (mode == "on" || mode == "attr-on-env-off" || mode == "parent-off")
+                options.attributes["wide_concat_reduction"] = "1";
+            if (mode == "off" || mode == "attr-off-env-on" || mode == "parent-off-wide-off")
+                options.attributes["wide_concat_reduction"] = "0";
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            if (!emitter.emit(fixture.design, options).success || diagnostics.hasError())
+                return fail("wide concat reduction emit failed: " + mode);
+            const auto sched = collectSchedFiles(dir, "grhsim_top_sched_");
+            const auto states = collectSchedFiles(dir, "grhsim_top_state");
+            const auto source = readFiles(sched);
+            sources[mode] = source;
+            if (mode == "on" && source != sources.at("default")) return fail("wide concat reduction default/on mismatch");
+            if ((mode == "env-off" || mode == "attr-off-env-on") && source != sources.at("off"))
+                return fail("wide concat reduction explicit disable or attribute precedence mismatch");
+            if (mode == "attr-on-env-off" && source != sources.at("on"))
+                return fail("wide concat reduction attribute enable precedence mismatch");
+            if (mode == "parent-off-wide-off" && source != sources.at("parent-off"))
+                return fail("wide concat reduction bypassed parent disable");
+            const std::string marker = "// Wide concat reduction: ";
+            unsigned matches = 0;
+            for (auto p = source.find(marker); p != std::string::npos; p = source.find(marker, p + marker.size())) ++matches;
+            if (matches != (enabled ? 14u : 0u)) return fail("wide concat reduction unexpected matches: " + std::to_string(matches));
+            if (mode != "on" && mode != "off") continue;
+            const auto harness = dir / "harness.cpp";
+            std::ofstream out(harness);
+            out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                "int main(){GrhSIM_top sim;sim.init();std::uint64_t rng=20261111;"
+                "auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                "auto pattern=[&](unsigned t,unsigned i)->std::uint64_t{"
+                "if(t<2)return t?UINT64_MAX:0;"
+                "if(t<67)return i==t-2?UINT64_MAX:0;"
+                "if(t<132)return i==t-67?0:UINT64_MAX;"
+                "if(t<196)return UINT64_C(1)<<(t-132);"
+                "if(t<260)return ~(UINT64_C(1)<<(t-196));return random();};"
+                "for(unsigned t=0;t<12000;++t){\n" << setup.str()
+                << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n" << checks.str() << "}}return 0;}\n";
+            out.close();
+            std::string files;
+            for (const auto &p : states) files += " " + p.string();
+            files += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &p : sched) files += " " + p.string();
+            files += " " + harness.string();
+            for (const std::string opt : {"-O0", "-O3"})
+            {
+                const auto binary = dir / (opt == "-O0" ? "harness_o0" : "harness_o3");
+                const auto command = "clang++ -std=c++20 " + opt +
+                    " -fsanitize=address,undefined -fno-sanitize-recover=all -I" + dir.string() + files + " -o " + binary.string();
+                if (std::system(command.c_str()) || std::system(binary.c_str()))
+                    return fail("wide concat reduction runtime failed: " + mode + "/" + opt);
+            }
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        else ::unsetenv(key);
+        return 0;
+    }
+
+    int runScalarConcatReductionMaskTests(bool shortFields = false)
+    {
+        const char *maskOption = shortFields ? "WOLVRIX_GRHSIM_SHORT_CONCAT_REDUCTION_MASKS"
+                                             : "WOLVRIX_GRHSIM_SCALAR_CONCAT_REDUCTION_MASKS";
+        const char *oldOption = std::getenv(maskOption);
+        const std::optional<std::string> savedOption = oldOption ? std::optional<std::string>(oldOption) : std::nullopt;
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        std::vector<ValueId> inputs;
+        std::ostringstream setup, checks, checkCalls;
+        for (unsigned i = 0; i < 65; ++i)
+        {
+            const std::string name = "in" + std::to_string(i);
+            inputs.push_back(makeLogicValue(graph, name, 1));
+            graph.bindInputPort(name, inputs.back());
+            setup << "sim." << name << " = bits[" << i << "];\n";
+        }
+        // Direct inputs, external stored bools, then conservative fallbacks:
+        // >64 leaves, local writes, numeric uses, mixed families and effects.
+        ActivityScheduleSupernodeToOps nodes(shortFields ? 21u : 11u);
+        std::vector<ValueId> inverted;
+        const auto unary = [&](OperationKind kind, ValueId input, const std::string &name,
+                               unsigned node, int width = 1) {
+            auto value = makeLogicValue(graph, name, width);
+            auto op = graph.createOperation(kind, graph.internSymbol(name + "_op"));
+            graph.addOperand(op, input);
+            graph.addResult(op, value);
+            nodes[node].push_back(op);
+            return value;
+        };
+        for (unsigned i = 0; i < 64; ++i)
+            inverted.push_back(unary(OperationKind::kNot, inputs[i], "inv" + std::to_string(i), 0));
+        for (unsigned group = 0; group < (shortFields ? 20u : 10u); ++group)
+        {
+            const unsigned node = group + 1;
+            if (shortFields)
+            {
+                // Keep the independent reference checks bounded for the host
+                // optimizer while retaining every input/output comparison.
+                checks << "[[gnu::noinline]] static int check" << group
+                       << "(GrhSIM_top &sim, const bool *bits){\n";
+                checkCalls << "if (const int result = check" << group
+                           << "(sim, bits)) return result;\n";
+            }
+            const unsigned leaves = shortFields && group == 13 ? 16u : shortFields && group == 15 ? 32u :
+                group == 0 ? 16u : group == 3 ? 65u : 64u;
+            auto operands = group == 2 ? inverted : inputs;
+            if (group == 4 || group == 7)
+            {
+                // An internal definition cannot be captured at scope entry.
+                for (unsigned i = 0; i < (group == 4 ? 64u : 1u); ++i)
+                    operands[i] = unary(OperationKind::kNot, inputs[i],
+                        "written" + std::to_string(group) + "_" + std::to_string(i), node);
+                if (group == 7) graph.setAttr(nodes[node].back(), "hasSideEffects", true);
+            }
+            std::vector<std::vector<unsigned>> shortPatterns;
+            if (shortFields)
+            {
+                const unsigned fields = group == 10 ? 3u : group == 11 ? 16u :
+                    group == 12 || group == 13 ? 4u : group == 14 ? 15u : group == 15 ? 6u : 12u;
+                const unsigned count = group == 0 ? 2u : group == 8 ? 127u : group == 12 ? 16u :
+                    group == 19 ? 15u : group >= 16 ? 32u : 128u;
+                std::set<std::vector<unsigned>> unique;
+                std::uint64_t random = UINT64_C(20261112) + group;
+                while (shortPatterns.size() < count)
+                {
+                    if (group == 16)
+                    {
+                        // Many predicates share eleven fields: the ordinary
+                        // Boolean expression already has a cheap common factor.
+                        std::vector<unsigned> pattern{0,1,2,3,4,5,6,7,8,9,10};
+                        pattern.push_back(11u + static_cast<unsigned>(shortPatterns.size()));
+                        shortPatterns.push_back(std::move(pattern));
+                        continue;
+                    }
+                    std::set<unsigned> selected;
+                    while (selected.size() < fields)
+                    {
+                        random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+                        selected.insert(static_cast<unsigned>(random % leaves));
+                    }
+                    std::vector<unsigned> pattern(selected.begin(), selected.end());
+                    if (unique.insert(pattern).second) shortPatterns.push_back(std::move(pattern));
+                }
+            }
+            for (unsigned term = 0; term < (shortFields ? (group >= 16 ? 64u : 256u) : group >= 8 ? 32u : 24u); ++term)
+            {
+                const std::string prefix = "g" + std::to_string(group) + "t" + std::to_string(term);
+                const unsigned fields = shortFields ? (group == 10 ? 3u : group == 11 ? 16u : group == 12 || group == 13 ? 4u : group == 14 ? 15u : 12u)
+                                                    : (group < 8 && term == 23 && leaves <= 64 ? 64u : 16u);
+                auto concat = makeLogicValue(graph, prefix + "_concat", fields);
+                auto op = graph.createOperation(OperationKind::kConcat, graph.internSymbol(prefix + "_op"));
+                checks << "{ bool all = true, any = false; std::uint64_t packed = 0;\n";
+                for (unsigned j = 0; j < fields; ++j)
+                {
+                    const unsigned start = group >= 8 ? term % (group == 8 ? 15u : 16u) : term * 4;
+                    const unsigned index = shortFields
+                        ? shortPatterns[term % shortPatterns.size()][group == 15 ? j % 6 : j]
+                        : (start + j) % leaves;
+                    graph.addOperand(op, operands[index]);
+                    checks << "{ const bool bit = " << ((group == 2 || group == 4 || (group == 7 && index == 0)) ? "!" : "")
+                           << "bits[" << index << "]; all &= bit; any |= bit; packed = (packed << 1) | bit; }\n";
+                }
+                graph.addResult(op, concat);
+                nodes[node].push_back(op);
+                const bool andFamily = !(shortFields && group == 18) && (group >= 8 || term % 2 == 0);
+                const auto addOutput = [&](OperationKind kind, const std::string &suffix, const std::string &expected) {
+                    const auto name = prefix + suffix;
+                    const auto value = unary(kind, concat, name, node);
+                    graph.bindOutputPort(name, value);
+                    checks << "if (sim." << name << " != (" << expected << ")) return " << node << ";\n";
+                };
+                addOutput(andFamily ? OperationKind::kReduceAnd : OperationKind::kReduceOr,
+                          "_value", andFamily ? "all" : "any");
+                addOutput(andFamily ? OperationKind::kReduceNand : OperationKind::kReduceNor,
+                          "_inverse", andFamily ? "!all" : "!any");
+                if (group == 5)
+                {
+                    graph.bindOutputPort(prefix + "_packed", concat);
+                    checks << "if (sim." << prefix << "_packed != packed) return 90;\n";
+                }
+                if (group == 6)
+                    addOutput(andFamily ? OperationKind::kReduceOr : OperationKind::kReduceAnd,
+                              "_mixed", andFamily ? "any" : "all");
+                checks << "}\n";
+            }
+            if (shortFields) checks << "return 0;}\n";
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        for (ValueId value : inverted) fanout[value.index - 1u] = {3u};
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", shortFields
+            ? ActivityScheduleTopoOrder{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20}
+            : ActivityScheduleTopoOrder{0,1,2,3,4,5,6,7,8,9,10});
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+            (shortFields ? "grhsim_cpp_short_concat_reduction_masks" : "grhsim_cpp_scalar_concat_reduction_masks");
+        std::map<std::string, std::string> sources;
+        for (const std::string mode : {"default", "on", "off", "env-off", "attr-on-env-off",
+                                       "attr-off-env-on", "parent-off", "parent-off-mask-off"})
+        {
+            ::unsetenv(maskOption);
+            if (mode == "env-off" || mode == "attr-on-env-off") ::setenv(maskOption, "0", 1);
+            if (mode == "attr-off-env-on") ::setenv(maskOption, "1", 1);
+            const bool parentOff = mode.starts_with("parent-off");
+            const bool enabled = mode == "default" || mode == "on" || mode == "attr-on-env-off";
+            const auto dir = base / mode;
+            EmitOptions options;
+            options.outputDir = dir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["scalar_concat_reduction"] = parentOff ? "0" : "1";
+            if (shortFields) options.attributes["scalar_concat_reduction_masks"] = "0";
+            if (mode == "on" || mode == "attr-on-env-off" || mode == "parent-off")
+                options.attributes[shortFields ? "short_concat_reduction_masks" : "scalar_concat_reduction_masks"] = "1";
+            if (mode == "off" || mode == "attr-off-env-on" || mode == "parent-off-mask-off")
+                options.attributes[shortFields ? "short_concat_reduction_masks" : "scalar_concat_reduction_masks"] = "0";
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            if (!emitter.emit(fixture.design, options).success || diagnostics.hasError())
+                return fail("masked reduction emit failed: " + mode);
+            const auto sched = collectSchedFiles(dir, "grhsim_top_sched_");
+            const auto states = collectSchedFiles(dir, "grhsim_top_state");
+            const auto source = readFiles(sched);
+            sources.emplace(mode, source);
+            if (mode == "on" && source != sources.at("default")) return fail("masked reduction default/on drift");
+            if ((mode == "env-off" || mode == "attr-off-env-on") && source != sources.at("off"))
+                return fail("masked reduction explicit disable/precedence failed");
+            if (mode == "attr-on-env-off" && source != sources.at("on"))
+                return fail("masked reduction attribute enable precedence failed");
+            if (mode == "parent-off-mask-off" && source != sources.at("parent-off"))
+                return fail("masked reduction bypassed disabled parent rule");
+            const std::string marker = shortFields ? "const std::uint64_t grhsim_short_reduction_inputs ="
+                                                   : "const std::uint64_t grhsim_reduction_inputs =";
+            std::size_t packs = 0;
+            for (auto p = source.find(marker); p != std::string::npos; p = source.find(marker, p + marker.size())) ++packs;
+            // Group 0 repeats only two predicates despite its 24 concat ops.
+            // Groups 8/9 exercise the 15/16 long predicate boundary and the
+            // factored-cost/dense short paths at 127/128 predicates.
+            // Short groups 10/11 reject fields outside 4..15; group 12
+            // has too few distinct short predicates despite repeated operations.
+            // Groups 13/14 cover accepted 4/15 fields; group 15 repeats fields.
+            // Group 16 rejects common-factor reuse despite 32 predicates;
+            // 17/18 accept more complex 32-predicate AND/OR families; 19
+            // stays below the 16-distinct-predicate floor.
+            if (packs != (enabled ? (shortFields ? 9u : 3u) : 0u))
+                return fail("masked reduction accepted wrong scopes: " + std::to_string(packs));
+            if (shortFields)
+            {
+                const std::set<unsigned> expectedGroups{1,2,8,9,13,14,15,17,18};
+                for (unsigned group = 0; group < 20u; ++group)
+                {
+                    const auto begin = source.find("// Supernode " + std::to_string(group + 1u) + ":");
+                    if (begin == std::string::npos) return fail("missing short reduction test scope");
+                    const auto end = source.find("// Supernode ", begin + 1u);
+                    const bool hasPack = source.substr(begin, end - begin).find(marker) != std::string::npos;
+                    if (hasPack != (enabled && expectedGroups.contains(group)))
+                        return fail("short reduction profitability mismatch in group " + std::to_string(group));
+                }
+            }
+            // Identical source variants need no duplicate compiler/runtime check.
+            // Source-only checks can compare policy changes against previously
+            // validated generated sources; normal CTest still runs the harnesses.
+            if (std::getenv("WOLVRIX_TEST_REDUCTION_SOURCE_ONLY") != nullptr ||
+                (mode != "on" && mode != "off" && mode != "parent-off")) continue;
+            const auto harness = dir / "harness.cpp";
+            std::ofstream out(harness);
+            out << "#include \"grhsim_top.hpp\"\n#include <cstdint>\n"
+                << (shortFields ? checks.str() : std::string{})
+                << "int main(){GrhSIM_top sim;sim.init();std::uint64_t rng=20261111;bool bits[65];"
+                "auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                "for(unsigned t=0;t<12000;++t){for(unsigned i=0;i<65;++i)"
+                "bits[i]=t<2?t!=0:t<67?i==t-2:t<132?i!=t-67:bool(random()&1);\n"
+                << setup.str() << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n"
+                << (shortFields ? checkCalls.str() : checks.str()) << "}}return 0;}\n";
+            out.close();
+            std::string files;
+            for (const auto &file : states) files += " " + file.string();
+            files += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &file : sched) files += " " + file.string();
+            files += " " + harness.string();
+            for (const std::string opt : {"-O0", "-O3"})
+            {
+                const auto binary = dir / (opt == "-O0" ? "harness_o0" : "harness_o3");
+                const auto command = "clang++ -std=c++20 " + opt +
+                    " -fsanitize=address,undefined -fno-sanitize-recover=all -I" + dir.string() +
+                    files + " -o " + binary.string();
+                if (std::system(command.c_str()) != 0 || std::system(binary.c_str()) != 0)
+                    return fail("masked reduction runtime failed: " + mode + "/" + opt);
+            }
+        }
+        if (savedOption) ::setenv(maskOption, savedOption->c_str(), 1);
+        else ::unsetenv(maskOption);
+        return 0;
+    }
+
 } // namespace
 
 #ifndef WOLF_SV_EMIT_ARTIFACT_DIR
@@ -11621,6 +12046,12 @@ int main() {
 
 int main()
 {
+    if (std::getenv("WOLVRIX_TEST_SHORT_CONCAT_REDUCTION_MASKS") != nullptr)
+        return runScalarConcatReductionMaskTests(true);
+    if (std::getenv("WOLVRIX_TEST_WIDE_CONCAT_REDUCTION") != nullptr)
+        return runWideConcatReductionTests();
+    if (std::getenv("WOLVRIX_TEST_SCALAR_CONCAT_REDUCTION_MASKS") != nullptr)
+        return runScalarConcatReductionMaskTests();
     if (std::getenv("WOLVRIX_TEST_BOOL_PRODUCER_REDUCE") != nullptr)
     {
         return runBoolProducerReduceFocusedTests();

@@ -2318,6 +2318,10 @@ namespace wolvrix::lib::emit
             std::unordered_map<ValueId, std::string, ValueIdHash> demandedBitSourceCacheByValue;
             std::size_t nextDemandedBitSourceCacheId = 0;
             std::unordered_set<ValueId, ValueIdHash> reducedScalarConcatValues;
+            std::vector<ValueId> packedScalarConcatInputs;
+            std::unordered_map<ValueId, std::string, ValueIdHash> packedScalarConcatReductions;
+            std::vector<ValueId> packedShortConcatInputs;
+            std::unordered_map<ValueId, std::string, ValueIdHash> packedShortConcatReductions;
             std::unordered_set<ValueId, ValueIdHash> preserveLocalSnapshot;
             std::unordered_set<ValueId, ValueIdHash> stablePackedArrayIndices;
             bool stableWideStateReadRefs = false;
@@ -4792,6 +4796,9 @@ namespace wolvrix::lib::emit
             bool scalarLeafMuxUnpredictable = false;
             bool stagedScalarConcat = false;
             bool scalarConcatReduction = false;
+            bool scalarConcatReductionMasks = false;
+            bool shortConcatReductionMasks = false;
+            bool wideConcatReduction = false;
             std::size_t scalarConcatReductionMinFields = 16u;
             bool wordwiseWideConcat = false;
             bool wordwiseWideConcatBoolPack = false;
@@ -18227,14 +18234,14 @@ template<class Index>
             }
             const ValueId result = op.results().front();
             const int32_t resultWidth = graph.valueWidth(result);
-            if (resultWidth <= 1 || resultWidth > 64)
+            if (resultWidth <= 1 || (resultWidth > 64 && !model.wideConcatReduction))
             {
                 return std::nullopt;
             }
             std::size_t totalWidth = 0u;
             for (ValueId operand : op.operands())
             {
-                if (!isScalarLogicValue(graph, operand))
+                if (!isScalarLogicValue(graph, operand) || isEventValue(model, operand))
                 {
                     return std::nullopt;
                 }
@@ -18307,6 +18314,12 @@ template<class Index>
                 return std::nullopt;
             }
 
+            if (const auto it = context.packedScalarConcatReductions.find(result);
+                it != context.packedScalarConcatReductions.end())
+            {
+                return it->second;
+            }
+
             std::vector<std::string> terms;
             terms.reserve(op.operands().size());
             for (std::size_t i = 0; i < op.operands().size(); ++i)
@@ -18329,6 +18342,205 @@ template<class Index>
                 }
             }
             return joinStrings(terms, " | ");
+        }
+
+        std::size_t estimateFactoredBooleanOps(
+            const std::set<std::pair<std::uint64_t, bool>> &predicates)
+        {
+            // A bounded profitability estimate, not a Boolean rewrite. Give
+            // the ordinary lowering credit for common two-input expressions.
+            // Keep AND/OR separate; inversion at a consumer is not a new term.
+            std::size_t cost = 0;
+            for (const bool family : {false, true})
+            {
+                std::vector<std::vector<std::size_t>> expressions;
+                for (const auto &[mask, andFamily] : predicates)
+                {
+                    if (andFamily != family) continue;
+                    auto &terms = expressions.emplace_back();
+                    for (std::size_t bit = 0; bit < 64u; ++bit)
+                        if (mask & (UINT64_C(1) << bit)) terms.push_back(bit);
+                }
+                std::size_t nextTerm = 64u;
+                while (true)
+                {
+                    std::map<std::pair<std::size_t, std::size_t>, std::size_t> uses;
+                    for (const auto &terms : expressions)
+                        for (std::size_t i = 0; i < terms.size(); ++i)
+                            for (std::size_t j = i + 1; j < terms.size(); ++j)
+                                ++uses[{terms[i], terms[j]}];
+                    std::pair<std::size_t, std::size_t> best{};
+                    std::size_t bestUses = 1u;
+                    // Ordered iteration gives deterministic ties.
+                    for (const auto &[pair, count] : uses)
+                        if (count > bestUses) { best = pair; bestUses = count; }
+                    if (bestUses == 1u) break;
+                    ++cost;
+                    for (auto &terms : expressions)
+                    {
+                        if (!std::binary_search(terms.begin(), terms.end(), best.first) ||
+                            !std::binary_search(terms.begin(), terms.end(), best.second)) continue;
+                        std::erase(terms, best.first);
+                        std::erase(terms, best.second);
+                        terms.push_back(nextTerm); // New ids preserve sorted order.
+                    }
+                    ++nextTerm;
+                }
+                for (const auto &terms : expressions)
+                    if (!terms.empty()) cost += terms.size() - 1u;
+            }
+            return cost;
+        }
+
+        void collectPackedScalarConcatReductions(const Graph &graph,
+                                                  const EmitModel &model,
+                                                  std::span<const OperationId> ops,
+                                                  SupernodeLocalExprContext &context,
+                                                  bool shortFields = false)
+        {
+            // Share a word across a dense family of predicates on stable bools.
+            // Packing is profitable only when many reductions reuse the inputs.
+            // Keep the representation local: no graph, state or activation change.
+            const std::size_t minFields = shortFields ? 4u : 16u;
+            const std::size_t maxFields = shortFields ? 15u : 64u;
+            const std::size_t minPredicates = 16u;
+            if (!model.scalarConcatReduction ||
+                !(shortFields ? model.shortConcatReductionMasks : model.scalarConcatReductionMasks))
+                return;
+            std::size_t possiblePredicates = 0;
+            for (OperationId id : ops)
+            {
+                const auto op = graph.getOperation(id);
+                if (op.kind() == OperationKind::kConcat && op.operands().size() >= minFields &&
+                    op.operands().size() <= maxFields && ++possiblePredicates == minPredicates)
+                    break;
+            }
+            if (possiblePredicates < minPredicates) return;
+            std::unordered_set<ValueId, ValueIdHash> written;
+            std::unordered_set<std::size_t> writtenBoolSlots;
+            for (OperationId id : ops)
+            {
+                for (ValueId result : graph.getOperation(id).results())
+                {
+                    const auto value = canonicalMaterializedStorageValue(model, result);
+                    written.insert(value);
+                    const auto slot = model.valueScalarSlotByValue.find(value);
+                    if (slot != model.valueScalarSlotByValue.end() && slot->second.kind == ValueSlotScalarKind::kBool)
+                        writtenBoolSlots.insert(slot->second.slotIndex);
+                }
+            }
+            const auto stableBool = [&](ValueId value) {
+                if (graph.valueType(value) != ValueType::Logic || graph.valueWidth(value) != 1 ||
+                    isEventValue(model, value) || model.directStateReadSymbolByValue.contains(value))
+                    return false;
+                const auto canonical = canonicalMaterializedStorageValue(model, value);
+                if (written.contains(canonical)) return false;
+                if (model.inputFieldByValue.contains(value)) return true;
+                const auto slot = model.valueScalarSlotByValue.find(canonical);
+                return isMaterializedValue(model, value) && slot != model.valueScalarSlotByValue.end() &&
+                       slot->second.kind == ValueSlotScalarKind::kBool &&
+                       !writtenBoolSlots.contains(slot->second.slotIndex);
+            };
+            std::vector<OperationId> candidates;
+            std::vector<ValueId> inputs;
+            std::unordered_map<ValueId, std::size_t, ValueIdHash> bitByValue;
+            bool effectsSeen = false;
+            for (OperationId id : ops)
+            {
+                const Operation op = graph.getOperation(id);
+                // Unknown effects must not move a read ahead of its snapshot.
+                effectsSeen |= getAttribute<bool>(op, "hasSideEffects").value_or(false) ||
+                               op.kind() == OperationKind::kDpicCall || op.kind() == OperationKind::kSystemTask;
+                if (effectsSeen || op.kind() != OperationKind::kConcat ||
+                    op.results().size() != 1u || op.operands().size() < minFields ||
+                    op.operands().size() > maxFields || isEventValue(model, op.results()[0]) ||
+                    isMaterializedValue(model, op.results()[0]) || valueNeedsTrackedChange(model, op.results()[0]) ||
+                    context.storedValueRefByValue.contains(op.results()[0]) ||
+                    !std::ranges::all_of(op.operands(), stableBool))
+                    continue;
+                // Reuse the complete reduction-only use proof, including scope,
+                // ordering, widths and rejection of mixed AND/OR families.
+                const std::vector<std::string> dummy(op.operands().size(), "false");
+                if (!scalarConcatReductionExpr(graph, model, op, dummy, context,
+                                               model.scalarConcatReductionMinFields))
+                    continue;
+                candidates.push_back(id);
+                for (ValueId value : op.operands())
+                {
+                    if (bitByValue.emplace(value, inputs.size()).second)
+                        inputs.push_back(value);
+                }
+                // A bounded, conservative rule; leave wider families untouched.
+                if (inputs.size() > 64u) return;
+            }
+            if (candidates.size() < minPredicates) return;
+            std::set<std::pair<std::uint64_t, bool>> distinctPredicates;
+            std::vector<std::pair<std::uint64_t, bool>> predicates;
+            predicates.reserve(candidates.size());
+            for (OperationId id : candidates)
+            {
+                const Operation op = graph.getOperation(id);
+                std::uint64_t mask = 0;
+                for (ValueId value : op.operands()) mask |= UINT64_C(1) << bitByValue.at(value);
+                const Value result = graph.getValue(op.results()[0]);
+                const auto kind = graph.getOperation(result.users().front().operation).kind();
+                const bool andFamily = kind == OperationKind::kReduceAnd || kind == OperationKind::kReduceNand;
+                predicates.emplace_back(mask, andFamily);
+                distinctPredicates.emplace(mask, andFamily);
+            }
+            // Reordered or repeated concat fields can describe the same Boolean
+            // predicate. The host compiler already merges those reductions;
+            // counting graph operations would pay for a pack without enough reuse.
+            if (distinctPredicates.size() < minPredicates) return;
+            if (shortFields)
+            {
+                std::size_t distinctInputUses = 0;
+                for (const auto &[mask, family] : distinctPredicates)
+                    distinctInputUses += std::popcount(mask);
+                // Short conditions are cheap individually. Amortize the input
+                // pack over substantial reuse, not repeated identical predicates.
+                if (distinctInputUses < 4u * inputs.size()) return;
+                // Retain the validated dense-family path. Smaller families
+                // must still have substantial work after common-factor reuse.
+                // These are heuristic cost units: two per mask comparison and
+                // one per captured input, not host instruction/cycle counts.
+                if (distinctPredicates.size() < 128u &&
+                    estimateFactoredBooleanOps(distinctPredicates) <
+                        2u * distinctPredicates.size() + inputs.size()) return;
+            }
+            auto &packedInputs = shortFields ? context.packedShortConcatInputs : context.packedScalarConcatInputs;
+            auto &reductions = shortFields ? context.packedShortConcatReductions : context.packedScalarConcatReductions;
+            packedInputs = std::move(inputs);
+            for (std::size_t i = 0; i < candidates.size(); ++i)
+            {
+                const auto [mask, andFamily] = predicates[i];
+                const Operation op = graph.getOperation(candidates[i]);
+                // scalarConcatReduction stores bad bits for AND/NAND, any bits
+                // for OR/NOR. The existing consumer lowering applies negation.
+                const std::string literal = "UINT64_C(" + std::to_string(mask) + ")";
+                reductions.emplace(op.results()[0],
+                    "((" + std::string(shortFields ? "grhsim_short_reduction_inputs" : "grhsim_reduction_inputs") +
+                    " & " + literal + ") != " +
+                    (andFamily ? literal : "UINT64_C(0)") + ")");
+            }
+        }
+
+        void emitPackedScalarConcatInputs(std::ostream &stream, const EmitModel &model,
+                                           const SupernodeLocalExprContext &context,
+                                           bool shortFields = false)
+        {
+            const auto &inputs = shortFields ? context.packedShortConcatInputs : context.packedScalarConcatInputs;
+            if (inputs.empty()) return;
+            stream << "        // Shared stable Boolean inputs for masked concat reductions.\n";
+            stream << "        const std::uint64_t "
+                   << (shortFields ? "grhsim_short_reduction_inputs" : "grhsim_reduction_inputs") << " =\n";
+            for (std::size_t i = 0; i < inputs.size(); ++i)
+            {
+                stream << "            (static_cast<std::uint64_t>("
+                       << resolvedScheduleValueExpr(model, inputs[i], &context)
+                       << ") << " << i << "u)"
+                       << (i + 1u == inputs.size() ? ";\n" : " |\n");
+            }
         }
 
         std::uint64_t scalarRepeatPattern(std::size_t elemWidth, std::size_t rep)
@@ -19059,6 +19271,30 @@ template<class Index>
             {
                 return false;
             }
+            // Short concat fields were captured from immutable inputs inside
+            // this activity scope. Keep the compare inline at each reduction,
+            // without materializing the original-width concat or another temp.
+            if (op.kind() == OperationKind::kConcat &&
+                context->packedShortConcatReductions.contains(op.results().front()))
+            {
+                return true;
+            }
+            if (op.operands().size() == 1u)
+            {
+                const auto packed = context->packedShortConcatReductions.find(op.operands().front());
+                if (packed != context->packedShortConcatReductions.end())
+                {
+                    const bool negate = op.kind() == OperationKind::kReduceAnd ||
+                                        op.kind() == OperationKind::kReduceNor;
+                    if (!negate && op.kind() != OperationKind::kReduceNand &&
+                        op.kind() != OperationKind::kReduceOr)
+                        return false;
+                    emitLogicAssignFromScalarExpr(stream, graph, model, op.results().front(),
+                        negate ? "(!" + packed->second + ")" : packed->second,
+                        true, context, activationContext, deferredContext);
+                    return true;
+                }
+            }
             if (op.operands().size() == 1u &&
                 context->reducedScalarConcatValues.contains(op.operands().front()))
             {
@@ -19109,12 +19345,19 @@ template<class Index>
             // Do not turn an already cheap inline concat into a new long-lived
             // temporary. This rule changes an existing snapshot's representation,
             // not the emitter's choice of where to materialize scalar values.
-            const std::string original = renderScalarAssignedExpr(graph, resultValue,
-                scalarDirectConcatExpr(graph, op, operandExprs), true, false);
-            if (canInlineSingleUserLocalValue(graph, model, resultValue, original,
-                                              SupernodeLocalExprKind::kScalarInline, context))
+            if (graph.valueWidth(resultValue) <= 64)
             {
-                return false;
+                const std::string original = renderScalarAssignedExpr(graph, resultValue,
+                    scalarDirectConcatExpr(graph, op, operandExprs), true, false);
+                if (canInlineSingleUserLocalValue(graph, model, resultValue, original,
+                                                  SupernodeLocalExprKind::kScalarInline, context))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                stream << "        // Wide concat reduction: keep the predicate at the original snapshot.\n";
             }
             // Do not put a bool in the ordinary original-width expression map
             // or defer evaluation to a consumer across intervening stores.
@@ -26129,6 +26372,10 @@ template<class Index>
                             localExprContext.demandedBitComputePositions.emplace(id, i);
                     }
                     collectDemandedBitSourceCacheCandidates(graph, model, supernodeOps, localExprContext);
+                    collectPackedScalarConcatReductions(graph, model, supernodeOps, localExprContext);
+                    collectPackedScalarConcatReductions(graph, model, supernodeOps, localExprContext, true);
+                    emitPackedScalarConcatInputs(stream, model, localExprContext);
+                    emitPackedScalarConcatInputs(stream, model, localExprContext, true);
                 }
                 bool commitEventHandledByDispatch = false;
                 std::optional<std::size_t> boolZeroGroupEnd;
@@ -28333,6 +28580,8 @@ template<class Index>
                             localContext.demandedBitComputePositions.emplace(ops[i], i);
                     }
                     collectDemandedBitSourceCacheCandidates(graph, model, ops, localContext);
+                    collectPackedScalarConcatReductions(graph, model, ops, localContext);
+                    collectPackedScalarConcatReductions(graph, model, ops, localContext, true);
                 }
                 const std::size_t activeId = model.activeIdBySupernode.at(id);
                 const ActivationEmitContext staticActivationContext{
@@ -28342,6 +28591,16 @@ template<class Index>
                 const auto addShape = [&](std::string_view name, uint64_t count = 1) {
                     features[std::string(name)] += count;
                 };
+                if (!localContext.packedScalarConcatInputs.empty())
+                {
+                    addShape("scalar.concat_reduction_input_packs");
+                    addShape("scalar.concat_reduction_input_bits", localContext.packedScalarConcatInputs.size());
+                }
+                if (!localContext.packedShortConcatInputs.empty())
+                {
+                    addShape("scalar.short_reduction_input_packs");
+                    addShape("scalar.short_reduction_input_bits", localContext.packedShortConcatInputs.size());
+                }
                 const auto operandWidthBits = [&](std::span<const ValueId> values) {
                     uint64_t bits = 0;
                     for (const auto value : values)
@@ -28567,7 +28826,35 @@ template<class Index>
                         std::vector<std::string> operandExprs;
                         operandExprs.reserve(operands.size());
                         for (auto value : operands) operandExprs.push_back(resolvedScheduleValueExpr(model, value, &localContext));
-                        if (isWideLogicValue(graph, result) || opNeedsWordLogicEmit(graph, op))
+                        const bool wideConcatCandidate = model.scalarConcatReduction && model.wideConcatReduction &&
+                            op.kind() == OperationKind::kConcat && isWideLogicValue(graph, result) &&
+                            packedArrayLaneViewForSourceValue(model, result) == nullptr &&
+                            !isEventValue(model, result) && !isMaterializedValue(model, result) &&
+                            !valueNeedsTrackedChange(model, result, &staticActivationContext) &&
+                            !localContext.storedValueRefByValue.contains(result);
+                        if (op.kind() == OperationKind::kConcat && localContext.packedShortConcatReductions.contains(result))
+                        {
+                            addShape("scalar.short_reduction_concat_elided");
+                        }
+                        else if (operands.size() == 1u && localContext.packedShortConcatReductions.contains(operands.front()))
+                        {
+                            addShape("scalar.short_reduction_mask");
+                            classifyStoredResult(result, "scalar.result");
+                        }
+                        else if (wideConcatCandidate && scalarConcatReductionExpr(graph, model, op, operandExprs,
+                                localContext, model.scalarConcatReductionMinFields))
+                        {
+                            addShape("wide.concat_reduction");
+                            localContext.reducedScalarConcatValues.insert(result);
+                            classifyStoredResult(result, "scalar.result");
+                        }
+                        else if (operands.size() == 1u && isWideLogicValue(graph, operands.front()) &&
+                                 localContext.reducedScalarConcatValues.contains(operands.front()))
+                        {
+                            addShape("wide.concat_reduced_consumer");
+                            classifyStoredResult(result, "scalar.result");
+                        }
+                        else if (isWideLogicValue(graph, result) || opNeedsWordLogicEmit(graph, op))
                         {
                             addShape("wide.operand_words", operandWords);
                             if (const auto bit = localShiftDemandedBit(graph, model, op, localContext))
@@ -28711,6 +28998,8 @@ template<class Index>
                                 if (reduction)
                                 {
                                     addShape("scalar.concat_reduction");
+                                    if (localContext.packedScalarConcatReductions.contains(result))
+                                        addShape("scalar.concat_reduction_mask");
                                     localContext.reducedScalarConcatValues.insert(result);
                                 }
                             }
@@ -29332,6 +29621,21 @@ template<class Index>
             parseBooleanEmitOption(options,
                                    "scalar_concat_reduction",
                                    "WOLVRIX_GRHSIM_SCALAR_CONCAT_REDUCTION");
+        const bool scalarConcatReductionMasks =
+            parseBooleanEmitOption(options,
+                                   "scalar_concat_reduction_masks",
+                                   "WOLVRIX_GRHSIM_SCALAR_CONCAT_REDUCTION_MASKS",
+                                   true);
+        const bool wideConcatReduction =
+            parseBooleanEmitOption(options,
+                                   "wide_concat_reduction",
+                                   "WOLVRIX_GRHSIM_WIDE_CONCAT_REDUCTION",
+                                   true);
+        const bool shortConcatReductionMasks =
+            parseBooleanEmitOption(options,
+                                   "short_concat_reduction_masks",
+                                   "WOLVRIX_GRHSIM_SHORT_CONCAT_REDUCTION_MASKS",
+                                   true);
         std::string invalidScalarConcatReductionFields;
         const auto scalarConcatReductionMinFields =
             parseUnsignedEmitOption(options,
@@ -29698,6 +30002,9 @@ template<class Index>
             configuredModel.scalarLeafMuxUnpredictable = scalarLeafMuxUnpredictable;
             configuredModel.stagedScalarConcat = stagedScalarConcat;
             configuredModel.scalarConcatReduction = scalarConcatReduction;
+            configuredModel.scalarConcatReductionMasks = scalarConcatReductionMasks;
+            configuredModel.shortConcatReductionMasks = shortConcatReductionMasks;
+            configuredModel.wideConcatReduction = wideConcatReduction;
             configuredModel.scalarConcatReductionMinFields = *scalarConcatReductionMinFields;
             configuredModel.wordwiseWideConcat = wordwiseWideConcat;
             configuredModel.wordwiseWideConcatBoolPack = wordwiseWideConcat && wordwiseWideConcatBoolPack;

@@ -501,6 +501,15 @@ set_tests_properties(emit-grhsim-cpp-bool-zero-group-guard
 add_test(NAME emit-grhsim-cpp-scalar-concat-reduction COMMAND emit-grhsim-cpp)
 set_tests_properties(emit-grhsim-cpp-scalar-concat-reduction
     PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SCALAR_CONCAT_REDUCTION=1")
+add_test(NAME emit-grhsim-cpp-scalar-concat-reduction-masks COMMAND $<TARGET_FILE:emit-grhsim-cpp>)
+set_tests_properties(emit-grhsim-cpp-scalar-concat-reduction-masks
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SCALAR_CONCAT_REDUCTION_MASKS=1")
+add_test(NAME emit-grhsim-cpp-short-concat-reduction-masks COMMAND $<TARGET_FILE:emit-grhsim-cpp>)
+set_tests_properties(emit-grhsim-cpp-short-concat-reduction-masks
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SHORT_CONCAT_REDUCTION_MASKS=1")
+add_test(NAME emit-grhsim-cpp-wide-concat-reduction COMMAND $<TARGET_FILE:emit-grhsim-cpp>)
+set_tests_properties(emit-grhsim-cpp-wide-concat-reduction
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_WIDE_CONCAT_REDUCTION=1")
 add_test(NAME emit-grhsim-cpp-local-shift-demanded-bit COMMAND emit-grhsim-cpp)
 set_tests_properties(emit-grhsim-cpp-local-shift-demanded-bit
     PROPERTIES ENVIRONMENT "WOLVRIX_TEST_LOCAL_SHIFT_DEMANDED_BIT=1")

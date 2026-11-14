@@ -4,9 +4,10 @@
 `WOLVRIX_GRHSIM_SHORT_CONCAT_REDUCTION_MASKS=1`, shares one input word across
 dense short concat reductions in a compute supernode. It is enabled by default
 when the parent `scalar_concat_reduction` rule is enabled, independently of the
-long-field mask and wide-concat reduction switches. Set the attribute or
-environment variable to `0` to disable it; an explicit attribute takes
-precedence over the environment. The standard preset records the enabled value.
+long-field mask and wide-concat reduction switches. The parent rule now also
+defaults to enabled. Set the parent or child attribute/environment variable to
+`0` to disable it; an explicit child attribute takes precedence over its
+environment variable. The standard preset records both settings explicitly.
 
 Eligible concats contain 4–15 one-bit fields. A family must have at least 16
 distinct predicates, at most 64 distinct stable inputs, and at least four times

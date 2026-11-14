@@ -29620,7 +29620,8 @@ template<class Index>
         const bool scalarConcatReduction =
             parseBooleanEmitOption(options,
                                    "scalar_concat_reduction",
-                                   "WOLVRIX_GRHSIM_SCALAR_CONCAT_REDUCTION");
+                                   "WOLVRIX_GRHSIM_SCALAR_CONCAT_REDUCTION",
+                                   true);
         const bool scalarConcatReductionMasks =
             parseBooleanEmitOption(options,
                                    "scalar_concat_reduction_masks",

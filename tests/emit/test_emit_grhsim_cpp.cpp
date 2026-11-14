@@ -11582,10 +11582,10 @@ int main() {
             const auto states = collectSchedFiles(dir, "grhsim_top_state");
             const std::string source = readFiles(sched);
             if (mode == "default") defaultSource = source;
-            if (mode == "off" && source != defaultSource)
-                return fail("concat-reduction default/off drift");
-            if (mode == "on" && source == defaultSource)
-                return fail("concat-reduction focused rule did not trigger");
+            if (mode == "off" && source == defaultSource)
+                return fail("concat-reduction explicit off matched the enabled default");
+            if (mode == "on" && source != defaultSource)
+                return fail("concat-reduction default/on drift");
             const auto harness = dir / "harness.cpp";
             {
                 std::ofstream out(harness);

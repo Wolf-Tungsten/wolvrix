@@ -3,9 +3,10 @@
 The `grhsim-cpp` attribute `wide_concat_reduction=1` (environment variable
 `WOLVRIX_GRHSIM_WIDE_CONCAT_REDUCTION=1`) extends the existing
 `scalar_concat_reduction=1` rule to concat results wider than 64 bits. The wide
-extension is enabled by default when the parent rule is enabled; disabling the
-parent rule disables both widths. Set `wide_concat_reduction=0` or its environment
-variable to `0` to retain the original wide lowering. Explicit attributes take
+extension is enabled by default when the parent rule is enabled; the parent
+rule now also defaults to enabled. Disabling the parent rule disables both
+widths. Set `wide_concat_reduction=0` or its environment variable to `0` to
+retain the original wide lowering. Explicit attributes take
 precedence over environment variables. The standard `config/grhsim32.json`
 preset also records the enabled setting. This extension is independent of shared
 Boolean input masks.

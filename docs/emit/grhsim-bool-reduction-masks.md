@@ -2,13 +2,13 @@
 
 The `grhsim-cpp` attribute `scalar_concat_reduction_masks=1` (environment:
 `WOLVRIX_GRHSIM_SCALAR_CONCAT_REDUCTION_MASKS=1`) shares an input word across
-repeated concat reductions in one compute supernode. It is enabled by default
-when the parent rule `scalar_concat_reduction=1` is enabled. The parent rule's
-default is unchanged. Set the attribute or environment variable to `0` to
-disable mask sharing; an explicit attribute takes precedence over the environment.
-The standard `config/grhsim32.json` preset records the enabled setting explicitly.
-For that pipeline, set its `options.WOLVRIX_GRHSIM_SCALAR_CONCAT_REDUCTION_MASKS`
-entry to `"0"` for an off/on comparison.
+repeated concat reductions in one compute supernode. The child rule and the
+parent `scalar_concat_reduction` rule now default to enabled. Explicitly set
+either the parent or child attribute/environment variable to `0` to disable it;
+an explicit child attribute takes precedence over its environment variable. The
+standard `config/grhsim32.json` preset records both settings explicitly. To turn
+the rule off in that pipeline, set the parent or child key under `options` to
+`"0"`.
 
 For example, a concat of Boolean inputs `a, b, d` followed by AND reduction can
 use `(inputs & 0xb) == 0xb`, where `inputs` contains `a, b, c, d` in bits 0–3.
@@ -47,3 +47,9 @@ identity, explicit disabling and attribute/environment precedence, disabled-pare
 isolation, the 15/16 distinct-predicate boundary, repeated operands, 64/65 input
 limits, all-zero/all-one and walking-bit cases, deterministic random inputs,
 and repeated eval with Clang at `-O0`/`-O3` under ASan/UBSan.
+
+The parent-rule default was enabled after an after/DefaultConfig single-model
+GrhSIM comparison using an identical frozen graph, DiffTest traces, and Clang
+23.1.2 build flags. On node030 CPU96, 8 paired runs measured 9.98% lower Host
+time for default-on versus explicit-off (95% CI [-10.23%, -9.74%]); see
+[`TNO0072`](../../../pdocs/kunminghu_v3_grhsim_merge_20261110/TNO0072_scalar_concat_reduction_parent_default_20261114.md).

@@ -83,6 +83,12 @@ namespace wolvrix::lib::transform
         bool commitGuardEventBuckets = true;
         bool splitOversizeComputeNodes = false;
         bool declaredValueComputeNodeBoundary = false;
+        // Fuse pure terminal cones of one register commit event before emission.
+        // Default-off; state/event/effect boundaries and commit order are retained.
+        bool eventRegions = false;
+        // Refine mixed pure groups by endpoint set, then coalesce classes
+        // with identical multiple endpoints. Requires eventRegions.
+        bool eventRegionsShared = false;
         std::string localSharedComputeCommonOwnerPolicy = "off";
         std::string finalFaninPullbackPolicy = "off";
         std::string finalTerminalPushforwardPolicy = "off";

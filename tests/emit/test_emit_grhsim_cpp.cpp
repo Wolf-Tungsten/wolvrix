@@ -11472,6 +11472,942 @@ int main() {
         return 0;
     }
 
+    int runLocalEqualityDecodeTests()
+    {
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_local_equality_decode";
+        for (const std::string fixture : {"ordinary", "input", "small", "wide", "duplicates", "effect", "local_source"})
+        {
+            Design design; auto &g = design.createGraph("top"); design.markAsTop("top");
+            ActivityScheduleSupernodeToOps nodes(2);
+            const int width = fixture == "wide" ? 13 : 12;
+            auto address = makeLogicValue(g, "address", width); g.bindInputPort("address", address);
+            auto noise = makeLogicValue(g, "noise", 32); g.bindInputPort("noise", noise);
+            const auto zero = addConstant(g, "zero", "zero_value", width, std::to_string(width) + "'d0");
+            nodes[0].push_back(g.valueDef(zero));
+            // A stored producer outside the decoder body exercises the non-input
+            // source path. Moving it inside must make the entry snapshot ineligible.
+            const auto derived = makeLogicValue(g, "source", width);
+            const auto source = fixture == "input" ? address : derived;
+            const auto producer = g.createOperation(OperationKind::kXor, g.internSymbol("source_op"));
+            g.addOperand(producer, address); g.addOperand(producer, zero); g.addResult(producer, derived);
+            nodes[fixture == "local_source" ? 1 : 0].push_back(producer);
+            std::vector<ValueId> fields;
+            const unsigned count = fixture == "small" ? 15 : 32;
+            for (unsigned i = 0; i < count; ++i)
+            {
+                const auto name = "predicate_" + std::to_string(i);
+                const auto number = fixture == "duplicates" ? i % 8 : i * 7;
+                const auto constant = addConstant(g, name + "_constant", name + "_constant_value", width,
+                    std::to_string(width) + "'d" + std::to_string(number));
+                nodes[1].push_back(g.valueDef(constant));
+                const auto p = makeLogicValue(g, name, 1);
+                const auto eq = g.createOperation(OperationKind::kEq, g.internSymbol(name + "_eq"));
+                g.addOperand(eq, i % 2 ? constant : source); g.addOperand(eq, i % 2 ? source : constant);
+                g.addResult(eq, p); nodes[1].push_back(eq);
+                if (fixture == "effect" && i == 3) g.setAttr(eq, "hasSideEffects", true);
+                const auto bit = makeLogicValue(g, name + "_noise", 1);
+                const auto slice = g.createOperation(OperationKind::kSliceStatic, g.internSymbol(name + "_slice"));
+                g.addOperand(slice, noise); g.addResult(slice, bit);
+                g.setAttr(slice, "sliceStart", int64_t{i}); g.setAttr(slice, "sliceEnd", int64_t{i});
+                nodes[1].push_back(slice);
+                const auto used = makeLogicValue(g, name + "_used", 1);
+                const auto use = g.createOperation(OperationKind::kXor, g.internSymbol(name + "_use"));
+                g.addOperand(use, p); g.addOperand(use, bit); g.addResult(use, used); nodes[1].push_back(use);
+                fields.insert(fields.begin(), used); // Consumers interleave the equalities.
+            }
+            const auto output = makeLogicValue(g, "y", count); g.bindOutputPort("y", output);
+            const auto concat = g.createOperation(OperationKind::kConcat, g.internSymbol("concat"));
+            for (const auto f : fields) g.addOperand(concat, f);
+            g.addResult(concat, output); nodes[1].push_back(concat);
+            ActivityScheduleValueFanout fanout(g.values().size());
+            fanout[address.index - 1].push_back(fixture == "local_source" ? 1u : 0u);
+            fanout[noise.index - 1].push_back(1);
+            if (fixture != "local_source") fanout[source.index - 1].push_back(1);
+            else fanout[zero.index - 1].push_back(1);
+            SessionStore session;
+            setActivityScheduleFixtureSlot(session, "supernode_to_ops", nodes);
+            setActivityScheduleFixtureSlot(session, "value_fanout", fanout);
+            setActivityScheduleFixtureSlot(session, "topo_order", ActivityScheduleTopoOrder{0,1});
+            setActivityScheduleFixtureSlot(session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+            std::string defaultSource;
+            for (const std::string mode : {"default", "off", "on", "fullpass", "parent_off"})
+            {
+                const auto dir = base / fixture / mode;
+                EmitOptions options; options.outputDir = dir; options.session = &session; options.sessionPathPrefix = "top";
+                options.attributes["waveform"] = "off";
+                if (mode != "default") options.attributes["local_equality_decode"] = mode == "off" ? "0" : "1";
+                if (mode == "fullpass") options.attributes["input_fullpass_specialization"] = "1";
+                if (mode == "parent_off") options.attributes["shared_equality_decode"] = "0";
+                EmitDiagnostics diagnostics; EmitGrhSimCpp emitter(&diagnostics);
+                if (!emitter.emit(design, options).success || diagnostics.hasError()) return fail("local decode emit failed");
+                const auto sched = collectSchedFiles(dir, "grhsim_top_sched_");
+                const auto text = readFiles(sched);
+                if (mode == "default") defaultSource = text;
+                if (mode == "off" && defaultSource != text) return fail("local decode must default off");
+                const bool positive = fixture == "ordinary" || fixture == "input";
+                const bool enabled = positive && (mode == "on" || mode == "fullpass");
+                if ((text.find("// Local equality decode:") != std::string::npos) != enabled)
+                    return fail("local decode eligibility mismatch: " + fixture + "/" + mode);
+                if (enabled)
+                {
+                    const auto header = readFile(dir / "grhsim_top.hpp");
+                    if (header.find("std::array<bool, 4096> local_equality_table_") == std::string::npos ||
+                        text.find("u] != UINT8_C(0)") != std::string::npos)
+                        return fail("local decode lost its Boolean storage contract");
+                }
+                GrhSimExecutionPlan plan;
+                if (!emitter.analyzeExecutionPlan(design, options, plan).success) return fail("local decode planner failed");
+                std::uint64_t predicates = 0;
+                for (const auto &entry : plan.computeLowering)
+                    if (const auto it = entry.features.find("local_equality_decode_predicates"); it != entry.features.end())
+                        predicates += it->second;
+                if (predicates != (enabled && mode != "fullpass" ? 32u : 0u)) return fail("local decode planner drift");
+                if (!positive || (mode != "off" && mode != "on" && mode != "fullpass")) continue;
+                const auto harness = dir / "harness.cpp";
+                std::ofstream(harness) << R"CPP(#include "grhsim_top.hpp"
+#include <cstdint>
+int main() {
+    GrhSIM_top sim;
+    for(unsigned reset=0;reset<3;++reset) {
+        sim.init();
+        for(unsigned t=0;t<4096;++t) {
+            // Repeated address with changing consumers, unmatched addresses,
+            // reinit, and spare high storage bits in the 12-bit input.
+            sim.address=(t/5)%257 + (t%7==0 ? 32768 : 0);
+            sim.noise=t*1664525u+1013904223u;
+            sim.eval();
+            uint32_t expected=0;
+            for(unsigned bit=0;bit<32;++bit)
+                expected |= uint32_t((sim.address==bit*7u)^((sim.noise>>bit)&1))<<bit;
+            if(sim.y!=expected)return 1;
+            sim.eval(); if(sim.y!=expected)return 2;
+        }
+    }
+})CPP";
+                std::string files;
+                for (const auto &p : collectSchedFiles(dir, "grhsim_top_state")) files += " " + p.string();
+                files += " " + (dir / "grhsim_top_eval.cpp").string();
+                for (const auto &p : sched) files += " " + p.string();
+                files += " " + harness.string();
+                for (const std::string opt : {"-O0", "-O3"})
+                {
+                    const auto exe = dir / "check";
+                    const auto command = "clang++ -std=c++20 " + opt +
+                        " -fsanitize=address,undefined -fno-sanitize-recover=all -I" + dir.string() +
+                        files + " -o " + exe.string();
+                    if (std::system(command.c_str()) || std::system(exe.c_str()))
+                        return fail("local decode runtime failed: " + mode);
+                }
+            }
+        }
+        return 0;
+    }
+
+    int runSharedEqualityFamilyTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_SHARED_EQUALITY_FAMILIES";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        Design design; auto &g = design.createGraph("top"); design.markAsTop("top");
+        const std::vector<std::string> cases{"local", "input", "mixed", "small", "duplicates", "effect"};
+        const uint32_t consumer = static_cast<uint32_t>(cases.size() + 1), commit = consumer + 1;
+        ActivityScheduleSupernodeToOps nodes(commit + 1);
+        const auto input = [&](const std::string &name, int width) {
+            auto v = makeLogicValue(g, name, width); g.bindInputPort(name, v); return v;
+        };
+        const auto address = input("address", 12), other = input("other", 12), noise = input("noise", 1);
+        const auto clk = input("clk", 1), enable = input("enable", 1), data = input("data", 12);
+        const auto one = addConstant(g, "one", "one_v", 1, "1'b1");
+        const auto mask = addConstant(g, "mask", "mask_v", 12, "12'hfff");
+        nodes[0].push_back(g.valueDef(one)); nodes[0].push_back(g.valueDef(mask));
+        const auto reg = g.createOperation(OperationKind::kRegister, g.internSymbol("q"));
+        g.setAttr(reg, "width", int64_t{12}); g.setAttr(reg, "isSigned", false); g.setAttr(reg, "initValue", std::string("12'd7"));
+        const auto q = makeLogicValue(g, "q_read", 12);
+        const auto read = g.createOperation(OperationKind::kRegisterReadPort, g.internSymbol("read_q"));
+        g.setAttr(read, "regSymbol", std::string("q")); g.addResult(read, q); nodes[0].push_back(read);
+        const auto write = g.createOperation(OperationKind::kRegisterWritePort, g.internSymbol("write_q"));
+        for (auto v : {enable, data, mask, clk}) g.addOperand(write, v);
+        g.setAttr(write, "regSymbol", std::string("q")); g.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        nodes[commit].push_back(write);
+        std::ostringstream checks;
+        for (std::size_t c = 0; c < cases.size(); ++c)
+        {
+            const auto &kind = cases[c]; const uint32_t sid = static_cast<uint32_t>(c + 1);
+            auto source = address;
+            if (kind != "input" && kind != "mixed")
+            {
+                source = makeLogicValue(g, kind + "_source", 12);
+                const auto op = g.createOperation(OperationKind::kXor, g.internSymbol(kind + "_source_op"));
+                g.addOperand(op, address); g.addOperand(op, q); g.addResult(op, source); nodes[sid].push_back(op);
+            }
+            const unsigned count = kind == "small" ? 15 : 32;
+            for (unsigned i = 0; i < count; ++i)
+            {
+                const auto name = kind + std::to_string(i); const unsigned number = (kind == "duplicates" ? i % 8 : i) * 7;
+                const auto k = addConstant(g, name + "_k", name + "_kv", 12, "12'd" + std::to_string(number));
+                nodes[0].push_back(g.valueDef(k));
+                const auto p = makeLogicValue(g, name + "_p", 1);
+                const auto eq = g.createOperation(OperationKind::kEq, g.internSymbol(name + "_eq"));
+                const auto actual = kind == "mixed" && i % 2 ? other : source;
+                g.addOperand(eq, i % 2 ? k : actual); g.addOperand(eq, i % 2 ? actual : k);
+                g.addResult(eq, p); nodes[sid].push_back(eq);
+                // Same-region consumers are interleaved with comparisons.
+                // Another scope forces each predicate's own persistent slot.
+                const auto local = makeLogicValue(g, name + "_local", 1);
+                const auto use = g.createOperation(OperationKind::kXor, g.internSymbol(name + "_use"));
+                g.addOperand(use, p); g.addOperand(use, noise); g.addResult(use, local);
+                if (kind == "effect" && i == 16) g.setAttr(use, "hasSideEffects", true);
+                nodes[sid].push_back(use); g.bindOutputPort(name + "_local", local);
+                const auto output = makeLogicValue(g, name + "_out", 1);
+                const auto copy = g.createOperation(OperationKind::kAssign, g.internSymbol(name + "_copy"));
+                g.addOperand(copy, p); g.addResult(copy, output); nodes[consumer].push_back(copy); g.bindOutputPort(name + "_out", output);
+                const std::string oracle = kind == "input" ? "unsigned(sim.address)" : kind == "mixed"
+                    ? (i % 2 ? "unsigned(sim.other)" : "unsigned(sim.address)") : "(unsigned(sim.address)^q)";
+                checks << "if(sim." << name << "_out!=(" << oracle << "==" << number << "u))return 10;\n"
+                       << "if(sim." << name << "_local!=((" << oracle << "==" << number << "u)^bool(sim.noise)))return 11;\n";
+            }
+        }
+        std::map<uint32_t, uint32_t> owner;
+        for (uint32_t sid = 0; sid < nodes.size(); ++sid) for (auto op : nodes[sid]) owner[op.index] = sid;
+        ActivityScheduleValueFanout fanout(g.values().size());
+        for (uint32_t sid = 0; sid < nodes.size(); ++sid)
+            for (auto id : nodes[sid])
+            {
+                const auto op = g.getOperation(id);
+                for (auto v : op.operands())
+                    if (!g.valueDef(v).valid() || owner.at(g.valueDef(v).index) != sid)
+                    {
+                        auto &targets = fanout[v.index - 1];
+                        if (std::find(targets.begin(), targets.end(), sid) == targets.end()) targets.push_back(sid);
+                    }
+            }
+        SessionStore session; ActivityScheduleTopoOrder topo(nodes.size()); std::iota(topo.begin(), topo.end(), 0u);
+        setActivityScheduleFixtureSlot(session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(session, "topo_order", std::move(topo));
+        setActivityScheduleFixtureSlot(session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{{"q", {0u}}});
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_equality_families";
+        std::map<std::string, std::string> defaults;
+        for (const std::string mode : {"default", "off", "on", "parent-off", "env", "precedence", "split", "fullpass", "shared", "conditional"})
+        {
+            const bool enabled = mode != "default" && mode != "off" && mode != "parent-off" && mode != "precedence";
+            const auto dir = base / mode; EmitOptions options; options.outputDir = dir.string();
+            options.session = &session; options.sessionPathPrefix = "top";
+            options.attributes["direct_single_writer_state_reads"] = "0";
+            if (mode != "default" && mode != "env") options.attributes["shared_equality_families"] = mode == "parent-off" || enabled ? "1" : "0";
+            if (mode == "parent-off") options.attributes["shared_equality_decode"] = "0";
+            if (mode == "env" || mode == "precedence") ::setenv(key, "1", 1);
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "fullpass")
+            {
+                options.attributes["input_fullpass_specialization"] = "1";
+                options.attributes["posedge_fullpass_specialization"] = "1";
+            }
+            if (mode == "shared")
+                for (const char *option : {"direct_deferred_activation", "packed_deferred_activation", "shared_deferred_activation"})
+                    options.attributes[option] = "1";
+            if (mode == "conditional") options.attributes["conditional_mux_cones"] = "1";
+            EmitDiagnostics diagnostics; EmitGrhSimCpp emitter(&diagnostics);
+            if (!emitter.emit(design, options).success || diagnostics.hasError()) return fail("equality family emit: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaults = files;
+            if ((mode == "off" || mode == "precedence") && files != defaults) return fail("family default/off drift");
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            const auto emittedFamilies = countSubstring(code, "// Shared equality family:");
+            if (mode == "fullpass" ? (emittedFamilies < 4u || emittedFamilies % 4u != 0u) :
+                emittedFamilies != (enabled ? 4u : 0u))
+                return fail("family coverage mismatch: " + mode);
+            wolvrix::lib::emit::GrhSimExecutionPlan plan;
+            if (!emitter.analyzeExecutionPlan(design, options, plan).success) return fail("family plan failed");
+            uint64_t families = 0, predicates = 0;
+            for (const auto &item : plan.computeLowering)
+            {
+                if (auto it = item.features.find("shared_equality_family_groups"); it != item.features.end()) families += it->second;
+                if (auto it = item.features.find("shared_equality_family_predicates"); it != item.features.end()) predicates += it->second;
+            }
+            if (families != (enabled && mode != "fullpass" ? 4u : 0u) || predicates != (enabled && mode != "fullpass" ? 96u : 0u))
+                return fail("family plan coverage mismatch: " + mode);
+            ::unsetenv(key);
+            if (mode == "default" || mode == "off" || mode == "env" || mode == "precedence") continue;
+            const auto harness = dir / "harness.cpp"; std::ofstream out(harness);
+            out << "#include \"grhsim_top.hpp\"\n#include <cstdint>\nint main(){GrhSIM_top sim;"
+                   "for(unsigned reset=0;reset<3;++reset){sim.init();unsigned q=7;"
+                   "for(unsigned t=0;t<1024;++t){sim.address=((t/4)*7)&4095;sim.other=((t/3)*7)&4095;"
+                   "if(t%17==0)sim.address|=32768;sim.data=((t/16)*7)&4095;sim.enable=t%4==0;"
+                   "for(unsigned edge=0;edge<2;++edge){sim.clk=edge;if(edge&&sim.enable)q=sim.data;"
+                   "for(unsigned n=0;n<3;++n){sim.noise=(t+n)&1;sim.eval();\n" << checks.str() << "}}}}}\n";
+            out.close();
+            std::string sources;
+            for (const auto &[name, content] : files) if (name.ends_with(".cpp")) sources += " " + (dir / name).string();
+            sources += " " + harness.string();
+            for (const std::string opt : {"-O0", "-O3"})
+            {
+                const auto binary = dir / (opt == "-O0" ? "harness_o0" : "harness_o3");
+                const auto cmd = "clang++ -std=c++20 " + opt + " -fsanitize=address,undefined -fno-sanitize-recover=all -I" +
+                    dir.string() + sources + " -o " + binary.string();
+                if (std::system(cmd.c_str()) || std::system(binary.c_str())) return fail("family oracle: " + mode + "/" + opt);
+            }
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runSharedEqualityDecodeTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_SHARED_EQUALITY_DECODE";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        Design design;
+        Graph &graph = design.createGraph("top"); design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(4);
+        const auto input = [&](const std::string &name, int32_t width, bool sign = false) {
+            const auto value = makeLogicValue(graph, name, width, sign); graph.bindInputPort(name, value); return value;
+        };
+        const auto address = input("address", 8), other = input("other", 8), wide = input("wide", 13);
+        const auto signedAddress = input("signed_address", 8, true);
+        const auto narrow = input("narrow", 12);
+        const auto clk = input("clk", 1), enable = input("enable", 1), data = input("data", 12);
+        const auto one = addConstant(graph, "one", "one_value", 1, "1'b1");
+        const auto mask = addConstant(graph, "mask", "mask_value", 12, "12'hfff");
+        nodes[0].push_back(graph.valueDef(one)); nodes[0].push_back(graph.valueDef(mask));
+        const auto reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("q"));
+        graph.setAttr(reg, "width", int64_t{12}); graph.setAttr(reg, "isSigned", false);
+        graph.setAttr(reg, "initValue", std::string("12'd7"));
+        const auto q = makeLogicValue(graph, "q_read", 12);
+        const auto read = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("read_q"));
+        graph.setAttr(read, "regSymbol", std::string("q")); graph.addResult(read, q); nodes[0].push_back(read);
+        const auto qout = makeLogicValue(graph, "q_out", 12);
+        const auto qa = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_q"));
+        graph.addOperand(qa, q); graph.addResult(qa, qout); graph.bindOutputPort("q_out", qout); nodes[1].push_back(qa);
+        const auto write = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("write_q"));
+        for (auto value : {enable, data, mask, clk}) graph.addOperand(write, value);
+        graph.setAttr(write, "regSymbol", std::string("q")); graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        nodes[3].push_back(write);
+        std::ostringstream checks;
+        struct Family { ValueId source; unsigned count; unsigned stride; unsigned base; int kind; std::string oracle; };
+        const std::vector<Family> families = {
+            {address, 32, 3, 0, 0, "unsigned(sim.address)"},
+            {signedAddress, 16, 1, 240, 0, "(unsigned(sim.signed_address)&255u)"},
+            {q, 32, 7, 0, 0, "expected_q"},
+            {address, 16, 1, 32, 0, "unsigned(sim.address)"},
+            {address, 15, 1, 0, 0, "unsigned(sim.address)"}, // Too few distinct predicates.
+            {wide, 16, 1, 0, 0, "unsigned(sim.wide)"}, // Domain too large.
+            {address, 16, 1, 0, 1, "unsigned(sim.address)"}, // Mixed sources.
+            {address, 16, 1, 0, 2, "unsigned(sim.address)"}, // Effect boundary.
+            {address, 16, 1, 0, 3, "unsigned(sim.address)"}, // Event predicate.
+            {address, 16, 1, 0, 4, "unsigned(sim.address)"}, // Duplicate constants split the run.
+            {address, 16, 1, 0, 5, "unsigned(sim.address)"}, // Unequal comparison widths.
+            {address, 16, 1, 0, 6, "unsigned(sim.address)"}, // Separate compute scopes.
+            {address, 16, 1, 0, 7, "unsigned(sim.address)"}, // Unknown literal is not a decoder entry.
+            {narrow, 16, 1, 0, 0, "unsigned(sim.narrow)"}, // Preserve spare storage bits exactly as generic equality.
+        };
+        for (std::size_t f = 0; f < families.size(); ++f)
+        {
+            const auto &test = families[f]; std::vector<ValueId> constants;
+            const auto width = graph.valueWidth(test.source);
+            for (unsigned i = 0; i < test.count; ++i)
+            {
+                const auto c = test.base + (test.kind == 4 ? i % 8 : i) * test.stride;
+                const auto name = "f" + std::to_string(f) + "c" + std::to_string(i);
+                const auto k = addConstant(graph, name, name + "_value", test.kind == 5 ? 16 : width,
+                    test.kind == 7 && i == 8 ? "8'hxx" :
+                    std::to_string(test.kind == 5 ? 16 : width) + "'d" + std::to_string(c));
+                constants.push_back(k); nodes[0].push_back(graph.valueDef(k));
+            }
+            for (unsigned i = 0; i < test.count; ++i)
+            {
+                const auto name = "f" + std::to_string(f) + "p" + std::to_string(i);
+                const auto predicate = makeLogicValue(graph, name, 1);
+                const auto eq = graph.createOperation(OperationKind::kEq, graph.internSymbol(name + "_eq"));
+                const auto src = test.kind == 1 && i % 2 ? other : test.source;
+                graph.addOperand(eq, i % 2 ? constants[i] : src);
+                graph.addOperand(eq, i % 2 ? src : constants[i]); graph.addResult(eq, predicate);
+                if (test.kind == 2 && i == 8) graph.setAttr(eq, "hasSideEffects", true);
+                nodes[test.kind == 6 && i >= 8 ? 1 : 0].push_back(eq);
+                if (test.kind == 3 && i == 8)
+                {
+                    const auto er = graph.createOperation(OperationKind::kRegister, graph.internSymbol("event_q"));
+                    graph.setAttr(er, "width", int64_t{1}); graph.setAttr(er, "isSigned", false);
+                    graph.setAttr(er, "initValue", std::string("1'b0"));
+                    const auto ew = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("event_write"));
+                    for (auto v : {one, one, one, predicate}) graph.addOperand(ew, v);
+                    graph.setAttr(ew, "regSymbol", std::string("event_q"));
+                    graph.setAttr(ew, "eventEdge", std::vector<std::string>{"posedge"}); nodes[3].push_back(ew);
+                }
+                const auto output = makeLogicValue(graph, name + "_out", 1);
+                const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_assign"));
+                graph.addOperand(assign, predicate); graph.addResult(assign, output); graph.bindOutputPort(name + "_out", output);
+                nodes[2].push_back(assign);
+                checks << "if(sim." << name << "_out!=("
+                       << (test.kind == 1 && i % 2 ? "unsigned(sim.other)" : test.oracle) << "=="
+                       << (test.kind == 7 && i == 8 ? 0 : test.base + (test.kind == 4 ? i % 8 : i) * test.stride)
+                       << "u))return " << f + 1 << ";\n";
+                if (f == 0 && i % 3 == 0)
+                {
+                    const auto also = makeLogicValue(graph, name + "_also", 1);
+                    const auto copy = graph.createOperation(OperationKind::kNot, graph.internSymbol(name + "_not"));
+                    graph.addOperand(copy, predicate); graph.addResult(copy, also); graph.bindOutputPort(name + "_also", also);
+                    nodes[1].push_back(copy);
+                    checks << "if(sim." << name << "_also==sim." << name << "_out)return 90;\n";
+                }
+            }
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        std::map<uint32_t, uint32_t> nodeByOp;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node]) nodeByOp[id.index] = node;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node])
+            {
+                const auto op = graph.getOperation(id);
+                for (auto v : op.operands())
+                    if (!graph.valueDef(v).valid() || nodeByOp.at(graph.valueDef(v).index) != node)
+                    {
+                        auto &targets = fanout[v.index - 1u];
+                        if (std::find(targets.begin(), targets.end(), node) == targets.end()) targets.push_back(node);
+                    }
+            }
+        SessionStore session;
+        setActivityScheduleFixtureSlot(session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(session, "topo_order", ActivityScheduleTopoOrder{0u,1u,2u,3u});
+        setActivityScheduleFixtureSlot(session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{{"q",{0u}}});
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_shared_equality_decode";
+        std::map<std::string, std::string> sources;
+        for (const std::string mode : {"default", "on", "off", "env-off", "precedence", "split", "profile", "shared", "fullpass"})
+        {
+            ::unsetenv(key);
+            if (mode == "env-off" || mode == "precedence") ::setenv(key, "0", 1);
+            const bool enabled = mode != "off" && mode != "env-off";
+            EmitOptions options; const auto dir = base / mode;
+            options.outputDir = dir.string(); options.session = &session; options.sessionPathPrefix = "top";
+            options.attributes["direct_single_writer_state_reads"] = "0";
+            if (mode == "on" || mode == "precedence") options.attributes["shared_equality_decode"] = "1";
+            if (mode == "off") options.attributes["shared_equality_decode"] = "0";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "profile") options.attributes["runtime_profile"] = "1";
+            if (mode == "shared")
+            {
+                options.attributes["shared_deferred_activation"] = "1";
+                options.attributes["direct_deferred_activation"] = "1";
+                options.attributes["packed_deferred_activation"] = "1";
+            }
+            if (mode == "fullpass") options.attributes["input_fullpass_specialization"] = "1";
+            EmitDiagnostics diagnostics; EmitGrhSimCpp emitter(&diagnostics);
+            if (!emitter.emit(design, options).success || diagnostics.hasError()) return fail("shared equality emit failed: " + mode);
+            const auto sched = collectSchedFiles(dir, "grhsim_top_sched_");
+            sources[mode] = readFiles(sched);
+            const auto count = countSubstring(sources[mode], "// Shared equality decode:");
+            if ((enabled && count < 5) || (!enabled && count != 0)) return fail("shared equality coverage failed: " + mode + ": " + std::to_string(count));
+            if ((mode == "on" || mode == "precedence") && sources[mode] != sources["default"])
+                return fail("shared equality default/attribute precedence mismatch");
+            if (mode == "env-off" && sources[mode] != sources["off"]) return fail("shared equality disable mismatch");
+            wolvrix::lib::emit::GrhSimExecutionPlan plan;
+            if (!emitter.analyzeExecutionPlan(design, options, plan).success) return fail("shared equality planner failed");
+            std::uint64_t planned = 0;
+            for (const auto &entry : plan.computeLowering)
+                if (const auto it = entry.features.find("shared_equality_decode_groups"); it != entry.features.end()) planned += it->second;
+            // The planner intentionally leaves nonordinary fullpass work unpriced.
+            if (planned != (enabled && mode != "fullpass" ? 5u : 0u))
+                return fail("shared equality planner coverage mismatch: " + std::to_string(planned));
+            if (mode == "fullpass" && (!plan.inputFullpass || plan.computeLowering.empty() ||
+                plan.computeLowering.front().unmodeledWork.empty())) return fail("fullpass planner must retain its explicit boundary");
+            if (mode == "default" || mode == "env-off" || mode == "precedence") continue;
+            const auto harness = dir / "harness.cpp"; std::ofstream out(harness);
+            out << "#include \"grhsim_top.hpp\"\n#include <cstdint>\nint main(){GrhSIM_top sim;"
+                   "for(unsigned reset=0;reset<3;++reset){sim.init();unsigned expected_q=7;"
+                << (mode == "profile" ? "sim.set_runtime_profile_enabled(true);" : "")
+                << "for(unsigned t=0;t<2048;++t){sim.address=(t/2+reset*97)&255;sim.other=(t*7)&255;"
+                   "sim.signed_address=(t/3)&255;sim.wide=t&8191;sim.narrow=(t%2?32768u:0u)+((t/2)%32);sim.data=(t*7)&4095;sim.enable=t%3!=0;"
+                   "sim.clk=0;sim.eval();\n" << checks.str()
+                << "sim.clk=1;sim.eval();if(sim.enable)expected_q=sim.data;\n" << checks.str()
+                << "sim.eval();\n" << checks.str() << "if(sim.q_out!=expected_q)return 91;}}}\n";
+            out.close();
+            std::string files;
+            for (const auto &p : collectSchedFiles(dir, "grhsim_top_state")) files += " " + p.string();
+            files += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &p : sched) files += " " + p.string();
+            files += " " + harness.string();
+            for (const std::string opt : {"-O0", "-O3"})
+            {
+                const auto exe = dir / (opt == "-O0" ? "harness_o0" : "harness_o3");
+                const auto command = "clang++ -std=c++20 " + opt + " -fsanitize=address,undefined -fno-sanitize-recover=all -I" +
+                    dir.string() + files + " -o " + exe.string();
+                if (std::system(command.c_str()) || std::system(exe.c_str())) return fail("shared equality runtime failed: " + mode + "/" + opt);
+            }
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1); else ::unsetenv(key);
+        return 0;
+    }
+
+    int runPackedScalarSlicesTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_PACKED_SCALAR_SLICES";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        Design design;
+        Graph &graph = design.createGraph("top"); design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(3);
+        const auto input = [&](const std::string &name, int32_t width) {
+            const auto v = makeLogicValue(graph, name, width, width > 1); graph.bindInputPort(name, v); return v;
+        };
+        const auto clk = input("clk", 1), enable = input("enable", 1), data = input("data", 32);
+        const auto one = addConstant(graph, "one", "one_value", 1, "1'b1");
+        const auto mask = addConstant(graph, "mask", "mask_value", 32, "32'hffffffff");
+        nodes[0].push_back(graph.valueDef(one)); nodes[0].push_back(graph.valueDef(mask));
+        const auto reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("q"));
+        graph.setAttr(reg, "width", int64_t{32}); graph.setAttr(reg, "isSigned", false);
+        graph.setAttr(reg, "initValue", std::string("32'hdeadbeef"));
+        const auto q = makeLogicValue(graph, "q_read", 32);
+        const auto read = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("read_q"));
+        graph.setAttr(read, "regSymbol", std::string("q")); graph.addResult(read, q); nodes[0].push_back(read);
+        const auto write = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("write_q"));
+        for (auto v : {enable, data, mask, clk}) graph.addOperand(write, v);
+        graph.setAttr(write, "regSymbol", std::string("q")); graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        nodes[2].push_back(write);
+        struct Case { int32_t width; std::vector<int64_t> bits; int kind; };
+        const std::vector<Case> cases = {
+            {8, {0,1,2,3,4,5,6}, 0}, // Unpacked prefix also makes later groups unaligned.
+            {8, {0,1,2,3,4,5,6,7}, 0},
+            {32, {31,30,29,28,27,26,25,24}, 0},
+            {64, {63,0,31,1,62,17,33,5}, 0},
+            {32, {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}, 0},
+            {32, {0,1,2,3,4,5,6,7}, 1}, // Named local snapshot.
+            {32, {0,1,2,3,4,5,6,7}, 2}, // Different source for alternating bits.
+            {32, {0,1,2,3,4,5,6,7}, 3}, // Explicit effect inside the region.
+            {32, {0,1,2,3,4,5,6,7}, 4}, // Event output must retain event classification.
+            {32, {0,1,2,3,4,5,6,7}, 6}, // Separate inlined roots with stable leaves.
+            {32, {31,30,29,28,27,26,25,24}, 5}, // Visible register state across commit.
+        };
+        std::ostringstream setup, checks;
+        for (std::size_t c = 0; c < cases.size(); ++c)
+        {
+            const auto &test = cases[c]; const auto prefix = "c" + std::to_string(c);
+            const auto in = input(prefix + "_in", test.width), other = input(prefix + "_other", test.width);
+            setup << "sim." << prefix << "_in=static_cast<decltype(sim." << prefix << "_in)>(pattern(t));"
+                  << "sim." << prefix << "_other=static_cast<decltype(sim." << prefix << "_other)>(pattern(t+1));\n";
+            ValueId source = test.kind == 5 ? q : in;
+            if (test.kind == 1)
+            {
+                source = makeLogicValue(graph, prefix + "_local", test.width);
+                const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol(prefix + "_not"));
+                graph.addOperand(op, in); graph.addResult(op, source); nodes[0].push_back(op);
+            }
+            std::vector<ValueId> inlineSources;
+            if (test.kind == 6)
+                for (std::size_t i = 0; i < test.bits.size(); ++i)
+                {
+                    const auto value = makeLogicValue(graph, prefix + "_inline" + std::to_string(i), test.width);
+                    const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol(prefix + "_inline_op" + std::to_string(i)));
+                    graph.addOperand(op, in); graph.addResult(op, value); nodes[0].push_back(op); inlineSources.push_back(value);
+                }
+            for (std::size_t i = 0; i < test.bits.size(); ++i)
+            {
+                const auto name = prefix + "_bit" + std::to_string(i);
+                const auto v = makeLogicValue(graph, name, 1);
+                const auto op = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol(name + "_op"));
+                graph.addOperand(op, test.kind == 6 ? inlineSources[i] : (test.kind == 2 && i % 2 ? other : source)); graph.addResult(op, v);
+                graph.setAttr(op, "sliceStart", test.bits[i]); graph.setAttr(op, "sliceEnd", test.bits[i]);
+                if (test.kind == 3 && i == 3) graph.setAttr(op, "hasSideEffects", true);
+                nodes[0].push_back(op);
+                const auto out = makeLogicValue(graph, name + "_out", 1);
+                const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_assign"));
+                graph.addOperand(assign, v); graph.addResult(assign, out); graph.bindOutputPort(name + "_out", out);
+                nodes[1].push_back(assign);
+                checks << "if(sim." << name << "_out!=bool((";
+                if (test.kind == 1 || test.kind == 6) checks << "~";
+                if (test.kind == 5) checks << "std::uint64_t(expected_q)";
+                else checks << "static_cast<std::uint64_t>(sim." << prefix
+                            << (test.kind == 2 && i % 2 ? "_other" : "_in") << ")";
+                checks << ">>" << test.bits[i] << ")&1u))return " << c + 1 << ";\n";
+                if (test.kind == 4 && i == 0)
+                {
+                    const auto er = graph.createOperation(OperationKind::kRegister, graph.internSymbol("event_q"));
+                    graph.setAttr(er, "width", int64_t{1}); graph.setAttr(er, "isSigned", false);
+                    graph.setAttr(er, "initValue", std::string("1'b0"));
+                    const auto ew = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("event_write"));
+                    for (auto x : {one, one, one, v}) graph.addOperand(ew, x);
+                    graph.setAttr(ew, "regSymbol", std::string("event_q"));
+                    graph.setAttr(ew, "eventEdge", std::vector<std::string>{"posedge"}); nodes[2].push_back(ew);
+                }
+            }
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        std::map<uint32_t, uint32_t> nodeByOp;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node]) nodeByOp[id.index] = node;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node])
+            {
+                const Operation op = graph.getOperation(id);
+                for (auto v : op.operands())
+                    if (!graph.valueDef(v).valid() || nodeByOp.at(graph.valueDef(v).index) != node)
+                    {
+                        auto &targets = fanout[v.index - 1u];
+                        if (std::find(targets.begin(), targets.end(), node) == targets.end()) targets.push_back(node);
+                    }
+            }
+        SessionStore session;
+        setActivityScheduleFixtureSlot(session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(session, "topo_order", ActivityScheduleTopoOrder{0u,1u,2u});
+        setActivityScheduleFixtureSlot(session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{{"q",{0u}}});
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_packed_scalar_slices";
+        std::string defaults;
+        for (const std::string mode : {"default", "on", "off", "env-off", "precedence", "split", "profile", "shared"})
+        {
+            ::unsetenv(key);
+            if (mode == "env-off" || mode == "precedence") ::setenv(key, "0", 1);
+            const bool enabled = mode != "off" && mode != "env-off";
+            EmitOptions options; const auto dir = base / mode;
+            options.outputDir = dir.string(); options.session = &session; options.sessionPathPrefix = "top";
+            if (mode == "on" || mode == "precedence") options.attributes["packed_scalar_slices"] = "1";
+            if (mode == "off") options.attributes["packed_scalar_slices"] = "0";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "shared")
+            {
+                options.attributes["shared_deferred_activation"] = "1";
+                options.attributes["bool_eager_logic"] = "1";
+                options.attributes["wordwise_wide_concat"] = "1";
+                options.attributes["wordwise_wide_concat_bool_pack"] = "1";
+            }
+            if (mode == "profile")
+            {
+                options.attributes["emit_runtime_profile"] = "1";
+                options.attributes["batch_trigger_bitmap_validate"] = "1";
+                options.attributes["perf"] = "eval";
+            }
+            EmitDiagnostics diagnostics; EmitGrhSimCpp emitter(&diagnostics);
+            if (!emitter.emit(design, options).success || diagnostics.hasError()) return fail("packed slices emit failed: " + mode);
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            const auto count = countSubstring(code, "// Packed scalar slices:");
+            if (mode == "default") defaults = code;
+            if ((mode == "on" || mode == "precedence") && code != defaults) return fail("packed slices option precedence changed output");
+            if (count != (enabled ? 8u : 0u)) return fail("packed slices coverage: " + mode + " count=" + std::to_string(count));
+            wolvrix::lib::emit::GrhSimExecutionPlan plan;
+            if (!emitter.analyzeExecutionPlan(design, options, plan).success) return fail("packed slices planner failed");
+            std::uint64_t planned = 0;
+            for (const auto &entry : plan.computeLowering)
+                if (const auto it = entry.features.find("packed_scalar_slice_groups"); it != entry.features.end()) planned += it->second;
+            if (planned != count) return fail("packed slices planner/emitter disagreement: " + mode + " plan=" + std::to_string(planned) + " emit=" + std::to_string(count));
+            if (mode != "on" && mode != "off" && mode != "split" && mode != "profile" && mode != "shared") continue;
+            const auto harness = dir / "harness.cpp"; std::ofstream out(harness);
+            out << "#include \"grhsim_top.hpp\"\n#include \"grhsim_top_runtime.hpp\"\n#include <array>\n#include <cstdint>\n"
+                   "int main(){std::uint64_t rng=39;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};\n";
+            if (enabled)
+                out << "for(unsigned t=0;t<2048;++t){std::array<bool,10>a{},b{};for(auto &v:a)v=random()&1; b=a;auto before=a;auto src=random();"
+                       "auto fast=grhsim_store_scalar_slices<false,63,0,31,1,62,17,33,5>(a.data()+1,src);"
+                       "auto slow=grhsim_store_scalar_slices<true,63,0,31,1,62,17,33,5>(b.data()+1,src);"
+                       "constexpr unsigned bits[]={63,0,31,1,62,17,33,5};for(unsigned i=0;i<8;++i){bool expected=(src>>bits[i])&1;"
+                       "auto mask=UINT64_C(0xff)<<(8*i);if(a[i+1]!=expected||b[i+1]!=expected||bool(fast&mask)!=(before[i+1]!=expected)||"
+                       "bool(slow&mask)!=(before[i+1]!=expected))return 80;}if(a[0]!=before[0]||a[9]!=before[9]||a!=b)return 81;}\n";
+            out << "auto pattern=[&](unsigned t){return t<64?UINT64_C(1)<<t:t<128?~(UINT64_C(1)<<(t-64)):random();};"
+                   "GrhSIM_top sim;for(unsigned reset=0;reset<2;++reset){sim.init();std::uint32_t expected_q=0xdeadbeef;"
+                << (mode == "profile" ? "sim.set_runtime_profile_enabled(true);" : "")
+                << "for(unsigned t=0;t<1024;++t){" << setup.str()
+                << "sim.clk=0;sim.enable=t%4!=0;sim.data=random();sim.eval();\n" << checks.str()
+                << "sim.eval();\n" << checks.str()
+                << "sim.clk=1;sim.eval();if(sim.enable)expected_q=sim.data;\n" << checks.str() << "}}}\n";
+            out.close();
+            std::string sources;
+            for (const auto &[name, content] : collectGeneratedSourceFiles(dir, "grhsim_top"))
+                if (name.ends_with(".cpp")) sources += " " + (dir / name).string();
+            for (const std::string opt : {"-O0", "-O3"})
+            {
+                const auto exe = dir / (opt == "-O0" ? "harness_o0" : "harness_o3");
+                const auto command = "clang++ -std=c++20 " + opt + " -fsanitize=address,undefined -fno-sanitize-recover=all -I" +
+                    dir.string() + sources + " " + harness.string() + " -o " + exe.string();
+                if (std::system(command.c_str()) || std::system(exe.c_str())) return fail("packed slices harness failed: " + mode + "/" + opt);
+            }
+        }
+        ::unsetenv(key); if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runIndexedConcatSliceTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_INDEXED_CONCAT_SLICE";
+        constexpr const char *paddingKey = "WOLVRIX_GRHSIM_INDEXED_CONCAT_WIDE_CONSTANTS";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        const char *previousPadding = std::getenv(paddingKey);
+        const std::optional<std::string> savedPadding = previousPadding ? std::optional<std::string>(previousPadding) : std::nullopt;
+        ::unsetenv(key);
+        ::unsetenv(paddingKey);
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(2);
+        const auto input = [&](const std::string &name, int32_t width, bool sign = false) {
+            const auto value = makeLogicValue(graph, name, width, sign);
+            graph.bindInputPort(name, value);
+            return value;
+        };
+        const auto index = input("index", 64), wideIndex = input("wide_index", 129);
+        struct Case { std::vector<int32_t> fields; int32_t width; int kind; bool wideIndex; };
+        std::vector<Case> cases;
+        for (int32_t width : {1, 7, 32, 63, 64})
+            cases.push_back({{1, 63, 7, 57, 31, 32, 1, 64, 3, 5}, width, 0, width % 2 != 0});
+        cases.push_back({std::vector<int32_t>(1024, 1), 32, 0, false});
+        cases.push_back({{64, 64, 64, 64, 1}, 64, 8, true});
+        for (int kind = 1; kind <= 6; ++kind)
+            cases.push_back({kind == 5 ? std::vector<int32_t>{65, 64, 64, 64} :
+                            kind == 6 ? std::vector<int32_t>{64, 64} : std::vector<int32_t>(8, 32),
+                            32, kind, false});
+        cases.push_back({{1792, 32, 32, 32, 32, 64, 32, 32}, 32, 9, false});
+        cases.push_back({{7, 129, 63, 65, 57, 128, 3}, 64, 10, true});
+        cases.push_back({{65, 5, 129, 1, 97}, 1, 10, false});
+        cases.push_back({{129, 63, 65}, 63, 11, true});
+        cases.push_back({{129, 64, 64}, 32, 12, false}); // Unknown padding must fall back.
+        std::ostringstream setup, checks;
+        for (std::size_t c = 0; c < cases.size(); ++c)
+        {
+            const auto &test = cases[c];
+            const auto prefix = "c" + std::to_string(c);
+            const int32_t total = std::accumulate(test.fields.begin(), test.fields.end(), 0);
+            std::vector<ValueId> operands;
+            setup << "std::array<bool," << total << "> bits" << c << "{};unsigned cursor" << c << "=" << total << ";\n";
+            for (std::size_t i = 0; i < test.fields.size(); ++i)
+            {
+                const auto name = prefix + "_in" + std::to_string(i);
+                const auto width = test.fields[i];
+                const bool wideConstant = width > 64 && test.kind >= 9;
+                ValueId value;
+                std::string expectedBit;
+                if (wideConstant)
+                {
+                    std::string literal = std::to_string(width) + "'b0";
+                    expectedBit = "false";
+                    if (test.kind == 10)
+                    {
+                        literal = std::to_string(width) + "'b";
+                        for (int32_t bit = width; bit-- > 0;)
+                            literal += ((bit * 7 + i * 3) % 17 < 7) ? '1' : '0';
+                        expectedBit = "((b*7+" + std::to_string(i * 3) + ")%17<7)";
+                    }
+                    else if (test.kind == 11)
+                    {
+                        literal = "-65'sd7";
+                        expectedBit = "(b==0||b>=3)";
+                    }
+                    else if (test.kind == 12) literal = std::to_string(width) + "'bx";
+                    value = addConstant(graph, name + "_constant", name, width, literal,
+                                        ValueType::Logic, test.kind == 11);
+                    nodes[0].push_back(graph.valueDef(value));
+                }
+                else value = input(name, width, width > 1 && i % 2 != 0);
+                if (!wideConstant && width <= 64)
+                    setup << "sim." << name << "=static_cast<decltype(sim." << name << ")>(random()"
+                          << (width == 1 ? "&1u" : "") << ");\n";
+                else if (!wideConstant) setup << "for(auto &w:sim." << name << ") w=random();\n";
+                if (test.kind == 8)
+                {
+                    const auto local = makeLogicValue(graph, name + "_local", width);
+                    const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol(name + "_not"));
+                    graph.addOperand(op, value); graph.addResult(op, local); nodes[0].push_back(op);
+                    value = local;
+                }
+                operands.push_back(value);
+                setup << "cursor" << c << "-=" << width << ";for(unsigned b=0;b<" << width << ";++b) bits"
+                      << c << "[cursor" << c << "+b]=" << (test.kind == 8 ? "!(" : "(");
+                if (wideConstant) setup << expectedBit;
+                else if (width <= 64) setup << "(static_cast<std::uint64_t>(sim." << name << ")>>b)&1u";
+                else setup << "(sim." << name << "[b/64]>>(b%64))&1u";
+                setup << ");\n";
+            }
+            const auto concat = makeLogicValue(graph, prefix + "_concat", total);
+            const auto cat = graph.createOperation(OperationKind::kConcat, graph.internSymbol(prefix + "_cat"));
+            for (auto value : operands) graph.addOperand(cat, value);
+            graph.addResult(cat, concat); nodes[0].push_back(cat);
+            if (test.kind == 1)
+            {
+                graph.bindOutputPort(prefix + "_whole", concat);
+                checks << "for(unsigned b=0;b<" << total << ";++b)if(((sim." << prefix
+                       << "_whole[b/64]>>(b%64))&1u)!=bits" << c << "[b])return 80;\n";
+            }
+            if (test.kind == 4)
+            {
+                const auto barrierValue = makeLogicValue(graph, prefix + "_effect", 64);
+                const auto barrier = graph.createOperation(OperationKind::kAssign, graph.internSymbol(prefix + "_barrier"));
+                graph.addOperand(barrier, index); graph.addResult(barrier, barrierValue);
+                graph.setAttr(barrier, "hasSideEffects", true); nodes[0].push_back(barrier);
+            }
+            // Define the index after the concat; exercise the lifetime proof.
+            const auto localIndex = makeLogicValue(graph, prefix + "_index", test.wideIndex ? 129 : 64);
+            const auto indexOp = graph.createOperation(OperationKind::kAssign, graph.internSymbol(prefix + "_index_op"));
+            graph.addOperand(indexOp, test.wideIndex ? wideIndex : index); graph.addResult(indexOp, localIndex);
+            nodes[test.kind == 3 ? 1 : 0].push_back(indexOp);
+            for (int port = 0; port < (test.kind == 2 ? 2 : 1); ++port)
+            {
+                const auto name = prefix + "_out" + std::to_string(port);
+                const auto output = makeLogicValue(graph, name, test.width);
+                const auto slice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol(name + "_slice"));
+                graph.addOperand(slice, concat); graph.addOperand(slice, localIndex); graph.addResult(slice, output);
+                graph.setAttr(slice, "sliceWidth", int64_t{test.width}); graph.bindOutputPort(name, output);
+                nodes[test.kind == 3 ? 1 : 0].push_back(slice);
+                checks << "{std::uint64_t expected=0;if(sim.index<" << total
+                       << (test.wideIndex ? "&&sim.wide_index[1]==0&&sim.wide_index[2]==0" : "")
+                       << ")for(unsigned b=0;b<" << test.width << "&&sim.index+b<" << total << ";++b)"
+                       << "expected|=std::uint64_t(bits" << c << "[sim.index+b])<<b;"
+                       << "if(static_cast<std::uint64_t>(sim." << name << ")!=expected)return " << c + 1 << ";}\n";
+            }
+        }
+        // Two ports of a small clocked register bank, including constant x0.
+        // Keep explicit read snapshots so this also covers commit/eval changes
+        // with an unchanged read index, independent of direct state views.
+        const auto clk = input("clk", 1), enable = input("enable", 1);
+        const auto writeIndex = input("write_index", 3), data = input("data", 32);
+        const auto zero = addConstant(graph, "zero", "zero_value", 32, "32'h0");
+        const auto mask = addConstant(graph, "mask", "mask_value", 32, "32'hffffffff");
+        nodes[0].push_back(graph.valueDef(zero)); nodes[0].push_back(graph.valueDef(mask));
+        std::vector<ValueId> bank{zero};
+        nodes.emplace_back();
+        ActivityScheduleStateReadSupernodes readers;
+        for (unsigned i = 1; i < 8; ++i)
+        {
+            const auto name = "q" + std::to_string(i);
+            const auto reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol(name));
+            graph.setAttr(reg, "width", int64_t{32}); graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::string("32'h0"));
+            const auto value = makeLogicValue(graph, name + "_value", 32);
+            const auto read = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol(name + "_read"));
+            graph.setAttr(read, "regSymbol", name); graph.addResult(read, value); nodes[0].push_back(read);
+            readers[name] = {0u}; bank.push_back(value);
+            const auto address = addConstant(graph, name + "_addr", name + "_addr_value", 3, "3'd" + std::to_string(i));
+            nodes[0].push_back(graph.valueDef(address));
+            const auto selected = makeLogicValue(graph, name + "_selected", 1);
+            const auto eq = graph.createOperation(OperationKind::kEq, graph.internSymbol(name + "_eq"));
+            graph.addOperand(eq, writeIndex); graph.addOperand(eq, address); graph.addResult(eq, selected); nodes[0].push_back(eq);
+            const auto enabled = makeLogicValue(graph, name + "_enabled", 1);
+            const auto gate = graph.createOperation(OperationKind::kAnd, graph.internSymbol(name + "_gate"));
+            graph.addOperand(gate, selected); graph.addOperand(gate, enable); graph.addResult(gate, enabled); nodes[0].push_back(gate);
+            const auto write = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol(name + "_write"));
+            for (auto v : {enabled, data, mask, clk}) graph.addOperand(write, v);
+            graph.setAttr(write, "regSymbol", name); graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            nodes[2].push_back(write);
+        }
+        for (unsigned port = 0; port < 2; ++port)
+        {
+            const auto name = "bank" + std::to_string(port);
+            const auto address = input(name + "_index", 64);
+            const auto packed = makeLogicValue(graph, name + "_packed", port == 0 ? 256 : 2048);
+            ValueId padding;
+            if (port == 1)
+            {
+                padding = addConstant(graph, name + "_padding_op", name + "_padding", 1792, "1792'b0");
+                nodes[0].push_back(graph.valueDef(padding));
+            }
+            const auto cat = graph.createOperation(OperationKind::kConcat, graph.internSymbol(name + "_cat"));
+            if (port == 1) graph.addOperand(cat, padding);
+            for (auto it = bank.rbegin(); it != bank.rend(); ++it) graph.addOperand(cat, *it);
+            graph.addResult(cat, packed); nodes[0].push_back(cat);
+            const auto output = makeLogicValue(graph, name + "_out", 32);
+            const auto slice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol(name + "_slice"));
+            graph.addOperand(slice, packed); graph.addOperand(slice, address); graph.addResult(slice, output);
+            graph.setAttr(slice, "sliceWidth", int64_t{32}); graph.bindOutputPort(name + "_out", output); nodes[0].push_back(slice);
+            checks << "{std::uint32_t expected=0;if(sim." << name << "_index<256)for(unsigned b=0;b<32&&sim."
+                   << name << "_index+b<256;++b){auto n=sim." << name
+                   << "_index+b;expected|=((bank[n/32]>>(n%32))&1u)<<b;}if(sim." << name << "_out!=expected)return 90;}\n";
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        std::map<uint32_t, uint32_t> nodeByOp;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node]) nodeByOp[id.index] = node;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node])
+            {
+                const Operation op = graph.getOperation(id);
+                for (auto value : op.operands())
+                    if (!graph.valueDef(value).valid() || nodeByOp.at(graph.valueDef(value).index) != node)
+                    {
+                        auto &targets = fanout[value.index - 1u];
+                        if (std::find(targets.begin(), targets.end(), node) == targets.end()) targets.push_back(node);
+                    }
+            }
+        SessionStore session;
+        setActivityScheduleFixtureSlot(session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(session, "topo_order", ActivityScheduleTopoOrder{0u, 1u, 2u});
+        setActivityScheduleFixtureSlot(session, "state_read_supernodes", std::move(readers));
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_indexed_concat_slice";
+        std::string defaultSource, enabledSource;
+        for (const std::string mode : {"default", "on", "off", "env-off", "precedence", "split", "profile",
+                                       "padding-env-on", "padding-off", "padding-precedence"})
+        {
+            ::unsetenv(key);
+            ::unsetenv(paddingKey);
+            if (mode == "env-off" || mode == "precedence") ::setenv(key, "0", 1);
+            if (mode == "padding-env-on" || mode == "padding-precedence") ::setenv(paddingKey, "1", 1);
+            const bool enabled = mode != "off" && mode != "env-off";
+            const bool padding = mode != "default" && mode != "padding-off" && mode != "padding-precedence";
+            const auto dir = base / mode;
+            EmitOptions options;
+            options.outputDir = dir.string(); options.session = &session; options.sessionPathPrefix = "top";
+            options.attributes["direct_single_writer_state_reads"] = "0";
+            if (mode != "default" && mode != "padding-env-on")
+                options.attributes["indexed_concat_wide_constants"] = padding ? "1" : "0";
+            if (mode == "on" || mode == "precedence") options.attributes["indexed_concat_slice"] = "1";
+            if (mode == "off") options.attributes["indexed_concat_slice"] = "0";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "profile") options.attributes["emit_runtime_profile"] = "1";
+            EmitDiagnostics diagnostics;
+            if (!EmitGrhSimCpp(&diagnostics).emit(design, options).success || diagnostics.hasError())
+                return fail("indexed concat emit failed: " + mode);
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            if (mode == "default") defaultSource = code;
+            if (mode == "on") enabledSource = code;
+            if ((mode == "precedence" || mode == "padding-env-on") && code != enabledSource)
+                return fail("indexed concat enable/precedence mismatch");
+            if ((mode == "padding-off" || mode == "padding-precedence") && code != defaultSource)
+                return fail("indexed concat padding must be opt-in");
+            const std::uint64_t expectedViews = enabled ? (padding ? 13u : 8u) : 0u;
+            if (countSubstring(code, "// Indexed concat:") != expectedViews)
+                return fail("indexed concat coverage mismatch: " + mode);
+            wolvrix::lib::emit::GrhSimExecutionPlan plan;
+            if (!EmitGrhSimCpp(&diagnostics).analyzeExecutionPlan(design, options, plan).success)
+                return fail("indexed concat planner failed: " + mode);
+            std::uint64_t planned = 0;
+            for (const auto &entry : plan.computeLowering)
+                if (const auto it = entry.features.find("wide.indexed_concat_view"); it != entry.features.end())
+                    planned += it->second;
+            if (planned != expectedViews) return fail("indexed concat planner coverage mismatch: " + mode);
+            if (mode != "on" && mode != "off" && mode != "split" && mode != "profile") continue;
+            const auto harness = dir / "harness.cpp";
+            std::ofstream out(harness);
+            out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                   "int main(){GrhSIM_top sim;std::uint64_t rng=20261114;"
+                   "auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                   "for(unsigned reset=0;reset<2;++reset){sim.init();std::array<std::uint32_t,8> bank{};for(unsigned t=0;t<8400;++t){"
+                   "sim.index=t<8300?t/4:(t%2?UINT64_MAX:UINT64_C(1)<<63);"
+                   "sim.wide_index={sim.index,t%13==0?UINT64_C(1):0,t%17==0?UINT64_C(1):0};\n"
+                << setup.str() << "sim.bank0_index=(t/4)%290;sim.bank1_index=sim.index;sim.write_index=t%8;sim.data=random();sim.enable=t%5!=0;"
+                   "sim.clk=0;sim.eval();\n" << checks.str()
+                << "sim.clk=1;sim.eval();if(sim.enable&&sim.write_index)bank[sim.write_index]=sim.data;\n" << checks.str()
+                << "sim.eval();\n" << checks.str() << "}}}\n";
+            out.close();
+            std::string sources;
+            for (const auto &[name, content] : collectGeneratedSourceFiles(dir, "grhsim_top"))
+                if (name.ends_with(".cpp")) sources += " " + (dir / name).string();
+            for (const std::string optimization : {"-O0", "-O3"})
+            {
+                const auto exe = dir / (optimization == "-O0" ? "harness_o0" : "harness_o3");
+                const auto command = "clang++ -std=c++20 " + optimization +
+                    " -fsanitize=address,undefined -fno-sanitize-recover=all -I" + dir.string() + sources +
+                    " " + harness.string() + " -o " + exe.string();
+                if (std::system(command.c_str()) || std::system(exe.c_str()))
+                    return fail("indexed concat harness failed: " + mode + "/" + optimization);
+            }
+        }
+        ::unsetenv(key);
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        ::unsetenv(paddingKey);
+        if (savedPadding) ::setenv(paddingKey, savedPadding->c_str(), 1);
+        return 0;
+    }
+
     int runScalarConcatReductionFocusedTests()
     {
         constexpr const char *key = "WOLVRIX_GRHSIM_SCALAR_CONCAT_REDUCTION";
@@ -12046,6 +12982,16 @@ int main() {
 
 int main()
 {
+    if (std::getenv("WOLVRIX_TEST_SHARED_EQUALITY_FAMILIES") != nullptr)
+        return runSharedEqualityFamilyTests();
+    if (std::getenv("WOLVRIX_TEST_LOCAL_EQUALITY_DECODE") != nullptr)
+        return runLocalEqualityDecodeTests();
+    if (std::getenv("WOLVRIX_TEST_SHARED_EQUALITY_DECODE") != nullptr)
+        return runSharedEqualityDecodeTests();
+    if (std::getenv("WOLVRIX_TEST_PACKED_SCALAR_SLICES") != nullptr)
+        return runPackedScalarSlicesTests();
+    if (std::getenv("WOLVRIX_TEST_INDEXED_CONCAT_SLICE") != nullptr)
+        return runIndexedConcatSliceTests();
     if (std::getenv("WOLVRIX_TEST_SHORT_CONCAT_REDUCTION_MASKS") != nullptr)
         return runScalarConcatReductionMaskTests(true);
     if (std::getenv("WOLVRIX_TEST_WIDE_CONCAT_REDUCTION") != nullptr)

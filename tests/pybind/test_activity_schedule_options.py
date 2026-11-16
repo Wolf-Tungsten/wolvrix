@@ -6,6 +6,18 @@ from wolvrix import _compile_activity_schedule_kwargs
 
 
 class ActivityScheduleOptionTest(unittest.TestCase):
+    def test_event_regions_option_is_forwarded(self) -> None:
+        self.assertEqual(_compile_activity_schedule_kwargs({"event_regions": True}),
+                         ["-event-regions", "true"])
+        self.assertEqual(_compile_activity_schedule_kwargs({"event_regions": False}),
+                         ["-event-regions", "false"])
+
+    def test_shared_event_regions_option_is_forwarded(self) -> None:
+        self.assertEqual(_compile_activity_schedule_kwargs({"event_regions": True, "event_regions_shared": True}),
+                         ["-event-regions", "true", "-event-regions-shared", "true"])
+        self.assertEqual(_compile_activity_schedule_kwargs({"event_regions_shared": False}),
+                         ["-event-regions-shared", "false"])
+
     def test_final_terminal_pushforward_options_are_forwarded(self) -> None:
         self.assertEqual(
             _compile_activity_schedule_kwargs(

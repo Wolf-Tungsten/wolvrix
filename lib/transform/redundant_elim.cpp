@@ -652,31 +652,118 @@ namespace wolvrix::lib::transform
                         changed = true;
                     }
 
-                    if (!changed || failed)
+                    if (failed)
                     {
                         continue;
                     }
 
                     const wolvrix::lib::grh::Value resultValue = graph.getValue(resultId);
-                    if (flattenedWidth != resultValue.width())
+                    if (flattenedWidth != resultValue.width() ||
+                        resultValue.type() != wolvrix::lib::grh::ValueType::Logic)
+                    {
+                        continue;
+                    }
+
+                    // Recover word operands before scheduling materializes the
+                    // individual slices. Keep existing slices and their users;
+                    // only this concat's operand list is changed.
+                    struct SliceRange
+                    {
+                        wolvrix::lib::grh::ValueId source;
+                        int64_t low;
+                        int64_t high;
+                    };
+                    auto sliceRange = [&](wolvrix::lib::grh::ValueId id)
+                        -> std::optional<SliceRange> {
+                        const auto value = graph.getValue(id);
+                        const auto defId = value.definingOp();
+                        if (value.type() != wolvrix::lib::grh::ValueType::Logic ||
+                            !defId.valid())
+                        {
+                            return std::nullopt;
+                        }
+                        const auto def = graph.getOperation(defId);
+                        if (def.kind() != wolvrix::lib::grh::OperationKind::kSliceStatic ||
+                            def.operands().size() != 1 || def.results().size() != 1 ||
+                            def.results()[0] != id || !def.operands()[0].valid())
+                        {
+                            return std::nullopt;
+                        }
+                        const auto low = getIntAttr(def, "sliceStart");
+                        const auto high = getIntAttr(def, "sliceEnd");
+                        const auto source = graph.getValue(def.operands()[0]);
+                        if (!low || !high || *low < 0 || *high < *low ||
+                            *high >= source.width() || *high - *low + 1 != value.width() ||
+                            source.type() != wolvrix::lib::grh::ValueType::Logic)
+                        {
+                            return std::nullopt;
+                        }
+                        return SliceRange{def.operands()[0], *low, *high};
+                    };
+                    std::vector<wolvrix::lib::grh::ValueId> mergedOperands;
+                    mergedOperands.reserve(flattenedOperands.size());
+                    for (std::size_t i = 0; i < flattenedOperands.size();)
+                    {
+                        auto range = sliceRange(flattenedOperands[i]);
+                        std::size_t end = i + 1;
+                        if (range)
+                        {
+                            while (end < flattenedOperands.size())
+                            {
+                                const auto next = sliceRange(flattenedOperands[end]);
+                                if (!next || next->source != range->source ||
+                                    next->high + 1 != range->low)
+                                {
+                                    break;
+                                }
+                                range->low = next->low;
+                                ++end;
+                            }
+                        }
+                        if (end == i + 1 ||
+                            dependsTransitivelyOn(graph, range->source, resultId))
+                        {
+                            mergedOperands.push_back(flattenedOperands[i++]);
+                            continue;
+                        }
+                        const auto source = graph.getValue(range->source);
+                        auto merged = range->source;
+                        if (range->low != 0 || range->high + 1 != source.width())
+                        {
+                            merged = graph.createValue(static_cast<int32_t>(range->high - range->low + 1),
+                                                       false);
+                            const auto slice = graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceStatic);
+                            graph.addOperand(slice, range->source);
+                            graph.addResult(slice, merged);
+                            graph.setAttr(slice, "sliceStart", range->low);
+                            graph.setAttr(slice, "sliceEnd", range->high);
+                            const auto loc = makeTransformSrcLoc("redundant-elim", "concat_slices");
+                            graph.setOpSrcLoc(slice, loc);
+                            graph.setValueSrcLoc(merged, loc);
+                        }
+                        mergedOperands.push_back(merged);
+                        changed = true;
+                        i = end;
+                    }
+                    if (!changed)
                     {
                         continue;
                     }
 
                     try
                     {
-                        for (std::size_t i = 0; i < flattenedOperands.size(); ++i)
+                        for (std::size_t i = 0; i < mergedOperands.size(); ++i)
                         {
                             if (graph.getOperation(opId).operands().size() > i)
                             {
-                                graph.replaceOperand(opId, i, flattenedOperands[i]);
+                                graph.replaceOperand(opId, i, mergedOperands[i]);
                             }
                             else
                             {
-                                graph.addOperand(opId, flattenedOperands[i]);
+                                graph.addOperand(opId, mergedOperands[i]);
                             }
                         }
-                        while (graph.getOperation(opId).operands().size() > flattenedOperands.size())
+                        while (graph.getOperation(opId).operands().size() > mergedOperands.size())
                         {
                             graph.eraseOperand(opId, graph.getOperation(opId).operands().size() - 1);
                         }
@@ -685,7 +772,7 @@ namespace wolvrix::lib::transform
                     catch (const std::exception &ex)
                     {
                         this->error(graph, op,
-                                    std::string("Failed to flatten nested concat: ") + ex.what());
+                                    std::string("Failed to simplify concat operands: ") + ex.what());
                     }
                     continue;
                 }

@@ -7,6 +7,10 @@ schedule，并把结果写入 session。plain 调度路径是默认；local shar
 clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bounded
 实验入口。
 
+`-event-regions true` 是默认关闭的[事件尾部区域合并](./activity-event-regions.md)
+路径：把只服务同一寄存器提交事件的纯组合节点合并，以减少内部持久值和变化通知。
+区域入口仍使用 activity 调度，所有 compute 仍在 commit 前执行。
+
 这个 pass 不会生成新的 wrapper/module，但会：
 
 - 为缺失 symbol 的可分区 op 补内部 symbol
@@ -59,6 +63,8 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-disable-commit-guard-event-buckets` | `false` | 关闭 commit guard/event bucket 分组 |
 | `-split-oversize-compute-nodes` | `false` | materialize 阶段拆分超过上限的单个 compute node |
 | `-declared-value-compute-node-boundary` | `false` | 把带 declared symbol 的 value 作为 compute-node 截断边界 |
+| `-event-regions` | `false` | 合并同一 register commit 终点的完整纯组合尾部区域；固定 8192-op 上限，保留 commit 顺序及事件/副作用屏障 |
+| `-event-regions-shared` | `false` | 按相同多终点集合合并共享纯组合区域；保护memory/event/effect组，固定32终点、8192-op上限；要求父选项开启 |
 | `-final-terminal-pushforward-policy` | `off` | terminal common-target pushforward 策略：`off/probe/strict` |
 | `-final-terminal-pushforward-max-node-ops` | `8` | 候选 terminal compute node 的最大 raw compute op 数 |
 | `-final-terminal-pushforward-max-inputs` | `16` | 候选 cone 的最大 external input value 数 |

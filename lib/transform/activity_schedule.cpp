@@ -14110,6 +14110,539 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        struct EventRegionStats
+        {
+            std::size_t regions = 0;
+            std::size_t nodes = 0;
+            std::size_t ops = 0;
+            std::size_t oversized = 0;
+            std::size_t boundaryBefore = 0;
+            std::size_t boundaryAfter = 0;
+            std::size_t liveStepsBefore = 0;
+            std::size_t liveStepsAfter = 0;
+            std::size_t sourceGroups = 0;
+            std::size_t terminalLimit = 0;
+            std::size_t splitGroups = 0;
+        };
+
+        bool orderEventRegionByUse(const wolvrix::lib::grh::Graph &graph,
+                                   const ActivityScheduleBuild &baseline,
+                                   std::vector<wolvrix::lib::grh::OperationId> &ordered,
+                                   EventRegionStats &stats,
+                                   std::string &error)
+        {
+            using namespace wolvrix::lib::grh;
+            // Layer order makes many independent intermediates live
+            // simultaneously in a large region. Emit dependencies at
+            // first use, retaining one definition for shared producers.
+            std::unordered_map<OperationId, std::size_t, OperationIdHash> positions;
+            for (std::size_t i = 0; i < ordered.size(); ++i) positions.emplace(ordered[i], i);
+            std::vector<std::vector<std::size_t>> dependencies(ordered.size());
+            std::vector<bool> roots(ordered.size(), false);
+            std::unordered_set<ValueId, ValueIdHash> observable;
+            for (const auto &port : graph.outputPorts()) observable.insert(port.value);
+            for (const auto &port : graph.inoutPorts())
+            {
+                observable.insert(port.out);
+                observable.insert(port.oe);
+            }
+            for (std::size_t i = 0; i < ordered.size(); ++i)
+            {
+                const auto op = graph.getOperation(ordered[i]);
+                for (const auto operand : op.operands())
+                    if (const auto it = positions.find(graph.valueDef(operand)); it != positions.end())
+                    {
+                        if (it->second >= i)
+                        {
+                            error = "event-regions use order requires acyclic producer-before-consumer dependencies";
+                            return false;
+                        }
+                        dependencies[i].push_back(it->second);
+                    }
+                for (const auto result : op.results())
+                {
+                    if (observable.contains(result)) roots[i] = true;
+                    for (const auto &use : graph.getValue(result).users())
+                        if (!positions.contains(use.operation) && use.operation.index > 0 &&
+                            use.operation.index <= baseline.opToSupernode.size() &&
+                            baseline.opToSupernode[use.operation.index - 1] != kInvalidActivitySupernodeId)
+                            roots[i] = true;
+                }
+            }
+            const auto liveSteps = [&](const std::vector<OperationId> &order) {
+                std::unordered_map<OperationId, std::size_t, OperationIdHash> position;
+                for (std::size_t i = 0; i < order.size(); ++i) position.emplace(order[i], i);
+                std::size_t total = 0;
+                for (std::size_t i = 0; i < order.size(); ++i)
+                {
+                    const auto op = graph.getOperation(order[i]);
+                    if (op.kind() == OperationKind::kConstant || op.kind() == OperationKind::kRegisterReadPort) continue;
+                    for (const auto result : op.results())
+                    {
+                        std::size_t last = i;
+                        for (const auto &use : graph.getValue(result).users())
+                            if (const auto it = position.find(use.operation); it != position.end())
+                                last = std::max(last, it->second);
+                        total += last - i;
+                    }
+                }
+                return total;
+            };
+            std::vector<OperationId> byUse;
+            std::vector<bool> emitted(ordered.size(), false);
+            std::vector<std::pair<std::size_t, std::size_t>> stack;
+            const auto emit = [&](std::size_t root) {
+                if (emitted[root]) return;
+                stack.emplace_back(root, 0);
+                while (!stack.empty())
+                {
+                    auto &[index, next] = stack.back();
+                    if (next < dependencies[index].size())
+                    {
+                        const auto dependency = dependencies[index][next++];
+                        if (!emitted[dependency]) stack.emplace_back(dependency, 0);
+                    }
+                    else
+                    {
+                        byUse.push_back(ordered[index]);
+                        emitted[index] = true;
+                        stack.pop_back();
+                    }
+                }
+            };
+            for (std::size_t i = 0; i < ordered.size(); ++i) if (roots[i]) emit(i);
+            for (std::size_t i = 0; i < ordered.size(); ++i) emit(i);
+            stats.liveStepsBefore += liveSteps(ordered);
+            stats.liveStepsAfter += liveSteps(byUse);
+            ordered = std::move(byUse);
+            return true;
+        }
+
+        bool buildEventRegions(const wolvrix::lib::grh::Graph &graph,
+                               const ComputeRewriteBuild &rewrite,
+                               ActivityScheduleBuild &build,
+                               EventRegionStats &stats,
+                               std::string &error)
+        {
+            using namespace wolvrix::lib::grh;
+            constexpr int64_t empty = -1;
+            constexpr int64_t barrier = -2;
+            constexpr std::size_t maxRegionOps = 8192;
+            const ActivityScheduleBuild baseline = build;
+            const std::size_t count = rewrite.computeNodes.size();
+            std::vector<int64_t> terminal(count, empty);
+            const auto join = [&](uint32_t node, int64_t target) {
+                if (node >= count || target == empty) return;
+                auto &current = terminal[node];
+                if (current == empty) current = target;
+                else if (current != target) current = barrier;
+            };
+            const auto owner = [&](ValueId value) {
+                const auto def = graph.valueDef(value);
+                return def.valid() && def.index < rewrite.computeNodeOfOp.size()
+                    ? rewrite.computeNodeOfOp[def.index] : kInvalidActivitySupernodeId;
+            };
+            // These are execution barriers, not just public names. Region-local
+            // values are still evaluated before all commits, on the old snapshot.
+            for (uint32_t node = 0; node < count; ++node)
+            {
+                const auto &record = rewrite.computeNodes[node];
+                if (record.indivisible || !record.intentGroup.empty()) join(node, barrier);
+                for (const auto id : record.ops)
+                {
+                    const auto op = graph.getOperation(id);
+                    const auto kind = op.kind();
+                    if (opHasSideEffects(op) ||
+                        (!isLocalSharedComputeOpKind(kind) &&
+                         kind != OperationKind::kConstant && kind != OperationKind::kRegisterReadPort))
+                        join(node, barrier);
+                    for (const auto &attr : op.attrs())
+                        if (std::string_view(attr.key).starts_with("regToMem.intent.")) join(node, barrier);
+                    for (const auto result : op.results())
+                        if (graph.valueType(result) != ValueType::Logic) join(node, barrier);
+                }
+            }
+            for (const auto &port : graph.outputPorts()) join(owner(port.value), barrier);
+            for (const auto &port : graph.inoutPorts())
+            {
+                join(owner(port.out), barrier);
+                join(owner(port.oe), barrier);
+            }
+            // Do not change the activation context of observable compute effects,
+            // even by extracting a pure sibling from their original supernode.
+            for (uint32_t group = 0; group < baseline.supernodeToOps.size(); ++group)
+            {
+                if (baseline.supernodeKinds[group] != ActivityScheduleSupernodeKind::Compute) continue;
+                const bool effect = std::any_of(baseline.supernodeToOps[group].begin(),
+                    baseline.supernodeToOps[group].end(), [&](OperationId id) {
+                        const auto op = graph.getOperation(id);
+                        return opHasSideEffects(op) || op.kind() == OperationKind::kSystemFunction ||
+                               op.kind() == OperationKind::kDpicCall || op.kind() == OperationKind::kSystemTask;
+                    });
+                if (effect)
+                    for (const auto node : baseline.computeNodesBySupernode[group]) join(node, barrier);
+            }
+            for (uint32_t group = 0; group < baseline.supernodeToOps.size(); ++group)
+            {
+                if (baseline.supernodeKinds[group] != ActivityScheduleSupernodeKind::Commit) continue;
+                bool eligible = !baseline.supernodeToOps[group].empty();
+                std::vector<std::string> eventEdges;
+                std::vector<ValueId> eventValues;
+                for (const auto id : baseline.supernodeToOps[group])
+                {
+                    const auto op = graph.getOperation(id);
+                    const auto edges = getAttrValue<std::vector<std::string>>(op, "eventEdge")
+                        .value_or(std::vector<std::string>{});
+                    const auto operands = op.operands();
+                    if (op.kind() != OperationKind::kRegisterWritePort || edges.empty() ||
+                        operands.size() < edges.size() || opHasSideEffects(op))
+                    {
+                        eligible = false;
+                        continue;
+                    }
+                    const std::vector<ValueId> events(operands.end() - edges.size(), operands.end());
+                    if (eventEdges.empty()) { eventEdges = edges; eventValues = events; }
+                    else if (eventEdges != edges || eventValues != events) eligible = false;
+                }
+                for (const auto id : baseline.supernodeToOps[group])
+                {
+                    const auto op = graph.getOperation(id);
+                    const auto edges = getAttrValue<std::vector<std::string>>(op, "eventEdge")
+                        .value_or(std::vector<std::string>{});
+                    const auto operands = op.operands();
+                    for (std::size_t i = 0; i < operands.size(); ++i)
+                    {
+                        const bool isEvent = edges.size() <= operands.size() &&
+                                             i >= operands.size() - edges.size();
+                        join(owner(operands[i]), eligible && !isEvent ? int64_t{group} : barrier);
+                    }
+                }
+            }
+            // A single-terminal set is closed towards its consumers. Therefore
+            // coalescing the whole set cannot introduce a compute quotient cycle.
+            // Multi-terminal and barrier cones retain their original grouping.
+            for (auto it = rewrite.computeTopoOrder.rbegin(); it != rewrite.computeTopoOrder.rend(); ++it)
+            {
+                for (const auto successor : rewrite.computeDag[*it]) join(*it, terminal[successor]);
+                if (terminal[*it] == empty) terminal[*it] = barrier;
+            }
+            std::vector<uint32_t> oldGroup(count, kInvalidActivitySupernodeId);
+            for (uint32_t group = 0; group < baseline.computeNodesBySupernode.size(); ++group)
+                for (const auto node : baseline.computeNodesBySupernode[group])
+                {
+                    if (node >= count || oldGroup[node] != kInvalidActivitySupernodeId)
+                    {
+                        error = "event-regions requires whole compute nodes (disable oversize-node splitting)";
+                        return false;
+                    }
+                    oldGroup[node] = group;
+                }
+            std::map<int64_t, std::vector<uint32_t>> regions;
+            for (uint32_t node = 0; node < count; ++node)
+                if (terminal[node] >= 0 && oldGroup[node] != kInvalidActivitySupernodeId)
+                    regions[terminal[node]].push_back(node);
+            std::vector<bool> moved(count, false);
+            for (auto it = regions.begin(); it != regions.end();)
+            {
+                std::size_t size = 0;
+                std::set<uint32_t> groups;
+                for (const auto node : it->second)
+                {
+                    size += rewrite.computeNodes[node].ops.size();
+                    groups.insert(oldGroup[node]);
+                }
+                if (size > maxRegionOps || groups.size() < 2)
+                {
+                    if (size > maxRegionOps) ++stats.oversized;
+                    it = regions.erase(it);
+                    continue;
+                }
+                ++stats.regions;
+                stats.nodes += it->second.size();
+                stats.ops += size;
+                for (const auto node : it->second) moved[node] = true;
+                ++it;
+            }
+            const auto boundaryCount = [](const ActivityScheduleBuild &s) {
+                return std::count_if(s.valueFanout.begin(), s.valueFanout.end(),
+                                     [](const auto &targets) { return !targets.empty(); });
+            };
+            stats.boundaryBefore = boundaryCount(baseline);
+            if (regions.empty()) { stats.boundaryAfter = stats.boundaryBefore; return true; }
+            ActivityScheduleBuild candidate;
+            const auto appendCompute = [&](std::vector<uint32_t> nodes, bool region = false) -> bool {
+                if (nodes.empty()) return true;
+                std::vector<OperationId> ops;
+                for (const auto node : nodes)
+                    ops.insert(ops.end(), rewrite.computeNodes[node].ops.begin(), rewrite.computeNodes[node].ops.end());
+                std::vector<OperationId> ordered;
+                if (!topoSortLocalOps(graph, ops, ordered, error)) return false;
+                if (region && !orderEventRegionByUse(graph, baseline, ordered, stats, error)) return false;
+                candidate.supernodeToOps.push_back(std::move(ordered));
+                candidate.computeNodesBySupernode.push_back(std::move(nodes));
+                candidate.supernodeKinds.push_back(ActivityScheduleSupernodeKind::Compute);
+                return true;
+            };
+            for (uint32_t group = 0; group < baseline.supernodeToOps.size(); ++group)
+            {
+                if (baseline.supernodeKinds[group] != ActivityScheduleSupernodeKind::Compute) continue;
+                std::vector<uint32_t> remaining;
+                for (const auto node : baseline.computeNodesBySupernode[group])
+                    if (!moved[node]) remaining.push_back(node);
+                const bool unchanged = remaining.size() == baseline.computeNodesBySupernode[group].size();
+                const bool nonempty = !remaining.empty();
+                if (!appendCompute(std::move(remaining))) return false;
+                if (unchanged && nonempty) candidate.supernodeToOps.back() = baseline.supernodeToOps[group];
+            }
+            for (const auto &[target, nodes] : regions)
+            {
+                (void)target;
+                if (!appendCompute(nodes, true)) return false;
+            }
+            std::vector<uint32_t> commitOrder;
+            for (const auto group : baseline.topoOrder)
+            {
+                if (baseline.supernodeKinds[group] != ActivityScheduleSupernodeKind::Commit) continue;
+                commitOrder.push_back(static_cast<uint32_t>(candidate.supernodeToOps.size()));
+                candidate.supernodeToOps.push_back(baseline.supernodeToOps[group]);
+                candidate.computeNodesBySupernode.push_back({});
+                candidate.supernodeKinds.push_back(ActivityScheduleSupernodeKind::Commit);
+            }
+            if (!rebuildFinalScheduleDerivedNoSplit(graph, candidate, error)) return false;
+            // No scheduled operation is created, lost or duplicated. Commit lists
+            // are copied verbatim, and preserve baseline inter-group ordering.
+            const auto allOps = [](const ActivityScheduleBuild &s) {
+                std::vector<uint32_t> ids;
+                for (const auto &group : s.supernodeToOps)
+                    for (const auto id : group) ids.push_back(id.index);
+                std::sort(ids.begin(), ids.end());
+                return ids;
+            };
+            if (allOps(candidate) != allOps(baseline))
+            {
+                error = "event-regions changed the scheduled operation set";
+                return false;
+            }
+            candidate.topoOrder.erase(std::remove_if(candidate.topoOrder.begin(), candidate.topoOrder.end(),
+                [&](uint32_t group) { return candidate.supernodeKinds[group] == ActivityScheduleSupernodeKind::Commit; }),
+                candidate.topoOrder.end());
+            candidate.topoOrder.insert(candidate.topoOrder.end(), commitOrder.begin(), commitOrder.end());
+            stats.boundaryAfter = boundaryCount(candidate);
+            build = std::move(candidate);
+            return true;
+        }
+
+        bool buildSharedEventRegions(const wolvrix::lib::grh::Graph &graph,
+                                     const ComputeRewriteBuild &rewrite,
+                                     ActivityScheduleBuild &build,
+                                     EventRegionStats &stats,
+                                     std::string &error)
+        {
+            using namespace wolvrix::lib::grh;
+            constexpr std::size_t maxRegionOps = 8192;
+            constexpr std::size_t maxTerminals = 32;
+            const ActivityScheduleBuild baseline = build;
+            const std::size_t count = rewrite.computeNodes.size();
+            std::vector<bool> blocked(count, false);
+            std::vector<std::vector<uint32_t>> terminals(count);
+            std::vector<uint32_t> oldGroup(count, kInvalidActivitySupernodeId);
+            const auto owner = [&](ValueId value) {
+                const auto def = graph.valueDef(value);
+                return def.valid() && def.index < rewrite.computeNodeOfOp.size()
+                    ? rewrite.computeNodeOfOp[def.index] : kInvalidActivitySupernodeId;
+            };
+            const auto block = [&](uint32_t node) {
+                if (node < count) { blocked[node] = true; terminals[node].clear(); }
+            };
+            const auto join = [&](uint32_t node, uint32_t terminal) {
+                if (node >= count || blocked[node]) return;
+                auto &set = terminals[node];
+                const auto it = std::lower_bound(set.begin(), set.end(), terminal);
+                if (it != set.end() && *it == terminal) return;
+                if (set.size() == maxTerminals) { block(node); ++stats.terminalLimit; }
+                else set.insert(it, terminal);
+            };
+            for (uint32_t node = 0; node < count; ++node)
+            {
+                const auto &record = rewrite.computeNodes[node];
+                if (record.indivisible || !record.intentGroup.empty()) block(node);
+                for (const auto id : record.ops)
+                {
+                    const auto op = graph.getOperation(id);
+                    if (opHasSideEffects(op) ||
+                        (!isLocalSharedComputeOpKind(op.kind()) && op.kind() != OperationKind::kConstant &&
+                         op.kind() != OperationKind::kRegisterReadPort)) block(node);
+                    for (const auto &attr : op.attrs())
+                        if (std::string_view(attr.key).starts_with("regToMem.intent.")) block(node);
+                    for (const auto result : op.results())
+                        if (graph.valueType(result) != ValueType::Logic) block(node);
+                }
+            }
+            for (uint32_t group = 0; group < baseline.supernodeToOps.size(); ++group)
+            {
+                if (baseline.supernodeKinds[group] != ActivityScheduleSupernodeKind::Compute) continue;
+                const auto &ops = baseline.supernodeToOps[group];
+                const bool effect = std::any_of(ops.begin(), ops.end(), [&](OperationId id) {
+                    const auto op = graph.getOperation(id);
+                    return opHasSideEffects(op) || op.kind() == OperationKind::kSystemFunction ||
+                        op.kind() == OperationKind::kSystemTask || op.kind() == OperationKind::kDpicCall;
+                });
+                for (const auto node : baseline.computeNodesBySupernode[group])
+                {
+                    if (node >= count || oldGroup[node] != kInvalidActivitySupernodeId)
+                    { error = "shared event-regions requires whole compute nodes"; return false; }
+                    oldGroup[node] = group;
+                    if (effect) block(node);
+                }
+            }
+            // Ports are observable endpoints, not clock-qualified execution.
+            // Event producers remain hard barriers. Data/enable/address inputs
+            // of every commit are endpoints; the commits themselves never move.
+            uint32_t endpoint = static_cast<uint32_t>(baseline.supernodeToOps.size());
+            for (const auto &port : graph.outputPorts()) join(owner(port.value), endpoint++);
+            for (const auto &port : graph.inoutPorts())
+            {
+                join(owner(port.out), endpoint++);
+                join(owner(port.oe), endpoint++);
+            }
+            for (uint32_t group = 0; group < baseline.supernodeToOps.size(); ++group)
+            {
+                if (baseline.supernodeKinds[group] != ActivityScheduleSupernodeKind::Commit) continue;
+                for (const auto id : baseline.supernodeToOps[group])
+                {
+                    const auto op = graph.getOperation(id);
+                    const auto edges = getAttrValue<std::vector<std::string>>(op, "eventEdge")
+                        .value_or(std::vector<std::string>{});
+                    const auto operands = op.operands();
+                    for (std::size_t i = 0; i < operands.size(); ++i)
+                    {
+                        const bool event = edges.size() <= operands.size() && i >= operands.size() - edges.size();
+                        if (!event) join(owner(operands[i]), group);
+                        else block(owner(operands[i]));
+                    }
+                }
+            }
+            // Preserve the complete original context of every hard boundary.
+            // Its pure inputs may form regions, but the boundary is a distinct
+            // endpoint rather than poisoning its entire combinational fanin.
+            std::vector<uint32_t> barrierEndpoint(count, kInvalidActivitySupernodeId);
+            for (uint32_t group = 0; group < baseline.computeNodesBySupernode.size(); ++group)
+            {
+                const auto &nodes = baseline.computeNodesBySupernode[group];
+                if (!std::any_of(nodes.begin(), nodes.end(), [&](uint32_t n) { return blocked[n]; })) continue;
+                const auto token = endpoint++;
+                for (const auto node : nodes) { block(node); barrierEndpoint[node] = token; }
+            }
+            for (auto it = rewrite.computeTopoOrder.rbegin(); it != rewrite.computeTopoOrder.rend(); ++it)
+            {
+                const auto node = *it;
+                if (barrierEndpoint[node] != kInvalidActivitySupernodeId) continue;
+                for (const auto successor : rewrite.computeDag[node])
+                {
+                    if (barrierEndpoint[successor] != kInvalidActivitySupernodeId)
+                        join(node, barrierEndpoint[successor]);
+                    else if (blocked[successor]) block(node);
+                    else for (const auto terminal : terminals[successor]) join(node, terminal);
+                }
+                if (terminals[node].empty()) block(node);
+            }
+            // Endpoint sets only shrink along compute-node edges. Contract all
+            // nodes in an equal-set class; partition every unmerged remainder by
+            // the same classes. Leaving mixed remainders could create a quotient
+            // cycle despite an acyclic node DAG. Effect groups are wholly blocked
+            // and retain their original membership, order and activation context.
+            std::map<std::vector<uint32_t>, std::vector<uint32_t>> regions;
+            for (uint32_t node = 0; node < count; ++node)
+                if (!blocked[node] && terminals[node].size() > 1 && oldGroup[node] != kInvalidActivitySupernodeId)
+                    regions[terminals[node]].push_back(node);
+            std::vector<bool> moved(count, false);
+            std::set<uint32_t> allSources;
+            for (auto it = regions.begin(); it != regions.end();)
+            {
+                std::size_t ops = 0;
+                std::set<uint32_t> sources;
+                for (const auto node : it->second)
+                { ops += rewrite.computeNodes[node].ops.size(); sources.insert(oldGroup[node]); }
+                if (sources.size() < 2 || ops > maxRegionOps)
+                {
+                    if (ops > maxRegionOps) ++stats.oversized;
+                    it = regions.erase(it); continue;
+                }
+                ++stats.regions; stats.ops += ops; stats.nodes += it->second.size();
+                allSources.insert(sources.begin(), sources.end());
+                for (const auto node : it->second) moved[node] = true;
+                ++it;
+            }
+            stats.sourceGroups = allSources.size();
+            const auto boundaries = [](const ActivityScheduleBuild &s) {
+                return std::count_if(s.valueFanout.begin(), s.valueFanout.end(),
+                    [](const auto &fanout) { return !fanout.empty(); });
+            };
+            stats.boundaryBefore = stats.boundaryAfter = boundaries(baseline);
+            if (regions.empty()) return true;
+            ActivityScheduleBuild candidate;
+            const auto append = [&](std::vector<OperationId> ops, std::vector<uint32_t> nodes) {
+                candidate.supernodeToOps.push_back(std::move(ops));
+                candidate.computeNodesBySupernode.push_back(std::move(nodes));
+                candidate.supernodeKinds.push_back(ActivityScheduleSupernodeKind::Compute);
+            };
+            for (uint32_t group = 0; group < baseline.supernodeToOps.size(); ++group)
+            {
+                if (baseline.supernodeKinds[group] != ActivityScheduleSupernodeKind::Compute) continue;
+                std::map<std::vector<uint32_t>, std::vector<uint32_t>> fragments;
+                for (const auto node : baseline.computeNodesBySupernode[group])
+                    if (!moved[node]) fragments[terminals[node]].push_back(node);
+                if (fragments.size() > 1) ++stats.splitGroups;
+                for (auto &[key, nodes] : fragments)
+                {
+                    (void)key;
+                    if (nodes.size() == baseline.computeNodesBySupernode[group].size())
+                    { append(baseline.supernodeToOps[group], std::move(nodes)); continue; }
+                    std::unordered_set<OperationId, OperationIdHash> membership;
+                    for (const auto node : nodes)
+                        membership.insert(rewrite.computeNodes[node].ops.begin(), rewrite.computeNodes[node].ops.end());
+                    std::vector<OperationId> ops;
+                    for (const auto op : baseline.supernodeToOps[group])
+                        if (membership.contains(op)) ops.push_back(op);
+                    append(std::move(ops), std::move(nodes));
+                }
+            }
+            for (auto &[key, nodes] : regions)
+            {
+                (void)key;
+                std::vector<OperationId> ops, ordered;
+                for (const auto node : nodes)
+                    ops.insert(ops.end(), rewrite.computeNodes[node].ops.begin(), rewrite.computeNodes[node].ops.end());
+                if (!topoSortLocalOps(graph, ops, ordered, error) ||
+                    !orderEventRegionByUse(graph, baseline, ordered, stats, error)) return false;
+                append(std::move(ordered), std::move(nodes));
+            }
+            std::vector<uint32_t> commitOrder;
+            for (const auto group : baseline.topoOrder)
+                if (baseline.supernodeKinds[group] == ActivityScheduleSupernodeKind::Commit)
+                {
+                    commitOrder.push_back(static_cast<uint32_t>(candidate.supernodeToOps.size()));
+                    candidate.supernodeToOps.push_back(baseline.supernodeToOps[group]);
+                    candidate.computeNodesBySupernode.push_back({});
+                    candidate.supernodeKinds.push_back(ActivityScheduleSupernodeKind::Commit);
+                }
+            if (!rebuildFinalScheduleDerivedNoSplit(graph, candidate, error)) return false;
+            const auto allOps = [](const ActivityScheduleBuild &s) {
+                std::vector<uint32_t> ids;
+                for (const auto &ops : s.supernodeToOps) for (const auto id : ops) ids.push_back(id.index);
+                std::sort(ids.begin(), ids.end()); return ids;
+            };
+            if (allOps(candidate) != allOps(baseline))
+            { error = "shared event-regions changed the scheduled operation set"; return false; }
+            candidate.topoOrder.erase(std::remove_if(candidate.topoOrder.begin(), candidate.topoOrder.end(),
+                [&](uint32_t group) { return candidate.supernodeKinds[group] == ActivityScheduleSupernodeKind::Commit; }),
+                candidate.topoOrder.end());
+            candidate.topoOrder.insert(candidate.topoOrder.end(), commitOrder.begin(), commitOrder.end());
+            stats.boundaryAfter = boundaries(candidate);
+            build = std::move(candidate);
+            return true;
+        }
+
         bool applyFinalFaninPullbackStrict(
             const wolvrix::lib::grh::Graph &graph,
             const ActivityScheduleOptions &options,
@@ -15102,6 +15635,12 @@ namespace wolvrix::lib::transform
     {
         PassResult result;
         const auto totalStart = std::chrono::steady_clock::now();
+        if (options_.eventRegionsShared && !options_.eventRegions)
+        {
+            error("event-regions-shared requires event-regions");
+            result.failed = true;
+            return result;
+        }
         if (options_.path.empty())
         {
             error("activity-schedule requires -path");
@@ -16667,6 +17206,48 @@ namespace wolvrix::lib::transform
                         " storage_distance=" +
                         std::to_string(candidate.storageDistance));
             }
+        }
+
+        if (options_.eventRegions)
+        {
+            EventRegionStats regionStats;
+            if (!buildEventRegions(*graph, rewrite, build, regionStats, buildError))
+            {
+                error(*graph, buildError);
+                result.failed = true;
+                return result;
+            }
+            logInfo("activity-schedule event-regions: regions=" + std::to_string(regionStats.regions) +
+                    " compute_nodes=" + std::to_string(regionStats.nodes) +
+                    " ops=" + std::to_string(regionStats.ops) +
+                    " oversized=" + std::to_string(regionStats.oversized) +
+                    " boundary_values_before=" + std::to_string(regionStats.boundaryBefore) +
+                    " boundary_values_after=" + std::to_string(regionStats.boundaryAfter) +
+                    " local_value_live_steps_before=" + std::to_string(regionStats.liveStepsBefore) +
+                    " local_value_live_steps_after=" + std::to_string(regionStats.liveStepsAfter) +
+                    " commit_order_preserved=true");
+        }
+
+        if (options_.eventRegionsShared)
+        {
+            EventRegionStats shared;
+            if (!buildSharedEventRegions(*graph, rewrite, build, shared, buildError))
+            {
+                error(*graph, buildError);
+                result.failed = true;
+                return result;
+            }
+            logInfo("activity-schedule shared event-regions: regions=" + std::to_string(shared.regions) +
+                    " source_groups=" + std::to_string(shared.sourceGroups) +
+                    " compute_nodes=" + std::to_string(shared.nodes) + " ops=" + std::to_string(shared.ops) +
+                    " oversized=" + std::to_string(shared.oversized) +
+                    " terminal_limit=" + std::to_string(shared.terminalLimit) +
+                    " split_groups=" + std::to_string(shared.splitGroups) +
+                    " boundary_values_before=" + std::to_string(shared.boundaryBefore) +
+                    " boundary_values_after=" + std::to_string(shared.boundaryAfter) +
+                    " local_value_live_steps_before=" + std::to_string(shared.liveStepsBefore) +
+                    " local_value_live_steps_after=" + std::to_string(shared.liveStepsAfter) +
+                    " commit_order_preserved=true");
         }
 
         ActivityScheduleCommitLocalityGroupOrder commitLocalityGroupOrder;

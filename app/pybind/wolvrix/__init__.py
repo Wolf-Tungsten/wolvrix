@@ -855,6 +855,8 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("commit_guard_event_buckets", "-commit-guard-event-buckets"),
         ("split_oversize_compute_nodes", "-split-oversize-compute-nodes"),
         ("declared_value_compute_node_boundary", "-declared-value-compute-node-boundary"),
+        ("event_regions", "-event-regions"),
+        ("event_regions_shared", "-event-regions-shared"),
     ]
 
     for key, arg in string_options:

@@ -1401,6 +1401,33 @@ namespace wolvrix::lib::emit
         using BoundaryActivationFanoutMap =
             std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash>;
 
+        struct ConditionalMuxNotifyGroup
+        {
+            std::vector<ValueId> sources;
+            std::vector<std::size_t> targets;
+            std::string changedExpr;
+            bool reuseDeferred = false;
+            std::string fallbackExpr;
+        };
+
+        struct JointNotifyBucket
+        {
+            std::vector<ValueId> sources;
+            std::vector<std::size_t> deferredGroups;
+            std::vector<std::size_t> cacheGroups;
+            std::string changedExpr;
+        };
+
+        struct ConditionalMuxNotifyPlan
+        {
+            std::vector<ConditionalMuxNotifyGroup> groups;
+            std::unordered_map<ValueId, std::vector<std::size_t>, ValueIdHash> groupsBySource;
+            std::vector<JointNotifyBucket> jointBuckets;
+            std::unordered_map<ValueId, std::size_t, ValueIdHash> jointBucketBySource;
+            std::size_t jointOriginalContributions = 0;
+            std::size_t jointFactoredContributions = 0;
+        };
+
         struct ActivationEmitContext
         {
             std::size_t currentWordIndex = 0;
@@ -1427,6 +1454,7 @@ namespace wolvrix::lib::emit
             // a conservative union or from an exact local mask accumulator.
             std::map<std::size_t, std::uint64_t> *batchTriggerBoundaryMasks = nullptr;
             bool batchTriggerBoundaryAccumulate = false;
+            const ConditionalMuxNotifyPlan *conditionalMuxNotifyPlan = nullptr;
         };
 
         ActiveMaskGapPackProbe *resolveActiveMaskGapPackProbe(
@@ -2322,6 +2350,7 @@ namespace wolvrix::lib::emit
             std::unordered_map<ValueId, std::string, ValueIdHash> packedScalarConcatReductions;
             std::vector<ValueId> packedShortConcatInputs;
             std::unordered_map<ValueId, std::string, ValueIdHash> packedShortConcatReductions;
+            std::unordered_map<ValueId, OperationId, ValueIdHash> indexedConcatSlices;
             std::unordered_set<ValueId, ValueIdHash> preserveLocalSnapshot;
             std::unordered_set<ValueId, ValueIdHash> stablePackedArrayIndices;
             bool stableWideStateReadRefs = false;
@@ -4633,6 +4662,36 @@ namespace wolvrix::lib::emit
             std::uint64_t mask = UINT64_C(0);
         };
 
+        struct SharedEqualityDecode
+        {
+            ValueId source;
+            std::vector<OperationId> ops;
+            std::vector<ValueId> results;
+            std::vector<uint64_t> constants;
+            std::size_t cacheIndex = 0;
+        };
+
+        struct LocalEqualityDecode
+        {
+            uint32_t supernode = 0;
+            ValueId source;
+            std::size_t entries = 0;
+            std::vector<OperationId> ops;
+            std::vector<uint64_t> constants;
+        };
+
+        struct ConditionalMuxInputCache
+        {
+            std::vector<ValueId> inputs;
+            std::size_t index = 0;
+        };
+
+        struct ConditionalMuxChangeCache
+        {
+            std::vector<ValueId> sources;
+            std::size_t index = 0;
+        };
+
         struct EmitModel
         {
             std::unordered_map<ValueId, std::string, ValueIdHash> inputFieldByValue;
@@ -4667,6 +4726,22 @@ namespace wolvrix::lib::emit
             std::unordered_map<ValueId, ValueId, ValueIdHash> materializedValueAliasByValue;
             std::unordered_map<ValueId, std::string, ValueIdHash> directStateReadSymbolByValue;
             std::unordered_set<ValueId, ValueIdHash> directInvertedBoolStateValues;
+            struct CoveredStateView
+            {
+                std::string state;
+                std::string expression;
+                ValueId source;
+                uint32_t producer = 0;
+                std::vector<uint32_t> consumers;
+                bool inlineValue = false;
+                bool composed = false;
+                uint32_t expressionOps = 1;
+            };
+            std::unordered_map<ValueId, CoveredStateView, ValueIdHash> coveredStateViews;
+            bool coveredStateViewNotifications = false;
+            bool coveredStateViewInline = false;
+            bool coveredStateViewComposition = false;
+            bool coveredStateViewCompositionInline = false;
             std::unordered_map<ValueId, std::vector<std::optional<ProducerDirtyWordBit>>, ValueIdHash>
                 producerDirtyWordBitsByValue;
             std::unordered_map<std::string, std::vector<ProducerDirtyWordBit>>
@@ -4793,8 +4868,32 @@ namespace wolvrix::lib::emit
             bool boolEagerLogic = false;
             bool boolZeroGroupGuard = false;
             bool boolProducerReduce = false;
+            bool packedScalarSlices = false;
+            bool sharedEqualityDecode = false;
+            std::unordered_map<OperationId, SharedEqualityDecode, OperationIdHash> sharedEqualityDecodes;
+            bool sharedEqualityFamilies = false;
+            // Each member names its first comparison. The source is available
+            // there; later comparisons need not be adjacent to that anchor.
+            std::unordered_map<OperationId, OperationId, OperationIdHash> sharedEqualityFamilyAnchors;
+            bool localEqualityDecode = false;
+            bool conditionalMuxCones = false;
+            bool conditionalMuxWide = false;
+            bool localPredicateSets = false;
+            bool conditionalMuxInputCache = false;
+            bool conditionalMuxChangeCache = false;
+            bool conditionalMuxChangeGrouped = false;
+            bool conditionalMuxChangeJoint = false;
+            std::unordered_map<OperationId, ConditionalMuxInputCache, OperationIdHash> conditionalMuxInputCaches;
+            std::unordered_map<OperationId, ConditionalMuxChangeCache, OperationIdHash> conditionalMuxChangeCaches;
+            std::unordered_map<ValueId, std::vector<std::size_t>, ValueIdHash> conditionalMuxChangeByValue;
+            std::unordered_map<ValueId, std::vector<std::size_t>, ValueIdHash> conditionalMuxChangeByInput;
+            std::unordered_map<std::string, std::vector<std::size_t>> conditionalMuxChangeByState;
+            std::vector<LocalEqualityDecode> localEqualityDecodes;
+            std::unordered_map<OperationId, std::pair<std::size_t, uint64_t>, OperationIdHash> localEqualityLookup;
             bool scalarLeafMuxUnpredictable = false;
             bool stagedScalarConcat = false;
+            bool indexedConcatSlice = false;
+            bool indexedConcatWideConstants = false;
             bool scalarConcatReduction = false;
             bool scalarConcatReductionMasks = false;
             bool shortConcatReductionMasks = false;
@@ -7988,6 +8087,51 @@ namespace wolvrix::lib::emit
                                               const EmitModel &model,
                                               const WaveformSignalDecl &signal);
 
+        void emitConditionalMuxChangeCacheMarks(std::ostream &stream,
+                                                const EmitModel &model,
+                                                ValueId source,
+                                                std::string_view condition,
+                                                std::string_view indent,
+                                                const ActivationEmitContext *context = nullptr,
+                                                bool deferredFollows = false)
+        {
+            const auto it = model.conditionalMuxChangeByValue.find(source);
+            if (it == model.conditionalMuxChangeByValue.end()) return;
+            std::unordered_set<std::size_t> buffered;
+            if (context != nullptr && context->conditionalMuxNotifyPlan != nullptr)
+            {
+                const auto &plan = *context->conditionalMuxNotifyPlan;
+                if (const auto found = plan.groupsBySource.find(source); found != plan.groupsBySource.end())
+                    for (const std::size_t groupIndex : found->second)
+                    {
+                        const auto &group = plan.groups[groupIndex];
+                        // Some assignment paths notify immediately instead
+                        // of feeding deferred activation. Keep their changes
+                        // in a separate local fallback without mutating the
+                        // existing activation predicate or adding activations.
+                        const auto joint = plan.jointBucketBySource.find(source);
+                        const bool sharedJoint = deferredFollows && joint != plan.jointBucketBySource.end() &&
+                            std::find(plan.jointBuckets[joint->second].cacheGroups.begin(),
+                                      plan.jointBuckets[joint->second].cacheGroups.end(), groupIndex) !=
+                                plan.jointBuckets[joint->second].cacheGroups.end();
+                        if ((!group.reuseDeferred || !deferredFollows) && !sharedJoint)
+                        {
+                            const auto &expr = group.reuseDeferred ? group.fallbackExpr : group.changedExpr;
+                            stream << indent << expr << " = static_cast<bool>(" << expr
+                                   << " | (" << condition << "));\n";
+                        }
+                        buffered.insert(group.targets.begin(), group.targets.end());
+                    }
+            }
+            for (const std::size_t index : it->second)
+            {
+                if (buffered.contains(index)) continue;
+                stream << indent << "conditional_mux_change_dirty_[" << index
+                       << "u] = static_cast<bool>(conditional_mux_change_dirty_[" << index
+                       << "u] | (" << condition << "));\n";
+            }
+        }
+
         void emitChangedValueEffects(std::ostream &stream,
                                      const EmitModel &model,
                                      ValueId resultValue,
@@ -7996,6 +8140,7 @@ namespace wolvrix::lib::emit
                                      std::string_view indent,
                                      const ActivationEmitContext *context = nullptr)
         {
+            emitConditionalMuxChangeCacheMarks(stream, model, resultValue, "true", indent, context);
             if (const auto eventIt = model.eventEdgeFieldByValue.find(resultValue);
                 eventIt != model.eventEdgeFieldByValue.end())
             {
@@ -8014,6 +8159,8 @@ namespace wolvrix::lib::emit
                                                  const ActivationEmitContext *context = nullptr,
                                                  DeferredActivationEmitContext *deferredContext = nullptr)
         {
+            emitConditionalMuxChangeCacheMarks(stream, model, resultValue, conditionExpr, indent, context,
+                                                deferredContext != nullptr && deferredContext->groups != nullptr);
             if (const auto eventIt = model.eventEdgeFieldByValue.find(resultValue);
                 eventIt != model.eventEdgeFieldByValue.end())
             {
@@ -8037,6 +8184,18 @@ namespace wolvrix::lib::emit
             }
             if (deferredContext != nullptr && deferredContext->groups != nullptr)
             {
+                const JointNotifyBucket *jointBucket = nullptr;
+                if (context != nullptr && context->conditionalMuxNotifyPlan != nullptr)
+                {
+                    const auto &plan = *context->conditionalMuxNotifyPlan;
+                    if (const auto found = plan.jointBucketBySource.find(resultValue);
+                        found != plan.jointBucketBySource.end())
+                    {
+                        jointBucket = &plan.jointBuckets[found->second];
+                        stream << indent << jointBucket->changedExpr << " = static_cast<bool>("
+                               << jointBucket->changedExpr << " | (" << conditionExpr << "));\n";
+                    }
+                }
                 std::vector<uint32_t> directActiveIds = fanoutIt->second;
                 uint32_t packedMask = 0;
                 std::map<std::size_t, std::uint64_t> accumulatorMasks;
@@ -8050,8 +8209,9 @@ namespace wolvrix::lib::emit
                     }
                 }
                 bool sharedContributionEmitted = false;
-                for (auto &group : *deferredContext->groups)
+                for (std::size_t groupIndex = 0; groupIndex < deferredContext->groups->size(); ++groupIndex)
                 {
+                    auto &group = (*deferredContext->groups)[groupIndex];
                     if (!containsValueId(group.sourceValues, resultValue))
                     {
                         continue;
@@ -8066,7 +8226,10 @@ namespace wolvrix::lib::emit
                     }
                     else
                     {
-                        if (sharedCohort == nullptr || !sharedContributionEmitted)
+                        const bool factored = jointBucket != nullptr &&
+                            std::find(jointBucket->deferredGroups.begin(), jointBucket->deferredGroups.end(), groupIndex) !=
+                                jointBucket->deferredGroups.end();
+                        if (!factored && (sharedCohort == nullptr || !sharedContributionEmitted))
                         {
                             const auto &changed = sharedCohort == nullptr
                                 ? group.changedExpr : sharedCohort->changedExpr;
@@ -14507,6 +14670,9 @@ namespace wolvrix::lib::emit
 
         std::string valueRef(const EmitModel &model, ValueId value)
         {
+            if (model.coveredStateViewInline)
+                if (const auto view = model.coveredStateViews.find(value); view != model.coveredStateViews.end() && view->second.inlineValue)
+                    return view->second.expression;
             if (auto it = model.inputFieldByValue.find(value); it != model.inputFieldByValue.end())
             {
                 return it->second;
@@ -14556,6 +14722,9 @@ namespace wolvrix::lib::emit
                                               ValueId value,
                                               const SupernodeLocalExprContext *context = nullptr)
         {
+            if (model.coveredStateViewInline)
+                if (const auto view = model.coveredStateViews.find(value); view != model.coveredStateViews.end() && view->second.inlineValue)
+                    return view->second.expression;
             if (const auto zeroIt = model.provedZeroExprByValue.find(value);
                 zeroIt != model.provedZeroExprByValue.end())
             {
@@ -14612,6 +14781,369 @@ namespace wolvrix::lib::emit
                 }
             }
             return valueRef(model, value);
+        }
+
+        void buildSharedEqualityDecodes(const Graph &graph, const ScheduleRefs &schedule, EmitModel &model)
+        {
+            model.sharedEqualityDecodes.clear();
+            model.sharedEqualityFamilyAnchors.clear();
+            if (!model.sharedEqualityDecode || model.localComputeUseOrder || model.priorityMuxChains ||
+                model.boolProducerReduce || model.boolZeroGroupGuard) return;
+            std::unordered_map<std::size_t, std::size_t> slotOwners;
+            for (const auto &[value, slot] : model.valueScalarSlotByValue)
+                if (slot.kind == ValueSlotScalarKind::kBool) ++slotOwners[slot.slotIndex];
+            const auto entry = [&](OperationId id, SharedEqualityDecode &group, bool allowLocal = false) -> bool {
+                const auto op = graph.getOperation(id);
+                if (op.kind() != OperationKind::kEq || op.operands().size() != 2 || op.results().size() != 1 ||
+                    getAttribute<bool>(op, "hasSideEffects").value_or(false) || isRegToMemIntentBypassOp(model, id)) return false;
+                ValueId source, constant;
+                for (unsigned i = 0; i < 2; ++i)
+                {
+                    const auto def = graph.valueDef(op.operands()[i]);
+                    if (def.valid() && graph.getOperation(def).kind() == OperationKind::kConstant)
+                    { constant = op.operands()[i]; source = op.operands()[1u - i]; break; }
+                }
+                if (!source.valid() || !constant.valid() || !isScalarLogicValue(graph, source) ||
+                    graph.valueWidth(source) < 2 || graph.valueWidth(source) > 12 ||
+                    graph.valueType(constant) != ValueType::Logic || graph.valueWidth(constant) != graph.valueWidth(source) ||
+                    isEventValue(model, source) ||
+                    (!allowLocal && !model.inputFieldByValue.contains(source) && !isMaterializedValue(model, source))) return false;
+                const auto result = op.results()[0];
+                const auto slot = model.valueScalarSlotByValue.find(result);
+                if (graph.valueWidth(result) != 1 || graph.valueType(result) != ValueType::Logic ||
+                    isEventValue(model, result) || !isMaterializedValue(model, result) ||
+                    canonicalMaterializedStorageValue(model, result) != result ||
+                    slot == model.valueScalarSlotByValue.end() || slot->second.kind != ValueSlotScalarKind::kBool ||
+                    slotOwners[slot->second.slotIndex] != 1 || model.directStateReadSymbolByValue.contains(result) ||
+                    model.directInvertedBoolStateValues.contains(result)) return false;
+                const auto literal = getAttribute<std::string>(graph.getOperation(graph.valueDef(constant)), "constValue");
+                if (!literal) return false;
+                auto parsed = parseConstLiteral(*literal);
+                if (!parsed || parsed->hasUnknown()) return false;
+                *parsed = parsed->resize(static_cast<slang::bitwidth_t>(graph.valueWidth(source)));
+                parsed->setSigned(false);
+                const auto number = parsed->as<uint64_t>();
+                if (!number || (!group.ops.empty() && source != group.source) ||
+                    std::find(group.constants.begin(), group.constants.end(), *number) != group.constants.end()) return false;
+                group.source = source; group.ops.push_back(id); group.results.push_back(result); group.constants.push_back(*number);
+                return true;
+            };
+            for (const auto sid : model.computeSupernodeIds)
+            {
+                const auto &ops = schedule.supernodeToOps[sid];
+                if (model.sharedEqualityFamilies && std::none_of(ops.begin(), ops.end(), [&](OperationId id) {
+                        const auto op = graph.getOperation(id);
+                        return getAttribute<bool>(op, "hasSideEffects").value_or(false) ||
+                            isRegToMemIntentBypassOp(model, id) ||
+                            (op.kind() != OperationKind::kRegisterReadPort &&
+                             !isDeferredActivationForwardPureKind(op.kind()));
+                    }))
+                {
+                    std::unordered_map<OperationId, std::size_t, OperationIdHash> positions;
+                    for (std::size_t i = 0; i < ops.size(); ++i) positions.emplace(ops[i], i);
+                    std::unordered_map<ValueId, std::size_t, ValueIdHash> bySource;
+                    std::vector<SharedEqualityDecode> families;
+                    for (std::size_t i = 0; i < ops.size(); ++i)
+                    {
+                        SharedEqualityDecode single;
+                        if (!entry(ops[i], single, true)) continue;
+                        const auto source = single.source;
+                        const auto producer = positions.find(graph.valueDef(source));
+                        // A source defined inside the region must precede the
+                        // first comparison. External sources require storage.
+                        if (producer != positions.end())
+                        {
+                            if (producer->second >= i) continue;
+                        }
+                        else if (!model.inputFieldByValue.contains(source) && !isMaterializedValue(model, source)) continue;
+                        if (isMaterializedValue(model, source) &&
+                            canonicalMaterializedStorageValue(model, source) != source) continue;
+                        auto [it, inserted] = bySource.emplace(source, families.size());
+                        if (inserted) families.push_back(SharedEqualityDecode{.source = source});
+                        auto &family = families[it->second];
+                        family.ops.push_back(ops[i]); family.results.push_back(single.results.front());
+                        family.constants.push_back(single.constants.front());
+                    }
+                    for (auto &family : families)
+                    {
+                        const std::set<uint64_t> distinct(family.constants.begin(), family.constants.end());
+                        if (family.ops.size() < 16 || family.ops.size() > 256 || distinct.size() != family.ops.size()) continue;
+                        const auto anchor = family.ops.front();
+                        for (const auto id : family.ops) model.sharedEqualityFamilyAnchors.emplace(id, anchor);
+                        family.cacheIndex = model.sharedEqualityDecodes.size();
+                        model.sharedEqualityDecodes.emplace(anchor, std::move(family));
+                    }
+                }
+                for (std::size_t begin = 0; begin < ops.size();)
+                {
+                    SharedEqualityDecode group;
+                    std::size_t end = begin;
+                    while (end < ops.size() && !model.sharedEqualityFamilyAnchors.contains(ops[end]) &&
+                           group.ops.size() < 256 && entry(ops[end], group)) ++end;
+                    if (group.ops.size() >= 16)
+                    {
+                        group.cacheIndex = model.sharedEqualityDecodes.size();
+                        model.sharedEqualityDecodes.emplace(ops[begin], std::move(group));
+                    }
+                    begin = std::max(begin + 1, end);
+                }
+            }
+        }
+
+        void buildLocalEqualityDecodes(const Graph &graph, const ScheduleRefs &schedule, EmitModel &model)
+        {
+            model.localEqualityDecodes.clear();
+            model.localEqualityLookup.clear();
+            if (!model.sharedEqualityDecode || !model.localEqualityDecode || model.localComputeUseOrder ||
+                model.priorityMuxChains || model.boolProducerReduce || model.boolZeroGroupGuard) return;
+            for (const auto sid : model.computeSupernodeIds)
+            {
+                const auto &ops = schedule.supernodeToOps[sid];
+                // The source is sampled at region entry. No effect, transparent
+                // storage or alternate writer may change it during this body.
+                if (std::any_of(ops.begin(), ops.end(), [&](OperationId id) {
+                        const auto op = graph.getOperation(id);
+                        return getAttribute<bool>(op, "hasSideEffects").value_or(false) ||
+                            isRegToMemIntentBypassOp(model, id) ||
+                            (op.kind() != OperationKind::kRegisterReadPort &&
+                             !isDeferredActivationForwardPureKind(op.kind()));
+                    })) continue;
+                const std::unordered_set<OperationId, OperationIdHash> members(ops.begin(), ops.end());
+                std::vector<LocalEqualityDecode> candidates;
+                std::unordered_map<ValueId, std::size_t, ValueIdHash> bySource;
+                for (const auto id : ops)
+                {
+                    const auto op = graph.getOperation(id);
+                    if (op.kind() != OperationKind::kEq || op.operands().size() != 2 || op.results().size() != 1)
+                        continue;
+                    const auto result = op.results()[0];
+                    if (isMaterializedValue(model, result) || isEventValue(model, result) ||
+                        graph.valueType(result) != ValueType::Logic || graph.valueWidth(result) != 1) continue;
+                    ValueId source, constant;
+                    for (unsigned i = 0; i < 2; ++i)
+                    {
+                        const auto def = graph.valueDef(op.operands()[i]);
+                        if (def.valid() && graph.getOperation(def).kind() == OperationKind::kConstant)
+                        { constant = op.operands()[i]; source = op.operands()[1u - i]; break; }
+                    }
+                    if (!source.valid() || !isScalarLogicValue(graph, source) || isEventValue(model, source) ||
+                        graph.valueWidth(source) < 2 || graph.valueWidth(source) > 12 ||
+                        graph.valueType(constant) != ValueType::Logic ||
+                        graph.valueWidth(source) != graph.valueWidth(constant) || members.contains(graph.valueDef(source)))
+                        continue;
+                    if (!model.inputFieldByValue.contains(source))
+                    {
+                        const auto slot = model.valueScalarSlotByValue.find(source);
+                        if (slot == model.valueScalarSlotByValue.end() ||
+                            canonicalMaterializedStorageValue(model, source) != source ||
+                            model.directStateReadSymbolByValue.contains(source) ||
+                            std::count_if(model.valueScalarSlotByValue.begin(), model.valueScalarSlotByValue.end(),
+                                [&](const auto &entry) { return entry.second.kind == slot->second.kind &&
+                                    entry.second.slotIndex == slot->second.slotIndex; }) != 1) continue;
+                    }
+                    const auto literal = getAttribute<std::string>(graph.getOperation(graph.valueDef(constant)), "constValue");
+                    if (!literal) continue;
+                    auto parsed = parseConstLiteral(*literal);
+                    if (!parsed || parsed->hasUnknown()) continue;
+                    *parsed = parsed->resize(static_cast<slang::bitwidth_t>(graph.valueWidth(source)));
+                    parsed->setSigned(false);
+                    const auto number = parsed->as<uint64_t>();
+                    if (!number) continue;
+                    auto [it, inserted] = bySource.emplace(source, candidates.size());
+                    if (inserted) candidates.push_back(LocalEqualityDecode{
+                        .supernode = sid, .source = source,
+                        .entries = std::size_t{1} << graph.valueWidth(source), .ops = {}, .constants = {}});
+                    auto &candidate = candidates[it->second];
+                    candidate.ops.push_back(id); candidate.constants.push_back(*number);
+                }
+                for (auto &candidate : candidates)
+                {
+                    const std::set<uint64_t> distinct(candidate.constants.begin(), candidate.constants.end());
+                    if (distinct.size() < 16 || candidate.ops.size() > 256) continue;
+                    const auto index = model.localEqualityDecodes.size();
+                    for (std::size_t i = 0; i < candidate.ops.size(); ++i)
+                        model.localEqualityLookup.emplace(candidate.ops[i], std::pair{index, candidate.constants[i]});
+                    model.localEqualityDecodes.push_back(std::move(candidate));
+                }
+            }
+        }
+
+        void emitLocalEqualityCaches(std::ostream &stream, const Graph &graph, const EmitModel &model,
+                                     uint32_t supernode, const SupernodeLocalExprContext &local)
+        {
+            for (std::size_t i = 0; i < model.localEqualityDecodes.size(); ++i)
+            {
+                const auto &group = model.localEqualityDecodes[i];
+                if (group.supernode != supernode) continue;
+                const auto table = "local_equality_table_" + std::to_string(i) + "_";
+                const auto previous = "local_equality_previous_" + std::to_string(i) + "_";
+                const auto address = "grhsim_local_eq_address_" + std::to_string(i);
+                stream << "        // Local equality decode: one source check, no activity boundary.\n"
+                       << "        {\n            const std::uint64_t " << address << " = "
+                       << scalarValueBitsExpr(graph, group.source, resolvedScheduleValueExpr(model, group.source, &local))
+                       << ";\n            if (" << address << " != " << previous << ") {\n"
+                       << "                if (" << previous << " < " << group.entries << "u) "
+                       << table << "[" << previous << "] = false;\n"
+                       << "                if (" << address << " < " << group.entries << "u) " << table << "[" << address << "] = true;\n"
+                       << "                " << previous << " = " << address << ";\n            }\n        }\n";
+            }
+        }
+
+        const SharedEqualityDecode *sharedEqualityDecodeAt(const EmitModel &model,
+            std::span<const OperationId> ops, std::size_t begin, std::size_t limit)
+        {
+            if (model.sharedEqualityFamilyAnchors.contains(ops[begin])) return nullptr;
+            const auto it = model.sharedEqualityDecodes.find(ops[begin]);
+            if (it == model.sharedEqualityDecodes.end() || begin > limit || it->second.ops.size() > limit - begin)
+                return nullptr;
+            return std::equal(it->second.ops.begin(), it->second.ops.end(), ops.begin() + begin) ? &it->second : nullptr;
+        }
+
+        void emitSharedEqualityDecode(std::ostream &stream, const Graph &graph, const EmitModel &model,
+            const SharedEqualityDecode &group, const SupernodeLocalExprContext &local,
+            const ActivationEmitContext &activation, DeferredActivationEmitContext &deferred)
+        {
+            // Destinations have exclusive storage. For a family, the source
+            // precedes its first comparison in a pure region. Computing later
+            // predicates here cannot change any earlier SSA consumer; effects,
+            // transparent storage and alternate result writers are excluded.
+            const std::string cache = "grhsim_eq_cache_" + std::to_string(group.cacheIndex);
+            const std::string address = "grhsim_eq_address_" + std::to_string(group.cacheIndex);
+            stream << "        // Shared equality decode: stable source, exact changed predicates.\n"
+                   << "        {\n            auto &" << cache << " = shared_equality_cache_[" << group.cacheIndex << "u];\n"
+                   << "            const std::uint16_t " << address << " = static_cast<std::uint16_t>("
+                   << scalarValueBitsExpr(graph, group.source, resolvedScheduleValueExpr(model, group.source, &local)) << ");\n"
+                   << "            if (!" << cache << ".valid) {\n";
+            const auto assign = [&](std::size_t i, const std::string &expr, std::string_view indent) {
+                const auto result = group.results[i];
+                const auto lhs = resolvedStoredValueRefExpr(model, result, &local);
+                stream << indent << "{\n";
+                emitScalarChangedValueAssign(stream, model, result, lhs, expr,
+                                             std::string(indent) + "    ", &activation, &deferred);
+                stream << indent << "}\n";
+            };
+            for (std::size_t i = 0; i < group.results.size(); ++i)
+                assign(i, "(" + address + " == " + std::to_string(group.constants[i]) + "u)", "                ");
+            stream << "                " << cache << ".valid = true;\n            } else if ("
+                   << address << " != " << cache << ".previous) {\n";
+            for (const bool setting : {false, true})
+            {
+                stream << "                switch (" << (setting ? address : cache + ".previous") << ") {\n";
+                for (std::size_t i = 0; i < group.results.size(); ++i)
+                {
+                    stream << "                case " << group.constants[i] << "u:\n";
+                    assign(i, setting ? "true" : "false", "                    ");
+                    stream << "                    break;\n";
+                }
+                stream << "                default: break;\n                }\n";
+            }
+            stream << "            }\n            " << cache << ".previous = " << address << ";\n        }\n";
+        }
+
+        struct PackedScalarSlices
+        {
+            std::size_t firstSlot = 0;
+            std::string sourceExpr;
+            std::array<ValueId, 8> results;
+            std::array<std::size_t, 8> bits;
+        };
+
+        std::optional<PackedScalarSlices> findPackedScalarSlices(
+            const Graph &graph, const EmitModel &model, std::span<const OperationId> ops,
+            std::size_t begin, std::size_t limit, const SupernodeLocalExprContext &context)
+        {
+            if (!model.packedScalarSlices || begin > limit || limit - begin < 8u) return std::nullopt;
+            PackedScalarSlices group;
+            for (std::size_t i = 0; i < 8u; ++i)
+            {
+                const Operation op = graph.getOperation(ops[begin + i]);
+                if (op.kind() != OperationKind::kSliceStatic || op.operands().size() != 1u ||
+                    op.results().size() != 1u || getAttribute<bool>(op, "hasSideEffects").value_or(false) ||
+                    isRegToMemIntentBypassOp(model, op.id())) return std::nullopt;
+                const ValueId source = op.operands()[0], result = op.results()[0];
+                const auto bit = getAttribute<int64_t>(op, "sliceStart").value_or(0);
+                if (!isScalarLogicValue(graph, source) || graph.valueWidth(source) < 8 ||
+                    isEventValue(model, source) || graph.valueWidth(result) != 1 ||
+                    graph.valueType(result) != ValueType::Logic || isEventValue(model, result) ||
+                    bit < 0 || bit >= graph.valueWidth(source) ||
+                    getAttribute<int64_t>(op, "sliceEnd").value_or(bit) != bit ||
+                    !isMaterializedValue(model, result) || canonicalMaterializedStorageValue(model, result) != result ||
+                    model.directStateReadSymbolByValue.contains(result) ||
+                    model.directInvertedBoolStateValues.contains(result)) return std::nullopt;
+                const auto slot = model.valueScalarSlotByValue.find(result);
+                if (slot == model.valueScalarSlotByValue.end() || slot->second.kind != ValueSlotScalarKind::kBool)
+                    return std::nullopt;
+                if (i == 0) group.firstSlot = slot->second.slotIndex;
+                else if (slot->second.slotIndex != group.firstSlot + i) return std::nullopt;
+
+                // Follow only expressions actually inlined by the emitter.
+                // A named local remains its original snapshot. No leaf may
+                // read a destination slot, including through physical aliases.
+                std::vector<ValueId> pending{source};
+                std::unordered_set<ValueId, ValueIdHash> visited;
+                while (!pending.empty())
+                {
+                    const ValueId value = pending.back(); pending.pop_back();
+                    if (!visited.insert(value).second) continue;
+                    if (isEventValue(model, value)) return std::nullopt;
+                    if (isMaterializedValue(model, value))
+                    {
+                        const auto leaf = model.valueScalarSlotByValue.find(canonicalMaterializedStorageValue(model, value));
+                        if (leaf != model.valueScalarSlotByValue.end() && leaf->second.kind == ValueSlotScalarKind::kBool &&
+                            leaf->second.slotIndex >= group.firstSlot && leaf->second.slotIndex < group.firstSlot + 8u)
+                            return std::nullopt;
+                        continue;
+                    }
+                    if (model.inputFieldByValue.contains(value) || model.directStateReadSymbolByValue.contains(value)) continue;
+                    const auto *local = findSupernodeLocalExpr(&context, value);
+                    if (local == nullptr || local->expr == valueRef(model, value) ||
+                        local->expr == resolvedStoredValueRefExpr(model, value, &context)) continue;
+                    const auto def = graph.valueDef(value);
+                    if (!def.valid()) return std::nullopt;
+                    const Operation producer = graph.getOperation(def);
+                    if (getAttribute<bool>(producer, "hasSideEffects").value_or(false)) return std::nullopt;
+                    if (producer.kind() == OperationKind::kRegisterReadPort ||
+                        producer.kind() == OperationKind::kLatchReadPort) continue;
+                    if (!isDeferredActivationForwardPureKind(producer.kind()) ||
+                        producer.kind() == OperationKind::kBehaviorComputeGroup) return std::nullopt;
+                    pending.insert(pending.end(), producer.operands().begin(), producer.operands().end());
+                }
+                const std::string expr = resolvedScheduleValueExpr(model, source, &context);
+                if (i == 0) group.sourceExpr = expr;
+                else if (group.sourceExpr != expr) return std::nullopt;
+                group.results[i] = result;
+                group.bits[i] = static_cast<std::size_t>(bit);
+            }
+            // Only adjacent pure slices are combined. Their scalar source
+            // cannot alias bool value storage, and no consumer or effect can
+            // observe the original intermediate stores inside this region.
+            return group;
+        }
+
+        void emitPackedScalarSlices(std::ostream &stream, const EmitModel &model,
+                                     const PackedScalarSlices &group,
+                                     const ActivationEmitContext &context,
+                                     DeferredActivationEmitContext &deferredContext)
+        {
+            const std::string changed = "grhsim_slice_changes_" + std::to_string(group.results[0].index);
+            stream << "        // Packed scalar slices: eight adjacent bool slots, exact per-bit changes.\n";
+            stream << "        [[maybe_unused]] const auto " << changed << " = grhsim_store_scalar_slices<false, ";
+            for (std::size_t i = 0; i < 8u; ++i) stream << (i ? ", " : "") << group.bits[i] << "u";
+            stream << ">(value_bool_slots_.data() + " << group.firstSlot << "u, static_cast<std::uint64_t>("
+                   << group.sourceExpr << "));\n";
+            const bool tracked = std::any_of(group.results.begin(), group.results.end(),
+                [&](ValueId value) { return valueNeedsTrackedChange(model, value, &context); });
+            if (!tracked || context.suppressComputePropagation) return;
+            stream << "        if (" << changed << " != UINT64_C(0)) {\n";
+            for (std::size_t i = 0; i < 8u; ++i)
+            {
+                if (!valueNeedsTrackedChange(model, group.results[i], &context)) continue;
+                const std::string condition = "((" + changed + " & UINT64_C(" +
+                    std::to_string(UINT64_C(0xff) << (i * 8u)) + ")) != UINT64_C(0))";
+                emitChangedValueEffectsForCondition(stream, model, group.results[i], "", "", condition,
+                                                   "            ", &context, &deferredContext);
+            }
+            stream << "        }\n";
         }
 
         struct BoolZeroGroup
@@ -18041,6 +18573,8 @@ template<class Index>
             }
             else
             {
+                emitConditionalMuxChangeCacheMarks(stream, model, resultValue,
+                                                   lhs + " != next_value", "            ", activationContext);
                 stream << "            " << lhs << " = next_value;\n";
             }
             stream << "        }\n";
@@ -18100,6 +18634,8 @@ template<class Index>
             }
             else
             {
+                emitConditionalMuxChangeCacheMarks(stream, model, resultValue,
+                                                   lhs + " != next_value", "            ", activationContext);
                 stream << "            " << lhs << " = next_value;\n";
             }
             stream << "        }\n";
@@ -19257,6 +19793,175 @@ template<class Index>
                 recordSupernodeLocalExprRef(graph, resultValue, lhs, SupernodeLocalExprKind::kWideWords, context);
             }
             return true;
+        }
+
+        void collectIndexedConcatSlices(const Graph &graph,
+                                        const EmitModel &model,
+                                        std::span<const OperationId> ops,
+                                        SupernodeLocalExprContext &context)
+        {
+            if (!model.indexedConcatSlice) return;
+            const auto &positions = context.demandedBitComputePositions;
+            for (OperationId id : ops)
+            {
+                const Operation concat = graph.getOperation(id);
+                if (concat.kind() != OperationKind::kConcat || concat.results().size() != 1u ||
+                    !positions.contains(id) || getAttribute<bool>(concat, "hasSideEffects").value_or(false)) continue;
+                const ValueId value = concat.results()[0];
+                // At least four words: a scalar slice needs at most two of them.
+                // Escaping, tracked and already-specialized representations keep
+                // their ordinary snapshot. No graph or activation edges change.
+                if (graph.valueWidth(value) < 256 || isMaterializedValue(model, value) ||
+                    isEventValue(model, value) || valueNeedsTrackedChange(model, value) ||
+                    packedArrayLaneViewForSourceValue(model, value) != nullptr ||
+                    context.storedValueRefByValue.contains(value)) continue;
+                const Value info = graph.getValue(value);
+                if (info.users().size() != 1u) continue;
+                const OperationId sliceId = info.users()[0].operation;
+                const auto use = positions.find(sliceId);
+                if (use == positions.end() || use->second <= positions.at(id)) continue;
+                const Operation slice = graph.getOperation(sliceId);
+                if (slice.kind() != OperationKind::kSliceDynamic || slice.operands().size() != 2u ||
+                    slice.operands()[0] != value || slice.results().size() != 1u ||
+                    !isScalarLogicValue(graph, slice.results()[0]) || isEventValue(model, slice.results()[0]) ||
+                    getAttribute<bool>(slice, "hasSideEffects").value_or(false) ||
+                    getAttribute<int64_t>(slice, "sliceWidth").value_or(1) != graph.valueWidth(slice.results()[0])) continue;
+
+                bool safe = true;
+                std::size_t width = 0;
+                std::unordered_set<std::string> storage;
+                std::vector<ValueId> snapshots;
+                for (ValueId input : concat.operands())
+                {
+                    if (isEventValue(model, input) || model.directStateReadSymbolByValue.contains(input))
+                    { safe = false; break; }
+                    width += static_cast<std::size_t>(graph.valueWidth(input));
+                    if (!isScalarLogicValue(graph, input))
+                    {
+                        if (!model.indexedConcatWideConstants) { safe = false; break; }
+                        const auto bits = constLogicValue(graph, input, graph.valueWidth(input));
+                        if (!bits || getAttribute<bool>(graph.getOperation(graph.valueDef(input)),
+                                                        "hasSideEffects").value_or(false))
+                        { safe = false; break; }
+                        // Known wide padding is sliced at emit time. It never
+                        // becomes a captured array or a deferred computation.
+                        continue;
+                    }
+                    if (isMaterializedValue(model, input))
+                    {
+                        // Compare physical references, including slot reuse and
+                        // aliases with different ValueIds.
+                        storage.insert(valueRef(model, canonicalMaterializedStorageValue(model, input)));
+                    }
+                    else if (!model.inputFieldByValue.contains(input))
+                    {
+                        const OperationId def = graph.valueDef(input);
+                        if (!def.valid()) { safe = false; break; }
+                        if (graph.getOperation(def).kind() == OperationKind::kConstant) continue;
+                        const auto pos = positions.find(def);
+                        if (pos == positions.end() || pos->second >= positions.at(id)) { safe = false; break; }
+                        // A local expression may otherwise reread mutable leaves.
+                        // Keep its existing evaluation point as a named scalar.
+                        snapshots.push_back(input);
+                    }
+                }
+                if (!safe || width != static_cast<std::size_t>(graph.valueWidth(value))) continue;
+                for (std::size_t i = positions.at(id) + 1u; safe && i < use->second; ++i)
+                {
+                    const Operation op = graph.getOperation(ops[i]);
+                    if (!positions.contains(ops[i]) || !isDeferredActivationForwardPureKind(op.kind()) ||
+                        op.kind() == OperationKind::kBehaviorComputeGroup ||
+                        getAttribute<bool>(op, "hasSideEffects").value_or(false)) { safe = false; break; }
+                    for (ValueId result : op.results())
+                    {
+                        if (isEventValue(model, result) || (isMaterializedValue(model, result) &&
+                            storage.contains(valueRef(model, canonicalMaterializedStorageValue(model, result)))))
+                        { safe = false; break; }
+                    }
+                }
+                if (!safe) continue;
+                context.indexedConcatSlices.emplace(value, sliceId);
+                context.preserveLocalSnapshot.insert(snapshots.begin(), snapshots.end());
+                // The slice itself must not move past a later store either.
+                context.preserveLocalSnapshot.insert(slice.results()[0]);
+            }
+        }
+
+        bool emitIndexedConcatSliceOperation(std::ostream &stream,
+                                             const Graph &graph,
+                                             const EmitModel &model,
+                                             const Operation &op,
+                                             SupernodeLocalExprContext &context,
+                                             const ActivationEmitContext *activationContext,
+                                             DeferredActivationEmitContext *deferredContext)
+        {
+            const auto name = [](ValueId value) { return "grhsim_concat_word_" + std::to_string(value.index); };
+            if (op.kind() == OperationKind::kConcat && op.results().size() == 1u &&
+                context.indexedConcatSlices.contains(op.results()[0]))
+            {
+                const ValueId result = op.results()[0];
+                std::vector<std::vector<std::string>> words(logicWordCount(graph.valueWidth(result)));
+                std::vector<std::uint64_t> constantWords(words.size(), UINT64_C(0));
+                std::size_t offset = 0;
+                for (std::size_t i = op.operands().size(); i != 0; --i)
+                {
+                    const ValueId input = op.operands()[i - 1u];
+                    const auto width = static_cast<std::size_t>(graph.valueWidth(input));
+                    const auto constant = width > 64u ? constLogicValue(graph, input, graph.valueWidth(input)) :
+                                                       std::optional<slang::SVInt>{};
+                    const std::string expr = resolvedScheduleValueExpr(model, input, &context);
+                    for (std::size_t consumed = 0; consumed < width;)
+                    {
+                        const std::size_t shift = offset % 64u;
+                        const std::size_t bits = std::min({width - consumed, 64u - shift, 64u - consumed % 64u});
+                        if (constant)
+                        {
+                            const std::uint64_t mask = bits == 64u ? UINT64_MAX : (UINT64_C(1) << bits) - 1u;
+                            const auto fragment = (constant->getRawPtr()[consumed / 64u] >> (consumed % 64u)) & mask;
+                            constantWords[offset / 64u] |= fragment << shift;
+                        }
+                        else
+                        {
+                            std::string term = "static_cast<std::uint64_t>(" + expr + ")";
+                            if (consumed) term = "(" + term + " >> " + std::to_string(consumed) + "u)";
+                            term = scalarTruncExpr(term, bits);
+                            if (shift) term = "(" + term + " << " + std::to_string(shift) + "u)";
+                            words[offset / 64u].push_back(term);
+                        }
+                        consumed += bits;
+                        offset += bits;
+                    }
+                }
+                stream << "        // Indexed concat: assemble only the selected word(s).\n";
+                stream << "        const auto " << name(result) << " = [&](std::size_t word) -> std::uint64_t {\n";
+                stream << "            switch (word) {\n";
+                for (std::size_t word = 0; word < words.size(); ++word)
+                {
+                    if (constantWords[word]) words[word].push_back("UINT64_C(" + std::to_string(constantWords[word]) + ")");
+                    // All-zero words, including padding-only words, share the
+                    // default case rather than a runtime initialization/store.
+                    if (words[word].empty()) continue;
+                    stream << "            case " << word << "u: return ";
+                    for (std::size_t i = 0; i < words[word].size(); ++i)
+                        stream << (i ? " | " : "") << words[word][i];
+                    stream << ";\n";
+                }
+                stream << "            default: return UINT64_C(0);\n            }\n        };\n";
+                return true;
+            }
+            if (op.kind() == OperationKind::kSliceDynamic && op.operands().size() == 2u &&
+                context.indexedConcatSlices.contains(op.operands()[0]))
+            {
+                const ValueId source = op.operands()[0];
+                const ValueId result = op.results()[0];
+                const std::string expr = "grhsim_indexed_concat_slice<" + std::to_string(graph.valueWidth(source)) +
+                    "u, " + std::to_string(graph.valueWidth(result)) + "u>(" +
+                    resolvedScheduleValueExpr(model, op.operands()[1], &context) + ", " + name(source) + ")";
+                emitLogicAssignFromScalarExpr(stream, graph, model, result, expr, true,
+                                             &context, activationContext, deferredContext);
+                return true;
+            }
+            return false;
         }
 
         bool emitScalarConcatReductionOperation(std::ostream &stream,
@@ -22140,6 +22845,1059 @@ template<class Index>
             return ScalarLogicExpr{};
         }
 
+        struct ConditionalMuxCone
+        {
+            std::array<std::vector<OperationId>, 2> arms;
+        };
+
+        struct ConditionalMuxPlan
+        {
+            std::unordered_map<OperationId, ConditionalMuxCone, OperationIdHash> roots;
+            std::unordered_set<OperationId, OperationIdHash> absorbed;
+        };
+
+        ConditionalMuxPlan collectConditionalMuxCones(
+            const Graph &graph, const EmitModel &model, const ScheduleRefs &schedule,
+            uint32_t supernode, const std::vector<OperationId> &ops,
+            const SupernodeLocalExprContext &context)
+        {
+            ConditionalMuxPlan plan;
+            // These lowerings own overlapping operation ranges. Keep their
+            // existing contracts until their plans can explicitly compose.
+            if (!model.conditionalMuxCones || model.priorityMuxChains ||
+                model.boolProducerReduce || model.boolZeroGroupGuard) return plan;
+            std::unordered_map<OperationId, std::size_t, OperationIdHash> positions;
+            std::unordered_map<ValueId, std::size_t, ValueIdHash> producers;
+            for (std::size_t i = 0; i < ops.size(); ++i)
+            {
+                const auto op = graph.getOperation(ops[i]);
+                if (isRegToMemIntentBypassOp(model, op.id()) ||
+                    getAttribute<bool>(op, "hasSideEffects").value_or(false) ||
+                    (op.kind() != OperationKind::kRegisterReadPort &&
+                     !isDeferredActivationForwardPureKind(op.kind())) ||
+                    op.kind() == OperationKind::kBehaviorComputeGroup) return {};
+                positions.emplace(op.id(), i);
+                for (auto result : op.results())
+                {
+                    if (graph.valueType(result) != ValueType::Logic || isEventValue(model, result) ||
+                        !producers.emplace(canonicalMaterializedStorageValue(model, result), i).second)
+                        return {};
+                }
+            }
+            // A delayed expression must observe the same inputs. Reject
+            // read-before-write storage aliases, even in otherwise pure IR.
+            for (std::size_t i = 0; i < ops.size(); ++i)
+            {
+                const auto op = graph.getOperation(ops[i]);
+                for (auto operand : op.operands())
+                {
+                    if (graph.valueType(operand) != ValueType::Logic || isEventValue(model, operand)) return {};
+                    const auto producer = producers.find(canonicalMaterializedStorageValue(model, operand));
+                    if (producer != producers.end() && producer->second >= i) return {};
+                }
+            }
+            std::unordered_set<ValueId, ValueIdHash> protectedValues;
+            for (const auto &port : graph.outputPorts()) protectedValues.insert(port.value);
+            for (const auto &port : graph.inoutPorts())
+            {
+                protectedValues.insert(port.out);
+                protectedValues.insert(port.oe);
+            }
+            protectedValues.insert(context.packedScalarConcatInputs.begin(), context.packedScalarConcatInputs.end());
+            protectedValues.insert(context.packedShortConcatInputs.begin(), context.packedShortConcatInputs.end());
+            protectedValues.insert(context.reducedScalarConcatValues.begin(), context.reducedScalarConcatValues.end());
+            for (const auto &[value, _] : context.indexedConcatSlices) protectedValues.insert(value);
+            for (const auto &decl : collectScalarConcatPrefixCaches(graph, ops)) protectedValues.insert(decl.key.lhs);
+            const auto privateProducer = [&](ValueId value) {
+                const auto def = graph.valueDef(value);
+                const auto count = context.useCountByValue.find(value);
+                if (!positions.contains(def) || isMaterializedValue(model, value) ||
+                    valueNeedsTrackedChange(model, value) || protectedValues.contains(value) ||
+                    canonicalMaterializedStorageValue(model, value) != value ||
+                    count == context.useCountByValue.end() || count->second != 1u ||
+                    plan.absorbed.contains(def) || model.localEqualityLookup.contains(def) ||
+                    model.sharedEqualityDecodes.contains(def) || model.coveredStateViews.contains(value)) return false;
+                // Use counts describe emitted operations, not dead IR users.
+                // Cross-supernode uses remain eager regardless of local count.
+                if (value.index == 0 || value.index > schedule.valueFanout.size()) return false;
+                for (auto user : schedule.valueFanout[value.index - 1])
+                    if (user != supernode) return false;
+                const auto op = graph.getOperation(def);
+                if (op.results().size() != 1 || op.kind() == OperationKind::kConstant ||
+                    !isDeferredActivationForwardPureKind(op.kind())) return false;
+                if (opNeedsWordLogicEmit(graph, op))
+                {
+                    // Move only private data movement. Keep the original word
+                    // lowering, including dynamic slice bounds and signedness.
+                    // No wide object or state read is duplicated across arms.
+                    if (!model.conditionalMuxWide || graph.valueWidth(value) > 4096 ||
+                        (op.kind() != OperationKind::kConcat && op.kind() != OperationKind::kAssign &&
+                         op.kind() != OperationKind::kSliceStatic && op.kind() != OperationKind::kSliceDynamic)) return false;
+                    for (auto operand : op.operands())
+                        if (graph.valueWidth(operand) <= 0 || graph.valueWidth(operand) > 4096) return false;
+                    return true;
+                }
+                if (!isScalarLogicValue(graph, value)) return false;
+                for (auto operand : op.operands()) if (!isScalarLogicValue(graph, operand)) return false;
+                const std::vector<std::string> placeholders(op.operands().size(), "UINT64_C(0)");
+                return !scalarAssignmentExpr(op.kind(), placeholders, op, graph).expr.empty();
+            };
+            // Freeze a structural budget before measurement. Large outer
+            // cones win over their nested muxes; no operation is duplicated.
+            constexpr std::size_t minOperations = 16, maxOperations = 256;
+            for (std::size_t i = ops.size(); i-- > 0;)
+            {
+                const auto root = graph.getOperation(ops[i]);
+                if (plan.absorbed.contains(root.id()) || root.kind() != OperationKind::kMux ||
+                    root.results().size() != 1 || root.operands().size() != 3 ||
+                    !isScalarLogicValue(graph, root.results()[0]) ||
+                    !isScalarLogicValue(graph, root.operands()[0]) ||
+                    graph.valueWidth(root.operands()[1]) != graph.valueWidth(root.results()[0]) ||
+                    graph.valueWidth(root.operands()[2]) != graph.valueWidth(root.results()[0])) continue;
+                ConditionalMuxCone cone;
+                for (std::size_t arm = 0; arm < 2; ++arm)
+                {
+                    std::vector<ValueId> pending{root.operands()[arm + 1]};
+                    while (!pending.empty() && cone.arms[arm].size() <= maxOperations)
+                    {
+                        const auto value = pending.back(); pending.pop_back();
+                        if (!privateProducer(value)) continue;
+                        const auto op = graph.getOperation(graph.valueDef(value));
+                        cone.arms[arm].push_back(op.id());
+                        pending.insert(pending.end(), op.operands().begin(), op.operands().end());
+                    }
+                    auto &members = cone.arms[arm];
+                    if (members.size() < minOperations || members.size() > maxOperations) members.clear();
+                    std::sort(members.begin(), members.end(), [&](auto a, auto b) {
+                        return positions.at(a) < positions.at(b);
+                    });
+                }
+                if (cone.arms[0].empty() && cone.arms[1].empty()) continue;
+                for (const auto &arm : cone.arms) plan.absorbed.insert(arm.begin(), arm.end());
+                plan.roots.emplace(root.id(), std::move(cone));
+            }
+            return plan;
+        }
+
+        struct LocalPredicateSet
+        {
+            struct Family
+            {
+                ValueId source;
+                std::vector<std::pair<uint64_t, uint64_t>> intervals;
+                std::size_t constants = 0;
+            };
+            std::vector<Family> families;
+            std::vector<ValueId> residuals;
+        };
+
+        struct LocalPredicatePlan
+        {
+            std::unordered_map<OperationId, LocalPredicateSet, OperationIdHash> roots;
+            std::unordered_set<OperationId, OperationIdHash> absorbed;
+        };
+
+        LocalPredicatePlan collectLocalPredicateSets(const Graph &graph, const EmitModel &model,
+            const ScheduleRefs &schedule, uint32_t supernode, const std::vector<OperationId> &ops, const SupernodeLocalExprContext &context,
+            const ConditionalMuxPlan &conditional)
+        {
+            LocalPredicatePlan plan;
+            if (!model.localPredicateSets || model.localEqualityDecode || model.localComputeUseOrder ||
+                model.priorityMuxChains || model.boolProducerReduce || model.boolZeroGroupGuard) return plan;
+            std::unordered_set<OperationId, OperationIdHash> members(ops.begin(), ops.end());
+            std::unordered_map<OperationId, std::size_t, OperationIdHash> positions;
+            for (std::size_t i = 0; i < ops.size(); ++i) positions.emplace(ops[i], i);
+            for (auto id : ops)
+            {
+                const auto op = graph.getOperation(id);
+                if (getAttribute<bool>(op, "hasSideEffects").value_or(false) || isRegToMemIntentBypassOp(model, id) ||
+                    (op.kind() != OperationKind::kRegisterReadPort && !isDeferredActivationForwardPureKind(op.kind())))
+                    return {};
+                for (auto input : op.operands())
+                    if (const auto producer = positions.find(graph.valueDef(input));
+                        producer != positions.end() && producer->second >= positions.at(id)) return {};
+            }
+            std::unordered_set<ValueId, ValueIdHash> protectedValues;
+            for (const auto &port : graph.outputPorts()) protectedValues.insert(port.value);
+            for (const auto &port : graph.inoutPorts())
+            { protectedValues.insert(port.out); protectedValues.insert(port.oe); }
+            protectedValues.insert(context.packedScalarConcatInputs.begin(), context.packedScalarConcatInputs.end());
+            protectedValues.insert(context.packedShortConcatInputs.begin(), context.packedShortConcatInputs.end());
+            for (const auto &[value, _] : context.indexedConcatSlices) protectedValues.insert(value);
+            for (const auto &decl : collectScalarConcatPrefixCaches(graph, ops)) protectedValues.insert(decl.key.lhs);
+            const auto owned = [&](OperationId id) {
+                return conditional.absorbed.contains(id) || conditional.roots.contains(id) ||
+                    model.sharedEqualityDecodes.contains(id) || model.sharedEqualityFamilyAnchors.contains(id);
+            };
+            const auto boolean = [&](ValueId value) {
+                return graph.valueType(value) == ValueType::Logic && graph.valueWidth(value) == 1 && !isEventValue(model, value);
+            };
+            const auto local = [&](ValueId value) {
+                if (value.index == 0 || value.index > schedule.valueFanout.size()) return false;
+                for (auto user : schedule.valueFanout[value.index - 1]) if (user != supernode) return false;
+                return !isMaterializedValue(model, value) && !isEventValue(model, value) &&
+                    !valueNeedsTrackedChange(model, value) &&
+                    !model.coveredStateViews.contains(value) &&
+                    !protectedValues.contains(value) && members.contains(graph.valueDef(value)) &&
+                    !owned(graph.valueDef(value));
+            };
+            std::map<std::pair<ValueSlotScalarKind, std::size_t>, unsigned> owners;
+            for (const auto &[value, slot] : model.valueScalarSlotByValue) ++owners[{slot.kind, slot.slotIndex}];
+            // Sampling later at the consumer is allowed only for immutable
+            // inputs or exclusive source storage in this pure region.
+            const auto stableSource = [&](ValueId source) {
+                if (!isScalarLogicValue(graph, source) || graph.valueSigned(source) ||
+                    graph.valueWidth(source) < 2 || isEventValue(model, source)) return false;
+                if (model.inputFieldByValue.contains(source)) return true;
+                const auto slot = model.valueScalarSlotByValue.find(source);
+                return slot != model.valueScalarSlotByValue.end() &&
+                    canonicalMaterializedStorageValue(model, source) == source &&
+                    owners[{slot->second.kind, slot->second.slotIndex}] == 1 &&
+                    !model.directStateReadSymbolByValue.contains(source) &&
+                    !model.directInvertedBoolStateValues.contains(source);
+            };
+            for (auto id : ops)
+            {
+                const auto root = graph.getOperation(id);
+                if (owned(id) || root.results().size() != 1 || !boolean(root.results()[0]) ||
+                    (root.kind() != OperationKind::kOr && root.kind() != OperationKind::kLogicOr &&
+                     root.kind() != OperationKind::kReduceOr)) continue;
+                std::vector<ValueId> pending{root.results()[0]}, leaves;
+                std::unordered_set<ValueId, ValueIdHash> visited;
+                bool supported = true;
+                while (!pending.empty())
+                {
+                    const auto value = pending.back(); pending.pop_back();
+                    if (!visited.insert(value).second) continue;
+                    if (visited.size() > 2048 || !boolean(value)) { supported = false; break; }
+                    const auto def = graph.valueDef(value);
+                    if (value == root.results()[0] || local(value))
+                    {
+                        const auto op = graph.getOperation(def); const auto args = op.operands();
+                        if ((op.kind() == OperationKind::kOr || op.kind() == OperationKind::kLogicOr) &&
+                            args.size() == 2 && boolean(args[0]) && boolean(args[1]))
+                        { pending.push_back(args[1]); pending.push_back(args[0]); continue; }
+                        if (op.kind() == OperationKind::kReduceOr && args.size() == 1 && local(args[0]))
+                        {
+                            const auto concat = graph.getOperation(graph.valueDef(args[0]));
+                            if (concat.kind() == OperationKind::kConcat && concat.results().size() == 1 &&
+                                concat.operands().size() <= 512 &&
+                                graph.valueWidth(args[0]) == static_cast<int32_t>(concat.operands().size()) &&
+                                std::all_of(concat.operands().begin(), concat.operands().end(), boolean))
+                            {
+                                for (auto v : concat.operands()) pending.push_back(v);
+                                continue;
+                            }
+                        }
+                    }
+                    leaves.push_back(value);
+                    if (leaves.size() > 512) { supported = false; break; }
+                }
+                if (!supported) continue;
+                struct Candidate { ValueId source; std::vector<ValueId> leaves; std::set<uint64_t> constants; };
+                std::map<uint32_t, Candidate> families;
+                LocalPredicateSet replacement;
+                for (auto leaf : leaves)
+                {
+                    bool matched = false;
+                    if (local(leaf))
+                    {
+                        const auto eq = graph.getOperation(graph.valueDef(leaf));
+                        if (eq.kind() == OperationKind::kEq && eq.operands().size() == 2)
+                            for (unsigned side = 0; side < 2 && !matched; ++side)
+                            {
+                                const auto constant = eq.operands()[side], source = eq.operands()[1 - side];
+                                const auto def = graph.valueDef(constant);
+                                if (!def.valid() || graph.getOperation(def).kind() != OperationKind::kConstant ||
+                                    !stableSource(source) || graph.valueType(constant) != ValueType::Logic ||
+                                    graph.valueWidth(source) != graph.valueWidth(constant)) continue;
+                                const auto literal = getAttribute<std::string>(graph.getOperation(def), "constValue");
+                                auto parsed = literal ? parseConstLiteral(*literal) : std::nullopt;
+                                if (!parsed || parsed->hasUnknown()) continue;
+                                *parsed = parsed->resize(static_cast<slang::bitwidth_t>(graph.valueWidth(source)));
+                                parsed->setSigned(false); const auto number = parsed->as<uint64_t>();
+                                if (!number) continue;
+                                auto &family = families[source.index]; family.source = source;
+                                family.leaves.push_back(leaf); family.constants.insert(*number); matched = true;
+                            }
+                    }
+                    if (!matched) replacement.residuals.push_back(leaf);
+                }
+                for (auto &[key, family] : families)
+                {
+                    LocalPredicateSet::Family result{.source = family.source, .intervals = {},
+                        .constants = family.constants.size()};
+                    for (auto value : family.constants)
+                    {
+                        if (result.intervals.empty() || result.intervals.back().second == UINT64_MAX ||
+                            value != result.intervals.back().second + 1)
+                            result.intervals.emplace_back(value, value);
+                        else result.intervals.back().second = value;
+                    }
+                    // Same fixed density gate as the graph transform. Here
+                    // only local consumers change; schedule and slots do not.
+                    if (family.constants.size() >= 16 && family.constants.size() >= 8 * result.intervals.size())
+                        replacement.families.push_back(std::move(result));
+                    else replacement.residuals.insert(replacement.residuals.end(), family.leaves.begin(), family.leaves.end());
+                }
+                if (!replacement.families.empty()) plan.roots.emplace(id, std::move(replacement));
+            }
+            if (plan.roots.empty()) return plan;
+            const auto dependencies = [&](OperationId id) {
+                std::vector<ValueId> result;
+                if (const auto root = plan.roots.find(id); root != plan.roots.end())
+                {
+                    result = root->second.residuals;
+                    for (const auto &family : root->second.families) result.push_back(family.source);
+                }
+                else
+                {
+                    // Operation owns the operand vector; keep it alive while
+                    // copying the span used by the local use-count analysis.
+                    const auto operation = graph.getOperation(id);
+                    result.assign(operation.operands().begin(), operation.operands().end());
+                }
+                return result;
+            };
+            std::unordered_map<ValueId, std::size_t, ValueIdHash> uses;
+            for (auto id : ops) for (auto value : dependencies(id)) ++uses[value];
+            // Emitter-local DCE. Never delete a storage boundary, a protected
+            // packing input, or anything owned by another lowering.
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                for (auto it = ops.rbegin(); it != ops.rend(); ++it)
+                {
+                    const auto id = *it; const auto op = graph.getOperation(id);
+                    if (plan.absorbed.contains(id) || op.results().size() != 1 ||
+                        !local(op.results()[0]) || uses[op.results()[0]] != 0 ||
+                        (op.kind() != OperationKind::kEq && op.kind() != OperationKind::kOr &&
+                         op.kind() != OperationKind::kLogicOr && op.kind() != OperationKind::kConcat &&
+                         op.kind() != OperationKind::kReduceOr)) continue;
+                    for (auto value : dependencies(id)) --uses[value];
+                    plan.absorbed.insert(id); plan.roots.erase(id); changed = true;
+                }
+            }
+            return plan;
+        }
+
+        void emitLocalPredicateSet(std::ostream &stream, const Graph &graph, const EmitModel &model,
+            const Operation &op, const LocalPredicateSet &set, SupernodeLocalExprContext &context,
+            const ActivationEmitContext &activation, DeferredActivationEmitContext &deferred)
+        {
+            std::vector<std::string> terms;
+            std::size_t constants = 0, intervals = 0;
+            for (const auto &family : set.families)
+            {
+                const auto address = scalarValueBitsExpr(graph, family.source,
+                    resolvedScheduleValueExpr(model, family.source, &context));
+                constants += family.constants; intervals += family.intervals.size();
+                for (const auto &[lo, hi] : family.intervals)
+                    terms.push_back(lo == hi ? "(" + address + " == UINT64_C(" + std::to_string(lo) + "))" :
+                        "((" + address + " >= UINT64_C(" + std::to_string(lo) + ")) & (" +
+                        address + " <= UINT64_C(" + std::to_string(hi) + ")))" );
+            }
+            for (auto value : set.residuals) terms.push_back(resolvedScheduleValueExpr(model, value, &context));
+            stream << "        // Local predicate set: root=" << op.id().index << " constants=" << constants
+                   << " intervals=" << intervals << "\n";
+            context.preserveLocalSnapshot.insert(op.results()[0]);
+            emitLogicAssignFromScalarExpr(stream, graph, model, op.results()[0],
+                "static_cast<bool>(" + joinStrings(terms, " | ") + ")", true, &context, &activation, &deferred);
+        }
+
+        void buildConditionalMuxInputCaches(const Graph &graph, const ScheduleRefs &schedule, EmitModel &model)
+        {
+            model.conditionalMuxInputCaches.clear();
+            model.conditionalMuxChangeCaches.clear();
+            model.conditionalMuxChangeByValue.clear();
+            model.conditionalMuxChangeByInput.clear();
+            model.conditionalMuxChangeByState.clear();
+            if ((!model.conditionalMuxInputCache && !model.conditionalMuxChangeCache) ||
+                !model.conditionalMuxCones || model.localComputeUseOrder ||
+                model.priorityMuxChains || model.boolProducerReduce || model.boolZeroGroupGuard) return;
+            std::map<std::pair<ValueSlotScalarKind, std::size_t>, std::size_t> owners;
+            for (const auto &[value, slot] : model.valueScalarSlotByValue) ++owners[{slot.kind, slot.slotIndex}];
+            for (const auto sid : model.computeSupernodeIds)
+            {
+                const auto &ops = schedule.supernodeToOps[sid];
+                // Reconstruct the same protection/use information as normal
+                // conditional-cone selection, without changing its membership.
+                SupernodeLocalExprContext context;
+                for (std::size_t i = 0; i < ops.size(); ++i)
+                {
+                    const auto op = graph.getOperation(ops[i]);
+                    if (isCommitPhaseOp(op) || isRegToMemIntentBypassOp(model, op.id())) continue;
+                    for (auto value : op.operands()) ++context.useCountByValue[value];
+                    context.demandedBitComputePositions.emplace(op.id(), i);
+                }
+                if (model.localShiftDemandedBit || model.scalarConcatReduction || model.indexedConcatSlice)
+                {
+                    collectDemandedBitSourceCacheCandidates(graph, model, ops, context);
+                    collectPackedScalarConcatReductions(graph, model, ops, context);
+                    collectPackedScalarConcatReductions(graph, model, ops, context, true);
+                    collectIndexedConcatSlices(graph, model, ops, context);
+                }
+                const auto plan = collectConditionalMuxCones(graph, model, schedule, sid, ops, context);
+                const std::unordered_set<OperationId, OperationIdHash> scope(ops.begin(), ops.end());
+                for (const auto id : ops)
+                {
+                    const auto selected = plan.roots.find(id);
+                    if (selected == plan.roots.end()) continue;
+                    const auto root = graph.getOperation(id); const auto result = root.results()[0];
+                    const auto slot = model.valueScalarSlotByValue.find(result);
+                    if (!isMaterializedValue(model, result) || canonicalMaterializedStorageValue(model, result) != result ||
+                        slot == model.valueScalarSlotByValue.end() || owners[{slot->second.kind, slot->second.slotIndex}] != 1 ||
+                        model.directStateReadSymbolByValue.contains(result) || model.directInvertedBoolStateValues.contains(result)) continue;
+                    std::unordered_set<OperationId, OperationIdHash> members{id};
+                    for (const auto &arm : selected->second.arms) members.insert(arm.begin(), arm.end());
+                    ConditionalMuxInputCache cache;
+                    bool supported = true;
+                    std::unordered_set<ValueId, ValueIdHash> visited;
+                    std::set<std::tuple<std::string, int32_t, bool>> stateInputs;
+                    std::function<bool(ValueId, unsigned)> inputDependencies = [&](ValueId input, unsigned depth) {
+                        if (depth > 32 || !isScalarLogicValue(graph, input) || isEventValue(model, input)) return false;
+                        if (!visited.insert(input).second) return true;
+                        if (visited.size() > 256) return false;
+                        const auto def = graph.valueDef(input);
+                        if (def.valid() && graph.getOperation(def).kind() == OperationKind::kConstant) return true;
+                        // Local pure values need not be separate cache keys.
+                        // Their complete read set proves when they can change.
+                        if (!isMaterializedValue(model, input) && def.valid() && scope.contains(def) &&
+                            graph.getOperation(def).kind() != OperationKind::kRegisterReadPort &&
+                            graph.getOperation(def).kind() != OperationKind::kLatchReadPort)
+                        {
+                            const auto producer = graph.getOperation(def);
+                            if (producer.operands().empty()) return false;
+                            for (const auto operand : producer.operands())
+                                if (!inputDependencies(operand, depth + 1)) return false;
+                            return true;
+                        }
+                        // Source cloning may create several local reads of
+                        // the same state. A pure region has no intervening
+                        // writes; only identical scalar read views may merge.
+                        if (!isMaterializedValue(model, input) && def.valid() && scope.contains(def))
+                        {
+                            const auto read = graph.getOperation(def);
+                            if (read.kind() == OperationKind::kRegisterReadPort && read.operands().empty())
+                            {
+                                const auto symbol = getAttribute<std::string>(read, "regSymbol");
+                                if (!symbol) return false;
+                                if (!stateInputs.emplace(*symbol, graph.valueWidth(input), graph.valueSigned(input)).second)
+                                    return true;
+                            }
+                        }
+                        cache.inputs.push_back(input);
+                        return true;
+                    };
+                    // Exact dependency tuple, including selector and both arms.
+                    // Constants cannot change before init() invalidates caches.
+                    for (const auto member : ops)
+                    {
+                        if (!members.contains(member)) continue;
+                        const auto op = graph.getOperation(member);
+                        for (const auto input : op.operands())
+                        {
+                            const auto def = graph.valueDef(input);
+                            if (members.contains(def) || (def.valid() && graph.getOperation(def).kind() == OperationKind::kConstant)) continue;
+                            if (!inputDependencies(input, 0)) { supported = false; break; }
+                        }
+                    }
+                    if (!supported || cache.inputs.empty() || cache.inputs.size() > 32) continue;
+                    if (cache.inputs.size() <= 4 && model.conditionalMuxInputCache)
+                    {
+                        cache.index = model.conditionalMuxInputCaches.size();
+                        model.conditionalMuxInputCaches.emplace(id, std::move(cache));
+                        continue;
+                    }
+                    if (cache.inputs.size() < 5 || !model.conditionalMuxChangeCache ||
+                        model.inputFullpassSpecialization || model.posedgeFullpassSpecialization) continue;
+                    bool trackable = true;
+                    std::vector<std::pair<ValueId, std::string>> stateSources;
+                    std::unordered_set<ValueId, ValueIdHash> immutableStateSources;
+                    for (const ValueId input : cache.inputs)
+                    {
+                        std::optional<std::string> stateSymbol;
+                        if (const auto direct = model.directStateReadSymbolByValue.find(input);
+                            direct != model.directStateReadSymbolByValue.end()) stateSymbol = direct->second;
+                        const OperationId producer = graph.valueDef(input);
+                        const OperationKind kind = producer.valid() ? graph.getOperation(producer).kind()
+                                                                      : OperationKind::kConstant;
+                        // Only a live state view can invalidate at commit. A
+                        // materialized read is a snapshot: its own assignment
+                        // must invalidate after that snapshot actually changes.
+                        if (!stateSymbol && !isMaterializedValue(model, input) &&
+                            kind == OperationKind::kRegisterReadPort &&
+                            graph.getOperation(producer).operands().empty())
+                            stateSymbol = getAttribute<std::string>(graph.getOperation(producer), "regSymbol");
+                        if (stateSymbol)
+                        {
+                            const auto state = model.stateBySymbol.find(*stateSymbol);
+                            if (state == model.stateBySymbol.end() || state->second.kind != StateDecl::Kind::Register ||
+                                state->second.width <= 0 || state->second.width > 64 || state->second.regToMemIntentStorage)
+                            {
+                                trackable = false;
+                                break;
+                            }
+                            if (!model.stateWriteCountBySymbol.contains(*stateSymbol))
+                            {
+                                immutableStateSources.insert(input);
+                                continue;
+                            }
+                            stateSources.emplace_back(input, *stateSymbol);
+                            continue;
+                        }
+                        if (model.inputFieldByValue.contains(input) && model.prevInputFieldByValue.contains(input)) continue;
+                        const auto sourceSlot = model.valueScalarSlotByValue.find(input);
+                        if (!producer.valid() || !isMaterializedValue(model, input) ||
+                            canonicalMaterializedStorageValue(model, input) != input ||
+                            sourceSlot == model.valueScalarSlotByValue.end() ||
+                            owners[{sourceSlot->second.kind, sourceSlot->second.slotIndex}] != 1 ||
+                            model.directInvertedBoolStateValues.contains(input) || !valueNeedsTrackedChange(model, input) ||
+                            getAttribute<bool>(graph.getOperation(producer), "hasSideEffects").value_or(false) ||
+                            isRegToMemIntentBypassOp(model, producer) ||
+                            (kind != OperationKind::kRegisterReadPort && !isDeferredActivationForwardPureKind(kind)) ||
+                            kind == OperationKind::kBehaviorComputeGroup)
+                        {
+                            trackable = false;
+                            break;
+                        }
+                    }
+                    if (!trackable) continue;
+                    ConditionalMuxChangeCache changeCache;
+                    changeCache.sources = std::move(cache.inputs);
+                    changeCache.index = model.conditionalMuxChangeCaches.size();
+                    for (const auto &[source, symbol] : stateSources)
+                    {
+                        (void)source;
+                        auto &indexes = model.conditionalMuxChangeByState[symbol];
+                        if (std::find(indexes.begin(), indexes.end(), changeCache.index) == indexes.end())
+                            indexes.push_back(changeCache.index);
+                    }
+                    for (const ValueId source : changeCache.sources)
+                    {
+                        if (immutableStateSources.contains(source)) continue;
+                        if (std::any_of(stateSources.begin(), stateSources.end(),
+                                        [&](const auto &entry) { return entry.first == source; })) continue;
+                        auto &map = model.inputFieldByValue.contains(source) ? model.conditionalMuxChangeByInput
+                                                                            : model.conditionalMuxChangeByValue;
+                        auto &indexes = map[source];
+                        if (std::find(indexes.begin(), indexes.end(), changeCache.index) == indexes.end())
+                            indexes.push_back(changeCache.index);
+                    }
+                    model.conditionalMuxChangeCaches.emplace(id, std::move(changeCache));
+                }
+            }
+        }
+
+        ConditionalMuxNotifyPlan buildConditionalMuxNotifyPlan(
+            const Graph &graph, const EmitModel &model, const std::vector<OperationId> &ops,
+            uint32_t supernodeId, const DeferredActivationGroups &deferredGroups)
+        {
+            ConditionalMuxNotifyPlan plan;
+            if (!model.conditionalMuxChangeGrouped || model.conditionalMuxChangeCaches.empty()) return plan;
+            // A consumer in this region may execute before its exit. Keep all
+            // notifications to that consumer immediate, regardless of order.
+            std::unordered_set<std::size_t> localTargets;
+            for (const auto id : ops)
+                if (const auto it = model.conditionalMuxChangeCaches.find(id);
+                    it != model.conditionalMuxChangeCaches.end()) localTargets.insert(it->second.index);
+            std::map<std::size_t, std::vector<ValueId>> sourcesByTarget;
+            for (const auto id : ops)
+            {
+                const auto op = graph.getOperation(id);
+                for (const auto value : op.results())
+                    if (const auto it = model.conditionalMuxChangeByValue.find(value);
+                        it != model.conditionalMuxChangeByValue.end())
+                        for (const auto target : it->second)
+                            if (!localTargets.contains(target)) sourcesByTarget[target].push_back(value);
+            }
+            for (auto &[target, sources] : sourcesByTarget)
+            {
+                sortUniqueValueIds(sources);
+                if (sources.size() < 2) continue;
+                const auto existing = std::find_if(plan.groups.begin(), plan.groups.end(),
+                    [&](const auto &group) { return group.sources == sources; });
+                if (existing != plan.groups.end())
+                {
+                    existing->targets.push_back(target);
+                    continue;
+                }
+                ConditionalMuxNotifyGroup group;
+                group.sources = sources;
+                group.targets = {target};
+                group.changedExpr = "grhsim_mux_notify_group_" + std::to_string(supernodeId) + "_" +
+                                    std::to_string(plan.groups.size());
+                for (const auto &deferred : deferredGroups)
+                {
+                    if (deferred.directAccumulator != kInvalidIndex || deferred.packedMask != 0u) continue;
+                    auto exactSources = deferred.sourceValues;
+                    sortUniqueValueIds(exactSources);
+                    if (exactSources != sources) continue;
+                    group.fallbackExpr = group.changedExpr;
+                    group.changedExpr = deferred.changedExpr;
+                    group.reuseDeferred = true;
+                    break;
+                }
+                plan.groups.push_back(std::move(group));
+            }
+            for (std::size_t i = 0; i < plan.groups.size(); ++i)
+                for (const auto source : plan.groups[i].sources) plan.groupsBySource[source].push_back(i);
+            return plan;
+        }
+
+        void buildJointNotifyBuckets(const Graph &graph, const EmitModel &model,
+                                     const DeferredActivationGroups &deferredGroups,
+                                     const SharedDeferredActivationPlan &sharedPlan, uint32_t supernodeId,
+                                     ConditionalMuxNotifyPlan &plan)
+        {
+            // This plan composes ordinary exact predicates only. Other
+            // representations retain their original lowering and notifications.
+            if (!model.conditionalMuxChangeJoint || plan.groups.empty() || deferredGroups.empty() ||
+                !sharedPlan.cohorts.empty() || deferredGroups.size() + plan.groups.size() > 64 ||
+                model.deferredActivationCofireStrict || model.sameBatchActivationCohortStrict ||
+                std::any_of(deferredGroups.begin(), deferredGroups.end(), [](const auto &g) {
+                    return g.directAccumulator != kInvalidIndex || g.packedMask != 0u;
+                })) return;
+            std::unordered_map<ValueId, std::vector<std::size_t>, ValueIdHash> destinations;
+            const auto eligible = [&](ValueId value) {
+                if (!isScalarLogicValue(graph, value) || isEventValue(model, value) ||
+                    !isMaterializedValue(model, value) || !valueNeedsTrackedChange(model, value) ||
+                    canonicalMaterializedStorageValue(model, value) != value ||
+                    model.directStateReadSymbolByValue.contains(value) ||
+                    model.directInvertedBoolStateValues.contains(value)) return false;
+                const auto def = graph.valueDef(value);
+                if (!def.valid()) return false;
+                const auto op = graph.getOperation(def);
+                return !getAttribute<bool>(op, "hasSideEffects").value_or(false) &&
+                       !isRegToMemIntentBypassOp(model, def) &&
+                       (op.kind() == OperationKind::kRegisterReadPort ||
+                        (isDeferredActivationForwardPureKind(op.kind()) &&
+                         op.kind() != OperationKind::kConstant && op.kind() != OperationKind::kBehaviorComputeGroup));
+            };
+            for (std::size_t i = 0; i < deferredGroups.size(); ++i)
+                for (const auto source : deferredGroups[i].sourceValues)
+                    if (eligible(source)) destinations[source].push_back(i);
+            for (std::size_t i = 0; i < plan.groups.size(); ++i)
+            {
+                if (plan.groups[i].reuseDeferred) continue;
+                for (const auto source : plan.groups[i].sources)
+                    if (eligible(source)) destinations[source].push_back(deferredGroups.size() + i);
+            }
+            if (destinations.size() > 1024) return;
+            std::map<std::vector<std::size_t>, std::vector<ValueId>> partition;
+            std::size_t original = 0;
+            for (auto &[source, targets] : destinations)
+            {
+                std::sort(targets.begin(), targets.end());
+                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+                original += targets.size();
+                partition[targets].push_back(source);
+            }
+            if (partition.size() > 64) return;
+            std::size_t factored = destinations.size();
+            for (const auto &[targets, sources] : partition) factored += targets.size();
+            // Count OR contributions including reconstructing each target.
+            // This static gate has no input from runtime profiles or timings.
+            if (factored >= original) return;
+            for (auto &[targets, sources] : partition)
+            {
+                sortUniqueValueIds(sources);
+                JointNotifyBucket bucket;
+                bucket.sources = std::move(sources);
+                bucket.changedExpr = "grhsim_joint_notify_" + std::to_string(supernodeId) + "_" +
+                                     std::to_string(plan.jointBuckets.size());
+                for (const auto target : targets)
+                    if (target < deferredGroups.size()) bucket.deferredGroups.push_back(target);
+                    else bucket.cacheGroups.push_back(target - deferredGroups.size());
+                for (const auto source : bucket.sources)
+                    plan.jointBucketBySource.emplace(source, plan.jointBuckets.size());
+                plan.jointBuckets.push_back(std::move(bucket));
+            }
+            plan.jointOriginalContributions = original;
+            plan.jointFactoredContributions = factored;
+        }
+
+        bool emitConditionalMuxCone(std::ostream &stream, const Graph &graph, const EmitModel &model,
+                                    const Operation &root, const ConditionalMuxCone &cone,
+                                    SupernodeLocalExprContext &context,
+                                    const ActivationEmitContext &activation,
+                                    DeferredActivationEmitContext &deferred, std::string &error)
+        {
+            const auto result = root.results()[0];
+            const auto cached = model.conditionalMuxInputCaches.find(root.id());
+            const auto changeCached = model.conditionalMuxChangeCaches.find(root.id());
+            if (cached != model.conditionalMuxInputCaches.end())
+            {
+                const auto &cache = cached->second;
+                const auto suffix = std::to_string(cache.index);
+                stream << "        // Conditional mux input cache: root=" << root.id().index
+                       << " inputs=" << cache.inputs.size() << "\n";
+                std::vector<std::string> changed{"!conditional_mux_cache_valid_[" + suffix + "u]"};
+                for (std::size_t i = 0; i < cache.inputs.size(); ++i)
+                {
+                    const auto key = "grhsim_mux_cache_key_" + suffix + "_" + std::to_string(i);
+                    stream << "        const std::uint64_t " << key << " = " << scalarValueBitsExpr(graph,
+                        cache.inputs[i], resolvedScheduleValueExpr(model, cache.inputs[i], &context)) << ";\n";
+                    changed.push_back("(" + key + " != conditional_mux_cache_inputs_[" + suffix + "u][" + std::to_string(i) + "u])");
+                }
+                stream << "        const bool grhsim_mux_cache_miss_" << root.id().index << " = "
+                       << joinStrings(changed, " | ") << ";\n"
+                       << "        if (grhsim_mux_cache_miss_" << root.id().index << ") {\n";
+            }
+            else if (changeCached != model.conditionalMuxChangeCaches.end())
+            {
+                const auto &cache = changeCached->second;
+                stream << "        // Conditional mux change-trigger cache: root=" << root.id().index
+                       << " sources=" << cache.sources.size() << "\n"
+                       << "        if (conditional_mux_change_dirty_[" << cache.index << "u]) {\n";
+            }
+            const std::string temporary = "grhsim_mux_result_" + std::to_string(root.id().index);
+            // A capturing lambda can be outlined by the host compiler and
+            // force many live locals into a pointer closure. Keep the branch
+            // in the compute function so it introduces no call boundary.
+            stream << "        " << cppTypeForValue(graph, result) << " " << temporary << ";\n";
+            stream << "            // Conditional mux cone: root=" << root.id().index
+                       << " true_ops=" << cone.arms[0].size() << " false_ops=" << cone.arms[1].size() << "\n";
+            stream << "            if (" << resolvedScheduleValueExpr(model, root.operands()[0], &context) << ") {\n";
+            for (std::size_t arm = 0; arm < 2; ++arm)
+            {
+                auto branchContext = context;
+                for (auto id : cone.arms[arm])
+                {
+                    const auto op = graph.getOperation(id);
+                    if (opNeedsWordLogicEmit(graph, op))
+                    {
+                        stream << "                // Conditional wide operation: op=" << id.index << "\n";
+                        if (!emitWordLogicOperation(stream, graph, model, op, error, &branchContext)) return false;
+                        continue;
+                    }
+                    std::vector<std::string> operands;
+                    for (auto value : op.operands()) operands.push_back(resolvedScheduleValueExpr(model, value, &branchContext));
+                    const auto rhs = scalarAssignmentExpr(op.kind(), operands, op, graph, nullptr,
+                        model.oneBitBitwiseBytes, model.boolEagerLogic, &branchContext.boolStorageRefs);
+                    emitLogicAssignFromScalarExpr(stream, graph, model, op.results()[0], rhs.expr,
+                        rhs.alreadyBoundedToResultWidth, &branchContext, nullptr, nullptr, rhs.byteBitResult);
+                }
+                stream << "                " << temporary << " = " << scalarTypedInitializerExpr(graph, result,
+                    resolvedScheduleValueExpr(model, root.operands()[arm + 1], &branchContext)) << ";\n";
+                stream << (arm == 0 ? "            } else {\n" : "            }\n");
+            }
+            // Keep the result at the original root, not in a later consumer.
+            context.preserveLocalSnapshot.insert(result);
+            emitLogicAssignFromScalarExpr(stream, graph, model, result, temporary, true,
+                                         &context, &activation, &deferred);
+            if (cached != model.conditionalMuxInputCaches.end())
+            {
+                const auto &cache = cached->second; const auto suffix = std::to_string(cache.index);
+                for (std::size_t i = 0; i < cache.inputs.size(); ++i)
+                    stream << "        conditional_mux_cache_inputs_[" << suffix << "u][" << i
+                           << "u] = grhsim_mux_cache_key_" << suffix << "_" << i << ";\n";
+                stream << "        conditional_mux_cache_valid_[" << suffix << "u] = true;\n        }\n";
+            }
+            else if (changeCached != model.conditionalMuxChangeCaches.end())
+            {
+                stream << "        conditional_mux_change_dirty_[" << changeCached->second.index
+                       << "u] = false;\n        }\n";
+            }
+            return true;
+        }
+
+        void buildCoveredStateViews(const Graph &graph, const ScheduleRefs &schedule,
+            const std::unordered_set<ValueId, ValueIdHash> &waveformValues,
+            const std::unordered_set<uint32_t> &guardedGroups, EmitModel &model)
+        {
+            model.coveredStateViews.clear();
+            if (!model.coveredStateViewNotifications || model.inputFullpassSpecialization ||
+                model.posedgeFullpassSpecialization || model.emitRuntimeProfile || model.emitWaveform || model.directBoolStateViews ||
+                model.conditionalMuxChangeCache || model.producerDirtyWords || model.provedZeroValueElision ||
+                model.localComputeUseOrder || model.priorityMuxChains ||
+                model.boolProducerReduce || model.boolZeroGroupGuard) return;
+            std::unordered_map<OperationId, uint32_t, OperationIdHash> owners;
+            std::unordered_map<OperationId, std::size_t, OperationIdHash> positions;
+            std::unordered_set<uint32_t> pureGroups;
+            for (uint32_t sid = 0; sid < schedule.supernodeToOps.size(); ++sid)
+            {
+                bool pure = isComputeSupernode(model, sid) && !guardedGroups.contains(sid);
+                std::size_t position = 0;
+                for (auto id : schedule.supernodeToOps[sid])
+                {
+                    owners.emplace(id, sid); positions.emplace(id, position++);
+                    const auto op = graph.getOperation(id);
+                    pure &= !getAttribute<bool>(op, "hasSideEffects").value_or(false) &&
+                        !isRegToMemIntentBypassOp(model, id) &&
+                        (op.kind() == OperationKind::kRegisterReadPort || isDeferredActivationForwardPureKind(op.kind()));
+                }
+                if (pure) pureGroups.insert(sid);
+            }
+            auto protectedValues = waveformValues;
+            for (const auto &port : graph.outputPorts()) protectedValues.insert(port.value);
+            for (const auto &port : graph.inoutPorts())
+            { protectedValues.insert(port.out); protectedValues.insert(port.oe); }
+            for (const auto &[value, _] : model.eventEdgeFieldByValue) protectedValues.insert(value);
+            for (const auto &[alias, target] : model.materializedValueAliasByValue)
+            { protectedValues.insert(alias); protectedValues.insert(target); }
+            // These caches carry implicit uses absent from graph.valueUsers().
+            // Build them first and keep their keys/results and invalidations intact.
+            for (const auto &[id, family] : model.sharedEqualityDecodes)
+            {
+                protectedValues.insert(family.source);
+                protectedValues.insert(family.results.begin(), family.results.end());
+            }
+            for (const auto &family : model.localEqualityDecodes) protectedValues.insert(family.source);
+            for (const auto &[id, cache] : model.conditionalMuxInputCaches)
+            {
+                protectedValues.insert(cache.inputs.begin(), cache.inputs.end());
+                const auto op = graph.getOperation(id);
+                protectedValues.insert(op.results().begin(), op.results().end());
+            }
+            std::unordered_map<std::string, unsigned> writers;
+            for (const auto &write : model.writes)
+                if (write.kind == StateDecl::Kind::Register && owners.contains(write.opId) &&
+                    isCommitSupernode(model, owners.at(write.opId))) ++writers[write.symbol];
+            std::map<std::pair<ValueSlotScalarKind, std::size_t>, unsigned> slotOwners;
+            for (const auto &[value, slot] : model.valueScalarSlotByValue) ++slotOwners[{slot.kind, slot.slotIndex}];
+            // Freeze the independent register frontier. Removing a candidate
+            // edge must never become the proof for admitting another value.
+            const auto originalHeads = model.stateHeadSupernodesBySymbol;
+            for (auto sid : model.computeSupernodeIds)
+            {
+                if (!pureGroups.contains(sid)) continue;
+                for (auto id : schedule.supernodeToOps[sid])
+                {
+                    const auto op = graph.getOperation(id);
+                    if (op.results().size() != 1 || op.operands().size() != 1 ||
+                        (op.kind() != OperationKind::kSliceStatic && op.kind() != OperationKind::kNot &&
+                         op.kind() != OperationKind::kLogicNot && op.kind() != OperationKind::kAssign)) continue;
+                    const auto result = op.results()[0], input = op.operands()[0];
+                    const auto slot = model.valueScalarSlotByValue.find(result);
+                    const auto fanout = model.boundaryFanoutByValue.find(result);
+                    if (!isScalarLogicValue(graph, result) || !isScalarLogicValue(graph, input) ||
+                        protectedValues.contains(result) || model.directStateReadSymbolByValue.contains(result) ||
+                        model.packedArrayLaneViewByValue.contains(result) ||
+                        !model.materializedValues.contains(result) || canonicalMaterializedStorageValue(model, result) != result ||
+                        slot == model.valueScalarSlotByValue.end() || slotOwners[{slot->second.kind, slot->second.slotIndex}] != 1 ||
+                        fanout == model.boundaryFanoutByValue.end() || fanout->second.empty()) continue;
+                    const auto def = graph.valueDef(input);
+                    if (!owners.contains(def) || owners.at(def) != sid || positions.at(def) >= positions.at(id) ||
+                        model.materializedValues.contains(input) || protectedValues.contains(input)) continue;
+                    const auto read = graph.getOperation(def);
+                    if (read.kind() != OperationKind::kRegisterReadPort || !read.operands().empty() ||
+                        read.results().size() != 1 || getAttribute<bool>(read, "hasSideEffects").value_or(false)) continue;
+                    const auto symbol = getAttribute<std::string>(read, "regSymbol");
+                    if (!symbol || !model.stateBySymbol.contains(*symbol)) continue;
+                    const auto &state = model.stateBySymbol.at(*symbol);
+                    if (state.kind != StateDecl::Kind::Register || state.regToMemIntentStorage || writers[*symbol] != 1 ||
+                        state.width != graph.valueWidth(input) || state.isSigned != graph.valueSigned(input)) continue;
+                    if (op.kind() == OperationKind::kSliceStatic)
+                    {
+                        const auto start = getAttribute<int64_t>(op, "sliceStart").value_or(0);
+                        const auto end = getAttribute<int64_t>(op, "sliceEnd").value_or(start);
+                        if (start < 0 || end < start || end >= state.width || end - start + 1 != graph.valueWidth(result)) continue;
+                    }
+                    if ((op.kind() == OperationKind::kNot || op.kind() == OperationKind::kAssign) &&
+                        graph.valueWidth(input) != graph.valueWidth(result)) continue;
+                    if (op.kind() == OperationKind::kLogicNot && graph.valueWidth(result) != 1) continue;
+                    std::vector<uint32_t> targets, external;
+                    targets.push_back(static_cast<uint32_t>(model.activeIdBySupernode[sid]));
+                    bool eligible = true;
+                    const auto info = graph.getValue(result);
+                    for (const auto &use : info.users())
+                    {
+                        const auto owner = owners.find(use.operation);
+                        if (owner == owners.end()) continue; // Unscheduled dead IR is not an emitted consumer.
+                        const auto target = owner->second;
+                        if (!pureGroups.contains(target) || isCommitPhaseOp(graph.getOperation(use.operation)) ||
+                            (target == sid && positions.at(use.operation) <= positions.at(id)) ||
+                            (target != sid && model.activeIdBySupernode[target] <= model.activeIdBySupernode[sid]))
+                        { eligible = false; break; }
+                        const auto active = static_cast<uint32_t>(model.activeIdBySupernode[target]);
+                        targets.push_back(active);
+                        if (target != sid) external.push_back(active);
+                    }
+                    sortUniqueVector(targets); sortUniqueVector(external);
+                    const auto heads = originalHeads.find(*symbol);
+                    if (!eligible || external != fanout->second || heads == originalHeads.end() ||
+                        !std::includes(heads->second.begin(), heads->second.end(), targets.begin(), targets.end())) continue;
+                    const std::string inputExpr = "static_cast<" + cppTypeForValue(graph, input) + ">(" + stateRef(state) + ")";
+                    const auto rhs = scalarAssignmentExpr(op.kind(), {inputExpr}, op, graph);
+                    if (rhs.expr.empty()) continue;
+                    const auto expr = renderScalarAssignedExpr(graph, result, rhs.expr, rhs.alreadyBoundedToResultWidth);
+                    model.coveredStateViews.emplace(result, EmitModel::CoveredStateView{
+                        .state = *symbol, .expression = expr, .source = input, .producer = sid, .consumers = external,
+                        .inlineValue = model.coveredStateViewInline});
+                }
+            }
+            if (model.coveredStateViewComposition)
+            {
+                struct StateExpression {
+                    std::string state, expression;
+                    ValueId source;
+                    std::unordered_set<OperationId, OperationIdHash> operations;
+                    uint32_t treeCost = 0, depth = 0;
+                };
+                // Fixed structural bounds, independent of any execution profile.
+                constexpr uint32_t maxProofOps = 32, maxProofDepth = 16;
+                constexpr uint32_t maxInlineTreeOps = 4, maxInlineUseOps = 16;
+                for (auto sid : model.computeSupernodeIds)
+                {
+                    if (!pureGroups.contains(sid)) continue;
+                    std::unordered_map<ValueId, std::optional<StateExpression>, ValueIdHash> memo;
+                    std::unordered_set<ValueId, ValueIdHash> visiting;
+                    std::function<std::optional<StateExpression>(ValueId)> prove;
+                    prove = [&](ValueId value) -> std::optional<StateExpression> {
+                        if (const auto found = memo.find(value); found != memo.end()) return found->second;
+                        if (!isScalarLogicValue(graph, value) || visiting.size() >= maxProofDepth ||
+                            visiting.contains(value)) return std::nullopt;
+                        const auto def = graph.valueDef(value);
+                        if (!def.valid()) return std::nullopt;
+                        const auto op = graph.getOperation(def);
+                        if (op.kind() == OperationKind::kConstant)
+                        {
+                            const auto literal = getAttribute<std::string>(op, "constValue");
+                            const auto parsed = literal ? parseConstLiteral(*literal) : std::nullopt;
+                            if (!parsed || parsed->hasUnknown()) return std::nullopt;
+                            const auto expr = constantExpr(graph, op, value);
+                            if (!expr) return std::nullopt;
+                            StateExpression result;
+                            result.expression = renderScalarAssignedExpr(graph, value, *expr, false);
+                            return memo.emplace(value, result).first->second;
+                        }
+                        if (!owners.contains(def) || owners.at(def) != sid || protectedValues.contains(value) ||
+                            model.packedArrayLaneViewByValue.contains(value) ||
+                            getAttribute<bool>(op, "hasSideEffects").value_or(false) || op.results().size() != 1)
+                            return std::nullopt;
+                        if (op.kind() == OperationKind::kRegisterReadPort)
+                        {
+                            const auto symbol = getAttribute<std::string>(op, "regSymbol");
+                            if (!op.operands().empty() || model.materializedValues.contains(value) || !symbol ||
+                                !model.stateBySymbol.contains(*symbol)) return std::nullopt;
+                            const auto &state = model.stateBySymbol.at(*symbol);
+                            if (state.kind != StateDecl::Kind::Register || state.regToMemIntentStorage ||
+                                writers[*symbol] != 1 || state.width != graph.valueWidth(value) ||
+                                state.isSigned != graph.valueSigned(value)) return std::nullopt;
+                            StateExpression result;
+                            result.state = *symbol; result.source = value;
+                            result.expression = "static_cast<" + cppTypeForValue(graph, value) + ">(" + stateRef(state) + ")";
+                            return memo.emplace(value, result).first->second;
+                        }
+                        const auto operands = op.operands();
+                        switch (op.kind())
+                        {
+                        case OperationKind::kAssign: case OperationKind::kNot:
+                            if (operands.size() != 1 || graph.valueWidth(value) != graph.valueWidth(operands[0])) return std::nullopt;
+                            break;
+                        case OperationKind::kLogicNot: case OperationKind::kReduceOr:
+                            if (operands.size() != 1 || graph.valueWidth(value) != 1) return std::nullopt;
+                            break;
+                        case OperationKind::kSliceStatic:
+                        {
+                            if (operands.size() != 1) return std::nullopt;
+                            const auto first = getAttribute<int64_t>(op, "sliceStart").value_or(0);
+                            const auto last = getAttribute<int64_t>(op, "sliceEnd").value_or(first);
+                            if (first < 0 || last < first || last >= graph.valueWidth(operands[0]) ||
+                                last - first + 1 != graph.valueWidth(value)) return std::nullopt;
+                            break;
+                        }
+                        case OperationKind::kEq: case OperationKind::kLogicAnd: case OperationKind::kLogicOr:
+                            if (operands.size() != 2 || graph.valueWidth(value) != 1) return std::nullopt;
+                            break;
+                        case OperationKind::kAnd: case OperationKind::kOr:
+                            if (operands.size() != 2) return std::nullopt;
+                            break;
+                        case OperationKind::kConcat:
+                        {
+                            int64_t width = 0;
+                            for (auto input : operands) width += graph.valueWidth(input);
+                            if (operands.empty() || width != graph.valueWidth(value)) return std::nullopt;
+                            break;
+                        }
+                        default: return std::nullopt;
+                        }
+                        visiting.insert(value);
+                        StateExpression result; result.operations.insert(def); result.treeCost = 1;
+                        std::vector<std::string> expressions;
+                        bool valid = true;
+                        for (auto input : operands)
+                        {
+                            const auto inputDef = graph.valueDef(input);
+                            if (owners.contains(inputDef) && owners.at(inputDef) == sid &&
+                                positions.at(inputDef) >= positions.at(def)) { valid = false; break; }
+                            const auto child = prove(input);
+                            if (!child || (!result.state.empty() && !child->state.empty() && result.state != child->state))
+                            { valid = false; break; }
+                            if (result.state.empty() && !child->state.empty())
+                            { result.state = child->state; result.source = child->source; }
+                            result.operations.insert(child->operations.begin(), child->operations.end());
+                            result.depth = std::max(result.depth, child->depth + 1u);
+                            result.treeCost = std::min(maxInlineTreeOps + 1u, result.treeCost + child->treeCost);
+                            expressions.push_back(child->expression);
+                            if (result.operations.size() > maxProofOps || result.depth > maxProofDepth)
+                            { valid = false; break; }
+                        }
+                        visiting.erase(value);
+                        if (!valid) return memo.emplace(value, std::nullopt).first->second;
+                        if (result.treeCost <= maxInlineTreeOps &&
+                            std::all_of(expressions.begin(), expressions.end(), [](const auto &e) { return !e.empty(); }))
+                        {
+                            const auto rhs = scalarAssignmentExpr(op.kind(), expressions, op, graph);
+                            if (!rhs.expr.empty()) result.expression = renderScalarAssignedExpr(graph, value, rhs.expr, rhs.alreadyBoundedToResultWidth);
+                            if (result.expression.size() > 4096) result.expression.clear();
+                        }
+                        return memo.emplace(value, result).first->second;
+                    };
+                    for (auto id : schedule.supernodeToOps[sid])
+                    {
+                        const auto op = graph.getOperation(id);
+                        if (op.results().size() != 1) continue;
+                        const auto value = op.results()[0];
+                        if (model.coveredStateViews.contains(value)) continue;
+                        const auto slot = model.valueScalarSlotByValue.find(value);
+                        const auto fanout = model.boundaryFanoutByValue.find(value);
+                        if (!model.materializedValues.contains(value) || canonicalMaterializedStorageValue(model, value) != value ||
+                            model.directStateReadSymbolByValue.contains(value) || slot == model.valueScalarSlotByValue.end() ||
+                            slotOwners[{slot->second.kind, slot->second.slotIndex}] != 1 ||
+                            fanout == model.boundaryFanoutByValue.end() || fanout->second.empty()) continue;
+                        const auto proof = prove(value);
+                        if (!proof || proof->state.empty() || proof->operations.empty()) continue;
+                        std::vector<uint32_t> targets{static_cast<uint32_t>(model.activeIdBySupernode[sid])}, external;
+                        bool eligible = true; std::size_t uses = 0;
+                        const auto info = graph.getValue(value);
+                        for (const auto &use : info.users())
+                        {
+                            const auto owner = owners.find(use.operation);
+                            if (owner == owners.end()) continue;
+                            const auto target = owner->second; ++uses;
+                            if (!pureGroups.contains(target) || isCommitPhaseOp(graph.getOperation(use.operation)) ||
+                                (target == sid && positions.at(use.operation) <= positions.at(id)) ||
+                                (target != sid && model.activeIdBySupernode[target] <= model.activeIdBySupernode[sid]))
+                            { eligible = false; break; }
+                            const auto active = static_cast<uint32_t>(model.activeIdBySupernode[target]);
+                            targets.push_back(active); if (target != sid) external.push_back(active);
+                        }
+                        sortUniqueVector(targets); sortUniqueVector(external);
+                        const auto heads = originalHeads.find(proof->state);
+                        if (!eligible || heads == originalHeads.end() || external != fanout->second ||
+                            !std::includes(heads->second.begin(), heads->second.end(), targets.begin(), targets.end())) continue;
+                        const bool inlineValue = model.coveredStateViewInline && model.coveredStateViewCompositionInline &&
+                            !proof->expression.empty() && proof->treeCost <= maxInlineTreeOps &&
+                            uses <= maxInlineUseOps / proof->treeCost;
+                        model.coveredStateViews.emplace(value, EmitModel::CoveredStateView{
+                            .state = proof->state, .expression = proof->expression, .source = proof->source,
+                            .producer = sid, .consumers = external, .inlineValue = inlineValue,
+                            .composed = true, .expressionOps = static_cast<uint32_t>(proof->operations.size())});
+                    }
+                }
+            }
+            for (const auto &[value, view] : model.coveredStateViews)
+            {
+                model.boundaryFanoutByValue.erase(value);
+                if (view.inlineValue) model.materializedValues.erase(value);
+            }
+            std::fprintf(stderr, "[GRHSIM_COVERED_STATE_VIEWS] values=%zu inline=%d added_heads=0\n",
+                         model.coveredStateViews.size(), model.coveredStateViewInline ? 1 : 0);
+        }
+
         std::optional<std::string> exactEventExpr(const Graph &graph,
                                                   const EmitModel &model,
                                                   OperationId opId,
@@ -24680,30 +26438,28 @@ template<class Index>
                                          std::string_view indent,
                                          std::string_view condition = {})
         {
-            if (model.producerDirtyWordBankCount == 0)
-            {
-                return;
-            }
             const auto stateIt = model.producerDirtyBitsByState.find(std::string(stateSymbol));
-            if (stateIt == model.producerDirtyBitsByState.end())
-            {
-                return;
-            }
             std::map<std::size_t, std::uint64_t> masks;
-            for (const ProducerDirtyWordBit bit : stateIt->second)
+            if (stateIt != model.producerDirtyBitsByState.end())
             {
-                masks[bit.bank] |= bit.mask;
+                for (const ProducerDirtyWordBit bit : stateIt->second)
+                    masks[bit.bank] |= bit.mask;
             }
+            const auto cacheIt = model.conditionalMuxChangeByState.find(std::string(stateSymbol));
+            if ((model.producerDirtyWordBankCount == 0 || masks.empty()) &&
+                cacheIt == model.conditionalMuxChangeByState.end()) return;
             const bool conditional = !condition.empty() && condition != "true";
             if (conditional)
             {
                 stream << indent << "if (" << condition << ") {\n";
             }
             const std::string bodyIndent = conditional ? std::string(indent) + "    " : std::string(indent);
-            for (const auto &[bank, mask] : masks)
-            {
-                stream << bodyIndent << "producer_dirty_words_[" << bank << "u] |= UINT64_C(" << mask << ");\n";
-            }
+            if (model.producerDirtyWordBankCount != 0)
+                for (const auto &[bank, mask] : masks)
+                    stream << bodyIndent << "producer_dirty_words_[" << bank << "u] |= UINT64_C(" << mask << ");\n";
+            if (cacheIt != model.conditionalMuxChangeByState.end())
+                for (const std::size_t index : cacheIt->second)
+                    stream << bodyIndent << "conditional_mux_change_dirty_[" << index << "u] = true;\n";
             if (conditional)
             {
                 stream << indent << "}\n";
@@ -24718,8 +26474,12 @@ template<class Index>
         {
             // Merge writes to each bank, reusing the group's change predicates.
             std::map<std::size_t, std::map<std::uint64_t, std::vector<std::string>>> banks;
+            std::map<std::size_t, std::vector<std::string>> cacheConditions;
             for (const auto &[symbol, condition] : stateConditions)
             {
+                if (const auto cacheIt = model.conditionalMuxChangeByState.find(symbol);
+                    cacheIt != model.conditionalMuxChangeByState.end())
+                    for (const std::size_t index : cacheIt->second) cacheConditions[index].push_back(condition);
                 const auto stateIt = model.producerDirtyBitsByState.find(symbol);
                 if (stateIt == model.producerDirtyBitsByState.end()) continue;
                 std::map<std::size_t, std::uint64_t> masks;
@@ -24746,6 +26506,14 @@ template<class Index>
                 if (unconditional != 0) terms.push_back("UINT64_C(" + std::to_string(unconditional) + ")");
                 stream << indent << "producer_dirty_words_[" << bank << "u] |= "
                        << joinStrings(terms, " | ") << ";\n";
+            }
+            for (const auto &[index, conditions] : cacheConditions)
+            {
+                if (std::find(conditions.begin(), conditions.end(), "true") != conditions.end())
+                    stream << indent << "conditional_mux_change_dirty_[" << index << "u] = true;\n";
+                else
+                    stream << indent << "conditional_mux_change_dirty_[" << index << "u] = static_cast<bool>(conditional_mux_change_dirty_["
+                           << index << "u] | (" << joinStrings(conditions, " | ") << "));\n";
             }
         }
 
@@ -25979,6 +27747,7 @@ template<class Index>
                                   std::to_string(payloadWordIndex) + "_flags"
                             : "activeWordFlags";
                     std::map<std::size_t, std::uint64_t> batchTriggerBoundaryMasks;
+                    ConditionalMuxNotifyPlan conditionalMuxNotifyPlan;
                     const bool accumulateBatchTriggers =
                         model.batchTriggerSupernodeAccumulate && !fullpassVariant &&
                         batch.phase == ScheduleBatch::Phase::kCompute;
@@ -26016,6 +27785,7 @@ template<class Index>
                                 ? &batchTriggerBoundaryMasks
                                 : nullptr,
                         .batchTriggerBoundaryAccumulate = accumulateBatchTriggers,
+                        .conditionalMuxNotifyPlan = &conditionalMuxNotifyPlan,
                     };
                     const std::uint8_t supernodeMask =
                         static_cast<std::uint8_t>(UINT8_C(1) << (activeId % kActiveFlagBitsPerWord));
@@ -26282,6 +28052,35 @@ template<class Index>
                         }
                     }
                 }
+                if (batch.phase == ScheduleBatch::Phase::kCompute && !fullpassVariant)
+                {
+                    conditionalMuxNotifyPlan = buildConditionalMuxNotifyPlan(
+                        graph, model, supernodeOps, supernodeId, deferredActivationGroups);
+                    for (const auto &group : conditionalMuxNotifyPlan.groups)
+                        stream << "            bool " << (group.reuseDeferred ? group.fallbackExpr : group.changedExpr)
+                               << " = false;\n";
+                    buildJointNotifyBuckets(graph, model, deferredActivationGroups, sharedActivationPlan,
+                                            supernodeId, conditionalMuxNotifyPlan);
+                    if (!conditionalMuxNotifyPlan.jointBuckets.empty())
+                    {
+                        stream << "            // Joint notify plan: producer=" << supernodeId
+                               << " buckets=" << conditionalMuxNotifyPlan.jointBuckets.size()
+                               << " sources=" << conditionalMuxNotifyPlan.jointBucketBySource.size()
+                               << " before=" << conditionalMuxNotifyPlan.jointOriginalContributions
+                               << " after=" << conditionalMuxNotifyPlan.jointFactoredContributions << "\n";
+                        for (std::size_t i = 0; i < conditionalMuxNotifyPlan.jointBuckets.size(); ++i)
+                        {
+                            const auto &bucket = conditionalMuxNotifyPlan.jointBuckets[i];
+                            stream << "            // Joint notify bucket: producer=" << supernodeId << " bucket=" << i << " sources=";
+                            for (const auto source : bucket.sources) stream << source.index << ",";
+                            stream << " deferred=";
+                            for (const auto index : bucket.deferredGroups) stream << index << ",";
+                            stream << " cache=";
+                            for (const auto index : bucket.cacheGroups) stream << index << ",";
+                            stream << "\n            bool " << bucket.changedExpr << " = false;\n";
+                        }
+                    }
+                }
                 DeferredActivationEmitContext deferredActivationContext{
                     .groups = deferredActivationGroups.empty() ? nullptr : &deferredActivationGroups,
                     .boundaryFanoutByValue =
@@ -26361,7 +28160,7 @@ template<class Index>
                     }
                 }
                 std::optional<std::string> outerCommitEventExpr;
-                if ((model.localShiftDemandedBit || model.scalarConcatReduction) &&
+                if ((model.localShiftDemandedBit || model.scalarConcatReduction || model.indexedConcatSlice) &&
                     batch.phase == ScheduleBatch::Phase::kCompute)
                 {
                     for (std::size_t i = 0; i < supernodeOps.size(); ++i)
@@ -26374,10 +28173,19 @@ template<class Index>
                     collectDemandedBitSourceCacheCandidates(graph, model, supernodeOps, localExprContext);
                     collectPackedScalarConcatReductions(graph, model, supernodeOps, localExprContext);
                     collectPackedScalarConcatReductions(graph, model, supernodeOps, localExprContext, true);
+                    collectIndexedConcatSlices(graph, model, supernodeOps, localExprContext);
                     emitPackedScalarConcatInputs(stream, model, localExprContext);
                     emitPackedScalarConcatInputs(stream, model, localExprContext, true);
                 }
                 bool commitEventHandledByDispatch = false;
+                const ConditionalMuxPlan conditionalMuxPlan = batch.phase == ScheduleBatch::Phase::kCompute
+                    ? collectConditionalMuxCones(graph, model, schedule, supernodeId, supernodeOps, localExprContext)
+                    : ConditionalMuxPlan{};
+                const LocalPredicatePlan predicatePlan = batch.phase == ScheduleBatch::Phase::kCompute
+                    ? collectLocalPredicateSets(graph, model, schedule, supernodeId, supernodeOps, localExprContext, conditionalMuxPlan)
+                    : LocalPredicatePlan{};
+                if (batch.phase == ScheduleBatch::Phase::kCompute)
+                    emitLocalEqualityCaches(stream, graph, model, supernodeId, localExprContext);
                 std::optional<std::size_t> boolZeroGroupEnd;
                 const auto boolReduceIt = boolReducePlans.find(supernodeId);
                 const BoolProducerReducePlan *boolReducePlan =
@@ -26425,7 +28233,21 @@ template<class Index>
                         ++opIndex;
                         continue;
                     }
-                    if (priorityMuxPlan.absorbed.contains(opId))
+                    if (op.results().size() == 1)
+                        if (const auto view = model.coveredStateViews.find(op.results()[0]); view != model.coveredStateViews.end())
+                        {
+                            stream << "            // Covered state view: value=" << op.results()[0].index
+                                   << " source=" << view->second.source.index << " producer=" << view->second.producer
+                                   << " targets=" << view->second.consumers.size()
+                                   << " mode=" << (view->second.inlineValue ? "inline" : "notify") << "\n";
+                            if (view->second.composed)
+                                stream << "            // Composed state expression: value=" << op.results()[0].index
+                                       << " ops=" << view->second.expressionOps
+                                       << " mode=" << (view->second.inlineValue ? "inline" : "notify") << "\n";
+                            if (view->second.inlineValue) { ++opIndex; continue; }
+                        }
+                    if (priorityMuxPlan.absorbed.contains(opId) || conditionalMuxPlan.absorbed.contains(opId) ||
+                        predicatePlan.absorbed.contains(opId))
                     {
                         ++opIndex;
                         continue;
@@ -26461,6 +28283,22 @@ template<class Index>
                             continue;
                         }
                     }
+                    if (const auto predicate = predicatePlan.roots.find(opId); predicate != predicatePlan.roots.end())
+                    {
+                        emitLocalPredicateSet(stream, graph, model, op, predicate->second, localExprContext,
+                                              activationContext, deferredActivationContext);
+                        ++opIndex;
+                        continue;
+                    }
+                    if (const auto cone = conditionalMuxPlan.roots.find(opId); cone != conditionalMuxPlan.roots.end())
+                    {
+                        std::string error;
+                        if (!emitConditionalMuxCone(stream, graph, model, op, cone->second, localExprContext,
+                                                    activationContext, deferredActivationContext, error))
+                            return emitError(error, "conditional mux cone");
+                        ++opIndex;
+                        continue;
+                    }
                     if (const auto chain = priorityMuxPlan.roots.find(opId); chain != priorityMuxPlan.roots.end())
                     {
                         if (priorityMuxCommitDemandPlan != nullptr &&
@@ -26495,6 +28333,49 @@ template<class Index>
                             }
                             stream << ")) {\n";
                             boolZeroGroupEnd = group->end;
+                        }
+                    }
+                    if (batch.phase == ScheduleBatch::Phase::kCompute)
+                    {
+                        if (const auto member = model.sharedEqualityFamilyAnchors.find(opId);
+                            member != model.sharedEqualityFamilyAnchors.end())
+                        {
+                            if (member->second == opId)
+                            {
+                                const auto &family = model.sharedEqualityDecodes.at(opId);
+                                stream << "        // Shared equality family: source=" << family.source.index
+                                       << " predicates=" << family.ops.size() << "\n";
+                                emitSharedEqualityDecode(stream, graph, model, family, localExprContext,
+                                                         activationContext, deferredActivationContext);
+                            }
+                            ++opIndex;
+                            continue;
+                        }
+                        if (const auto lookup = model.localEqualityLookup.find(opId);
+                            lookup != model.localEqualityLookup.end())
+                        {
+                            emitLogicAssignFromScalarExpr(stream, graph, model, op.results()[0],
+                                "local_equality_table_" + std::to_string(lookup->second.first) + "_[" +
+                                std::to_string(lookup->second.second) + "u]", true,
+                                &localExprContext, &activationContext, &deferredActivationContext);
+                            ++opIndex;
+                            continue;
+                        }
+                        const std::size_t limit = nextConcatPrefixDecl < concatPrefixCacheDecls.size()
+                            ? concatPrefixCacheDecls[nextConcatPrefixDecl].firstUseIndex : supernodeOps.size();
+                        if (const auto *group = sharedEqualityDecodeAt(model, supernodeOps, opIndex, limit))
+                        {
+                            emitSharedEqualityDecode(stream, graph, model, *group, localExprContext,
+                                                     activationContext, deferredActivationContext);
+                            opIndex += group->ops.size();
+                            continue;
+                        }
+                        if (const auto group = findPackedScalarSlices(graph, model, supernodeOps,
+                                                                     opIndex, limit, localExprContext))
+                        {
+                            emitPackedScalarSlices(stream, model, *group, activationContext, deferredActivationContext);
+                            opIndex += 8u;
+                            continue;
                         }
                     }
                     if (isWritePortKind(op.kind()))
@@ -27141,6 +29022,8 @@ template<class Index>
                             }
                             else
                             {
+                                emitConditionalMuxChangeCacheMarks(stream, model, resultValue,
+                                                                   lhs + " != " + stateExpr, "            ", &activationContext);
                                 stream << "            " << lhs << " = " << stateExpr << ";\n";
                             }
                         }
@@ -27511,6 +29394,11 @@ template<class Index>
                                 stream << "            }\n";
                                 break;
                             }
+                        }
+                        if (emitIndexedConcatSliceOperation(stream, graph, model, op, localExprContext,
+                                                            &activationContext, &deferredActivationContext))
+                        {
+                            break;
                         }
                         if (emitPackedArrayLaneConcatOperation(stream, graph, model, op, &localExprContext, &activationContext))
                         {
@@ -27915,6 +29803,21 @@ template<class Index>
                     }
                     if (!fullpassVariant)
                     {
+                        for (const auto &bucket : conditionalMuxNotifyPlan.jointBuckets)
+                        {
+                            for (const auto index : bucket.deferredGroups)
+                            {
+                                const auto &expr = deferredActivationGroups[index].changedExpr;
+                                stream << "            " << expr << " = static_cast<bool>(" << expr
+                                       << " | " << bucket.changedExpr << ");\n";
+                            }
+                            for (const auto index : bucket.cacheGroups)
+                            {
+                                const auto &expr = conditionalMuxNotifyPlan.groups[index].changedExpr;
+                                stream << "            " << expr << " = static_cast<bool>(" << expr
+                                       << " | (" << bucket.changedExpr << "));\n";
+                            }
+                        }
                         // Merge before any predicate materialization, profile
                         // observation or final activation. Each original group
                         // retains its exact source set, including private ones.
@@ -27955,6 +29858,19 @@ template<class Index>
                                    << group.changedExpr << ";\n";
                             stream << "            const bool " << ready << " = " << materialized << ";\n";
                             group.changedExpr = ready;
+                        }
+                        for (std::size_t i = 0; i < conditionalMuxNotifyPlan.groups.size(); ++i)
+                        {
+                            const auto &group = conditionalMuxNotifyPlan.groups[i];
+                            stream << "            // Conditional mux notify group: producer=" << supernodeId
+                                   << " bucket=" << i << " sources=" << group.sources.size()
+                                   << " targets=" << group.targets.size() << " reuse=" << group.reuseDeferred << "\n";
+                            const std::string changed = group.reuseDeferred
+                                ? "(" + group.changedExpr + " | " + group.fallbackExpr + ")" : group.changedExpr;
+                            for (const auto target : group.targets)
+                                stream << "            conditional_mux_change_dirty_[" << target
+                                       << "u] = static_cast<bool>(conditional_mux_change_dirty_[" << target
+                                       << "u] | (" << changed << "));\n";
                         }
                         emitDeferredActivationFlushStatements(stream,
                                                               "supernode_active_curr_",
@@ -28571,7 +30487,7 @@ template<class Index>
                     if (!isCommitPhaseOp(op) && !isRegToMemIntentBypassOp(model, opId))
                         for (auto value : op.operands()) ++localContext.useCountByValue[value];
                 }
-                if (model.localShiftDemandedBit || model.scalarConcatReduction)
+                if (model.localShiftDemandedBit || model.scalarConcatReduction || model.indexedConcatSlice)
                 {
                     for (std::size_t i = 0; i < ops.size(); ++i)
                     {
@@ -28582,7 +30498,10 @@ template<class Index>
                     collectDemandedBitSourceCacheCandidates(graph, model, ops, localContext);
                     collectPackedScalarConcatReductions(graph, model, ops, localContext);
                     collectPackedScalarConcatReductions(graph, model, ops, localContext, true);
+                    collectIndexedConcatSlices(graph, model, ops, localContext);
                 }
+                const auto conditional = collectConditionalMuxCones(graph, model, schedule, id, ops, localContext);
+                const auto predicates = collectLocalPredicateSets(graph, model, schedule, id, ops, localContext, conditional);
                 const std::size_t activeId = model.activeIdBySupernode.at(id);
                 const ActivationEmitContext staticActivationContext{
                     .currentWordIndex = activeId / kActiveFlagBitsPerWord,
@@ -28698,7 +30617,49 @@ template<class Index>
                         ++features[feature]; entry.loweredOperations.push_back(op.id()); ++i;
                     };
                     if (isRegToMemIntentBypassOp(model, op.id())) { lowered("bypassed_operations"); continue; }
+                    if (op.results().size() == 1 && model.coveredStateViews.contains(op.results()[0]))
+                    {
+                        ++features["covered_state_view_notifications"];
+                        const auto &view = model.coveredStateViews.at(op.results()[0]);
+                        if (view.composed) ++features["covered_state_view_composition"];
+                        if (view.inlineValue) { lowered("covered_state_view_inlined_definitions"); continue; }
+                    }
                     if (priority.absorbed.contains(op.id())) { lowered("priority_absorbed_operations"); continue; }
+                    if (conditional.absorbed.contains(op.id())) { lowered("conditional_mux_absorbed_operations"); continue; }
+                    if (predicates.absorbed.contains(op.id())) { lowered("local_predicate_set_dead_operations"); continue; }
+                    if (const auto predicate = predicates.roots.find(op.id()); predicate != predicates.roots.end())
+                    {
+                        for (const auto &family : predicate->second.families)
+                        {
+                            features["local_predicate_set_constants"] += family.constants;
+                            features["local_predicate_set_intervals"] += family.intervals.size();
+                        }
+                        entry.unmodeledWork = "local predicate consumer intervals; no generic per-op cost";
+                        lowered("local_predicate_set_roots"); continue;
+                    }
+                    if (const auto cone = conditional.roots.find(op.id()); cone != conditional.roots.end())
+                    {
+                        entry.unmodeledWork = "conditional mux cones have selector-dependent execution";
+                        features["conditional_mux_true_operations_upper"] += cone->second.arms[0].size();
+                        features["conditional_mux_false_operations_upper"] += cone->second.arms[1].size();
+                        for (const auto &arm : cone->second.arms)
+                            for (auto member : arm)
+                                if (opNeedsWordLogicEmit(graph, graph.getOperation(member)))
+                                    ++features["conditional_mux_wide_operations_upper"];
+                        if (const auto cache = model.conditionalMuxInputCaches.find(op.id()); cache != model.conditionalMuxInputCaches.end())
+                        {
+                            ++features["conditional_mux_input_cache_roots"];
+                            features["conditional_mux_input_cache_keys"] += cache->second.inputs.size();
+                            entry.unmodeledWork = "conditional mux cache has input-change-dependent execution";
+                        }
+                        if (const auto cache = model.conditionalMuxChangeCaches.find(op.id()); cache != model.conditionalMuxChangeCaches.end())
+                        {
+                            ++features["conditional_mux_change_cache_roots"];
+                            features["conditional_mux_change_cache_sources"] += cache->second.sources.size();
+                            entry.unmodeledWork = "conditional mux change-trigger cache has producer-change-dependent execution";
+                        }
+                        lowered("conditional_mux_roots"); continue;
+                    }
                     if (op.results().size() == 1 && model.directInvertedBoolStateValues.contains(op.results()[0]))
                     { lowered("inverted_state_view_operations"); continue; }
                     if (const auto loop = reduce.loops.find(i); loop != reduce.loops.end())
@@ -28732,6 +30693,47 @@ template<class Index>
                         }
                         else ++features["priority_branch_roots"];
                         lowered("priority_roots"); continue;
+                    }
+                    const auto prefix = std::find_if(prefixDecls.begin(), prefixDecls.end(),
+                        [&](const auto &decl) { return decl.firstUseIndex > i; });
+                    const std::size_t sliceLimit = prefix == prefixDecls.end() ? ops.size() : prefix->firstUseIndex;
+                    if (const auto member = model.sharedEqualityFamilyAnchors.find(op.id());
+                        member != model.sharedEqualityFamilyAnchors.end())
+                    {
+                        if (member->second == op.id())
+                        {
+                            ++features["shared_equality_family_groups"];
+                            ++features["shared_equality_decode_groups"];
+                        }
+                        ++features["shared_equality_decode_predicates"];
+                        entry.unmodeledWork = "shared equality family has address-dependent sparse updates";
+                        lowered("shared_equality_family_predicates"); continue;
+                    }
+                    if (const auto local = model.localEqualityLookup.find(op.id()); local != model.localEqualityLookup.end())
+                    {
+                        const auto &decode = model.localEqualityDecodes[local->second.first];
+                        if (decode.ops.front() == op.id())
+                        {
+                            ++features["local_equality_decode_groups"];
+                            features["local_equality_decode_table_entries"] += decode.entries;
+                        }
+                        entry.unmodeledWork = "local equality decode has source-dependent sparse updates";
+                        lowered("local_equality_decode_predicates"); continue;
+                    }
+                    if (const auto *decode = sharedEqualityDecodeAt(model, ops, i, sliceLimit))
+                    {
+                        ++features["shared_equality_decode_groups"];
+                        features["shared_equality_decode_predicates"] += decode->ops.size();
+                        entry.unmodeledWork = "shared equality decode has address-dependent sparse updates";
+                        for (std::size_t n = 0; n < decode->ops.size(); ++n) entry.loweredOperations.push_back(ops[i++]);
+                        continue;
+                    }
+                    if (const auto slices = findPackedScalarSlices(graph, model, ops, i, sliceLimit, localContext))
+                    {
+                        ++features["packed_scalar_slice_groups"];
+                        features["packed_scalar_slice_values"] += 8u;
+                        for (std::size_t n = 0; n < 8u; ++n) entry.loweredOperations.push_back(ops[i++]);
+                        continue;
                     }
                     // The following cases mirror the order in emitWordLogic
                     // and the scalar assignment path. They record the chosen
@@ -28779,6 +30781,9 @@ template<class Index>
                             const bool inlineable = expr && canInlineSingleUserLocalValue(
                                 graph, model, result, *expr, SupernodeLocalExprKind::kScalarInline, &localContext);
                             addShape(inlineable ? "constant.scalar_inline" : "constant.scalar_temporary");
+                            if (expr && isScalarLogicValue(graph, result))
+                                recordSupernodeLocalExprRef(graph, result, *expr,
+                                    SupernodeLocalExprKind::kScalarInline, &localContext);
                         }
                         classifyStoredResult(result, "constant.result");
                         classified = true;
@@ -28806,6 +30811,17 @@ template<class Index>
                                     "grhsim_changed_" + std::to_string(result.index));
                         }
                         classifyStoredResult(result, "state_read.result");
+                        if (!isMaterializedValue(model, result) && isScalarLogicValue(graph, result) &&
+                            !model.directStateReadSymbolByValue.contains(result))
+                        {
+                            const auto symbol = getAttribute<std::string>(op,
+                                op.kind() == OperationKind::kRegisterReadPort ? "regSymbol" : "latchSymbol");
+                            if (symbol && model.stateBySymbol.contains(*symbol))
+                                tryRecordSupernodeInlineExpr(graph, model, result,
+                                    renderScalarAssignedExpr(graph, result, "static_cast<std::uint64_t>(" +
+                                        resolvedStateRefExpr(model.stateBySymbol.at(*symbol), &localContext) + ")", true, false),
+                                    SupernodeLocalExprKind::kScalarInline, &localContext);
+                        }
                         classified = true;
                     }
                     if (result.valid() && op.kind() == OperationKind::kMemoryReadPort && !op.operands().empty())
@@ -28832,7 +30848,17 @@ template<class Index>
                             !isEventValue(model, result) && !isMaterializedValue(model, result) &&
                             !valueNeedsTrackedChange(model, result, &staticActivationContext) &&
                             !localContext.storedValueRefByValue.contains(result);
-                        if (op.kind() == OperationKind::kConcat && localContext.packedShortConcatReductions.contains(result))
+                        if (op.kind() == OperationKind::kConcat && localContext.indexedConcatSlices.contains(result))
+                        {
+                            addShape("wide.indexed_concat_view");
+                        }
+                        else if (op.kind() == OperationKind::kSliceDynamic && operands.size() == 2u &&
+                                 localContext.indexedConcatSlices.contains(operands[0]))
+                        {
+                            addShape("scalar.indexed_concat_slice");
+                            classifyStoredResult(result, "scalar.result");
+                        }
+                        else if (op.kind() == OperationKind::kConcat && localContext.packedShortConcatReductions.contains(result))
                         {
                             addShape("scalar.short_reduction_concat_elided");
                         }
@@ -29039,6 +31065,13 @@ template<class Index>
                                     // make ordinary operators disappear.
                                     addShape(rhs.byteBitResult ? "scalar.byte_bool" :
                                         (helperCalls != 0 ? "scalar.helper_expr" : "scalar.native_expr"));
+                                    // Later packed-slice matching must see the
+                                    // same inlined expression leaves as codegen.
+                                    if (!isMaterializedValue(model, result))
+                                        tryRecordSupernodeInlineExpr(graph, model, result,
+                                            renderScalarAssignedExpr(graph, result, rhs.expr,
+                                                rhs.alreadyBoundedToResultWidth, rhs.byteBitResult),
+                                            SupernodeLocalExprKind::kScalarInline, &localContext);
                                 }
                             }
                             classifyStoredResult(result, "scalar.result");
@@ -29526,6 +31559,14 @@ template<class Index>
             parseBooleanEmitOption(options,
                                    "direct_bool_state_views",
                                    "WOLVRIX_GRHSIM_DIRECT_BOOL_STATE_VIEWS");
+        const bool coveredStateViewNotifications = parseBooleanEmitOption(options,
+            "covered_state_view_notifications", "WOLVRIX_GRHSIM_COVERED_STATE_VIEW_NOTIFICATIONS", false);
+        const bool coveredStateViewInline = parseBooleanEmitOption(options,
+            "covered_state_view_inline", "WOLVRIX_GRHSIM_COVERED_STATE_VIEW_INLINE", false);
+        const bool coveredStateViewComposition = parseBooleanEmitOption(options,
+            "covered_state_view_composition", "WOLVRIX_GRHSIM_COVERED_STATE_VIEW_COMPOSITION", false);
+        const bool coveredStateViewCompositionInline = parseBooleanEmitOption(options,
+            "covered_state_view_composition_inline", "WOLVRIX_GRHSIM_COVERED_STATE_VIEW_COMPOSITION_INLINE", false);
         const bool fullActiveWordConsume =
             parseBooleanEmitOption(options,
                                    "full_active_word_consume",
@@ -29578,6 +31619,11 @@ template<class Index>
             parseBooleanEmitOption(options,
                                    "bool_producer_reduce",
                                    "WOLVRIX_GRHSIM_BOOL_PRODUCER_REDUCE");
+        const bool packedScalarSlices =
+            parseBooleanEmitOption(options,
+                                   "packed_scalar_slices",
+                                   "WOLVRIX_GRHSIM_PACKED_SCALAR_SLICES",
+                                   true);
         const bool inputBitActivation =
             parseBooleanEmitOption(options,
                                    "input_bit_activation",
@@ -29617,6 +31663,34 @@ template<class Index>
             parseBooleanEmitOption(options,
                                    "staged_scalar_concat",
                                    "WOLVRIX_GRHSIM_STAGED_SCALAR_CONCAT");
+        const bool indexedConcatSlice =
+            parseBooleanEmitOption(options,
+                                   "indexed_concat_slice",
+                                   "WOLVRIX_GRHSIM_INDEXED_CONCAT_SLICE",
+                                   true);
+        const bool indexedConcatWideConstants =
+            parseBooleanEmitOption(options, "indexed_concat_wide_constants",
+                                   "WOLVRIX_GRHSIM_INDEXED_CONCAT_WIDE_CONSTANTS", false);
+        const bool sharedEqualityDecode =
+            parseBooleanEmitOption(options, "shared_equality_decode", "WOLVRIX_GRHSIM_SHARED_EQUALITY_DECODE", true);
+        const bool sharedEqualityFamilies =
+            parseBooleanEmitOption(options, "shared_equality_families", "WOLVRIX_GRHSIM_SHARED_EQUALITY_FAMILIES", false);
+        const bool localEqualityDecode =
+            parseBooleanEmitOption(options, "local_equality_decode", "WOLVRIX_GRHSIM_LOCAL_EQUALITY_DECODE", false);
+        const bool conditionalMuxCones =
+            parseBooleanEmitOption(options, "conditional_mux_cones", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_CONES", false);
+        const bool conditionalMuxWide =
+            parseBooleanEmitOption(options, "conditional_mux_wide", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_WIDE", false);
+        const bool localPredicateSets =
+            parseBooleanEmitOption(options, "local_predicate_sets", "WOLVRIX_GRHSIM_LOCAL_PREDICATE_SETS", false);
+        const bool conditionalMuxInputCache =
+            parseBooleanEmitOption(options, "conditional_mux_input_cache", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_INPUT_CACHE", false);
+        const bool conditionalMuxChangeCache =
+            parseBooleanEmitOption(options, "conditional_mux_change_cache", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_CHANGE_CACHE", false);
+        const bool conditionalMuxChangeGrouped =
+            parseBooleanEmitOption(options, "conditional_mux_change_grouped", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_CHANGE_GROUPED", false);
+        const bool conditionalMuxChangeJoint =
+            parseBooleanEmitOption(options, "conditional_mux_change_joint", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_CHANGE_JOINT", false);
         const bool scalarConcatReduction =
             parseBooleanEmitOption(options,
                                    "scalar_concat_reduction",
@@ -29999,9 +32073,26 @@ template<class Index>
             configuredModel.boolEagerLogic = boolEagerLogic;
             configuredModel.boolZeroGroupGuard = boolZeroGroupGuard;
             configuredModel.boolProducerReduce = boolProducerReduce;
+            configuredModel.packedScalarSlices = packedScalarSlices;
             configuredModel.directBoolStateViews = directBoolStateViews;
+            configuredModel.coveredStateViewNotifications = coveredStateViewNotifications;
+            configuredModel.coveredStateViewInline = coveredStateViewInline;
+            configuredModel.coveredStateViewComposition = coveredStateViewComposition;
+            configuredModel.coveredStateViewCompositionInline = coveredStateViewCompositionInline;
             configuredModel.scalarLeafMuxUnpredictable = scalarLeafMuxUnpredictable;
             configuredModel.stagedScalarConcat = stagedScalarConcat;
+            configuredModel.indexedConcatSlice = indexedConcatSlice;
+            configuredModel.indexedConcatWideConstants = indexedConcatWideConstants;
+            configuredModel.sharedEqualityDecode = sharedEqualityDecode;
+            configuredModel.sharedEqualityFamilies = sharedEqualityFamilies;
+            configuredModel.localEqualityDecode = localEqualityDecode;
+            configuredModel.conditionalMuxCones = conditionalMuxCones;
+            configuredModel.conditionalMuxWide = conditionalMuxWide;
+            configuredModel.localPredicateSets = localPredicateSets;
+            configuredModel.conditionalMuxInputCache = conditionalMuxInputCache;
+            configuredModel.conditionalMuxChangeCache = conditionalMuxChangeCache;
+            configuredModel.conditionalMuxChangeGrouped = conditionalMuxChangeGrouped;
+            configuredModel.conditionalMuxChangeJoint = conditionalMuxChangeJoint;
             configuredModel.scalarConcatReduction = scalarConcatReduction;
             configuredModel.scalarConcatReductionMasks = scalarConcatReductionMasks;
             configuredModel.shortConcatReductionMasks = shortConcatReductionMasks;
@@ -30306,6 +32397,22 @@ template<class Index>
                                          schedule.commitLocalityGroupOrder);
         rebuildMaterializedValueStorage(graph, batchReadLocalityValueOrder, model);
         buildProvedZeroWideStorage(graph, model);
+        buildSharedEqualityDecodes(graph, schedule, model);
+        buildLocalEqualityDecodes(graph, schedule, model);
+        buildConditionalMuxInputCaches(graph, schedule, model);
+        if (model.coveredStateViewNotifications && !sameBatchActivationCohortRequested && !deferredActivationCofireProbeRequested &&
+            !deferredActivationCofireStrictRequested && *activeMaskGapPackPolicy == ActiveMaskGapPackPolicy::kOff)
+        {
+            std::unordered_set<uint32_t> guardedGroups;
+            if (model.pureEventComputeWordBypass)
+                for (const auto &batch : scheduleBatches)
+                    for (const auto &word : batch.words)
+                        if (eligiblePureEventComputeWordExpr(graph, model, schedule, batch, word, true))
+                            guardedGroups.insert(word.supernodeIds.begin(), word.supernodeIds.end());
+            buildCoveredStateViews(graph, schedule, waveformValueIds, guardedGroups, model);
+            if (model.coveredStateViewInline && !model.coveredStateViews.empty())
+                rebuildMaterializedValueStorage(graph, batchReadLocalityValueOrder, model);
+        }
         if (sameBatchActivationCohortRequested)
         {
             std::vector<SameBatchActivationCohort> cohorts;
@@ -31495,6 +33602,39 @@ inline std::array<std::uint64_t, std::tuple_size_v<Words>> grhsim_gray_decode_wo
             *stream << "#define GRHSIM_ALWAYS_INLINE inline\n";
             *stream << "#endif\n";
             *stream << "#endif\n\n";
+            if (model.packedScalarSlices)
+            {
+                *stream << R"GRHSIM(
+inline constexpr bool grhsim_scalar_slice_bytes_supported =
+    sizeof(bool) == 1 && sizeof(std::uint64_t) == 8 && std::endian::native == std::endian::little &&
+    std::bit_cast<std::array<unsigned char, sizeof(bool)>>(true)[0] == 1 &&
+    std::bit_cast<std::array<unsigned char, sizeof(bool)>>(false)[0] == 0;
+
+template <bool Portable, std::size_t... Bits>
+GRHSIM_ALWAYS_INLINE std::uint64_t grhsim_store_scalar_slices(bool *dest, std::uint64_t source)
+{
+    static_assert(sizeof...(Bits) == 8 && ((Bits < 64u) && ...));
+    const std::array<bool, 8> next{static_cast<bool>((source >> Bits) & UINT64_C(1))...};
+    if constexpr (!Portable && grhsim_scalar_slice_bytes_supported) {
+        std::uint64_t oldBytes, newBytes;
+        // Exactly eight real adjacent bool objects. memcpy avoids aliasing
+        // and alignment assumptions, and next contains canonical bool values.
+        std::memcpy(&oldBytes, dest, sizeof(oldBytes));
+        std::memcpy(&newBytes, next.data(), sizeof(newBytes));
+        std::memcpy(dest, next.data(), sizeof(newBytes));
+        return oldBytes ^ newBytes;
+    } else {
+        std::uint64_t changes = 0;
+        for (std::size_t i = 0; i < next.size(); ++i) {
+            if (dest[i] != next[i]) changes |= UINT64_C(0xff) << (i * 8u);
+            dest[i] = next[i];
+        }
+        return changes;
+    }
+}
+
+)GRHSIM";
+            }
             if (model.wordwiseWideConcatBoolPack)
             {
                 *stream << R"GRHSIM(
@@ -32750,6 +34890,21 @@ inline std::size_t grhsim_index_words(const std::array<std::uint64_t, N> &value,
         return cap;
     }
     return static_cast<std::size_t>(value[0]);
+}
+
+template <std::size_t SourceWidth, std::size_t SliceWidth, typename Index, typename ReadWord>
+GRHSIM_ALWAYS_INLINE std::uint64_t grhsim_indexed_concat_slice(const Index &index, const ReadWord &readWord)
+{
+    static_assert(SliceWidth > 0 && SliceWidth <= 64);
+    const std::size_t start = grhsim_index_words(index, SourceWidth);
+    if (unlikely(start >= SourceWidth)) return UINT64_C(0);
+    const std::size_t word = start / 64u;
+    const std::size_t shift = start % 64u;
+    std::uint64_t result = readWord(word) >> shift;
+    if (shift != 0u && shift + SliceWidth > 64u)
+        result |= readWord(word + 1u) << (64u - shift);
+    if constexpr (SliceWidth < 64u) result &= (UINT64_C(1) << SliceWidth) - 1u;
+    return result;
 }
 
 template <typename T>
@@ -35309,6 +37464,27 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "                               bool deferred);\n\n";
             }
             *stream << "    bool first_eval_ = true;\n";
+            if (!model.conditionalMuxInputCaches.empty())
+            {
+                *stream << "    std::array<std::array<std::uint64_t, 4>, " << model.conditionalMuxInputCaches.size()
+                        << "> conditional_mux_cache_inputs_{};\n"
+                        << "    std::array<bool, " << model.conditionalMuxInputCaches.size() << "> conditional_mux_cache_valid_{};\n";
+            }
+            if (!model.conditionalMuxChangeCaches.empty())
+                *stream << "    std::array<bool, " << model.conditionalMuxChangeCaches.size()
+                        << "> conditional_mux_change_dirty_{};\n";
+            if (!model.sharedEqualityDecodes.empty())
+            {
+                *stream << "    struct shared_equality_cache { std::uint16_t previous = 0; bool valid = false; };\n";
+                *stream << "    std::array<shared_equality_cache, " << model.sharedEqualityDecodes.size()
+                        << "> shared_equality_cache_{};\n";
+            }
+            for (std::size_t i = 0; i < model.localEqualityDecodes.size(); ++i)
+                // Preserve the 0/1 contract across function boundaries. Byte
+                // storage would require normalizing every table read again.
+                *stream << "    std::array<bool, " << model.localEqualityDecodes[i].entries
+                        << "> local_equality_table_" << i << "_{};\n"
+                        << "    std::uint64_t local_equality_previous_" << i << "_ = UINT64_MAX;\n";
             *stream << "    bool event_baseline_initialized_ = false;\n";
             if (model.producerDirtyWordBankCount != 0)
             {
@@ -38554,6 +40730,16 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     *stream << "    batch_trigger_bitmap_fallback_.fill(UINT64_C(0));\n";
                 }
                 *stream << "    first_eval_ = true;\n";
+                if (!model.conditionalMuxInputCaches.empty())
+                    *stream << "    for (auto &keys : conditional_mux_cache_inputs_) keys.fill(UINT64_C(0));\n"
+                            << "    conditional_mux_cache_valid_.fill(false);\n";
+                if (!model.conditionalMuxChangeCaches.empty())
+                    *stream << "    conditional_mux_change_dirty_.fill(true);\n";
+                if (!model.sharedEqualityDecodes.empty())
+                    *stream << "    shared_equality_cache_.fill({});\n";
+                for (std::size_t i = 0; i < model.localEqualityDecodes.size(); ++i)
+                    *stream << "    local_equality_table_" << i << "_.fill(false);\n"
+                            << "    local_equality_previous_" << i << "_ = UINT64_MAX;\n";
                 *stream << "    event_baseline_initialized_ = false;\n";
                 *stream << "    register_write_conflict_ = false;\n";
                 break;
@@ -39196,6 +41382,19 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 std::vector<std::pair<std::string, std::string>> deltas;
                 std::unordered_set<std::string> deltaNames;
                 const auto &inputs = inputSeedValues.at(supernodes);
+                if (model.conditionalMuxChangeCache)
+                {
+                    for (const ValueId input : inputs)
+                    {
+                        const auto dirty = model.conditionalMuxChangeByInput.find(input);
+                        if (dirty == model.conditionalMuxChangeByInput.end()) continue;
+                        *stream << "        if (" << inputChangedExpr(input, model.inputFieldByValue.at(input),
+                                                                       model.prevInputFieldByValue.at(input)) << ") {\n";
+                        for (const std::size_t index : dirty->second)
+                            *stream << "            conditional_mux_change_dirty_[" << index << "u] = true;\n";
+                        *stream << "        }\n";
+                    }
+                }
                 const auto maskFor = [&](ValueId input, uint32_t head) -> const InputBitMask *
                 {
                     // Preserve the old activation behavior: dependency masks

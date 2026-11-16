@@ -14,6 +14,8 @@
 #include "transform/memory_read_retime.hpp"
 #include "transform/memory_write_coalesce.hpp"
 #include "transform/multidriven_guard.hpp"
+#include "transform/predicate_set.hpp"
+#include "transform/slice_demand.hpp"
 #include "transform/reg_to_mem.hpp"
 #include "transform/repcut.hpp"
 #include "transform/simplify.hpp"
@@ -416,6 +418,8 @@ namespace wolvrix::lib::transform
             "comb-lane-pack",
             "comb-loop-elim",
             "dead-code-elim",
+            "predicate-set",
+            "slice-demand",
             "activity-schedule",
             "latch-transparent-read",
             "memory-read-retime",
@@ -1281,6 +1285,28 @@ namespace wolvrix::lib::transform
                         error = "invalid -split-oversize-compute-nodes value";
                         return nullptr;
                     }
+                }
+                else if (arg == "-event-regions")
+                {
+                    if (!parseBoolArg("-event-regions", options.eventRegions)) return nullptr;
+                }
+                else if (arg.starts_with("-event-regions="))
+                {
+                    const auto text = arg.substr(std::string_view("-event-regions=").size());
+                    if (text == "true" || text == "1" || text == "on") options.eventRegions = true;
+                    else if (text == "false" || text == "0" || text == "off") options.eventRegions = false;
+                    else { error = "invalid -event-regions value"; return nullptr; }
+                }
+                else if (arg == "-event-regions-shared")
+                {
+                    if (!parseBoolArg("-event-regions-shared", options.eventRegionsShared)) return nullptr;
+                }
+                else if (arg.starts_with("-event-regions-shared="))
+                {
+                    const auto text = arg.substr(std::string_view("-event-regions-shared=").size());
+                    if (text == "true" || text == "1" || text == "on") options.eventRegionsShared = true;
+                    else if (text == "false" || text == "0" || text == "off") options.eventRegionsShared = false;
+                    else { error = "invalid -event-regions-shared value"; return nullptr; }
                 }
                 else if (arg == "-declared-value-compute-node-boundary")
                 {
@@ -2227,6 +2253,36 @@ namespace wolvrix::lib::transform
                 }
             }
             return std::make_unique<SimplifyPass>(options);
+        }
+        if (normalized == "slice-demand")
+        {
+            SliceDemandOptions options;
+            if (!args.empty())
+            {
+                if (args.size() != 2 || args[0] != "-semantics" ||
+                    (args[1] != "2state" && args[1] != "4state"))
+                {
+                    error = "slice-demand accepts -semantics 2state|4state";
+                    return nullptr;
+                }
+                options.twoState = args[1] == "2state";
+            }
+            return std::make_unique<SliceDemandPass>(options);
+        }
+        if (normalized == "predicate-set")
+        {
+            PredicateSetOptions options;
+            if (!args.empty())
+            {
+                if (args.size() != 2 || args[0] != "-semantics" ||
+                    (args[1] != "2state" && args[1] != "4state"))
+                {
+                    error = "predicate-set accepts -semantics 2state|4state";
+                    return nullptr;
+                }
+                options.twoState = args[1] == "2state";
+            }
+            return std::make_unique<PredicateSetPass>(options);
         }
         if (normalized == "dead-code-elim")
         {

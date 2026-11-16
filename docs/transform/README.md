@@ -44,6 +44,8 @@ with wolvrix.Session() as sess:
 | [`mem-to-reg`](mem-to-reg.md) | lower selected small memories to row registers | expose register boundaries before partitioning |
 | [`repcut`](repcut.md) | partition one graph with RepCut | large-graph partitioning |
 | [`simplify`](simplify.md) | run standard IR simplifications | general cleanup and optimization |
+| [`predicate-set`](predicate-set.md) | experimental same-source equality-consumer interval fusion | explicit two-state optimization before activity scheduling; excluded from defaults |
+| [`slice-demand`](slice-demand.md) | experimental narrow windows of sparse wide logical shifts | explicit two-state optimization before activity scheduling; excluded from defaults |
 | [`stats`](stats.md) | collect design statistics | analysis and debugging |
 
 ## Internal Passes Used By `simplify`

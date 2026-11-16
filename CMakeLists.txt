@@ -123,6 +123,8 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/demo_stats.cpp
     lib/transform/const_fold.cpp
     lib/transform/redundant_elim.cpp
+    lib/transform/predicate_set.cpp
+    lib/transform/slice_demand.cpp
     lib/transform/dead_code_elim.cpp
     lib/transform/simplify.cpp
     lib/transform/memory_init_check.cpp
@@ -489,6 +491,45 @@ target_compile_definitions(emit-grhsim-cpp-input-bit-activation
     PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
 )
 register_test_exe(emit-grhsim-cpp-input-bit-activation)
+add_executable(emit-grhsim-event-regions tests/emit/test_emit_grhsim_event_regions.cpp)
+target_link_libraries(emit-grhsim-event-regions PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-event-regions PRIVATE
+    WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
+register_test_exe(emit-grhsim-event-regions)
+add_executable(emit-grhsim-conditional-mux tests/emit/test_emit_grhsim_conditional_mux.cpp)
+target_link_libraries(emit-grhsim-conditional-mux PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-conditional-mux PRIVATE
+    WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
+register_test_exe(emit-grhsim-conditional-mux)
+add_executable(emit-grhsim-consumer-structure tests/emit/test_emit_grhsim_consumer_structure.cpp)
+target_link_libraries(emit-grhsim-consumer-structure PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-consumer-structure PRIVATE
+    WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
+add_test(NAME emit-grhsim-conditional-wide COMMAND emit-grhsim-consumer-structure wide)
+add_test(NAME emit-grhsim-local-predicate-sets COMMAND emit-grhsim-consumer-structure predicates)
+add_executable(emit-grhsim-covered-state-views tests/emit/test_emit_grhsim_covered_state_views.cpp)
+target_link_libraries(emit-grhsim-covered-state-views PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-covered-state-views PRIVATE
+    WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
+register_test_exe(emit-grhsim-covered-state-views)
+add_test(NAME emit-grhsim-state-expressions COMMAND emit-grhsim-covered-state-views)
+set_tests_properties(emit-grhsim-state-expressions PROPERTIES ENVIRONMENT "WOLVRIX_TEST_STATE_EXPRESSIONS=1")
+add_test(NAME emit-grhsim-compute-entry-guard COMMAND emit-grhsim-covered-state-views)
+set_tests_properties(emit-grhsim-compute-entry-guard PROPERTIES ENVIRONMENT "WOLVRIX_TEST_COMPUTE_ENTRY_GUARD=1")
+add_test(NAME emit-grhsim-mux-input-cache COMMAND emit-grhsim-conditional-mux)
+set_tests_properties(emit-grhsim-mux-input-cache
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_MUX_INPUT_CACHE=1")
+add_test(NAME emit-grhsim-mux-change-cache COMMAND emit-grhsim-conditional-mux)
+set_tests_properties(emit-grhsim-mux-change-cache
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_MUX_CHANGE_CACHE=1")
+add_test(NAME emit-grhsim-mux-grouped-notify COMMAND emit-grhsim-conditional-mux)
+set_tests_properties(emit-grhsim-mux-grouped-notify PROPERTIES ENVIRONMENT "WOLVRIX_TEST_MUX_GROUPED_NOTIFY=1")
+add_test(NAME emit-grhsim-mux-joint-notify COMMAND emit-grhsim-conditional-mux)
+set_tests_properties(emit-grhsim-mux-joint-notify PROPERTIES ENVIRONMENT "WOLVRIX_TEST_MUX_JOINT_NOTIFY=1")
 add_test(NAME emit-grhsim-cpp-bool-producer-reduce COMMAND emit-grhsim-cpp)
 set_tests_properties(emit-grhsim-cpp-bool-producer-reduce
     PROPERTIES ENVIRONMENT "WOLVRIX_TEST_BOOL_PRODUCER_REDUCE=1")
@@ -498,6 +539,21 @@ set_tests_properties(emit-grhsim-cpp-direct-bool-state-view
 add_test(NAME emit-grhsim-cpp-bool-zero-group-guard COMMAND emit-grhsim-cpp)
 set_tests_properties(emit-grhsim-cpp-bool-zero-group-guard
     PROPERTIES ENVIRONMENT "WOLVRIX_TEST_BOOL_ZERO_GROUP_GUARD=1")
+add_test(NAME emit-grhsim-cpp-shared-equality-decode COMMAND emit-grhsim-cpp)
+add_test(NAME emit-grhsim-cpp-shared-equality-families COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-shared-equality-families
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SHARED_EQUALITY_FAMILIES=1")
+set_tests_properties(emit-grhsim-cpp-shared-equality-decode
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SHARED_EQUALITY_DECODE=1")
+add_test(NAME emit-grhsim-cpp-local-equality-decode COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-local-equality-decode
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_LOCAL_EQUALITY_DECODE=1")
+add_test(NAME emit-grhsim-cpp-packed-scalar-slices COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-packed-scalar-slices
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_PACKED_SCALAR_SLICES=1")
+add_test(NAME emit-grhsim-cpp-indexed-concat-slice COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-indexed-concat-slice
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_INDEXED_CONCAT_SLICE=1")
 add_test(NAME emit-grhsim-cpp-scalar-concat-reduction COMMAND emit-grhsim-cpp)
 set_tests_properties(emit-grhsim-cpp-scalar-concat-reduction
     PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SCALAR_CONCAT_REDUCTION=1")
@@ -678,6 +734,24 @@ target_link_libraries(transform-redundant-elim
 )
 
 register_test_exe(transform-redundant-elim)
+
+add_executable(transform-concat-slices tests/transform/test_concat_slice_coalescing.cpp)
+target_link_libraries(transform-concat-slices PRIVATE wolvrix-lib)
+register_test_exe(transform-concat-slices)
+
+add_executable(transform-predicate-set tests/transform/test_predicate_set.cpp)
+target_link_libraries(transform-predicate-set PRIVATE wolvrix-lib)
+target_compile_definitions(transform-predicate-set PRIVATE
+    WOLF_PREDICATE_ARTIFACT_DIR="${CMAKE_CURRENT_BINARY_DIR}/artifacts/predicate-set"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
+register_test_exe(transform-predicate-set)
+
+add_executable(transform-slice-demand tests/transform/test_slice_demand.cpp)
+target_link_libraries(transform-slice-demand PRIVATE wolvrix-lib)
+target_compile_definitions(transform-slice-demand PRIVATE
+    WOLF_SLICE_DEMAND_ARTIFACT_DIR="${CMAKE_CURRENT_BINARY_DIR}/artifacts/slice-demand"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
+register_test_exe(transform-slice-demand)
 
 add_executable(transform-simplify
     tests/transform/test_simplify_pass.cpp

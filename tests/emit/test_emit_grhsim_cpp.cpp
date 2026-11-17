@@ -12131,6 +12131,11 @@ int main() {
     {
         constexpr const char *key = "WOLVRIX_GRHSIM_INDEXED_CONCAT_SLICE";
         constexpr const char *paddingKey = "WOLVRIX_GRHSIM_INDEXED_CONCAT_WIDE_CONSTANTS";
+        constexpr const char *snapshotKey = "WOLVRIX_GRHSIM_INDEXED_CONCAT_SNAPSHOT_ARRAY";
+        const bool snapshotTesting = std::getenv("WOLVRIX_TEST_INDEXED_SNAPSHOT_ARRAY") != nullptr;
+        const char *oldSnapshot = std::getenv(snapshotKey);
+        const std::optional<std::string> savedSnapshot = oldSnapshot ? std::optional<std::string>(oldSnapshot) : std::nullopt;
+        ::unsetenv(snapshotKey);
         const char *previous = std::getenv(key);
         const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
         const char *previousPadding = std::getenv(paddingKey);
@@ -12162,6 +12167,18 @@ int main() {
         cases.push_back({{65, 5, 129, 1, 97}, 1, 10, false});
         cases.push_back({{129, 63, 65}, 63, 11, true});
         cases.push_back({{129, 64, 64}, 32, 12, false}); // Unknown padding must fall back.
+        std::size_t extraViews = 0;
+        if (snapshotTesting)
+        {
+            for (int32_t lane : {1, 3, 7, 8, 16, 29, 32, 63, 64})
+                for (int32_t result : {1, 32, 64})
+                {
+                    cases.push_back({std::vector<int32_t>((256 + lane - 1) / lane, lane), result, 8, result != 32});
+                    ++extraViews;
+                }
+            // Identical operands must not create a larger eager snapshot array.
+            cases.push_back({std::vector<int32_t>(256, 1), 1, 13, false}); ++extraViews;
+        }
         std::ostringstream setup, checks;
         for (std::size_t c = 0; c < cases.size(); ++c)
         {
@@ -12203,18 +12220,19 @@ int main() {
                     setup << "sim." << name << "=static_cast<decltype(sim." << name << ")>(random()"
                           << (width == 1 ? "&1u" : "") << ");\n";
                 else if (!wideConstant) setup << "for(auto &w:sim." << name << ") w=random();\n";
-                if (test.kind == 8)
+                if (test.kind == 8 || test.kind == 13)
                 {
                     const auto local = makeLogicValue(graph, name + "_local", width);
                     const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol(name + "_not"));
                     graph.addOperand(op, value); graph.addResult(op, local); nodes[0].push_back(op);
                     value = local;
                 }
+                if (test.kind == 13 && i != 0) value = operands.front();
                 operands.push_back(value);
                 setup << "cursor" << c << "-=" << width << ";for(unsigned b=0;b<" << width << ";++b) bits"
-                      << c << "[cursor" << c << "+b]=" << (test.kind == 8 ? "!(" : "(");
+                      << c << "[cursor" << c << "+b]=" << (test.kind == 8 || test.kind == 13 ? "!(" : "(");
                 if (wideConstant) setup << expectedBit;
-                else if (width <= 64) setup << "(static_cast<std::uint64_t>(sim." << name << ")>>b)&1u";
+                else if (width <= 64) setup << "(static_cast<std::uint64_t>(sim." << (test.kind == 13 ? prefix + "_in0" : name) << ")>>b)&1u";
                 else setup << "(sim." << name << "[b/64]>>(b%64))&1u";
                 setup << ");\n";
             }
@@ -12332,17 +12350,29 @@ int main() {
         setActivityScheduleFixtureSlot(session, "value_fanout", std::move(fanout));
         setActivityScheduleFixtureSlot(session, "topo_order", ActivityScheduleTopoOrder{0u, 1u, 2u});
         setActivityScheduleFixtureSlot(session, "state_read_supernodes", std::move(readers));
-        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_indexed_concat_slice";
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+            (snapshotTesting ? "grhsim_cpp_indexed_snapshot_array" : "grhsim_cpp_indexed_concat_slice");
+        const std::vector<std::string> modes = snapshotTesting ?
+            std::vector<std::string>{"default", "off", "on", "env-off", "env-on", "precedence-off",
+                                     "precedence-on", "concat-off", "split", "profile"} :
+            std::vector<std::string>{"default", "on", "off", "env-off", "precedence", "split", "profile",
+                                     "padding-env-on", "padding-off", "padding-precedence"};
         std::string defaultSource, enabledSource;
-        for (const std::string mode : {"default", "on", "off", "env-off", "precedence", "split", "profile",
-                                       "padding-env-on", "padding-off", "padding-precedence"})
+        std::map<std::string, std::string> snapshotDefaultFiles, snapshotOffFiles;
+        for (const std::string mode : modes)
         {
             ::unsetenv(key);
             ::unsetenv(paddingKey);
             if (mode == "env-off" || mode == "precedence") ::setenv(key, "0", 1);
             if (mode == "padding-env-on" || mode == "padding-precedence") ::setenv(paddingKey, "1", 1);
-            const bool enabled = mode != "off" && mode != "env-off";
-            const bool padding = mode != "default" && mode != "padding-off" && mode != "padding-precedence";
+            if (snapshotTesting)
+            {
+                ::unsetenv(key); ::unsetenv(snapshotKey);
+                if (mode == "env-on" || mode == "precedence-off") ::setenv(snapshotKey, "1", 1);
+                if (mode == "env-off" || mode == "precedence-on") ::setenv(snapshotKey, "0", 1);
+            }
+            const bool enabled = snapshotTesting ? mode != "concat-off" : (mode != "off" && mode != "env-off");
+            const bool padding = snapshotTesting || (mode != "default" && mode != "padding-off" && mode != "padding-precedence");
             const auto dir = base / mode;
             EmitOptions options;
             options.outputDir = dir.string(); options.session = &session; options.sessionPathPrefix = "top";
@@ -12353,18 +12383,46 @@ int main() {
             if (mode == "off") options.attributes["indexed_concat_slice"] = "0";
             if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
             if (mode == "profile") options.attributes["emit_runtime_profile"] = "1";
+            if (snapshotTesting)
+            {
+                options.attributes["indexed_concat_slice"] = mode == "concat-off" ? "0" : "1";
+                options.attributes["indexed_concat_wide_constants"] = "1";
+                if (mode != "default" && mode != "env-on" && mode != "env-off")
+                    options.attributes["indexed_concat_snapshot_array"] =
+                        mode == "off" || mode == "precedence-off" ? "0" : "1";
+            }
+            else
+            {
+                // Keep the original reader's regression independent of the
+                // default snapshot-array representation.
+                options.attributes["indexed_concat_snapshot_array"] = "0";
+            }
             EmitDiagnostics diagnostics;
             if (!EmitGrhSimCpp(&diagnostics).emit(design, options).success || diagnostics.hasError())
                 return fail("indexed concat emit failed: " + mode);
             const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
             if (mode == "default") defaultSource = code;
             if (mode == "on") enabledSource = code;
-            if ((mode == "precedence" || mode == "padding-env-on") && code != enabledSource)
+            if (!snapshotTesting && (mode == "precedence" || mode == "padding-env-on") && code != enabledSource)
                 return fail("indexed concat enable/precedence mismatch");
             if ((mode == "padding-off" || mode == "padding-precedence") && code != defaultSource)
                 return fail("indexed concat padding must be opt-in");
-            const std::uint64_t expectedViews = enabled ? (padding ? 13u : 8u) : 0u;
-            if (countSubstring(code, "// Indexed concat:") != expectedViews)
+            const std::uint64_t expectedViews = enabled ? (padding ? 13u : 8u) + extraViews : 0u;
+            if (snapshotTesting)
+            {
+                const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+                if (mode == "default") snapshotDefaultFiles = files;
+                if (mode == "off") snapshotOffFiles = files;
+                if ((mode == "on" || mode == "env-on" || mode == "precedence-on") && files != snapshotDefaultFiles)
+                    return fail("snapshot array default/on/precedence mismatch");
+                if ((mode == "env-off" || mode == "precedence-off") && files != snapshotOffFiles)
+                    return fail("snapshot array explicit/environment disable mismatch");
+                const auto expectedArrays = mode == "off" || mode == "env-off" ||
+                    mode == "precedence-off" || mode == "concat-off" ? 0u : 28u;
+                if (countSubstring(code, "// Indexed concat snapshot array:") != expectedArrays)
+                    return fail("snapshot array eligibility mismatch: " + mode);
+            }
+            if (countSubstring(code, "// Indexed concat:") + countSubstring(code, "// Indexed concat snapshot array:") != expectedViews)
                 return fail("indexed concat coverage mismatch: " + mode);
             wolvrix::lib::emit::GrhSimExecutionPlan plan;
             if (!EmitGrhSimCpp(&diagnostics).analyzeExecutionPlan(design, options, plan).success)
@@ -12374,6 +12432,14 @@ int main() {
                 if (const auto it = entry.features.find("wide.indexed_concat_view"); it != entry.features.end())
                     planned += it->second;
             if (planned != expectedViews) return fail("indexed concat planner coverage mismatch: " + mode);
+            if (snapshotTesting)
+            {
+                std::uint64_t arrays = 0;
+                for (const auto &entry : plan.computeLowering)
+                    if (const auto it = entry.features.find("wide.indexed_concat_snapshot_array"); it != entry.features.end()) arrays += it->second;
+                if (arrays != countSubstring(code, "// Indexed concat snapshot array:"))
+                    return fail("snapshot array planner mismatch: " + mode);
+            }
             if (mode != "on" && mode != "off" && mode != "split" && mode != "profile") continue;
             const auto harness = dir / "harness.cpp";
             std::ofstream out(harness);
@@ -12405,6 +12471,8 @@ int main() {
         if (saved) ::setenv(key, saved->c_str(), 1);
         ::unsetenv(paddingKey);
         if (savedPadding) ::setenv(paddingKey, savedPadding->c_str(), 1);
+        ::unsetenv(snapshotKey);
+        if (savedSnapshot) ::setenv(snapshotKey, savedSnapshot->c_str(), 1);
         return 0;
     }
 
@@ -12999,7 +13067,8 @@ int main()
         return runSharedEqualityDecodeTests();
     if (std::getenv("WOLVRIX_TEST_PACKED_SCALAR_SLICES") != nullptr)
         return runPackedScalarSlicesTests();
-    if (std::getenv("WOLVRIX_TEST_INDEXED_CONCAT_SLICE") != nullptr)
+    if (std::getenv("WOLVRIX_TEST_INDEXED_CONCAT_SLICE") != nullptr ||
+        std::getenv("WOLVRIX_TEST_INDEXED_SNAPSHOT_ARRAY") != nullptr)
         return runIndexedConcatSliceTests();
     if (std::getenv("WOLVRIX_TEST_SHORT_CONCAT_REDUCTION_MASKS") != nullptr)
         return runScalarConcatReductionMaskTests(true);

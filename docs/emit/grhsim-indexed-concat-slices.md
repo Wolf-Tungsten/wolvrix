@@ -22,11 +22,13 @@ number of bits in the result. Thus `bit_index = 32` reads `r1`; unaligned
 indices may span fields. This is a bit offset, not an array element index.
 
 The ordinary lowering assembles the entire packed value before selecting the
-result. The new lowering emits a local word-reader lambda. Its switch evaluates
+result. The indexed lowering can emit a local word-reader lambda. Its switch evaluates
 only the selected 64-bit word, or two words for a crossing slice. The runtime
 helper combines those words and masks the result. Missing source bits are zero;
 an index outside the source returns zero, including a wide index with nonzero
-upper words. No shift by 64 is evaluated.
+upper words. No shift by 64 is evaluated. Eligible equal-width local snapshots
+use the default-enabled [compact array representation](grhsim-indexed-snapshot-arrays.md),
+which reads the requested lanes directly.
 
 Known wide constant fields are supported by the experimental
 `indexed_concat_wide_constants` attribute, or
@@ -66,7 +68,9 @@ The emitter requires all of the following:
 Local scalar operands retain named snapshots at their original definition
 points, rather than deferring their expression trees. The slice result also
 retains its original evaluation point, so it cannot be inlined past a later
-write. The reader closure never escapes its compute scope. Persistent results
+write. The reader closure never escapes its compute scope. The default-enabled
+[compact snapshot array](grhsim-indexed-snapshot-arrays.md) replaces this closure
+for equal-width named scalar snapshots when its static storage cost fits. Persistent results
 still use ordinary change detection and reader activation.
 
 The IR, activity graph, commit ordering and fixed-point loop do not change.

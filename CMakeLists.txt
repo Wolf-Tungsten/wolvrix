@@ -510,6 +510,12 @@ target_compile_definitions(emit-grhsim-conditional-mux PRIVATE
     WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
     WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
 register_test_exe(emit-grhsim-conditional-mux)
+add_executable(emit-grhsim-shared-arm tests/emit/test_emit_grhsim_shared_arm.cpp)
+target_link_libraries(emit-grhsim-shared-arm PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-shared-arm PRIVATE
+    WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
+register_test_exe(emit-grhsim-shared-arm)
 add_executable(emit-grhsim-consumer-structure tests/emit/test_emit_grhsim_consumer_structure.cpp)
 target_link_libraries(emit-grhsim-consumer-structure PRIVATE wolvrix-lib)
 target_compile_definitions(emit-grhsim-consumer-structure PRIVATE
@@ -526,6 +532,12 @@ add_test(NAME emit-grhsim-packed-state-layout COMMAND emit-grhsim-packed-storage
 add_test(NAME emit-grhsim-packed-array-scope COMMAND emit-grhsim-packed-storage scope)
 add_test(NAME emit-grhsim-packed-array-no-init COMMAND emit-grhsim-packed-storage no-init)
 add_test(NAME emit-grhsim-packed-array-state-select COMMAND emit-grhsim-packed-storage select)
+add_executable(emit-grhsim-aligned-array-slice tests/emit/test_emit_grhsim_aligned_array_slice.cpp)
+target_link_libraries(emit-grhsim-aligned-array-slice PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-aligned-array-slice PRIVATE
+    WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
+register_test_exe(emit-grhsim-aligned-array-slice)
 add_executable(emit-grhsim-covered-state-views tests/emit/test_emit_grhsim_covered_state_views.cpp)
 target_link_libraries(emit-grhsim-covered-state-views PRIVATE wolvrix-lib)
 target_compile_definitions(emit-grhsim-covered-state-views PRIVATE
@@ -569,6 +581,9 @@ set_tests_properties(emit-grhsim-cpp-local-equality-decode
 add_test(NAME emit-grhsim-cpp-packed-scalar-slices COMMAND emit-grhsim-cpp)
 set_tests_properties(emit-grhsim-cpp-packed-scalar-slices
     PROPERTIES ENVIRONMENT "WOLVRIX_TEST_PACKED_SCALAR_SLICES=1")
+add_test(NAME emit-grhsim-cpp-indexed-snapshot-array COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-indexed-snapshot-array
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_INDEXED_SNAPSHOT_ARRAY=1")
 add_test(NAME emit-grhsim-cpp-indexed-concat-slice COMMAND emit-grhsim-cpp)
 set_tests_properties(emit-grhsim-cpp-indexed-concat-slice
     PROPERTIES ENVIRONMENT "WOLVRIX_TEST_INDEXED_CONCAT_SLICE=1")

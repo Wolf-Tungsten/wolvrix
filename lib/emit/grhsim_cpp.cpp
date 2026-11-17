@@ -4883,6 +4883,8 @@ namespace wolvrix::lib::emit
             bool localEqualityDecode = false;
             bool conditionalMuxCones = false;
             bool conditionalMuxWide = false;
+            bool conditionalMuxSharedArm = false;
+            bool conditionalMuxSharedArmAudit = false;
             bool localPredicateSets = false;
             bool conditionalMuxInputCache = false;
             bool conditionalMuxChangeCache = false;
@@ -4898,6 +4900,7 @@ namespace wolvrix::lib::emit
             bool scalarLeafMuxUnpredictable = false;
             bool stagedScalarConcat = false;
             bool indexedConcatSlice = false;
+            bool indexedConcatSnapshotArray = false;
             bool indexedConcatWideConstants = false;
             bool scalarConcatReduction = false;
             bool scalarConcatReductionMasks = false;
@@ -4919,6 +4922,7 @@ namespace wolvrix::lib::emit
             bool packedArrayLocalScope = false;
             bool packedArrayNoInit = false;
             bool packedArrayStateSelect = false;
+            bool alignedArraySlice = false;
             bool wideStateReadRefs = false;
             bool localComputeUseOrder = false;
             bool priorityMuxChains = false;
@@ -18312,6 +18316,18 @@ template<class Index>
             return out.str();
         }
 
+        bool canUseAlignedArraySlice(const Graph &graph, const EmitModel &model, const Operation &op)
+        {
+            if (!model.alignedArraySlice || op.kind() != OperationKind::kSliceArray ||
+                op.operands().size() != 2 || op.results().size() != 1 ||
+                !isWideLogicValue(graph, op.operands()[0]) ||
+                !isScalarLogicValue(graph, op.operands()[1]) ||
+                !isScalarLogicValue(graph, op.results()[0])) return false;
+            const auto width = getAttribute<int64_t>(op, "sliceWidth");
+            return width && *width > 0 && *width <= 64 && 64 % *width == 0 &&
+                   *width == graph.valueWidth(op.results()[0]);
+        }
+
         std::string unaryWordsBufferOpExpr(const std::string &valueExpr,
                                            int32_t resultWidth,
                                            std::string_view helperName)
@@ -19978,6 +19994,33 @@ template<class Index>
             }
         }
 
+        std::size_t indexedConcatSnapshotLaneWidth(const Graph &graph, const EmitModel &model,
+            const Operation &concat, const SupernodeLocalExprContext &context)
+        {
+            if (!model.indexedConcatSnapshotArray || concat.kind() != OperationKind::kConcat ||
+                concat.results().size() != 1u || concat.operands().empty() ||
+                !context.indexedConcatSlices.contains(concat.results()[0])) return 0;
+            const auto width = graph.valueWidth(concat.operands()[0]);
+            if (width <= 0 || width > 64) return 0;
+            std::unordered_set<ValueId, ValueIdHash> captures;
+            for (const auto input : concat.operands())
+            {
+                if (graph.valueWidth(input) != width || !isScalarLogicValue(graph, input)) return 0;
+                const auto def = graph.valueDef(input);
+                if (def.valid() && graph.getOperation(def).kind() == OperationKind::kConstant) continue;
+                // Copy only scalars already kept at their definition point.
+                // Persistent fields/ports would add eager loads to a lazy view.
+                if (isMaterializedValue(model, input) || model.inputFieldByValue.contains(input) ||
+                    model.coveredStateViews.contains(input) || !context.preserveLocalSnapshot.contains(input)) return 0;
+                captures.insert(input);
+            }
+            const std::size_t bytes = width <= 8 ? 1u : width <= 16 ? 2u : width <= 32 ? 4u : 8u;
+            // A repeated source can have a tiny closure but a very large packed
+            // width. Do not expand it into a larger array of duplicate values.
+            if (captures.empty() || concat.operands().size() * bytes > captures.size() * sizeof(void *)) return 0;
+            return static_cast<std::size_t>(width);
+        }
+
         bool emitIndexedConcatSliceOperation(std::ostream &stream,
                                              const Graph &graph,
                                              const EmitModel &model,
@@ -19991,6 +20034,22 @@ template<class Index>
                 context.indexedConcatSlices.contains(op.results()[0]))
             {
                 const ValueId result = op.results()[0];
+                if (const auto width = indexedConcatSnapshotLaneWidth(graph, model, op, context))
+                {
+                    const auto type = scalarLogicObjectCppType(valueScalarSlotKindForWidth(static_cast<int32_t>(width)));
+                    stream << "        // Indexed concat snapshot array: value=" << result.index
+                           << " lane_width=" << width << " lanes=" << op.operands().size() << "\n";
+                    stream << "        const std::array<" << type << ", " << op.operands().size()
+                           << "> " << name(result) << " = {\n";
+                    for (std::size_t i = op.operands().size(); i != 0; --i)
+                    {
+                        const auto expr = resolvedScheduleValueExpr(model, op.operands()[i - 1u], &context);
+                        stream << "            static_cast<" << type << ">(" << scalarTruncExpr(
+                            "static_cast<std::uint64_t>(" + expr + ")", width) << "),\n";
+                    }
+                    stream << "        };\n";
+                    return true;
+                }
                 std::vector<std::vector<std::string>> words(logicWordCount(graph.valueWidth(result)));
                 std::vector<std::uint64_t> constantWords(words.size(), UINT64_C(0));
                 std::size_t offset = 0;
@@ -20045,7 +20104,10 @@ template<class Index>
             {
                 const ValueId source = op.operands()[0];
                 const ValueId result = op.results()[0];
-                const std::string expr = "grhsim_indexed_concat_slice<" + std::to_string(graph.valueWidth(source)) +
+                const auto concat = graph.getOperation(graph.valueDef(source));
+                const auto laneWidth = indexedConcatSnapshotLaneWidth(graph, model, concat, context);
+                const std::string helper = laneWidth ? "grhsim_indexed_snapshot_slice<" : "grhsim_indexed_concat_slice<";
+                const std::string expr = helper + std::to_string(laneWidth ? laneWidth : graph.valueWidth(source)) +
                     "u, " + std::to_string(graph.valueWidth(result)) + "u>(" +
                     resolvedScheduleValueExpr(model, op.operands()[1], &context) + ", " + name(source) + ")";
                 emitLogicAssignFromScalarExpr(stream, graph, model, result, expr, true,
@@ -21890,6 +21952,16 @@ template<class Index>
                 {
                     return std::nullopt;
                 }
+                if (canUseAlignedArraySlice(graph, model, op))
+                {
+                    // Preserve the existing index multiplication/conversion, source
+                    // snapshot and result assignment. A multiple of this element
+                    // width cannot cross a word because the width divides 64.
+                    return logicBoolExpr("grhsim_aligned_array_slice_words<" + std::to_string(*sliceWidth) +
+                        "u>((" + operandWords(0, graph.valueWidth(operands[0])) +
+                        "), static_cast<std::size_t>(((" + operandExprs[1] + ") * " +
+                        std::to_string(*sliceWidth) + ")))" );
+                }
                 return eventLogicExprFromWordsExpr(
                     graph,
                     resultValue,
@@ -23121,6 +23193,17 @@ template<class Index>
         struct ConditionalMuxCone
         {
             std::array<std::vector<OperationId>, 2> arms;
+            struct SharedArm
+            {
+                std::vector<OperationId> additions;
+                std::size_t originalOperations = 0;
+                std::size_t reachableOperations = 0;
+                std::size_t outsideUseRejected = 0;
+                std::size_t sharedValues = 0;
+                bool cached = false;
+                bool oversized = false;
+            };
+            std::array<SharedArm, 2> sharedArms;
         };
 
         struct ConditionalMuxPlan
@@ -23132,7 +23215,7 @@ template<class Index>
         ConditionalMuxPlan collectConditionalMuxCones(
             const Graph &graph, const EmitModel &model, const ScheduleRefs &schedule,
             uint32_t supernode, const std::vector<OperationId> &ops,
-            const SupernodeLocalExprContext &context)
+            const SupernodeLocalExprContext &context, bool allowSharedArms = true)
         {
             ConditionalMuxPlan plan;
             // These lowerings own overlapping operation ranges. Keep their
@@ -23181,13 +23264,14 @@ template<class Index>
             protectedValues.insert(context.reducedScalarConcatValues.begin(), context.reducedScalarConcatValues.end());
             for (const auto &[value, _] : context.indexedConcatSlices) protectedValues.insert(value);
             for (const auto &decl : collectScalarConcatPrefixCaches(graph, ops)) protectedValues.insert(decl.key.lhs);
-            const auto privateProducer = [&](ValueId value) {
+            const auto privateProducer = [&](ValueId value, bool singleUse = true) {
                 const auto def = graph.valueDef(value);
                 const auto count = context.useCountByValue.find(value);
                 if (!positions.contains(def) || isMaterializedValue(model, value) ||
                     valueNeedsTrackedChange(model, value) || protectedValues.contains(value) ||
                     canonicalMaterializedStorageValue(model, value) != value ||
-                    count == context.useCountByValue.end() || count->second != 1u ||
+                    count == context.useCountByValue.end() || count->second == 0u ||
+                    (singleUse && count->second != 1u) ||
                     plan.absorbed.contains(def) || model.localEqualityLookup.contains(def) ||
                     model.sharedEqualityDecodes.contains(def) || model.coveredStateViews.contains(value)) return false;
                 // Use counts describe emitted operations, not dead IR users.
@@ -23248,6 +23332,102 @@ template<class Index>
                 if (cone.arms[0].empty() && cone.arms[1].empty()) continue;
                 for (const auto &arm : cone.arms) plan.absorbed.insert(arm.begin(), arm.end());
                 plan.roots.emplace(root.id(), std::move(cone));
+            }
+            if (!allowSharedArms || (!model.conditionalMuxSharedArm && !model.conditionalMuxSharedArmAudit) ||
+                plan.roots.empty()) return plan;
+
+            // Freeze the original roots and cache plans. Extend only nonempty
+            // existing arms; multiple operand uses are safe only when every
+            // scheduled use remains inside this exact arm.
+            struct LocalUse { OperationId operation; std::size_t operand; };
+            std::unordered_map<ValueId, std::vector<LocalUse>, ValueIdHash> uses;
+            for (const auto id : ops)
+            {
+                const auto op = graph.getOperation(id);
+                for (std::size_t operand = 0; operand < op.operands().size(); ++operand)
+                    uses[op.operands()[operand]].push_back({id, operand});
+            }
+            for (const auto &[id, cache] : model.conditionalMuxInputCaches)
+            {
+                protectedValues.insert(cache.inputs.begin(), cache.inputs.end());
+                const auto root = graph.getOperation(id);
+                protectedValues.insert(root.results().begin(), root.results().end());
+            }
+            for (const auto &[id, cache] : model.conditionalMuxChangeCaches)
+            {
+                protectedValues.insert(cache.sources.begin(), cache.sources.end());
+                const auto root = graph.getOperation(id);
+                protectedValues.insert(root.results().begin(), root.results().end());
+            }
+            for (const auto &[id, family] : model.sharedEqualityDecodes)
+            {
+                protectedValues.insert(family.source);
+                protectedValues.insert(family.results.begin(), family.results.end());
+            }
+            for (const auto &family : model.localEqualityDecodes) protectedValues.insert(family.source);
+            auto reserved = plan.absorbed;
+            for (const auto id : ops)
+            {
+                const auto selected = plan.roots.find(id);
+                if (selected == plan.roots.end()) continue;
+                auto &cone = selected->second;
+                for (std::size_t arm = 0; arm < 2; ++arm)
+                {
+                    auto &audit = cone.sharedArms[arm];
+                    audit.originalOperations = cone.arms[arm].size();
+                    if (cone.arms[arm].empty()) continue;
+                    if (model.conditionalMuxInputCaches.contains(id) || model.conditionalMuxChangeCaches.contains(id))
+                    { audit.cached = true; continue; }
+                    const std::unordered_set<OperationId, OperationIdHash> original(
+                        cone.arms[arm].begin(), cone.arms[arm].end());
+                    auto closure = original;
+                    auto pending = cone.arms[arm];
+                    while (!pending.empty())
+                    {
+                        const auto member = pending.back(); pending.pop_back();
+                        const auto op = graph.getOperation(member);
+                        for (const auto input : op.operands())
+                        {
+                            const auto def = graph.valueDef(input);
+                            if (closure.contains(def) || reserved.contains(def) || plan.roots.contains(def) ||
+                                !privateProducer(input, false) || positions.at(def) >= positions.at(id)) continue;
+                            const auto producer = graph.getOperation(def);
+                            // The first extension admits scalar DAGs only. Other
+                            // lowering ownership and width contracts stay intact.
+                            if (opNeedsWordLogicEmit(graph, producer)) continue;
+                            closure.insert(def); pending.push_back(def);
+                        }
+                    }
+                    audit.reachableOperations = closure.size() - original.size();
+                    // Users precede producers in this traversal. Removing an
+                    // escaping user therefore also removes its private ancestry.
+                    for (auto it = ops.rbegin(); it != ops.rend(); ++it)
+                    {
+                        if (!closure.contains(*it) || original.contains(*it)) continue;
+                        const auto op = graph.getOperation(*it);
+                        const auto result = op.results()[0];
+                        bool closed = true;
+                        for (const auto &use : uses.at(result))
+                            if (!closure.contains(use.operation) &&
+                                !(use.operation == id && use.operand == arm + 1u))
+                            { closed = false; break; }
+                        if (!closed) { closure.erase(*it); ++audit.outsideUseRejected; }
+                    }
+                    if (closure.size() > maxOperations) { audit.oversized = true; continue; }
+                    for (const auto member : ops)
+                        if (closure.contains(member) && !original.contains(member))
+                        {
+                            audit.additions.push_back(member);
+                            const auto op = graph.getOperation(member);
+                            audit.sharedValues += uses.at(op.results()[0]).size() > 1u;
+                        }
+                    reserved.insert(audit.additions.begin(), audit.additions.end());
+                    if (!model.conditionalMuxSharedArm) continue;
+                    auto &members = cone.arms[arm];
+                    members.insert(members.end(), audit.additions.begin(), audit.additions.end());
+                    std::sort(members.begin(), members.end(), [&](auto a, auto b) { return positions.at(a) < positions.at(b); });
+                    plan.absorbed.insert(audit.additions.begin(), audit.additions.end());
+                }
             }
             return plan;
         }
@@ -23511,7 +23691,7 @@ template<class Index>
                     collectPackedScalarConcatReductions(graph, model, ops, context, true);
                     collectIndexedConcatSlices(graph, model, ops, context);
                 }
-                const auto plan = collectConditionalMuxCones(graph, model, schedule, sid, ops, context);
+                const auto plan = collectConditionalMuxCones(graph, model, schedule, sid, ops, context, false);
                 const std::unordered_set<OperationId, OperationIdHash> scope(ops.begin(), ops.end());
                 for (const auto id : ops)
                 {
@@ -23798,6 +23978,19 @@ template<class Index>
                                     DeferredActivationEmitContext &deferred, std::string &error)
         {
             const auto result = root.results()[0];
+            if (model.conditionalMuxSharedArm || model.conditionalMuxSharedArmAudit)
+                for (std::size_t arm = 0; arm < 2; ++arm)
+                {
+                    const auto &audit = cone.sharedArms[arm];
+                    stream << "        // Conditional mux shared arm: root=" << root.id().index << " arm=" << arm
+                           << " original=" << audit.originalOperations << " reachable=" << audit.reachableOperations
+                           << " outside=" << audit.outsideUseRejected << " added=" << audit.additions.size()
+                           << " shared=" << audit.sharedValues << " cached=" << audit.cached
+                           << " oversized=" << audit.oversized << " mode=" << (model.conditionalMuxSharedArm ? "on" : "audit")
+                           << " ops=";
+                    for (const auto id : audit.additions) stream << id.index << ',';
+                    stream << '\n';
+                }
             const auto cached = model.conditionalMuxInputCaches.find(root.id());
             const auto changeCached = model.conditionalMuxChangeCaches.find(root.id());
             if (cached != model.conditionalMuxInputCaches.end())
@@ -30962,6 +31155,9 @@ template<class Index>
                         entry.unmodeledWork = "conditional mux cones have selector-dependent execution";
                         features["conditional_mux_true_operations_upper"] += cone->second.arms[0].size();
                         features["conditional_mux_false_operations_upper"] += cone->second.arms[1].size();
+                        for (const auto &arm : cone->second.sharedArms)
+                            if (model.conditionalMuxSharedArm)
+                                features["conditional_mux_shared_arm_added_operations_upper"] += arm.additions.size();
                         for (const auto &arm : cone->second.arms)
                             for (auto member : arm)
                                 if (opNeedsWordLogicEmit(graph, graph.getOperation(member)))
@@ -31171,6 +31367,11 @@ template<class Index>
                         if (op.kind() == OperationKind::kConcat && localContext.indexedConcatSlices.contains(result))
                         {
                             addShape("wide.indexed_concat_view");
+                            if (indexedConcatSnapshotLaneWidth(graph, model, op, localContext))
+                            {
+                                addShape("wide.indexed_concat_snapshot_array");
+                                addShape("wide.indexed_concat_snapshot_lanes", op.operands().size());
+                            }
                         }
                         else if (op.kind() == OperationKind::kSliceDynamic && operands.size() == 2u &&
                                  localContext.indexedConcatSlices.contains(operands[0]))
@@ -31226,6 +31427,11 @@ template<class Index>
                                      packedArrayLaneViewForValue(model, operands.front()) != nullptr)
                             {
                                 addShape("wide.packed_lane_slice");
+                            }
+                            else if (canUseAlignedArraySlice(graph, model, op))
+                            {
+                                addShape("wide.aligned_array_slice");
+                                addShape("wide.aligned_array_slice_source_word_loads");
                             }
                             else if (shouldEmitDirectWideConcatFastPath(graph, model, op, result))
                             {
@@ -31990,6 +32196,9 @@ template<class Index>
                                    "indexed_concat_slice",
                                    "WOLVRIX_GRHSIM_INDEXED_CONCAT_SLICE",
                                    true);
+        const bool indexedConcatSnapshotArray =
+            parseBooleanEmitOption(options, "indexed_concat_snapshot_array",
+                                   "WOLVRIX_GRHSIM_INDEXED_CONCAT_SNAPSHOT_ARRAY", true);
         const bool indexedConcatWideConstants =
             parseBooleanEmitOption(options, "indexed_concat_wide_constants",
                                    "WOLVRIX_GRHSIM_INDEXED_CONCAT_WIDE_CONSTANTS", false);
@@ -32003,6 +32212,10 @@ template<class Index>
             parseBooleanEmitOption(options, "conditional_mux_cones", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_CONES", false);
         const bool conditionalMuxWide =
             parseBooleanEmitOption(options, "conditional_mux_wide", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_WIDE", false);
+        const bool conditionalMuxSharedArm =
+            parseBooleanEmitOption(options, "conditional_mux_shared_arm", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_SHARED_ARM", false);
+        const bool conditionalMuxSharedArmAudit =
+            parseBooleanEmitOption(options, "conditional_mux_shared_arm_audit", "WOLVRIX_GRHSIM_CONDITIONAL_MUX_SHARED_ARM_AUDIT", false);
         const bool localPredicateSets =
             parseBooleanEmitOption(options, "local_predicate_sets", "WOLVRIX_GRHSIM_LOCAL_PREDICATE_SETS", false);
         const bool conditionalMuxInputCache =
@@ -32123,6 +32336,8 @@ template<class Index>
             "packed_array_no_init", "WOLVRIX_GRHSIM_PACKED_ARRAY_NO_INIT", false);
         const bool packedArrayStateSelect = parseBooleanEmitOption(options,
             "packed_array_state_select", "WOLVRIX_GRHSIM_PACKED_ARRAY_STATE_SELECT", false);
+        const bool alignedArraySlice = parseBooleanEmitOption(options,
+            "aligned_array_slice", "WOLVRIX_GRHSIM_ALIGNED_ARRAY_SLICE", false);
         const bool wideStateReadRefs =
             parseBooleanEmitOption(options,
                                    "wide_state_read_refs",
@@ -32413,12 +32628,15 @@ template<class Index>
             configuredModel.scalarLeafMuxUnpredictable = scalarLeafMuxUnpredictable;
             configuredModel.stagedScalarConcat = stagedScalarConcat;
             configuredModel.indexedConcatSlice = indexedConcatSlice;
+            configuredModel.indexedConcatSnapshotArray = indexedConcatSnapshotArray;
             configuredModel.indexedConcatWideConstants = indexedConcatWideConstants;
             configuredModel.sharedEqualityDecode = sharedEqualityDecode;
             configuredModel.sharedEqualityFamilies = sharedEqualityFamilies;
             configuredModel.localEqualityDecode = localEqualityDecode;
             configuredModel.conditionalMuxCones = conditionalMuxCones;
             configuredModel.conditionalMuxWide = conditionalMuxWide;
+            configuredModel.conditionalMuxSharedArm = conditionalMuxSharedArm;
+            configuredModel.conditionalMuxSharedArmAudit = conditionalMuxSharedArmAudit;
             configuredModel.localPredicateSets = localPredicateSets;
             configuredModel.conditionalMuxInputCache = conditionalMuxInputCache;
             configuredModel.conditionalMuxChangeCache = conditionalMuxChangeCache;
@@ -32444,6 +32662,7 @@ template<class Index>
             configuredModel.packedArrayLocalScope = packedArrayLocalScope;
             configuredModel.packedArrayNoInit = packedArrayNoInit;
             configuredModel.packedArrayStateSelect = packedArrayStateSelect;
+            configuredModel.alignedArraySlice = alignedArraySlice;
             configuredModel.wideStateReadRefs = wideStateReadRefs;
             configuredModel.localComputeUseOrder = localComputeUseOrder;
             configuredModel.priorityMuxChains = priorityMuxChains;
@@ -35242,7 +35461,44 @@ GRHSIM_ALWAYS_INLINE std::uint64_t grhsim_indexed_concat_slice(const Index &inde
     return result;
 }
 
-template <typename T>
+)CPP";
+            if (model.indexedConcatSnapshotArray)
+            {
+                *stream << R"CPP(template <std::size_t LaneWidth, std::size_t SliceWidth, typename Index, typename Lane, std::size_t N>
+GRHSIM_ALWAYS_INLINE std::uint64_t grhsim_indexed_snapshot_slice(const Index &index, const std::array<Lane, N> &lanes)
+{
+    static_assert(LaneWidth > 0 && LaneWidth <= 64 && SliceWidth > 0 && SliceWidth <= 64);
+    const std::size_t start = grhsim_index_words(index, N * LaneWidth);
+    if (unlikely(start >= N * LaneWidth)) return UINT64_C(0);
+    const std::size_t lane = start / LaneWidth;
+    const std::size_t shift = start % LaneWidth;
+    if constexpr (SliceWidth <= LaneWidth)
+    {
+        std::uint64_t result = static_cast<std::uint64_t>(lanes[lane]) >> shift;
+        if (shift != 0u && shift + SliceWidth > LaneWidth && lane + 1u < N)
+            result |= static_cast<std::uint64_t>(lanes[lane + 1u]) << (LaneWidth - shift);
+        if constexpr (SliceWidth < 64u) result &= (UINT64_C(1) << SliceWidth) - 1u;
+        return result;
+    }
+    else
+    {
+        std::uint64_t result = 0;
+        std::size_t cursor = lane, offset = shift, written = 0;
+        while (written < SliceWidth && cursor < N)
+        {
+            const std::size_t bits = std::min(LaneWidth - offset, SliceWidth - written);
+            const std::uint64_t part = (static_cast<std::uint64_t>(lanes[cursor]) >> offset)
+                                     & ((UINT64_C(1) << bits) - 1u);
+            result |= part << written;
+            written += bits; ++cursor; offset = 0;
+        }
+        return result;
+    }
+}
+
+)CPP";
+            }
+            *stream << R"CPP(template <typename T>
 inline std::size_t grhsim_index_in_range_words(T value)
 {
     return static_cast<std::size_t>(static_cast<std::uint64_t>(value));
@@ -36527,6 +36783,24 @@ inline std::array<std::uint64_t, N> grhsim_ashr_words(const std::array<std::uint
 }
 
 )CPP";
+            if (model.alignedArraySlice)
+            {
+                *stream << R"CPP(
+// The caller proves start is a multiple of Width and Width divides 64.
+// Keep the same rounded source-word bounds as grhsim_slice_words.
+template <std::size_t Width, std::size_t N>
+GRHSIM_ALWAYS_INLINE std::uint64_t grhsim_aligned_array_slice_words(
+    const std::array<std::uint64_t, N> &source, std::size_t start)
+{
+    static_assert(Width > 0 && Width <= 64 && 64 % Width == 0);
+    const std::size_t word = start / 64u;
+    if (word >= N) return UINT64_C(0);
+    if constexpr (Width == 64u) return source[word];
+    else return (source[word] >> (start & 63u)) & ((UINT64_C(1) << Width) - 1u);
+}
+
+)CPP";
+            }
             if (model.localShiftDemandedBit)
             {
                 *stream << R"CPP(

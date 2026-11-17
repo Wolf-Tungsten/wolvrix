@@ -32,7 +32,10 @@ if (condition) {
 ```
 
 Either or both arms can qualify. An ineligible arm keeps its original eager
-computation. Shared producers stay eager; the rule does not duplicate them.
+computation. Shared producers stay eager by default. The optional
+[shared-arm extension](grhsim-shared-arm-closures.md) can move a shared scalar
+producer when all of its scheduled uses belong to the same existing arm.
+Neither rule duplicates shared computations.
 Regular scalar lowering retains truncation, signed extension, and oversized
 shift semantics inside each branch. The C++ compiler remains free to simplify
 or if-convert the result; source branching alone is not proof of a runtime gain.

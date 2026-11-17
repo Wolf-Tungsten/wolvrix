@@ -4,6 +4,7 @@
 #include "transform/activity_schedule.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -126,9 +127,15 @@ void require(bool condition, const char *message) {
 }
 
 SessionStore schedule(Design &design, ActivityScheduleOptions options,
-                      const std::string &expectedError = {}) {
+                      const std::string &expectedError = {}, std::string *log = nullptr) {
     SessionStore session;
     PassManager manager; manager.options().session = &session;
+    if (log) {
+        manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+        manager.options().logSink = [log](wolvrix::lib::LogLevel, std::string_view, std::string_view message) {
+            *log += std::string(message) + '\n';
+        };
+    }
     manager.addPass(std::make_unique<ActivitySchedulePass>(options));
     PassDiagnostics diagnostics;
     const bool success = manager.run(design, diagnostics).success;
@@ -144,13 +151,15 @@ SessionStore schedule(Design &design, ActivityScheduleOptions options,
     return session;
 }
 
-void testProtectedGroup() {
+void testProtectedGroup(bool local = false, bool connected = false) {
     auto off = fixture(true), on = fixture(true);
     ActivityScheduleOptions options;
     options.path = "top"; options.maxOpInComputeNode = 4; options.maxOpInComputeSupernode = 8;
     auto before = schedule(off, options);
     options.eventRegions = true;
     options.eventRegionsShared = true;
+    options.eventRegionsSharedCycleRefinement = local;
+    options.eventRegionsSharedConnected = connected;
     auto after = schedule(on, options);
     const auto &oldGroups = slot<ActivityScheduleSupernodeToOps>(before, "supernode_to_ops");
     const auto &newGroups = slot<ActivityScheduleSupernodeToOps>(after, "supernode_to_ops");
@@ -194,13 +203,15 @@ Design longChain(unsigned length, unsigned publicOutputs = 0) {
 void testFallbackAndOptions() {
     for (const auto &args : std::vector<std::vector<std::string_view>>{
              {"-event-regions", "true"}, {"-event-regions=false"},
-             {"-event-regions-shared", "true"}, {"-event-regions-shared=false"}}) {
+             {"-event-regions-shared", "true"}, {"-event-regions-shared=false"},
+             {"-event-regions-shared-connected", "true"}, {"-event-regions-shared-connected=false"}}) {
         std::string error;
         require(makePass("activity-schedule", args, error) != nullptr, "valid region option rejected");
     }
     for (const auto &args : std::vector<std::vector<std::string_view>>{
              {"-event-regions", "maybe"}, {"-event-regions=maybe"}, {"-event-regions"},
-             {"-event-regions-shared", "maybe"}, {"-event-regions-shared=maybe"}, {"-event-regions-shared"}}) {
+             {"-event-regions-shared", "maybe"}, {"-event-regions-shared=maybe"}, {"-event-regions-shared"},
+             {"-event-regions-shared-connected", "maybe"}, {"-event-regions-shared-connected=maybe"}, {"-event-regions-shared-connected"}}) {
         std::string error;
         require(makePass("activity-schedule", args, error) == nullptr && !error.empty(),
                 "invalid region option accepted");
@@ -251,6 +262,116 @@ void testSharedFallback() {
     }
 }
 
+// Compare every exported schedule field, including commit order and reader
+// activation, so a rejected candidate cannot leak partially rebuilt metadata.
+bool sameSchedule(const SessionStore &a, const SessionStore &b) {
+#define SAME(TYPE, KEY) if (slot<TYPE>(a, KEY) != slot<TYPE>(b, KEY)) return false
+    SAME(ActivityScheduleSupernodeToOps, "supernode_to_ops");
+    SAME(ActivityScheduleOpToSupernode, "op_to_supernode");
+    SAME(ActivityScheduleCommitLocalityGroupByOp, "commit_locality_group_by_op");
+    SAME(ActivityScheduleCommitLocalityGroupOrder, "commit_locality_group_order");
+    SAME(ActivityScheduleDag, "dag");
+    SAME(ActivityScheduleSupernodeKinds, "supernode_kind");
+    SAME(ActivityScheduleComputeNodesBySupernode, "compute_nodes_by_supernode");
+    SAME(ActivityScheduleValueFanout, "value_fanout");
+    SAME(ActivityScheduleTopoOrder, "topo_order");
+    SAME(ActivityScheduleStateReadSupernodes, "state_read_supernodes");
+    SAME(std::string, "summary_stats");
+#undef SAME
+    return true;
+}
+
+std::array<std::size_t, 4> scheduleCosts(const SessionStore &s) {
+    std::array<std::size_t, 4> cost{};
+    for (const auto kind : slot<ActivityScheduleSupernodeKinds>(s, "supernode_kind"))
+        cost[0] += kind == ActivityScheduleSupernodeKind::Compute;
+    for (const auto &targets : slot<ActivityScheduleValueFanout>(s, "value_fanout")) {
+        cost[1] += !targets.empty(); cost[2] += targets.size();
+    }
+    for (const auto &[name, targets] : slot<ActivityScheduleStateReadSupernodes>(s, "state_read_supernodes")) {
+        (void)name; cost[3] += targets.size();
+    }
+    return cost;
+}
+
+void testSharedCostGuard() {
+    require(!ActivityScheduleOptions{}.eventRegionsSharedCostGuard, "cost guard must default off");
+    for (const auto &args : std::vector<std::vector<std::string_view>>{
+             {"-event-regions-shared-cost-guard", "true"}, {"-event-regions-shared-cost-guard=false"},
+             {"-event-regions-shared-cost-guard=on"}, {"-event-regions-shared-cost-guard=0"}}) {
+        std::string error;
+        require(makePass("activity-schedule", args, error) != nullptr, "valid cost guard option rejected");
+    }
+    for (const auto &args : std::vector<std::vector<std::string_view>>{
+             {"-event-regions-shared-cost-guard", "maybe"}, {"-event-regions-shared-cost-guard=maybe"},
+             {"-event-regions-shared-cost-guard"}}) {
+        std::string error;
+        require(makePass("activity-schedule", args, error) == nullptr && !error.empty(),
+                "invalid cost guard option accepted");
+    }
+    ActivityScheduleOptions options;
+    options.path = "top"; options.eventRegions = true; options.eventRegionsSharedCostGuard = true;
+    auto invalid = longChain(10);
+    schedule(invalid, options, "event-regions-shared-cost-guard requires event-regions-shared");
+
+    // A single multi-endpoint chain internalizes real boundaries without
+    // fragmenting any remainder. The guard must keep this useful contraction.
+    options.eventRegionsSharedCostGuard = false;
+    options.maxOpInComputeNode = 4; options.maxOpInComputeSupernode = 8;
+    auto baselineDesign = longChain(100, 1), sharedDesign = longChain(100, 1);
+    auto baseline = schedule(baselineDesign, options);
+    options.eventRegionsShared = true;
+    auto shared = schedule(sharedDesign, options);
+    const auto before = scheduleCosts(baseline), after = scheduleCosts(shared);
+    require(before != after, "acceptance fixture has no structural improvement");
+    for (std::size_t i = 0; i < before.size(); ++i)
+        require(after[i] <= before[i], "acceptance fixture has a growing cost");
+    auto explicitOffDesign = longChain(100, 1);
+    options.eventRegionsSharedCostGuard = false;
+    std::string offLog;
+    auto explicitOff = schedule(explicitOffDesign, options, {}, &offLog);
+    require(sameSchedule(shared, explicitOff) && offLog.find("cost guard:") == std::string::npos,
+            "explicit guard off changed shared schedule or emitted a decision");
+    auto acceptedDesign = longChain(100, 1);
+    options.eventRegionsSharedCostGuard = true;
+    std::string acceptedLog;
+    auto accepted = schedule(acceptedDesign, options, {}, &acceptedLog);
+    require(sameSchedule(shared, accepted) && acceptedLog.find("cost guard: accepted=true") != std::string::npos,
+            "guard failed to retain Pareto improvement");
+
+    // No candidate contraction is not a strict improvement. Check exact
+    // fallback including a real register commit and state-derived metadata.
+    auto equalBaselineDesign = fixture(false, false), equalGuardedDesign = fixture(false, false);
+    options.maxOpInComputeNode = 8192; options.maxOpInComputeSupernode = 8192;
+    options.eventRegionsShared = false; options.eventRegionsSharedCostGuard = false;
+    auto equalBaseline = schedule(equalBaselineDesign, options);
+    options.eventRegionsShared = true; options.eventRegionsSharedCostGuard = true;
+    std::string equalLog;
+    auto equalGuarded = schedule(equalGuardedDesign, options, {}, &equalLog);
+    require(sameSchedule(equalBaseline, equalGuarded) && equalLog.find("cost guard: accepted=false") != std::string::npos,
+            "guard accepted a cost tie or changed fallback metadata");
+
+    // The shared chain crosses groups which also hold unrelated output nodes.
+    // Extracting it can fragment the remainders and grow maintenance edges.
+    options.maxOpInComputeNode = 1; options.maxOpInComputeSupernode = 32;
+    options.eventRegionsShared = false; options.eventRegionsSharedCostGuard = false;
+    auto fragmentedBaselineDesign = fixture(false, true);
+    auto fragmentedBaseline = schedule(fragmentedBaselineDesign, options);
+    options.eventRegionsShared = true;
+    auto fragmentedSharedDesign = fixture(false, true);
+    auto fragmentedShared = schedule(fragmentedSharedDesign, options);
+    const auto oldCost = scheduleCosts(fragmentedBaseline), newCost = scheduleCosts(fragmentedShared);
+    require(newCost[0] > oldCost[0] && newCost[1] < oldCost[1] && newCost[2] < oldCost[2],
+            "rejection fixture must trade fewer boundaries for more groups");
+    options.eventRegionsSharedCostGuard = true;
+    auto fragmentedGuardedDesign = fixture(false, true);
+    std::string rejectedLog;
+    auto fragmentedGuarded = schedule(fragmentedGuardedDesign, options, {}, &rejectedLog);
+    require(sameSchedule(fragmentedBaseline, fragmentedGuarded) &&
+            rejectedLog.find("cost guard: accepted=false") != std::string::npos,
+            "guard did not restore the exact pre-shared schedule");
+}
+
 const char *harness = R"CPP(
 #include "grhsim_top.hpp"
 #include <cstdint>
@@ -297,24 +418,46 @@ int main() {
 )CPP";
 }
 
-int main() {
+int main(int argc, char **argv) {
     try {
-        testProtectedGroup();
+        testSharedCostGuard();
+        if (argc == 2 && std::string(argv[1]) == "--cost-guard-only") return 0;
+        const bool cycleOnly = argc == 2 && std::string(argv[1]) == "--cycle-refinement-only";
+        const bool connectedOnly = argc == 2 && std::string(argv[1]) == "--connected-only";
+        if (connectedOnly) {
+            ActivityScheduleOptions invalid; invalid.path = "top"; invalid.eventRegionsSharedConnected = true;
+            auto graph = fixture(); schedule(graph, invalid, "event-regions-shared-connected requires event-regions-shared");
+        }
+        if (cycleOnly) {
+            ActivityScheduleOptions invalid; invalid.path="top";
+            invalid.eventRegionsSharedCycleRefinement=true;
+            auto graph=fixture();
+            schedule(graph,invalid,"event-regions-shared-cycle-refinement requires event-regions-shared");
+        }
+        testProtectedGroup(cycleOnly, connectedOnly);
         testFallbackAndOptions();
         testSharedFallback();
         const auto root = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_event_regions";
         std::map<std::string, std::string> defaultFiles;
         std::size_t before = 0, after = 0;
         std::size_t sharedBefore = 0, sharedAfter = 0;
-        for (const std::string mode : {"default", "off", "on", "shared-off", "shared", "memory-off", "memory"}) {
-            const bool memoryFixture = mode == "memory-off" || mode == "memory";
-            const bool sharedFixture = mode == "shared-off" || mode == "shared" || memoryFixture;
+        for (const std::string mode : {"default", "off", "on", "shared-off", "shared", "memory-off", "memory", "cycle", "memory-cycle", "connected", "memory-connected"}) {
+            const bool cycleMode = mode == "cycle" || mode == "memory-cycle";
+            const bool connectedMode = mode == "connected" || mode == "memory-connected";
+            if (connectedOnly && !connectedMode) continue;
+            if (!connectedOnly && connectedMode) continue;
+            if (cycleOnly && !cycleMode) continue;
+            if (!cycleOnly && cycleMode) continue;
+            const bool memoryFixture = mode == "memory-off" || mode == "memory" || mode == "memory-cycle" || mode == "memory-connected";
+            const bool sharedFixture = mode == "shared-off" || mode == "shared" || memoryFixture || cycleMode || connectedMode;
             auto design = fixture(false, sharedFixture, memoryFixture);
             SessionStore session; PassManager manager; manager.options().session = &session;
             ActivityScheduleOptions schedule; schedule.path="top";
             schedule.maxOpInComputeNode=4; schedule.maxOpInComputeSupernode=8;
             if (mode != "default") schedule.eventRegions=mode=="on" || sharedFixture;
-            schedule.eventRegionsShared = mode == "shared" || mode == "memory";
+            schedule.eventRegionsShared = mode == "shared" || mode == "memory" || cycleMode || connectedMode;
+            schedule.eventRegionsSharedCycleRefinement = cycleMode;
+            schedule.eventRegionsSharedConnected = connectedMode;
             manager.addPass(std::make_unique<ActivitySchedulePass>(schedule));
             PassDiagnostics diagnostics;
             if (!manager.run(design, diagnostics).success) {
@@ -353,6 +496,7 @@ int main() {
                     throw std::runtime_error("generated model test failed: "+mode);
             }
         }
+        if (cycleOnly || connectedOnly) return 0;
         if(after>=before) throw std::runtime_error("event regions did not internalize boundaries");
         require(sharedAfter < sharedBefore, "shared region fixture did not internalize shared boundaries");
         std::cout<<"boundary values "<<before<<" -> "<<after<<'\n';

@@ -89,6 +89,13 @@ namespace wolvrix::lib::transform
         // Refine mixed pure groups by endpoint set, then coalesce classes
         // with identical multiple endpoints. Requires eventRegions.
         bool eventRegionsShared = false;
+        // Admit shared regions only when the complete rebuilt schedule is
+        // Pareto-no-worse on structural maintenance dimensions. Default-off.
+        bool eventRegionsSharedCostGuard = false;
+        // Preserve mixed remainders unless a quotient SCC requires refinement.
+        bool eventRegionsSharedCycleRefinement = false;
+        // Form computational components/equal activation classes; refine only cycles.
+        bool eventRegionsSharedConnected = false;
         std::string localSharedComputeCommonOwnerPolicy = "off";
         std::string finalFaninPullbackPolicy = "off";
         std::string finalTerminalPushforwardPolicy = "off";

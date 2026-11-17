@@ -282,6 +282,93 @@ void testExpressions() {
     std::cout<<"state expressions: oracle, ownership, budget and unchanged counts passed\n";
 }
 
+void testCrossRegion() {
+    const auto root=std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR)/"cross-region-state-views";
+    std::filesystem::remove_all(root);
+    const std::string oracleExtra=R"CPP(
+ uint64_t bitMask=(UINT64_C(1)<<n)-1;
+ if(m.z0!=((~slice&bitMask)^m.noise)||m.z1!=(((~q)&bitMask)^m.noise)||
+    m.z2!=((q==(UINT64_C(3)&mask))^m.noise)||m.z3!=(((slice|(q&bitMask))!=0)^m.noise)||
+    m.z4!=((~q&mask)^m.noise))return 3;
+)CPP";
+    auto arrange=[](Fixture &f,int width,const std::string &kind) {
+        build(f,width);auto roots=addExpressions(f,width,kind=="unknown"?kind:"ordinary");
+        // Original producer 0 -> extracted roots 1 -> original consumer 2.
+        // Independent register reads in 1 and 2 are real graph users, not
+        // synthetic activation metadata supplied only to make the proof pass.
+        auto old=f.nodes;f.nodes.assign(6,{});
+        f.nodes[0]=old[0];f.nodes[2]=old[1];f.nodes[3]=old[2];f.nodes[4]=old[3];f.nodes[5]=old[4];
+        for(auto value:roots) {
+            if(value==roots[2])continue; // Keep raw register read local; stored read views remain protected.
+            auto id=f.g.valueDef(value);auto &group=f.nodes[0];group.erase(std::find(group.begin(),group.end(),id));
+            f.nodes[1].push_back(id);
+        }
+        if(kind!="missing-reader") {
+            auto q=f.regRead("q_middle","q",width,1,width==17);
+            ValueId noise;for(const auto &port:f.g.inputPorts())
+                if(f.g.symbolText(f.g.valueSymbol(port.value))=="noise")noise=port.value;
+            auto used=f.op(OperationKind::kXor,"middle_use",width,{q,noise},1);
+            f.g.bindOutputPort("middle_read",used);
+        }
+        if(kind=="public")f.g.bindOutputPort("public_root",roots[0]);
+        if(kind=="effect")f.g.setAttr(f.g.valueDef(f.views[0]),"hasSideEffects",true);
+        if(kind=="decode-key") {
+            auto bits=f.g.valueWidth(f.views[0]);
+            for(unsigned i=0;i<16;++i) {
+                auto k=f.constant("protect_k"+std::to_string(i),bits,std::to_string(bits)+"'d"+std::to_string(i),1);
+                auto p=f.op(OperationKind::kEq,"protect_p"+std::to_string(i),1,{f.views[0],k},1);
+                f.g.bindOutputPort("protect"+std::to_string(i),p);
+            }
+        }
+        return roots;
+    };
+    auto crosses=[](const std::map<std::string,std::string> &files) {
+        std::map<unsigned,std::string> sites;
+        const std::regex pattern("Cross-region state expression: value=([0-9]+) ops=[0-9]+ mode=(inline|notify)");
+        for(const auto &[name,text]:files)
+            for(auto i=std::sregex_iterator(text.begin(),text.end(),pattern);i!=std::sregex_iterator();++i)
+                sites.emplace(std::stoul((*i)[1]),(*i)[2]);
+        return sites;
+    };
+    for(int width:{1,17,64}) {
+        std::string baselineCalls;GrhSimExecutionPlan baseline;
+        std::map<std::string,std::string> baselineSource;
+        for(const std::string stage:{"off","notify","inline","parent-off"}) {
+            Fixture f;auto roots=arrange(f,width,"ordinary");GrhSimExecutionPlan plan;
+            auto dir=root/(std::to_string(width)+stage);
+            std::map<std::string,std::string> options{{"covered_state_view_composition","1"},
+                {"covered_state_view_composition_inline",stage=="notify"?"0":"1"},
+                {"covered_state_view_cross_region",stage=="off"?"0":"1"}};
+            if(stage=="parent-off")options["covered_state_view_composition"]="0";
+            auto files=emit(f,dir,"inline",plan,options);const auto selected=crosses(files);
+            if(stage=="off"){baseline=plan;baselineSource=files;}
+            require(states(plan)==states(baseline),"cross-region changed state activation frontier");
+            if(stage=="off"||stage=="parent-off")require(selected.empty(),"disabled cross-region proof applied");
+            else {
+                // complement, sliced-not, reduction and deep chain cross a group.
+                // Equal-to-constant also has its register read upstream, and may
+                // conservatively fall back if direct-read lowering stores it.
+                for(unsigned i:{0u,1u,3u,4u})require(selected.contains(roots[i].index),"cross-region fixture missing proof");
+                require(selected.at(roots[4].index)=="notify","deep cross-region expression bypassed inline budget");
+            }
+            if(stage!="parent-off") {
+                auto calls=run(dir,files,width,oracleExtra,{},6);
+                if(stage=="off")baselineCalls=calls;else require(calls==baselineCalls,"cross-region changed execution counts");
+            }
+        }
+    }
+    for(const std::string kind:{"missing-reader","effect","public","unknown","decode-key"}) {
+        Fixture f;auto roots=arrange(f,17,kind);GrhSimExecutionPlan plan;
+        auto files=emit(f,root/kind,"inline",plan,{{"covered_state_view_composition","1"},
+            {"covered_state_view_composition_inline","1"},{"covered_state_view_cross_region","1"}});
+        auto selected=crosses(files);
+        if(kind=="missing-reader"||kind=="effect")require(selected.empty(),"unsafe producer/frontier accepted");
+        if(kind=="public"||kind=="decode-key")require(!selected.contains(roots[0].index),"protected cross-region value accepted");
+        if(kind=="unknown")require(!selected.contains(roots[2].index),"unknown literal proof accepted");
+    }
+    std::cout<<"cross-region expressions: snapshots, activation, ownership and budget passed\n";
+}
+
 void testEntryGuard() {
     const auto root=std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR)/"compute-entry-guard";
     std::filesystem::remove_all(root);
@@ -323,6 +410,7 @@ void testEntryGuard() {
 }
 int main() {
     try {
+        if(std::getenv("WOLVRIX_TEST_CROSS_REGION_VIEWS")){testCrossRegion();return 0;}
         if(std::getenv("WOLVRIX_TEST_COMPUTE_ENTRY_GUARD")){testEntryGuard();return 0;}
         if(std::getenv("WOLVRIX_TEST_STATE_EXPRESSIONS")){testExpressions();return 0;}
         const char *key="WOLVRIX_GRHSIM_COVERED_STATE_VIEW_NOTIFICATIONS";::unsetenv(key);

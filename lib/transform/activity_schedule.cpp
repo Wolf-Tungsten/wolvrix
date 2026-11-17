@@ -2,6 +2,8 @@
 
 #include "core/toposort.hpp"
 #include "activity_stage_trace.hpp"
+#include "activity_shared_refinement.hpp"
+#include "activity_shared_components.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -11572,7 +11574,8 @@ namespace wolvrix::lib::transform
                 for (const ValueId value : nodeResults)
                 {
                     bool external = false;
-                    for (const auto &user : graph.getValue(value).users())
+                    const auto usersOwner_value = graph.getValue(value);
+                    for (const auto &user : usersOwner_value.users())
                     {
                         if (!user.operation.valid() || !nodeOps.contains(user.operation))
                         {
@@ -11708,7 +11711,8 @@ namespace wolvrix::lib::transform
 
                 bool invalidExternalConsumer = false;
                 bool haveExternalConsumer = false;
-                for (const auto &user : graph.getValue(liveout).users())
+                const auto usersOwner_liveout = graph.getValue(liveout);
+                for (const auto &user : usersOwner_liveout.users())
                 {
                     if (user.operation.valid() && nodeOps.contains(user.operation))
                     {
@@ -11758,7 +11762,8 @@ namespace wolvrix::lib::transform
                 for (const ValueId value : boundaryInputs)
                 {
                     bool remainingTargetUse = false;
-                    for (const auto &user : graph.getValue(value).users())
+                    const auto usersOwner_value = graph.getValue(value);
+                    for (const auto &user : usersOwner_value.users())
                     {
                         if (user.operation.valid() && !nodeOps.contains(user.operation) &&
                             ownerOfOp(user.operation) == target)
@@ -12673,7 +12678,8 @@ namespace wolvrix::lib::transform
                 for (const ValueId resultValue : nodeResults)
                 {
                     bool external = false;
-                    for (const auto &user : graph.getValue(resultValue).users())
+                    const auto usersOwner_resultValue = graph.getValue(resultValue);
+                    for (const auto &user : usersOwner_resultValue.users())
                     {
                         if (user.operation.valid() && nodeOps.contains(user.operation))
                         {
@@ -13403,7 +13409,8 @@ namespace wolvrix::lib::transform
                 {
                     bool external = false;
                     std::size_t resultComputeTargets = 0;
-                    for (const auto &user : graph.getValue(result).users())
+                    const auto usersOwner_result = graph.getValue(result);
+                    for (const auto &user : usersOwner_result.users())
                     {
                         if (user.operation.valid() && nodeOps.contains(user.operation))
                         {
@@ -13486,7 +13493,8 @@ namespace wolvrix::lib::transform
                     }
                     bool hasSourceUse = false;
                     bool hasOtherSourceUse = false;
-                    for (const auto &user : graph.getValue(input).users())
+                    const auto usersOwner_input = graph.getValue(input);
+                    for (const auto &user : usersOwner_input.users())
                     {
                         if (!user.operation.valid())
                         {
@@ -13547,7 +13555,8 @@ namespace wolvrix::lib::transform
                     bool outputUsesPeer = false;
                     for (const ValueId output : outputs)
                     {
-                        for (const auto &user : graph.getValue(output).users())
+                        const auto usersOwner_output = graph.getValue(output);
+                        for (const auto &user : usersOwner_output.users())
                         {
                             if (user.operation.valid() &&
                                 ownerOfOp(user.operation) == peer &&
@@ -14123,6 +14132,11 @@ namespace wolvrix::lib::transform
             std::size_t sourceGroups = 0;
             std::size_t terminalLimit = 0;
             std::size_t splitGroups = 0;
+            std::size_t cycleRounds = 0;
+            std::size_t cycleRejected = 0;
+            std::size_t workComponents = 0;
+            std::size_t equalActivationJoins = 0;
+            std::size_t noContraction = 0;
         };
 
         bool orderEventRegionByUse(const wolvrix::lib::grh::Graph &graph,
@@ -14162,7 +14176,8 @@ namespace wolvrix::lib::transform
                 for (const auto result : op.results())
                 {
                     if (observable.contains(result)) roots[i] = true;
-                    for (const auto &use : graph.getValue(result).users())
+                    const auto usersOwner_result = graph.getValue(result);
+                    for (const auto &use : usersOwner_result.users())
                         if (!positions.contains(use.operation) && use.operation.index > 0 &&
                             use.operation.index <= baseline.opToSupernode.size() &&
                             baseline.opToSupernode[use.operation.index - 1] != kInvalidActivitySupernodeId)
@@ -14180,7 +14195,8 @@ namespace wolvrix::lib::transform
                     for (const auto result : op.results())
                     {
                         std::size_t last = i;
-                        for (const auto &use : graph.getValue(result).users())
+                        const auto usersOwner_result = graph.getValue(result);
+                        for (const auto &use : usersOwner_result.users())
                             if (const auto it = position.find(use.operation); it != position.end())
                                 last = std::max(last, it->second);
                         total += last - i;
@@ -14432,11 +14448,36 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        struct SharedEventRegionCost
+        {
+            std::size_t computeGroups = 0;
+            std::size_t boundaryValues = 0;
+            std::size_t boundaryActivationEdges = 0;
+            std::size_t stateReadActivationEdges = 0;
+        };
+
+        SharedEventRegionCost sharedEventRegionCost(const ActivityScheduleBuild &build)
+        {
+            SharedEventRegionCost cost;
+            for (const auto kind : build.supernodeKinds)
+                if (kind == ActivityScheduleSupernodeKind::Compute) ++cost.computeGroups;
+            for (const auto &fanout : build.valueFanout)
+            {
+                if (!fanout.empty()) ++cost.boundaryValues;
+                cost.boundaryActivationEdges += fanout.size();
+            }
+            for (const auto &[_, supernodes] : build.stateReadSupernodes)
+                cost.stateReadActivationEdges += supernodes.size();
+            return cost;
+        }
+
         bool buildSharedEventRegions(const wolvrix::lib::grh::Graph &graph,
                                      const ComputeRewriteBuild &rewrite,
                                      ActivityScheduleBuild &build,
                                      EventRegionStats &stats,
-                                     std::string &error)
+                                     std::string &error,
+                                     bool cycleRefinement = false,
+                                     bool connected = false)
         {
             using namespace wolvrix::lib::grh;
             constexpr std::size_t maxRegionOps = 8192;
@@ -14551,26 +14592,67 @@ namespace wolvrix::lib::transform
             // the same classes. Leaving mixed remainders could create a quotient
             // cycle despite an acyclic node DAG. Effect groups are wholly blocked
             // and retain their original membership, order and activation context.
-            std::map<std::vector<uint32_t>, std::vector<uint32_t>> regions;
+            std::map<std::vector<uint32_t>, std::vector<uint32_t>> terminalClasses;
             for (uint32_t node = 0; node < count; ++node)
                 if (!blocked[node] && terminals[node].size() > 1 && oldGroup[node] != kInvalidActivitySupernodeId)
-                    regions[terminals[node]].push_back(node);
+                    terminalClasses[terminals[node]].push_back(node);
+            std::vector<std::vector<uint32_t>> regions;
+            for (const auto &[key, nodes] : terminalClasses) regions.push_back(nodes);
+            if (connected)
+            {
+                std::vector<detail::SharedComponentNode> nodes(count);
+                std::vector<std::vector<uint32_t>> workDag(count);
+                std::map<std::string, uint64_t> states;
+                const auto isWork = [](OperationKind kind) {
+                    return kind != OperationKind::kConstant && kind != OperationKind::kRegisterReadPort;
+                };
+                for (uint32_t node = 0; node < count; ++node)
+                    for (const auto id : rewrite.computeNodes[node].ops)
+                    {
+                        const auto op = graph.getOperation(id);
+                        nodes[node].work = nodes[node].work || isWork(op.kind());
+                        if (op.kind() == OperationKind::kRegisterReadPort)
+                        {
+                            const auto state = getAttrValue<std::string>(op, "regSymbol");
+                            if (!state) nodes[node].activationKnown = false;
+                            else
+                            {
+                                const auto [it, inserted] = states.emplace(*state, states.size());
+                                nodes[node].states.push_back((uint64_t{1} << 63) | it->second);
+                            }
+                        }
+                        for (const auto value : op.operands())
+                        {
+                            const auto def = graph.valueDef(value);
+                            if (def.valid() && graph.getOperation(def).kind() == OperationKind::kConstant) continue;
+                            const auto source = owner(value);
+                            if (source != node) nodes[node].inputs.emplace_back(source, value.index);
+                            if (source < count && source != node && isWork(op.kind()) && def.valid() &&
+                                isWork(graph.getOperation(def).kind())) workDag[source].push_back(node);
+                        }
+                    }
+                const auto selected = detail::connectedSharedClasses(rewrite.computeDag, workDag, oldGroup, regions, nodes);
+                regions = selected.classes;
+                stats.workComponents = selected.workComponents;
+                stats.equalActivationJoins = selected.equalActivationJoins;
+                stats.noContraction = selected.noContraction;
+            }
             std::vector<bool> moved(count, false);
             std::set<uint32_t> allSources;
             for (auto it = regions.begin(); it != regions.end();)
             {
                 std::size_t ops = 0;
                 std::set<uint32_t> sources;
-                for (const auto node : it->second)
+                for (const auto node : *it)
                 { ops += rewrite.computeNodes[node].ops.size(); sources.insert(oldGroup[node]); }
                 if (sources.size() < 2 || ops > maxRegionOps)
                 {
                     if (ops > maxRegionOps) ++stats.oversized;
                     it = regions.erase(it); continue;
                 }
-                ++stats.regions; stats.ops += ops; stats.nodes += it->second.size();
+                ++stats.regions; stats.ops += ops; stats.nodes += it->size();
                 allSources.insert(sources.begin(), sources.end());
-                for (const auto node : it->second) moved[node] = true;
+                for (const auto node : *it) moved[node] = true;
                 ++it;
             }
             stats.sourceGroups = allSources.size();
@@ -14586,36 +14668,86 @@ namespace wolvrix::lib::transform
                 candidate.computeNodesBySupernode.push_back(std::move(nodes));
                 candidate.supernodeKinds.push_back(ActivityScheduleSupernodeKind::Compute);
             };
-            for (uint32_t group = 0; group < baseline.supernodeToOps.size(); ++group)
+            if (cycleRefinement || connected)
             {
-                if (baseline.supernodeKinds[group] != ActivityScheduleSupernodeKind::Compute) continue;
-                std::map<std::vector<uint32_t>, std::vector<uint32_t>> fragments;
-                for (const auto node : baseline.computeNodesBySupernode[group])
-                    if (!moved[node]) fragments[terminals[node]].push_back(node);
-                if (fragments.size() > 1) ++stats.splitGroups;
-                for (auto &[key, nodes] : fragments)
+                std::vector<std::vector<uint32_t>> classes;
+                for (const auto &nodes : regions) classes.push_back(nodes);
+                const auto refined = detail::refineSharedPartitions(
+                    rewrite.computeDag, baseline.computeNodesBySupernode, terminals, classes);
+                stats.regions = stats.nodes = stats.ops = 0;
+                stats.splitGroups = refined.splitGroups;
+                stats.cycleRounds = refined.rounds;
+                stats.cycleRejected = refined.rejected;
+                allSources.clear();
+                for (const auto &partition : refined.partitions)
                 {
-                    (void)key;
-                    if (nodes.size() == baseline.computeNodesBySupernode[group].size())
-                    { append(baseline.supernodeToOps[group], std::move(nodes)); continue; }
-                    std::unordered_set<OperationId, OperationIdHash> membership;
-                    for (const auto node : nodes)
-                        membership.insert(rewrite.computeNodes[node].ops.begin(), rewrite.computeNodes[node].ops.end());
-                    std::vector<OperationId> ops;
-                    for (const auto op : baseline.supernodeToOps[group])
-                        if (membership.contains(op)) ops.push_back(op);
-                    append(std::move(ops), std::move(nodes));
+                    std::vector<OperationId> ops, ordered;
+                    if (partition.originalGroup != detail::noSharedGroup)
+                    {
+                        const auto group = partition.originalGroup;
+                        if (partition.nodes == baseline.computeNodesBySupernode[group])
+                            ops = baseline.supernodeToOps[group];
+                        else
+                        {
+                            std::unordered_set<OperationId, OperationIdHash> membership;
+                            for (const auto node : partition.nodes)
+                                membership.insert(rewrite.computeNodes[node].ops.begin(), rewrite.computeNodes[node].ops.end());
+                            for (const auto id : baseline.supernodeToOps[group])
+                                if (membership.contains(id)) ops.push_back(id);
+                        }
+                    }
+                    else
+                    {
+                        ++stats.regions;
+                        stats.nodes += partition.nodes.size();
+                        for (const auto node : partition.nodes)
+                        {
+                            allSources.insert(oldGroup[node]);
+                            ops.insert(ops.end(), rewrite.computeNodes[node].ops.begin(), rewrite.computeNodes[node].ops.end());
+                        }
+                        stats.ops += ops.size();
+                        if (!topoSortLocalOps(graph, ops, ordered, error) ||
+                            !orderEventRegionByUse(graph, baseline, ordered, stats, error)) return false;
+                        ops = std::move(ordered);
+                    }
+                    append(std::move(ops), partition.nodes);
                 }
+                stats.sourceGroups = allSources.size();
+                // Preserve exact IDs and all derived data if every class fell back.
+                if (stats.regions == 0) return true;
             }
-            for (auto &[key, nodes] : regions)
+            else
             {
-                (void)key;
-                std::vector<OperationId> ops, ordered;
-                for (const auto node : nodes)
-                    ops.insert(ops.end(), rewrite.computeNodes[node].ops.begin(), rewrite.computeNodes[node].ops.end());
-                if (!topoSortLocalOps(graph, ops, ordered, error) ||
-                    !orderEventRegionByUse(graph, baseline, ordered, stats, error)) return false;
-                append(std::move(ordered), std::move(nodes));
+                for (uint32_t group = 0; group < baseline.supernodeToOps.size(); ++group)
+                {
+                    if (baseline.supernodeKinds[group] != ActivityScheduleSupernodeKind::Compute) continue;
+                    std::map<std::vector<uint32_t>, std::vector<uint32_t>> fragments;
+                    for (const auto node : baseline.computeNodesBySupernode[group])
+                        if (!moved[node]) fragments[terminals[node]].push_back(node);
+                    if (fragments.size() > 1) ++stats.splitGroups;
+                    for (auto &[key, nodes] : fragments)
+                    {
+                        (void)key;
+                        if (nodes.size() == baseline.computeNodesBySupernode[group].size())
+                        { append(baseline.supernodeToOps[group], std::move(nodes)); continue; }
+                        std::unordered_set<OperationId, OperationIdHash> membership;
+                        for (const auto node : nodes)
+                            membership.insert(rewrite.computeNodes[node].ops.begin(), rewrite.computeNodes[node].ops.end());
+                        std::vector<OperationId> ops;
+                        for (const auto op : baseline.supernodeToOps[group])
+                            if (membership.contains(op)) ops.push_back(op);
+                        append(std::move(ops), std::move(nodes));
+                    }
+                }
+                for (auto &nodes : regions)
+                {
+                    std::vector<OperationId> ops, ordered;
+                    for (const auto node : nodes)
+                        ops.insert(ops.end(), rewrite.computeNodes[node].ops.begin(), rewrite.computeNodes[node].ops.end());
+                    if (!topoSortLocalOps(graph, ops, ordered, error) ||
+                        !orderEventRegionByUse(graph, baseline, ordered, stats, error)) return false;
+                    append(std::move(ordered), std::move(nodes));
+                }
             }
             std::vector<uint32_t> commitOrder;
             for (const auto group : baseline.topoOrder)
@@ -15638,6 +15770,24 @@ namespace wolvrix::lib::transform
         if (options_.eventRegionsShared && !options_.eventRegions)
         {
             error("event-regions-shared requires event-regions");
+            result.failed = true;
+            return result;
+        }
+        if (options_.eventRegionsSharedConnected && !options_.eventRegionsShared)
+        {
+            error("event-regions-shared-connected requires event-regions-shared");
+            result.failed = true;
+            return result;
+        }
+        if (options_.eventRegionsSharedCycleRefinement && !options_.eventRegionsShared)
+        {
+            error("event-regions-shared-cycle-refinement requires event-regions-shared");
+            result.failed = true;
+            return result;
+        }
+        if (options_.eventRegionsSharedCostGuard && !options_.eventRegionsShared)
+        {
+            error("event-regions-shared-cost-guard requires event-regions-shared");
             result.failed = true;
             return result;
         }
@@ -17230,13 +17380,54 @@ namespace wolvrix::lib::transform
 
         if (options_.eventRegionsShared)
         {
+            std::optional<ActivityScheduleBuild> sharedBaseline;
+            if (options_.eventRegionsSharedCostGuard) sharedBaseline = build;
             EventRegionStats shared;
-            if (!buildSharedEventRegions(*graph, rewrite, build, shared, buildError))
+            if (!buildSharedEventRegions(*graph, rewrite, build, shared, buildError, options_.eventRegionsSharedCycleRefinement, options_.eventRegionsSharedConnected))
             {
                 error(*graph, buildError);
                 result.failed = true;
                 return result;
             }
+            if (options_.eventRegionsSharedCostGuard)
+            {
+                const auto before = sharedEventRegionCost(*sharedBaseline);
+                const auto after = sharedEventRegionCost(build);
+                const bool noGrowth = after.computeGroups <= before.computeGroups &&
+                                      after.boundaryValues <= before.boundaryValues &&
+                                      after.boundaryActivationEdges <= before.boundaryActivationEdges &&
+                                      after.stateReadActivationEdges <= before.stateReadActivationEdges;
+                const bool strictImprovement = after.computeGroups < before.computeGroups ||
+                                               after.boundaryValues < before.boundaryValues ||
+                                               after.boundaryActivationEdges < before.boundaryActivationEdges ||
+                                               after.stateReadActivationEdges < before.stateReadActivationEdges;
+                const bool accepted = noGrowth && strictImprovement;
+                logInfo("activity-schedule shared event-regions cost guard: accepted=" +
+                        std::string(accepted ? "true" : "false") +
+                        " compute_groups_before=" + std::to_string(before.computeGroups) +
+                        " compute_groups_after=" + std::to_string(after.computeGroups) +
+                        " boundary_values_before=" + std::to_string(before.boundaryValues) +
+                        " boundary_values_after=" + std::to_string(after.boundaryValues) +
+                        " boundary_activation_edges_before=" +
+                        std::to_string(before.boundaryActivationEdges) +
+                        " boundary_activation_edges_after=" +
+                        std::to_string(after.boundaryActivationEdges) +
+                        " state_read_activation_edges_before=" +
+                        std::to_string(before.stateReadActivationEdges) +
+                        " state_read_activation_edges_after=" +
+                        std::to_string(after.stateReadActivationEdges));
+                if (!accepted) build = std::move(*sharedBaseline);
+            }
+            if (options_.eventRegionsSharedConnected)
+                logInfo("activity-schedule shared connected components: work_components=" + std::to_string(shared.workComponents) +
+                        " equal_activation_joins=" + std::to_string(shared.equalActivationJoins) +
+                        " no_contraction=" + std::to_string(shared.noContraction) +
+                        " retained_classes=" + std::to_string(shared.regions));
+            if (options_.eventRegionsSharedCycleRefinement || options_.eventRegionsSharedConnected)
+                logInfo("activity-schedule shared cycle refinement: rounds=" + std::to_string(shared.cycleRounds) +
+                        " split_groups=" + std::to_string(shared.splitGroups) +
+                        " rejected_classes=" + std::to_string(shared.cycleRejected) +
+                        " retained_classes=" + std::to_string(shared.regions));
             logInfo("activity-schedule shared event-regions: regions=" + std::to_string(shared.regions) +
                     " source_groups=" + std::to_string(shared.sourceGroups) +
                     " compute_nodes=" + std::to_string(shared.nodes) + " ops=" + std::to_string(shared.ops) +

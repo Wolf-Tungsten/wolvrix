@@ -65,6 +65,7 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-declared-value-compute-node-boundary` | `false` | 把带 declared symbol 的 value 作为 compute-node 截断边界 |
 | `-event-regions` | `false` | 合并同一 register commit 终点的完整纯组合尾部区域；固定 8192-op 上限，保留 commit 顺序及事件/副作用屏障 |
 | `-event-regions-shared` | `false` | 按相同多终点集合合并共享纯组合区域；保护memory/event/effect组，固定32终点、8192-op上限；要求父选项开启 |
+| `-event-regions-shared-cost-guard` | `false` | 共享区域的静态 Pareto 准入：compute group、boundary value、boundary activation edge、state-read activation edge 均不增加且至少一项减少；否则恢复共享前 schedule；要求 `-event-regions-shared` |
 | `-final-terminal-pushforward-policy` | `off` | terminal common-target pushforward 策略：`off/probe/strict` |
 | `-final-terminal-pushforward-max-node-ops` | `8` | 候选 terminal compute node 的最大 raw compute op 数 |
 | `-final-terminal-pushforward-max-inputs` | `16` | 候选 cone 的最大 external input value 数 |

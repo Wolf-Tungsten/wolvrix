@@ -1308,6 +1308,42 @@ namespace wolvrix::lib::transform
                     else if (text == "false" || text == "0" || text == "off") options.eventRegionsShared = false;
                     else { error = "invalid -event-regions-shared value"; return nullptr; }
                 }
+                else if (arg == "-event-regions-shared-cost-guard")
+                {
+                    if (!parseBoolArg("-event-regions-shared-cost-guard",
+                                      options.eventRegionsSharedCostGuard)) return nullptr;
+                }
+                else if (arg.starts_with("-event-regions-shared-cost-guard="))
+                {
+                    const auto text = arg.substr(std::string_view("-event-regions-shared-cost-guard=").size());
+                    if (text == "true" || text == "1" || text == "on") options.eventRegionsSharedCostGuard = true;
+                    else if (text == "false" || text == "0" || text == "off") options.eventRegionsSharedCostGuard = false;
+                    else { error = "invalid -event-regions-shared-cost-guard value"; return nullptr; }
+                }
+                else if (arg == "-event-regions-shared-cycle-refinement")
+                {
+                    if (!parseBoolArg("-event-regions-shared-cycle-refinement",
+                                      options.eventRegionsSharedCycleRefinement)) return nullptr;
+                }
+                else if (arg.starts_with("-event-regions-shared-cycle-refinement="))
+                {
+                    const auto text = arg.substr(std::string_view("-event-regions-shared-cycle-refinement=").size());
+                    if (text == "true" || text == "1" || text == "on") options.eventRegionsSharedCycleRefinement = true;
+                    else if (text == "false" || text == "0" || text == "off") options.eventRegionsSharedCycleRefinement = false;
+                    else { error = "invalid -event-regions-shared-cycle-refinement value"; return nullptr; }
+                }
+                else if (arg == "-event-regions-shared-connected")
+                {
+                    if (!parseBoolArg("-event-regions-shared-connected",
+                                      options.eventRegionsSharedConnected)) return nullptr;
+                }
+                else if (arg.starts_with("-event-regions-shared-connected="))
+                {
+                    const auto text = arg.substr(std::string_view("-event-regions-shared-connected=").size());
+                    if (text == "true" || text == "1" || text == "on") options.eventRegionsSharedConnected = true;
+                    else if (text == "false" || text == "0" || text == "off") options.eventRegionsSharedConnected = false;
+                    else { error = "invalid -event-regions-shared-connected value"; return nullptr; }
+                }
                 else if (arg == "-declared-value-compute-node-boundary")
                 {
                     if (!parseBoolArg("-declared-value-compute-node-boundary",

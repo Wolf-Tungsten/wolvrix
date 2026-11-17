@@ -857,6 +857,9 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("declared_value_compute_node_boundary", "-declared-value-compute-node-boundary"),
         ("event_regions", "-event-regions"),
         ("event_regions_shared", "-event-regions-shared"),
+        ("event_regions_shared_cost_guard", "-event-regions-shared-cost-guard"),
+        ("event_regions_shared_cycle_refinement", "-event-regions-shared-cycle-refinement"),
+        ("event_regions_shared_connected", "-event-regions-shared-connected"),
     ]
 
     for key, arg in string_options:

@@ -6,6 +6,15 @@ from wolvrix import _compile_activity_schedule_kwargs
 
 
 class ActivityScheduleOptionTest(unittest.TestCase):
+    def test_shared_connected(self):
+        for enabled in (True, False):
+            self.assertEqual(_compile_activity_schedule_kwargs({"event_regions_shared_connected": enabled}),
+                             ["-event-regions-shared-connected", str(enabled).lower()])
+
+    def test_shared_cycle_refinement(self):
+        self.assertEqual(_compile_activity_schedule_kwargs({"event_regions_shared_cycle_refinement": True}),
+                         ["-event-regions-shared-cycle-refinement", "true"])
+
     def test_event_regions_option_is_forwarded(self) -> None:
         self.assertEqual(_compile_activity_schedule_kwargs({"event_regions": True}),
                          ["-event-regions", "true"])
@@ -17,6 +26,21 @@ class ActivityScheduleOptionTest(unittest.TestCase):
                          ["-event-regions", "true", "-event-regions-shared", "true"])
         self.assertEqual(_compile_activity_schedule_kwargs({"event_regions_shared": False}),
                          ["-event-regions-shared", "false"])
+
+    def test_shared_event_regions_cost_guard_is_forwarded(self) -> None:
+        self.assertEqual(_compile_activity_schedule_kwargs({}), [])
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                self.assertEqual(
+                    _compile_activity_schedule_kwargs({"event_regions_shared_cost_guard": enabled}),
+                    ["-event-regions-shared-cost-guard", str(enabled).lower()],
+                )
+        self.assertEqual(
+            _compile_activity_schedule_kwargs({"event_regions": True, "event_regions_shared": True,
+                                               "event_regions_shared_cost_guard": True}),
+            ["-event-regions", "true", "-event-regions-shared", "true",
+             "-event-regions-shared-cost-guard", "true"],
+        )
 
     def test_final_terminal_pushforward_options_are_forwarded(self) -> None:
         self.assertEqual(

@@ -6,6 +6,44 @@ extension of [event regions](activity-event-regions.md). It requires
 `eventRegions` to be enabled explicitly. The first pass still forms the same
 single-register-terminal regions; this extension then handles shared pure logic.
 
+For a static admission check, also enable
+`ActivityScheduleOptions::eventRegionsSharedCostGuard`, CLI
+`-event-regions-shared-cost-guard true`, or Python
+`event_regions_shared_cost_guard=True`. This guard is default-off and requires
+`eventRegionsShared`. It snapshots the schedule immediately before the shared
+pass, then compares the rebuilt candidate on four structural maintenance
+dimensions: compute group count, boundary value count, boundary activation edge
+count, and state-read activation edge count. The candidate is accepted only when
+every dimension is no larger and at least one is strictly smaller. Otherwise the
+complete pre-shared schedule, including its commit order and derived data, is
+restored. The decision uses only the static schedule and emits before/after
+metrics; it does not read runtime traces, profiles, or workload measurements.
+The guard counts state-read activation edges as the sum of the distinct group
+sets in `stateReadSupernodes`. This differs from the older schedule-summary
+field with the same name, which counts fanout of state-read result values.
+The existing shared-region summary describes the constructed candidate even
+when it is rejected; use the guard decision and final schedule summary to
+identify the retained schedule.
+
+## Local cycle refinement
+
+`eventRegionsSharedCycleRefinement` (CLI `-event-regions-shared-cycle-refinement`,
+Python `event_regions_shared_cycle_refinement`) is a separate default-off option,
+requiring shared regions. It selects the same endpoint classes and operation
+limits as the original pass. Unmoved nodes initially retain their original group.
+An iterative SCC walk checks the quotient graph; only original remainders inside
+nontrivial SCCs are partitioned by exact endpoint set. Acyclic descendants of an
+SCC are retained. If no further refinement is possible, only merged classes in
+cyclic SCCs are withdrawn, and the partition is rebuilt from the original groups.
+Each iteration either refines a mixed remainder or permanently withdraws a class.
+
+The final schedule still undergoes full operation coverage, dependency, topology,
+and commit-order reconstruction. Effects, state snapshots and complete compute
+nodes obey the existing rules. No model names, execution counts or runtime
+profiles affect decisions. The original global refinement remains unchanged
+when this option is off. This is independent of the experimental cost guard;
+comparison runs leave that guard off.
+
 ## Endpoints and hard boundaries
 
 Each complete compute node receives the sorted set of endpoints reachable through
@@ -76,3 +114,35 @@ The mechanism is independent of CV32E40P. XiangShan may have similar shared cont
 cones, but partition communication, memory intents, effects, larger endpoint sets
 and long live ranges constrain applicability. This option has no measured
 XiangShan benefit at present.
+# Connected candidates and exact activation frontiers
+
+`eventRegionsSharedConnected` (`-event-regions-shared-connected`, Python
+`event_regions_shared_connected`) is an experimental, default-off alternative
+to pooling an entire equal-terminal class. It requires `eventRegionsShared`.
+
+The rule keeps whole compute nodes and all existing effect, event, intent,
+terminal-count and region-size protections. Within each terminal class it joins
+nodes through actual computational def-use edges, excluding constant and
+register-read edges as evidence of shared computation. Read-only nodes can
+follow a component when all outgoing edges belong to that component.
+
+Disconnected components may share an entry only if their complete static
+activation frontiers are equal: the exact external nonconstant ValueIds and
+direct register state symbols. Equal terminal sets or partial overlap of state
+sources are insufficient. These keys are computed before schedule rebuilding;
+there are no runtime counts, model names or profile inputs. Initialization and
+compute-before-commit snapshot semantics remain unchanged.
+
+A candidate must contain computational nodes from multiple original groups
+and either internalize a previously crossing computational edge or merge equal
+activation frontiers. Attaching source reads alone does not satisfy that rule.
+The existing 8192-operation bound is unchanged. Unselected nodes retain their
+original groups. The local quotient-SCC refinement is used automatically;
+only cyclic remainders are split, with unresolved cyclic classes withdrawn.
+
+The diagnostic `shared connected components` reports initial work components,
+equal-frontier joins, components lacking a contraction, and retained classes.
+These are structural counts, not predicted time savings. In particular, state
+view eligibility and cache ownership can depend on the resulting read frontier
+and must be checked on each generated model. The default-off path preserves
+the prior schedule and generated source.

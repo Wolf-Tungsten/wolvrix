@@ -497,6 +497,13 @@ target_compile_definitions(emit-grhsim-event-regions PRIVATE
     WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
     WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
 register_test_exe(emit-grhsim-event-regions)
+add_test(NAME emit-grhsim-shared-cost-guard COMMAND emit-grhsim-event-regions --cost-guard-only)
+add_executable(transform-activity-shared-refinement tests/transform/test_activity_shared_refinement.cpp)
+register_test_exe(transform-activity-shared-refinement)
+add_test(NAME emit-grhsim-shared-cycle-refinement COMMAND emit-grhsim-event-regions --cycle-refinement-only)
+add_executable(transform-activity-shared-components tests/transform/test_activity_shared_components.cpp)
+register_test_exe(transform-activity-shared-components)
+add_test(NAME emit-grhsim-shared-connected COMMAND emit-grhsim-event-regions --connected-only)
 add_executable(emit-grhsim-conditional-mux tests/emit/test_emit_grhsim_conditional_mux.cpp)
 target_link_libraries(emit-grhsim-conditional-mux PRIVATE wolvrix-lib)
 target_compile_definitions(emit-grhsim-conditional-mux PRIVATE
@@ -510,12 +517,23 @@ target_compile_definitions(emit-grhsim-consumer-structure PRIVATE
     WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
 add_test(NAME emit-grhsim-conditional-wide COMMAND emit-grhsim-consumer-structure wide)
 add_test(NAME emit-grhsim-local-predicate-sets COMMAND emit-grhsim-consumer-structure predicates)
+add_executable(emit-grhsim-packed-storage tests/emit/test_emit_grhsim_packed_storage.cpp)
+target_link_libraries(emit-grhsim-packed-storage PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-packed-storage PRIVATE
+    WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
+add_test(NAME emit-grhsim-packed-state-layout COMMAND emit-grhsim-packed-storage)
+add_test(NAME emit-grhsim-packed-array-scope COMMAND emit-grhsim-packed-storage scope)
+add_test(NAME emit-grhsim-packed-array-no-init COMMAND emit-grhsim-packed-storage no-init)
+add_test(NAME emit-grhsim-packed-array-state-select COMMAND emit-grhsim-packed-storage select)
 add_executable(emit-grhsim-covered-state-views tests/emit/test_emit_grhsim_covered_state_views.cpp)
 target_link_libraries(emit-grhsim-covered-state-views PRIVATE wolvrix-lib)
 target_compile_definitions(emit-grhsim-covered-state-views PRIVATE
     WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
     WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}")
 register_test_exe(emit-grhsim-covered-state-views)
+add_test(NAME emit-grhsim-cross-region-views COMMAND emit-grhsim-covered-state-views)
+set_tests_properties(emit-grhsim-cross-region-views PROPERTIES ENVIRONMENT "WOLVRIX_TEST_CROSS_REGION_VIEWS=1")
 add_test(NAME emit-grhsim-state-expressions COMMAND emit-grhsim-covered-state-views)
 set_tests_properties(emit-grhsim-state-expressions PROPERTIES ENVIRONMENT "WOLVRIX_TEST_STATE_EXPRESSIONS=1")
 add_test(NAME emit-grhsim-compute-entry-guard COMMAND emit-grhsim-covered-state-views)

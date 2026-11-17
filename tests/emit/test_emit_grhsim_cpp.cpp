@@ -12790,6 +12790,15 @@ int main() {
                 for (unsigned i = 0; i < (group == 4 ? 64u : 1u); ++i)
                     operands[i] = unary(OperationKind::kNot, inputs[i],
                         "written" + std::to_string(group) + "_" + std::to_string(i), node);
+                if (group == 4)
+                {
+                    // Materialized internal writes must not look like stable
+                    // external leaves when checking scope-entry snapshots.
+                    // Merely local values also fail the separate storage gate
+                    // and would not catch a dangling results-span regression.
+                    for (unsigned i = 0; i < operands.size(); ++i)
+                        graph.bindOutputPort("written_watch_" + std::to_string(i), operands[i]);
+                }
                 if (group == 7) graph.setAttr(nodes[node].back(), "hasSideEffects", true);
             }
             std::vector<std::vector<unsigned>> shortPatterns;

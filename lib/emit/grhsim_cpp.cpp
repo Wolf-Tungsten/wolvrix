@@ -2353,6 +2353,9 @@ namespace wolvrix::lib::emit
             std::unordered_map<ValueId, OperationId, ValueIdHash> indexedConcatSlices;
             std::unordered_set<ValueId, ValueIdHash> preserveLocalSnapshot;
             std::unordered_set<ValueId, ValueIdHash> stablePackedArrayIndices;
+            std::unordered_map<OperationId, OperationId, OperationIdHash> scopedPackedSlicesByConcat;
+            std::unordered_map<OperationId, std::vector<std::string>, OperationIdHash> selectedPackedStateFieldsByConcat;
+            std::unordered_map<OperationId, std::string, OperationIdHash> scopedPackedResultBySlice;
             bool stableWideStateReadRefs = false;
         };
         bool isWritePortKind(OperationKind kind) noexcept;
@@ -4736,12 +4739,14 @@ namespace wolvrix::lib::emit
                 bool inlineValue = false;
                 bool composed = false;
                 uint32_t expressionOps = 1;
+                bool crossRegion = false;
             };
             std::unordered_map<ValueId, CoveredStateView, ValueIdHash> coveredStateViews;
             bool coveredStateViewNotifications = false;
             bool coveredStateViewInline = false;
             bool coveredStateViewComposition = false;
             bool coveredStateViewCompositionInline = false;
+            bool coveredStateViewCrossRegion = false;
             std::unordered_map<ValueId, std::vector<std::optional<ProducerDirtyWordBit>>, ValueIdHash>
                 producerDirtyWordBitsByValue;
             std::unordered_map<std::string, std::vector<ProducerDirtyWordBit>>
@@ -4910,6 +4915,10 @@ namespace wolvrix::lib::emit
             bool directDeferredActivation = false;
             bool sharedDeferredActivation = false;
             bool packedArrayLateIndex = false;
+            bool stateLayoutPackedAccess = false;
+            bool packedArrayLocalScope = false;
+            bool packedArrayNoInit = false;
+            bool packedArrayStateSelect = false;
             bool wideStateReadRefs = false;
             bool localComputeUseOrder = false;
             bool priorityMuxChains = false;
@@ -6119,6 +6128,8 @@ namespace wolvrix::lib::emit
             std::vector<StateLogicReferenceUnit> units;
             std::size_t demand = 0;
             std::size_t graphOrder = 0;
+            std::size_t blockOrder = 0;
+            std::size_t laneOrder = 0;
         };
 
         std::size_t stateLogicReferenceDemandClass(std::size_t demand) noexcept
@@ -6157,6 +6168,7 @@ namespace wolvrix::lib::emit
                         .units = {},
                         .demand = 0,
                         .graphOrder = graphOrder,
+                        .blockOrder = graphOrder,
                     });
                 }
                 ++graphOrder;
@@ -6266,6 +6278,79 @@ namespace wolvrix::lib::emit
                 }
             }
 
+            if (model.stateLayoutPackedAccess)
+            {
+                // Preserve the existing demand and exact reader signatures.
+                // Only their graph-order tie-break is replaced by indivisible
+                // access bundles. Choose overlapping bundles by graph order,
+                // never by observed execution frequency or measured cost.
+                std::vector<const PackedArrayLaneView *> views;
+                for (const auto &[_, view] : model.packedArrayLaneViewByValue)
+                    views.push_back(&view);
+                std::sort(views.begin(), views.end(), [](const auto *a, const auto *b) {
+                    if (a->concatOp.index != b->concatOp.index)
+                        return a->concatOp.index < b->concatOp.index;
+                    return a->value.index < b->value.index;
+                });
+                std::vector<bool> bundled(signatures.size(), false);
+                std::size_t bundles = 0, states = 0, incompatible = 0, overlap = 0;
+                for (const auto *view : views)
+                {
+                    const auto concat = graph.getOperation(view->concatOp);
+                    std::vector<std::size_t> lanes(view->elementCount, kInvalidIndex);
+                    bool valid = true;
+                    std::unordered_set<std::size_t> unique;
+                    const StateDecl *first = nullptr;
+                    std::size_t representative = kInvalidIndex;
+                    for (std::size_t i = 0; i < concat.operands().size(); ++i)
+                    {
+                        const auto operand = concat.operands()[i];
+                        std::optional<std::string> symbol;
+                        if (const auto direct = model.directStateReadSymbolByValue.find(operand);
+                            direct != model.directStateReadSymbolByValue.end()) symbol = direct->second;
+                        else if (const auto def = graph.valueDef(operand);
+                                 def.valid() && !isMaterializedValue(model, operand))
+                        {
+                            // Ordinary local reads are inlined from the state
+                            // without entering the cross-region direct-read map.
+                            const auto read = graph.getOperation(def);
+                            if (read.kind() == OperationKind::kRegisterReadPort)
+                                symbol = getAttribute<std::string>(read, "regSymbol");
+                            else if (read.kind() == OperationKind::kLatchReadPort)
+                                symbol = getAttribute<std::string>(read, "latchSymbol");
+                        }
+                        if (!symbol || !signatureBySymbol.contains(*symbol)) { valid = false; break; }
+                        const auto index = signatureBySymbol.at(*symbol);
+                        const auto &state = model.stateBySymbol.at(*symbol);
+                        if (isWideLogicWidth(state.width) || state.width != view->elementWidth ||
+                            !unique.insert(index).second || signatures[index].units.empty())
+                        { valid = false; break; }
+                        if (first == nullptr) { first = &state; representative = index; }
+                        else if (state.scalarKind != first->scalarKind ||
+                                 signatures[index].units != signatures[representative].units ||
+                                 signatures[index].demand != signatures[representative].demand)
+                        { valid = false; break; }
+                        lanes.at(view->laneByOperand.at(i)) = index;
+                    }
+                    if (!valid || std::find(lanes.begin(), lanes.end(), kInvalidIndex) != lanes.end())
+                    { ++incompatible; continue; }
+                    if (std::any_of(lanes.begin(), lanes.end(), [&](auto i) { return bundled[i]; }))
+                    { ++overlap; continue; }
+                    auto block = signatures[lanes.front()].graphOrder;
+                    for (const auto index : lanes) block = std::min(block, signatures[index].graphOrder);
+                    for (std::size_t lane = 0; lane < lanes.size(); ++lane)
+                    {
+                        auto &signature = signatures[lanes[lane]];
+                        signature.blockOrder = block;
+                        signature.laneOrder = lane;
+                        bundled[lanes[lane]] = true;
+                    }
+                    ++bundles; states += lanes.size();
+                }
+                std::fprintf(stderr, "[GRHSIM_PACKED_STATE_LAYOUT] bundles=%zu states=%zu incompatible=%zu overlap=%zu\n",
+                             bundles, states, incompatible, overlap);
+            }
+
             std::sort(
                 signatures.begin(),
                 signatures.end(),
@@ -6295,6 +6380,8 @@ namespace wolvrix::lib::emit
                     {
                         return lhs.demand > rhs.demand;
                     }
+                    if (lhs.blockOrder != rhs.blockOrder) return lhs.blockOrder < rhs.blockOrder;
+                    if (lhs.laneOrder != rhs.laneOrder) return lhs.laneOrder < rhs.laneOrder;
                     return lhs.graphOrder < rhs.graphOrder;
                 });
 
@@ -10436,7 +10523,8 @@ namespace wolvrix::lib::emit
                 {
                     const auto fanoutIt = model.boundaryFanoutByValue.find(value);
                     bool allUsersAreTarget = true;
-                    for (const auto &user : graph.getValue(value).users())
+                    const auto usersOwner_value = graph.getValue(value);
+                    for (const auto &user : usersOwner_value.users())
                     {
                         allUsersAreTarget =
                             allUsersAreTarget && user.operation.valid() &&
@@ -12817,7 +12905,8 @@ namespace wolvrix::lib::emit
                     if (rawEligible)
                     {
                         std::vector<uint32_t> userActiveIds;
-                        for (const auto &user : graph.getValue(resultValue).users())
+                        const auto usersOwner_resultValue = graph.getValue(resultValue);
+                        for (const auto &user : usersOwner_resultValue.users())
                         {
                             const OperationId userOpId = user.operation;
                             const uint32_t userSupernode =
@@ -16232,7 +16321,8 @@ template<class Index>
                     std::size_t unscheduledUserEdges = 0;
                     std::unordered_set<uint32_t> userSupernodes;
                     std::unordered_set<std::size_t> userBatches;
-                    for (const auto &user : graph.getValue(valueId).users())
+                    const auto usersOwner_valueId = graph.getValue(valueId);
+                    for (const auto &user : usersOwner_valueId.users())
                     {
                         ++graphUserEdges;
                         const OperationId userOpId = user.operation;
@@ -18956,7 +19046,8 @@ template<class Index>
             std::unordered_set<std::size_t> writtenBoolSlots;
             for (OperationId id : ops)
             {
-                for (ValueId result : graph.getOperation(id).results())
+                const auto operation = graph.getOperation(id);
+                for (ValueId result : operation.results())
                 {
                     const auto value = canonicalMaterializedStorageValue(model, result);
                     written.insert(value);
@@ -20158,6 +20249,45 @@ template<class Index>
             return resolvedStoredValueRefExpr(model, view.value, context);
         }
 
+        std::optional<std::vector<std::string>> packedArrayDirectStateFields(
+            const Graph &graph, const EmitModel &model, const Operation &concat, const PackedArrayLaneView &view)
+        {
+            // Complete scalar writes from distinct state storage cannot observe
+            // the destination array's initialization. Repeated source states
+            // are valid; each destination lane must still be written once.
+            if (concat.operands().size() != view.elementCount ||
+                view.laneByOperand.size() != view.elementCount ||
+                getAttribute<bool>(concat, "hasSideEffects").value_or(false)) return std::nullopt;
+            std::vector<std::string> fields(view.elementCount);
+            for (std::size_t i = 0; i < concat.operands().size(); ++i)
+            {
+                const auto value = concat.operands()[i];
+                const auto def = graph.valueDef(value);
+                if (!def.valid() || isEventValue(model, value) ||
+                    (isMaterializedValue(model, value) && !model.directStateReadSymbolByValue.contains(value)))
+                    return std::nullopt;
+                const auto read = graph.getOperation(def);
+                std::optional<std::string> symbol;
+                if (read.kind() == OperationKind::kRegisterReadPort)
+                    symbol = getAttribute<std::string>(read, "regSymbol");
+                else if (read.kind() == OperationKind::kLatchReadPort)
+                    symbol = getAttribute<std::string>(read, "latchSymbol");
+                if (!symbol || !model.stateBySymbol.contains(*symbol) ||
+                    getAttribute<bool>(read, "hasSideEffects").value_or(false)) return std::nullopt;
+                const auto &state = model.stateBySymbol.at(*symbol);
+                const auto lane = view.laneByOperand[i];
+                if (state.kind == StateDecl::Kind::Memory || state.regToMemIntentStorage ||
+                    state.logicSlotIndex == kInvalidIndex || state.width != view.elementWidth ||
+                    graph.valueWidth(value) != view.elementWidth ||
+                    scalarLogicObjectCppType(state.scalarKind) != packedArrayLaneCppType(view) ||
+                    lane >= fields.size() || !fields[lane].empty()) return std::nullopt;
+                fields[lane] = stateScalarStorageFieldName(state.scalarKind, std::to_string(state.logicSlotIndex));
+            }
+            if (std::any_of(fields.begin(), fields.end(), [](const auto &field) { return field.empty(); }))
+                return std::nullopt;
+            return fields;
+        }
+
         bool emitPackedArrayLaneConcatOperation(std::ostream &stream,
                                                 const Graph &graph,
                                                 const EmitModel &model,
@@ -20180,12 +20310,62 @@ template<class Index>
             const std::string lanes = packedArrayLaneRefExpr(model, *view, context);
             const std::string storageType = packedArrayLaneStorageType(*view);
             const std::string laneType = packedArrayLaneCppType(*view);
+            OperationId scopedSlice = OperationId::invalid();
+            std::string scopedName;
+            if (context != nullptr)
+            {
+                if (const auto it = context->scopedPackedSlicesByConcat.find(view->concatOp);
+                    it != context->scopedPackedSlicesByConcat.end())
+                {
+                    scopedSlice = it->second;
+                    if (context->scopedPackedResultBySlice.contains(scopedSlice)) return true;
+                    const auto slice = graph.getOperation(scopedSlice);
+                    scopedName = "grhsim_scoped_packed_select_" + std::to_string(slice.results().front().index);
+                    if (const auto selected = context->selectedPackedStateFieldsByConcat.find(view->concatOp);
+                        selected != context->selectedPackedStateFieldsByConcat.end())
+                    {
+                        const auto &fields = selected->second;
+                        auto tableSize = fields.size();
+                        while (tableSize > 1 && fields[tableSize - 1] == fields.front()) --tableSize;
+                        const auto suffix = std::to_string(view->value.index);
+                        const auto table = "packed_state_members_" + suffix;
+                        const auto index = "packed_state_index_" + suffix;
+                        stream << "        // Selected packed state: value=" << view->value.index
+                               << " slice=" << slice.results().front().index << " lanes=" << fields.size()
+                               << " table_lanes=" << tableSize << "\n";
+                        stream << "        static constexpr " << laneType << " state_logic_storage_t::* "
+                               << table << "[] = {\n";
+                        for (std::size_t i = 0; i < tableSize; ++i)
+                            stream << "            &state_logic_storage_t::" << fields[i] << ",\n";
+                        stream << "        };\n        const std::size_t " << index << " = static_cast<std::size_t>("
+                               << resolvedScheduleValueExpr(model, slice.operands()[1], context) << ");\n";
+                        const auto lane = tableSize == fields.size() ? index
+                            : "(" + index + " < " + std::to_string(tableSize) + "u ? " + index + " : 0u)";
+                        const auto expression = "(state_logic_storage_.*" + table + "[" + lane + "])";
+                        stream << "        const " << laneType << " " << scopedName << " = (" << index
+                               << " < " << fields.size() << "u) ? static_cast<" << laneType << ">("
+                               << scalarTruncExpr(expression, static_cast<std::size_t>(view->elementWidth))
+                               << ") : " << laneType << "{};\n";
+                        context->scopedPackedResultBySlice.emplace(scopedSlice, scopedName);
+                        return true;
+                    }
+                    stream << "        // Scoped packed array: value=" << view->value.index
+                           << " slice=" << slice.results().front().index << " lanes=" << view->elementCount << "\n";
+                    stream << "        const " << laneType << " " << scopedName
+                           << " = [&]() -> " << laneType << " {\n";
+                }
+            }
             emitValueAssignmentComment(stream, graph, model, view->value, "        ");
+            const bool completeOverwrite = model.packedArrayNoInit &&
+                packedArrayDirectStateFields(graph, model, op, *view).has_value();
+            if (completeOverwrite)
+                stream << "        // Packed array full overwrite: value=" << view->value.index
+                       << " lanes=" << view->elementCount << "\n";
             if (!materialized)
             {
-                stream << "        " << storageType << " " << lanes << "{};\n";
+                stream << "        " << storageType << " " << lanes << (completeOverwrite ? ";\n" : "{};\n");
             }
-            else
+            else if (!completeOverwrite)
             {
                 stream << "        " << lanes << " = " << storageType << "{};\n";
             }
@@ -20200,6 +20380,17 @@ template<class Index>
                        << scalarTruncExpr(scalarCastOperandExpr(operandExpr),
                                           static_cast<std::size_t>(view->elementWidth))
                        << ");\n";
+            }
+            if (scopedSlice.valid())
+            {
+                const auto slice = graph.getOperation(scopedSlice);
+                const std::string index = "scoped_packed_index_" + std::to_string(view->value.index);
+                stream << "        const std::size_t " << index << " = static_cast<std::size_t>("
+                       << resolvedScheduleValueExpr(model, slice.operands()[1], context) << ");\n";
+                stream << "        return (" << index << " < " << view->elementCount << "u) ? "
+                       << lanes << "[" << index << "] : " << laneType << "{};\n        }();\n";
+                context->scopedPackedResultBySlice.emplace(scopedSlice, scopedName);
+                return true;
             }
             if (materialized && view->sourceValue == view->value &&
                 valueNeedsChangeDetect(model, view->value, activationContext))
@@ -20274,6 +20465,16 @@ template<class Index>
                 return false;
             }
             const ValueId resultValue = op.results().front();
+            if (context != nullptr)
+            {
+                if (const auto it = context->scopedPackedResultBySlice.find(graph.valueDef(resultValue));
+                    it != context->scopedPackedResultBySlice.end())
+                {
+                    emitLogicAssignFromScalarExpr(stream, graph, model, resultValue, it->second, false,
+                                                  context, activationContext, deferredContext);
+                    return true;
+                }
+            }
             const std::string indexName = "packed_array_idx_" + std::to_string(resultValue.index);
             const std::string indexExpr = resolvedScheduleValueExpr(model, op.operands()[1], context);
             // A local single-use slice may be inlined far from its definition.
@@ -20868,6 +21069,78 @@ template<class Index>
                     continue;
                 }
                 context.stablePackedArrayIndices.insert(index);
+            }
+        }
+
+        template<class... Plans>
+        void collectScopedPackedArrays(const Graph &graph, const EmitModel &model,
+            const std::vector<OperationId> &ops, SupernodeLocalExprContext &context, const Plans &...plans)
+        {
+            if (!model.packedArrayLocalScope && !model.packedArrayStateSelect) return;
+            std::unordered_set<OperationId, OperationIdHash> excluded;
+            const auto exclude = [&](const auto &plan) {
+                excluded.insert(plan.absorbed.begin(), plan.absorbed.end());
+                for (const auto &[root, _] : plan.roots) excluded.insert(root);
+                if constexpr (requires { plan.loops; })
+                    for (const auto &[begin, loop] : plan.loops)
+                        for (auto i = begin; i < loop.end; ++i) excluded.insert(ops.at(i));
+            };
+            (exclude(plans), ...);
+            std::unordered_map<OperationId, std::size_t, OperationIdHash> position;
+            std::unordered_set<ValueId, ValueIdHash> written;
+            std::unordered_set<std::string> writtenStorage;
+            for (std::size_t i = 0; i < ops.size(); ++i)
+            {
+                const auto op = graph.getOperation(ops[i]);
+                if (isCommitPhaseOp(op) || isRegToMemIntentBypassOp(model, ops[i]) ||
+                    getAttribute<bool>(op, "hasSideEffects").value_or(false) ||
+                    op.kind() == OperationKind::kBehaviorComputeGroup ||
+                    (!isDeferredActivationForwardPureKind(op.kind()) &&
+                     op.kind() != OperationKind::kRegisterReadPort && op.kind() != OperationKind::kLatchReadPort))
+                    return;
+                position.emplace(ops[i], i);
+                for (auto result : op.results())
+                {
+                    written.insert(canonicalMaterializedStorageValue(model, result));
+                    if (isMaterializedValue(model, result)) writtenStorage.insert(valueRef(model, result));
+                }
+            }
+            for (const auto id : ops)
+            {
+                const auto concat = graph.getOperation(id);
+                if (concat.kind() != OperationKind::kConcat || concat.results().size() != 1) continue;
+                const auto *view = packedArrayLaneViewForSourceValue(model, concat.results().front());
+                if (view == nullptr || view->concatOp != id || isMaterializedValue(model, view->value) ||
+                    isEventValue(model, view->value) || excluded.contains(id) || excluded.contains(view->defOp) ||
+                    context.indexedConcatSlices.contains(view->sourceValue)) continue;
+                const auto value = graph.getValue(view->value);
+                if (value.users().size() != 1) continue;
+                const auto sliceId = value.users().front().operation;
+                if (!position.contains(sliceId) || position.at(sliceId) <= position.at(id) ||
+                    excluded.contains(sliceId)) continue;
+                const auto slice = graph.getOperation(sliceId);
+                if (!sliceArrayUsesPackedArrayLaneView(graph, *view, slice)) continue;
+                const auto index = slice.operands()[1];
+                const auto canonical = canonicalMaterializedStorageValue(model, index);
+                // Construction stays at its original operation. Only the single
+                // scalar selection moves earlier, so its index must be an
+                // unchanged input/stored scalar, including physical slot aliases.
+                // Locally computed indices and direct state aliases fall back.
+                if (!isScalarLogicValue(graph, index) || isEventValue(model, index) ||
+                    model.directStateReadSymbolByValue.contains(index) || written.contains(canonical) ||
+                    writtenStorage.contains(valueRef(model, canonical)) ||
+                    (!model.inputFieldByValue.contains(index) && !model.valueScalarSlotByValue.contains(canonical)))
+                    continue;
+                if (model.packedArrayStateSelect)
+                {
+                    if (auto fields = packedArrayDirectStateFields(graph, model, concat, *view))
+                    {
+                        context.selectedPackedStateFieldsByConcat.emplace(id, std::move(*fields));
+                        context.scopedPackedSlicesByConcat.emplace(id, sliceId);
+                        continue;
+                    }
+                }
+                if (model.packedArrayLocalScope) context.scopedPackedSlicesByConcat.emplace(id, sliceId);
             }
         }
 
@@ -23735,7 +24008,14 @@ template<class Index>
                     ValueId source;
                     std::unordered_set<OperationId, OperationIdHash> operations;
                     uint32_t treeCost = 0, depth = 0;
+                    bool crossRegion = false;
                 };
+                // With cross-region proofs, every nonconstant operation is pure
+                // and strictly upstream in this compute phase. The single writer
+                // commits after compute, so the state expression observes the same
+                // snapshot. Admission below still requires the original independent
+                // state activation heads for producer and all consumers; no new
+                // head is introduced and candidate deletions cannot prove each other.
                 // Fixed structural bounds, independent of any execution profile.
                 constexpr uint32_t maxProofOps = 32, maxProofDepth = 16;
                 constexpr uint32_t maxInlineTreeOps = 4, maxInlineUseOps = 16;
@@ -23763,7 +24043,11 @@ template<class Index>
                             result.expression = renderScalarAssignedExpr(graph, value, *expr, false);
                             return memo.emplace(value, result).first->second;
                         }
-                        if (!owners.contains(def) || owners.at(def) != sid || protectedValues.contains(value) ||
+                        if (!owners.contains(def) || protectedValues.contains(value) ||
+                            (!model.coveredStateViewCrossRegion && owners.at(def) != sid) ||
+                            (model.coveredStateViewCrossRegion &&
+                             (!pureGroups.contains(owners.at(def)) ||
+                              model.activeIdBySupernode[owners.at(def)] > model.activeIdBySupernode[sid])) ||
                             model.packedArrayLaneViewByValue.contains(value) ||
                             getAttribute<bool>(op, "hasSideEffects").value_or(false) || op.results().size() != 1)
                             return std::nullopt;
@@ -23778,6 +24062,7 @@ template<class Index>
                                 state.isSigned != graph.valueSigned(value)) return std::nullopt;
                             StateExpression result;
                             result.state = *symbol; result.source = value;
+                            result.crossRegion = owners.at(def) != sid;
                             result.expression = "static_cast<" + cppTypeForValue(graph, value) + ">(" + stateRef(state) + ")";
                             return memo.emplace(value, result).first->second;
                         }
@@ -23816,18 +24101,30 @@ template<class Index>
                         }
                         visiting.insert(value);
                         StateExpression result; result.operations.insert(def); result.treeCost = 1;
+                        result.crossRegion = owners.at(def) != sid;
                         std::vector<std::string> expressions;
                         bool valid = true;
                         for (auto input : operands)
                         {
                             const auto inputDef = graph.valueDef(input);
-                            if (owners.contains(inputDef) && owners.at(inputDef) == sid &&
-                                positions.at(inputDef) >= positions.at(def)) { valid = false; break; }
+                            if (!model.coveredStateViewCrossRegion && owners.contains(inputDef) &&
+                                owners.at(inputDef) == sid && positions.at(inputDef) >= positions.at(def))
+                            { valid = false; break; }
+                            if (model.coveredStateViewCrossRegion && owners.contains(inputDef) &&
+                                graph.opKind(inputDef) != OperationKind::kConstant)
+                            {
+                                const auto sourceGroup = owners.at(inputDef), targetGroup = owners.at(def);
+                                if ((sourceGroup == targetGroup && positions.at(inputDef) >= positions.at(def)) ||
+                                    (sourceGroup != targetGroup &&
+                                     model.activeIdBySupernode[sourceGroup] >= model.activeIdBySupernode[targetGroup]))
+                                { valid = false; break; }
+                            }
                             const auto child = prove(input);
                             if (!child || (!result.state.empty() && !child->state.empty() && result.state != child->state))
                             { valid = false; break; }
                             if (result.state.empty() && !child->state.empty())
                             { result.state = child->state; result.source = child->source; }
+                            result.crossRegion |= child->crossRegion;
                             result.operations.insert(child->operations.begin(), child->operations.end());
                             result.depth = std::max(result.depth, child->depth + 1u);
                             result.treeCost = std::min(maxInlineTreeOps + 1u, result.treeCost + child->treeCost);
@@ -23885,7 +24182,8 @@ template<class Index>
                         model.coveredStateViews.emplace(value, EmitModel::CoveredStateView{
                             .state = proof->state, .expression = proof->expression, .source = proof->source,
                             .producer = sid, .consumers = external, .inlineValue = inlineValue,
-                            .composed = true, .expressionOps = static_cast<uint32_t>(proof->operations.size())});
+                            .composed = true, .expressionOps = static_cast<uint32_t>(proof->operations.size()),
+                            .crossRegion = proof->crossRegion});
                     }
                 }
             }
@@ -24084,7 +24382,8 @@ template<class Index>
                         continue;
                     }
 
-                    const auto users = graph.getValue(chain.result).users();
+                    const auto chainResult = graph.getValue(chain.result);
+                    const auto users = chainResult.users();
                     if (users.size() != 1u)
                     {
                         ++resultUserMismatch;
@@ -28191,6 +28490,16 @@ template<class Index>
                 const BoolProducerReducePlan *boolReducePlan =
                     !fullpassVariant && batch.phase == ScheduleBatch::Phase::kCompute &&
                     boolReduceIt != boolReducePlans.end() ? &boolReduceIt->second : nullptr;
+                if (batch.phase == ScheduleBatch::Phase::kCompute &&
+                    (model.packedArrayLocalScope || model.packedArrayStateSelect))
+                {
+                    if (boolReducePlan)
+                        collectScopedPackedArrays(graph, model, supernodeOps, localExprContext,
+                                                  priorityMuxPlan, conditionalMuxPlan, predicatePlan, *boolReducePlan);
+                    else
+                        collectScopedPackedArrays(graph, model, supernodeOps, localExprContext,
+                                                  priorityMuxPlan, conditionalMuxPlan, predicatePlan);
+                }
                 if (batch.phase == ScheduleBatch::Phase::kCommit)
                 {
                     const auto commitEventInfo =
@@ -28242,6 +28551,10 @@ template<class Index>
                                    << " mode=" << (view->second.inlineValue ? "inline" : "notify") << "\n";
                             if (view->second.composed)
                                 stream << "            // Composed state expression: value=" << op.results()[0].index
+                                       << " ops=" << view->second.expressionOps
+                                       << " mode=" << (view->second.inlineValue ? "inline" : "notify") << "\n";
+                            if (view->second.crossRegion)
+                                stream << "            // Cross-region state expression: value=" << op.results()[0].index
                                        << " ops=" << view->second.expressionOps
                                        << " mode=" << (view->second.inlineValue ? "inline" : "notify") << "\n";
                             if (view->second.inlineValue) { ++opIndex; continue; }
@@ -30502,6 +30815,13 @@ template<class Index>
                 }
                 const auto conditional = collectConditionalMuxCones(graph, model, schedule, id, ops, localContext);
                 const auto predicates = collectLocalPredicateSets(graph, model, schedule, id, ops, localContext, conditional);
+                collectScopedPackedArrays(graph, model, ops, localContext, priority, conditional, predicates, reduce);
+                if (!localContext.scopedPackedSlicesByConcat.empty())
+                {
+                    features["packed_array.scoped_selects"] = localContext.scopedPackedSlicesByConcat.size() -
+                        localContext.selectedPackedStateFieldsByConcat.size();
+                    features["packed_array.state_selects"] = localContext.selectedPackedStateFieldsByConcat.size();
+                }
                 const std::size_t activeId = model.activeIdBySupernode.at(id);
                 const ActivationEmitContext staticActivationContext{
                     .currentWordIndex = activeId / kActiveFlagBitsPerWord,
@@ -31567,6 +31887,8 @@ template<class Index>
             "covered_state_view_composition", "WOLVRIX_GRHSIM_COVERED_STATE_VIEW_COMPOSITION", false);
         const bool coveredStateViewCompositionInline = parseBooleanEmitOption(options,
             "covered_state_view_composition_inline", "WOLVRIX_GRHSIM_COVERED_STATE_VIEW_COMPOSITION_INLINE", false);
+        const bool coveredStateViewCrossRegion = parseBooleanEmitOption(options,
+            "covered_state_view_cross_region", "WOLVRIX_GRHSIM_COVERED_STATE_VIEW_CROSS_REGION", false);
         const bool fullActiveWordConsume =
             parseBooleanEmitOption(options,
                                    "full_active_word_consume",
@@ -31793,6 +32115,14 @@ template<class Index>
             parseBooleanEmitOption(options,
                                    "packed_array_late_index",
                                    "WOLVRIX_GRHSIM_PACKED_ARRAY_LATE_INDEX");
+        const bool stateLayoutPackedAccess = parseBooleanEmitOption(options,
+            "state_layout_packed_access", "WOLVRIX_GRHSIM_STATE_LAYOUT_PACKED_ACCESS", false);
+        const bool packedArrayLocalScope = parseBooleanEmitOption(options,
+            "packed_array_local_scope", "WOLVRIX_GRHSIM_PACKED_ARRAY_LOCAL_SCOPE", false);
+        const bool packedArrayNoInit = parseBooleanEmitOption(options,
+            "packed_array_no_init", "WOLVRIX_GRHSIM_PACKED_ARRAY_NO_INIT", false);
+        const bool packedArrayStateSelect = parseBooleanEmitOption(options,
+            "packed_array_state_select", "WOLVRIX_GRHSIM_PACKED_ARRAY_STATE_SELECT", false);
         const bool wideStateReadRefs =
             parseBooleanEmitOption(options,
                                    "wide_state_read_refs",
@@ -32079,6 +32409,7 @@ template<class Index>
             configuredModel.coveredStateViewInline = coveredStateViewInline;
             configuredModel.coveredStateViewComposition = coveredStateViewComposition;
             configuredModel.coveredStateViewCompositionInline = coveredStateViewCompositionInline;
+            configuredModel.coveredStateViewCrossRegion = coveredStateViewCrossRegion;
             configuredModel.scalarLeafMuxUnpredictable = scalarLeafMuxUnpredictable;
             configuredModel.stagedScalarConcat = stagedScalarConcat;
             configuredModel.indexedConcatSlice = indexedConcatSlice;
@@ -32109,6 +32440,10 @@ template<class Index>
             configuredModel.directDeferredActivation = directDeferredActivation;
             configuredModel.sharedDeferredActivation = sharedDeferredActivation;
             configuredModel.packedArrayLateIndex = packedArrayLateIndex;
+            configuredModel.stateLayoutPackedAccess = stateLayoutPackedAccess;
+            configuredModel.packedArrayLocalScope = packedArrayLocalScope;
+            configuredModel.packedArrayNoInit = packedArrayNoInit;
+            configuredModel.packedArrayStateSelect = packedArrayStateSelect;
             configuredModel.wideStateReadRefs = wideStateReadRefs;
             configuredModel.localComputeUseOrder = localComputeUseOrder;
             configuredModel.priorityMuxChains = priorityMuxChains;

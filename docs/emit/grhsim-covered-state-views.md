@@ -124,3 +124,28 @@ The rule also applies to other designs, including XiangShan, when the same
 conditions hold. Inter-partition transfers and memory-backed registers do not
 inherit this proof; measured benefit on one design does not establish coverage
 or speedup on another.
+
+## Cross-region expression proof
+
+The separate default-off emitter attribute `covered_state_view_cross_region`
+(environment `WOLVRIX_GRHSIM_COVERED_STATE_VIEW_CROSS_REGION`) extends composition
+through earlier pure compute groups. It requires the existing notifications and
+composition options. It preserves the fixed operation/depth and inline budgets.
+All nonconstant dependency edges must follow local operation order or increasing
+compute active IDs. Register sources remain non-materialized single-writer reads;
+commits occur after compute, so the expression uses one register snapshot.
+
+The producer and every consumer must still belong to the original independent
+register activation frontier. The proof neither adds activation heads nor uses
+removed candidate edges as evidence for another candidate. Cache keys/results,
+events, aliases, waveform/public values, effect groups and commit uses retain
+the existing protection. A cross-group expression by itself does not establish
+activation coverage. Diagnostic comments mark only proofs actually crossing a
+group; the option-off output is unchanged.
+
+The focused `emit-grhsim-cross-region-views` regression checks cross-group
+slice/not/reduction chains, notify-only and bounded inline forms, three widths
+including signed and 64-bit, two clocks, asynchronous reset, masked writes,
+repeated evaluation and unchanged group execution counts at O0/O3 with
+sanitizers. Missing independent state reads, effects, public values and decode
+keys are rejected.
